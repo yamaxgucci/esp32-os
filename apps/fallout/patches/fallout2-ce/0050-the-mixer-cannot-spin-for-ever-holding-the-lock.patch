@@ -1,0 +1,166 @@
+diff --git a/src/audio_engine.cc b/src/audio_engine.cc
+--- a/src/audio_engine.cc
++++ b/src/audio_engine.cc
+@@ -61,6 +61,39 @@
+ 
+             unsigned char buffer[1024];
+             int pos = 0;
++            /*
++             * ARGON: how many turns have produced nothing at all.
++             *
++             * This loop advances `pos` by whatever the resampler gives back,
++             * and nothing here handled it giving back zero: `pos` then stays
++             * where it is, and for a *looping* buffer soundBuffer->pos wraps
++             * round instead of reaching the end - so the only two ways out,
++             * `pos >= length` and a hard error, are both unreachable and the
++             * loop runs for ever.  Holding this buffer's mutex, which is what
++             * makes it fatal rather than merely silent: every one of
++             * audioEngineCreateSoundBuffer, ...Lock and ...Release waits on
++             * it, and they are called from the game's own thread.
++             *
++             * That is the freeze Maxim has been hitting.  8 September 2026,
++             * walking into the second part of the Temple of Trials - the
++             * engine's log ends mid-sentence:
++             *
++             *     Loading sound file sprtrap.ACM...
++             *
++             * with no "succeeded." after it.  soundLoad had reached the audio
++             * engine and stopped there.  Everything else on the board went on
++             * running - the wire task, the network, the console's output -
++             * which is exactly the shape of one thread waiting on a mutex
++             * another thread will never give back.
++             *
++             * A generous bound rather than an immediate break: a resampler is
++             * entitled to swallow a few frames before it has enough to return
++             * any, and breaking on the first empty turn would clip the start
++             * of every sound.  Two hundred and fifty-six turns is 1 KB of
++             * input for this format - far past priming, and nowhere near a
++             * hang.
++             */
++            int idle = 0;
+             while (pos < length) {
+                 int remaining = length - pos;
+                 if (remaining > sizeof(buffer)) {
+@@ -75,6 +108,13 @@
+                 if (bytesRead == -1) {
+                     break;
+                 }
++                if (bytesRead == 0) {
++                    if (++idle > 256) {
++                        break;
++                    }
++                } else {
++                    idle = 0;
++                }
+ 
+                 SDL_MixAudioFormat(stream + pos, buffer, gAudioEngineSpec.format, bytesRead, soundBuffer->volume);
+ 
+@@ -156,6 +196,29 @@
+             soundBuffer->pos = 0;
+             soundBuffer->data = malloc(size);
+             soundBuffer->stream = SDL_NewAudioStream(bitsPerSample == 16 ? AUDIO_S16 : AUDIO_S8, channels, rate, gAudioEngineSpec.format, gAudioEngineSpec.channels, gAudioEngineSpec.freq);
++            /*
++             * ARGON: and if either could not be had, this slot is not usable.
++             *
++             * Both were taken unchecked, on a machine where they can fail:
++             * `size` here is a whole sound, tens of kilobytes, out of an arena
++             * that runs out.  A null `data` is read from by the mixer on the
++             * next callback; a null `stream` makes every Put fail and every
++             * Get answer -1, so the sound is silent and the slot is spent for
++             * the rest of the run - eight of those and there is no sound at
++             * all, with nothing said about why.
++             */
++            if (soundBuffer->data == nullptr || soundBuffer->stream == nullptr) {
++                if (soundBuffer->data != nullptr) {
++                    free(soundBuffer->data);
++                    soundBuffer->data = nullptr;
++                }
++                if (soundBuffer->stream != nullptr) {
++                    SDL_FreeAudioStream(soundBuffer->stream);
++                    soundBuffer->stream = nullptr;
++                }
++                soundBuffer->active = false;
++                return -1;
++            }
+             return index;
+         }
+     }
+diff --git a/src/sound.cc b/src/sound.cc
+--- a/src/sound.cc
++++ b/src/sound.cc
+@@ -670,13 +670,22 @@
+     }
+     const unsigned began = ag_cache_now_us();
+ 
++    /* And the two halves named apart, because the freeze of 8 September 2026
++     * stopped somewhere in here and the log could not say which: the open goes
++     * through the sound cache to the card, the preload through the ACM decoder
++     * to the audio engine, and they fail for entirely different reasons. */
++    const char* const step_was = ag_step;
++    AG_STEP("soundLoad: open");
+     sound->io.fd = sound->io.open(gSoundFileNameMangler(filePath), &(sound->rate));
+     if (sound->io.fd == -1) {
++        ag_step = step_was;
+         gSoundLastError = SOUND_FILE_NOT_FOUND;
+         return gSoundLastError;
+     }
+ 
++    AG_STEP("soundLoad: decode and hand to the audio engine");
+     const int rc = _preloadBuffers(sound);
++    ag_step = step_was;
+ 
+     const unsigned took = (ag_cache_now_us() - began) / 1000u;
+     ag_sfx_loads++;
+diff --git a/src/cache.cc b/src/cache.cc
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -331,8 +331,16 @@
+          * the miss before it. */
+         ag_miss_name[0] = '\0';
+ 
++        /* Put back rather than set to something fixed: a cache read happens
++         * inside a map load too, and a breadcrumb that overwrote "mapLoad"
++         * with "playing" would be a lie for the next several seconds. */
++        const char* const step_was = ag_step;
++        AG_STEP(cache->ag_kind == AG_CACHE_SOUND
++                    ? "cache: reading a sound off the card"
++                    : "cache: reading art off the card");
+         const unsigned began = ag_cache_now_us();
+         const bool got = cacheFetchEntryForKey(cache, key, &index);
++        ag_step = step_was;
+         const unsigned took_ms = (ag_cache_now_us() - began) / 1000u;
+         ag_cache_miss_ms[slot] += took_ms;
+ 
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -833,6 +833,7 @@
+      * mapLoad has one exit, at the bottom, so this is paired there.
+      */
+     ag_map_loading++;
++    AG_STEP("mapLoad");
+ 
+     _map_save_in_game(true);
+     // ARGON: 14 rather than 13 - streamed, not decoded whole into memory.
+@@ -1149,6 +1150,7 @@
+     if (ag_map_loading != 0u) {
+         ag_map_loading--;
+     }
++    AG_STEP("playing");
+ 
+     return rc;
+ }
+diff --git a/src/main.cc b/src/main.cc
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -412,6 +412,10 @@
+ 
+     scriptsEnable();
+ 
++    /* ARGON: the coarse breadcrumb the finer ones are put back to.  See
++     * port/ag_diag.h. */
++    AG_STEP("playing");
++
+     while (_game_user_wants_to_quit == 0) {
+         sharedFpsLimiter.mark();
+ 

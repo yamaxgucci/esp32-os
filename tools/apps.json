@@ -231,6 +231,8 @@
       "include": ["apps/common"],
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
       "src": ["apps/stm32flash/stm32flash.c", "apps/common/stm32/ag_stm32ldr.c"] },
+    { "out": "UARTMON.AXE", "group": "core", "src": ["apps/uartmon/uartmon.c"] },
+    { "out": "ATBAUD.AXE", "group": "core", "src": ["apps/atbaud/atbaud.c"] },
     { "out": "GC2145.SYS", "group": "core", "include": ["apps/gc2145"], "src": ["apps/gc2145/gc2145.c"] },
     { "out": "CAM.AXE", "group": "core", "src": ["apps/cam/cam.c"] },
     {
@@ -288,6 +290,7 @@
     },
 
     { "out": "GFXPIX.AXE", "group": "board", "src": ["apps/gfxpix/gfxpix.c"] },
+    { "out": "OOPS.AXE", "group": "board", "src": ["apps/oops/oops.c"] },
 
     { "out": "XIPBENCH.AXE", "src": ["apps/xipbench/xipbench.c"] },
     { "out": "MIDIPAD.AXE", "group": "board", "src": ["apps/midipad/midipad.c"] },
@@ -419,7 +422,7 @@
     },
     {
       "out": "LINK.AXE", "group": "core",
-      "_note": "The wire between two boards, measured. Sends 260-byte framed blocks with a sequence number and a checksum one way and counts ok/corrupt/lost/stray at the other end, so a line too fast for the wiring is told apart from a receiver that was not listening. Needs [uart1] tx/rx in BOARD.CFG on both ends. Build it once per chip - the CYD is an LX6, the S3 an LX7 - and note that this manifest only ever builds for CONFIG_IDF_TARGET, so the other image comes from a direct mkaxe call with --gcc xtensa-esp32-elf-gcc. 4 Mbaud = 400 067 B/s clean over 4 MB; docs/09-esp32-cyd.md has the table.",
+      "_note": "The wire between two boards, measured. Sends framed blocks with a sequence number and a checksum one way - `link send <baud> [kb] [block]` and `link recv <baud> [secs] [block]`, block being the whole block on the wire, 16..1040, default 260 - and counts ok/corrupt/lost/stray at the other end, so a line too fast for the wiring is told apart from a receiver that was not listening. Needs [uart1] tx/rx in BOARD.CFG on both ends. Build it once per chip - the CYD is an LX6, the S3 an LX7 - and note that this manifest only ever builds for CONFIG_IDF_TARGET, so the other image comes from a direct mkaxe call with --gcc xtensa-esp32-elf-gcc. 4 Mbaud = 400 067 B/s clean over 4 MB; docs/09-esp32-cyd.md has the table.",
       "src": ["apps/link/link.c"]
     },
     {
@@ -448,9 +451,33 @@
       "src": ["apps/remdisp/remdisp.c"]
     },
     {
+      "out": "PHONE.SYS", "group": "core",
+      "_note": "The board's screen and keyboard on a phone, over Wi-Fi. Publishes a display device (blit_rect for pixels, text_row/text_cursor for the console) and an input device, and serves its own client page on :8765 - a GET of / returns the HTML, a GET of /ws upgrades to a WebSocket carrying bands of pixels one way and keys and taps the other. Has a task of its own (sys->module_task, ABI 0.48), so blit_rect only copies the rectangle and marks the damage. Plan and protocol in docs/plans/phone.md.",
+      "generate": ["tools/mkpage.py"],
+      "include": ["apps/common/libc", "apps/common/pixband", "apps/common/ws",
+                  "apps/phone"],
+      "src": ["apps/phone/phone.c", "apps/common/pixband/ag_pixband.c",
+              "apps/common/ws/ag_ws.c", "apps/common/libc/libc_shim.c"]
+    },
+    {
+      "out": "PHONECL.AXE", "group": "core",
+      "_note": "A client of PHONE.SYS, so a second board can test the link instead of a person with a phone. Fetches the page over HTTP, upgrades to the WebSocket, answers the password challenge (SHA1 of nonce and password, apps/common/ws), then mirrors the console and sends keys: `-type`, `-enter`, `-key alt+2`, `-wait MS`, `-screen`, `-hold SECS`. Written after a day in which every one of five faults - a starved radio, picture buffers held for a text screen, a ten-second wait on a shut window, Ctrl+C dropped, an access point that went quiet - had to be reproduced by asking someone to press a key again. What it cannot judge is how the page looks.",
+      "include": ["apps/common/libc", "apps/common/ws"],
+      "src": ["apps/phonecl/phonecl.c", "apps/common/ws/ag_ws.c",
+              "apps/common/libc/libc_shim.c"]
+    },
+    {
       "out": "REMTERM.AXE", "group": "core",
       "_note": "The other end of REMDISP.SYS: takes bands of pixels to the panel with ag_gfx_present and console rows into its own console, switching between the two as the traffic does. Built here for the S3 only to keep it compiling - the image that runs is the LX6 one for the CYD, from a direct mkaxe call with --gcc xtensa-esp32-elf-gcc.",
       "src": ["apps/remterm/remterm.c"]
-    }
-  ]
+    },
+    {"_comment": "Built on worktree-fallout-cxx: the game's own test harness and the pieces it needs."},
+    {"out": "CPUPROBE.AXE", "group": "core", "_note": "Fixed arithmetic, a fixed wait spent awake, and a fixed wait spent asleep, worst of twenty reported. Tells apart a core that is slow, a core that is taken away, and a wake-up that is late - three things that look identical from a frame rate. It is what found REMDISP's wire task sitting above every application while never blocking.", "src": ["apps/cpuprobe/cpuprobe.c"]},
+    {"out": "CXXSTL.AXE", "group": "core", "include": ["apps/common/cxx"], "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin", "libs": ["stdc++"], "src": ["apps/cxxtest/stltest.cpp", "apps/common/cxx/cxx_rt.cpp", "apps/common/cxx/cxx_throw.cpp", "apps/common/cxx/cxx_hosted.c", "apps/common/libc/libc_shim.c"]},
+    {"out": "CXXTEST.AXE", "group": "core", "include": ["apps/common/cxx"], "src": ["apps/cxxtest/cxxtest.cpp", "apps/common/cxx/cxx_rt.cpp"]},
+    {"out": "FLUSHB.AXE", "group": "board", "src": ["apps/flushb/flushb.c"]},
+    {"out": "PCMPLAY.AXE", "group": "core", "_note": "Plays a raw PCM file straight at /dev/pcm0 and reports the rate the converter actually ran at, which is not the rate it was asked for. Written to settle 'the sound over the wire is not music': a file on the board's own disk removes the sender, the wire and the receiver's buffering from the question in one step, and the effective-rate line catches a clock divider that landed somewhere else - music at the wrong rate is exactly 'not music'. Default is 8-bit unsigned mono, which is what apps/remdisp carries, so the two put the same numbers on the same pin.", "include": ["apps/common/libc"], "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin", "src": ["apps/pcmplay/pcmplay.c", "apps/common/libc/libc_shim.c"]},
+    {"out": "SDLTEST.AXE", "group": "core", "_note": "The SDL shim with no engine and no data files. posix_io.cc is here for its counters rather than its files: the shim's reports read them, so without it the image does not link - which is how it quietly stopped building while the game was being measured. What the engine itself defines is stubbed at the top of sdltest.cc.", "include": ["apps/common/cxx", "apps/fallout/port"], "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin", "libs": ["stdc++"], "src": ["apps/fallout/port/sdltest.cc", "apps/fallout/port/sdl_shim.cc", "apps/fallout/port/posix_io.cc", "apps/common/cxx/cxx_rt.cpp", "apps/common/cxx/cxx_throw.cpp", "apps/common/cxx/cxx_hosted.c", "apps/common/libc/libc_shim.c"]},
+    {"out": "TICKER.AXE", "group": "core", "_note": "A clock with no hands: prints a line every 100 ms and says how late it was, measured against when the tick was due rather than against the last one. Run it beside something heavy and the gaps in its output are the gaps in which the system was not serving applications.", "src": ["apps/ticker/ticker.c"]}
+]
 }

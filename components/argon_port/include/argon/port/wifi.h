@@ -176,6 +176,23 @@ ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
 ag_err_t ag_port_wifi_ap_stop(void);
 ag_err_t ag_port_wifi_ap_status(ag_port_wifi_ap_status_t *out);
 
+/*
+ * Apply the point's settings to the radio again, exactly as they stand.
+ *
+ * For the failure nothing here can detect: the point stops transmitting, no
+ * AP_STOP event arrives, the mode is still AP, every field of ap_status is
+ * correct, and no phone can see the network.  Re-issuing `wifi ap` by hand
+ * fixes it in milliseconds, which is the whole of what this does.
+ *
+ * Not a fix - the cause is unknown - and deliberately not a timer inside the
+ * port.  The caller decides when it is harmless: the driver takes the point
+ * down and up again to apply a configuration, so this is only safe when
+ * nobody is connected.
+ *
+ * -AG_ENODEV when no point is running.
+ */
+ag_err_t ag_port_wifi_ap_refresh(void);
+
 #endif /* AG_PORT_WIFI_HAS_AP */
 
 #endif /* AG_PORT_HAS_WIFI */

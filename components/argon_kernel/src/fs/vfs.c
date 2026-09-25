@@ -43,6 +43,27 @@ static ag_vfs_lock_t        s_lock;
 static ag_pid_t (*s_owner_fn)(void);
 static bool s_initialised;
 
+/*
+ * Sized for the shape of the problem rather than the size of the disk.  With
+ * subtree entries doing the heavy lifting, a program needs an entry per
+ * missing directory, not per missing file; thirty-two covers every search path
+ * anything here has, and costs 2.6 KB of DRAM.  Paths longer than the buffer
+ * are simply not remembered, which loses speed and nothing else.
+ */
+#define AG_VFS_NEG_ENTRIES 32
+#define AG_VFS_NEG_PATH    80
+
+typedef struct {
+    uint32_t hash; /* 0 marks the slot empty */
+    uint8_t  len;
+    bool     subtree;
+    char     path[AG_VFS_NEG_PATH];
+} ag_neg_t;
+
+static ag_neg_t s_neg[AG_VFS_NEG_ENTRIES];
+static uint32_t s_neg_hits;
+static uint32_t s_neg_count;
+
 /* ---------------------------------------------------------------------- */
 
 static void lock(void)
@@ -59,6 +80,9 @@ static void unlock(void)
     }
 }
 
+/* Defined with the rest of the negative-lookup table, further down. */
+static void forget_misses_locked(void);
+
 static ag_pid_t current_owner(void)
 {
     return (s_owner_fn != NULL) ? s_owner_fn() : 0;
@@ -68,6 +92,9 @@ ag_err_t ag_vfs_init(const ag_vfs_lock_t *lock_iface)
 {
     memset(s_mounts, 0, sizeof(s_mounts));
     memset(s_handles, 0, sizeof(s_handles));
+    memset(s_neg, 0, sizeof(s_neg));
+    s_neg_count = 0;
+    s_neg_hits = 0;
     memset(&s_lock, 0, sizeof(s_lock));
     s_owner_fn = NULL;
 
@@ -158,6 +185,8 @@ ag_err_t ag_vfs_mount(const char *mountpoint, const ag_fs_ops_t *ops,
         m->ctx = ctx;
         m->flags = flags;
         m->used = true;
+        /* A new mount can bring names that were not there a moment ago. */
+        forget_misses_locked();
         unlock();
         return AG_OK;
     }
@@ -186,6 +215,7 @@ ag_err_t ag_vfs_unmount(const char *mountpoint)
             return -AG_EBUSY;
         }
         memset(m, 0, sizeof(*m));
+        forget_misses_locked();
         unlock();
         return AG_OK;
     }
@@ -215,6 +245,7 @@ ag_err_t ag_vfs_eject(const char *mountpoint)
             m->ops = NULL;
             m->ctx = NULL;
         }
+        forget_misses_locked();
         unlock();
         return AG_OK;
     }
@@ -399,6 +430,203 @@ static bool is_write_flag(uint32_t flags)
 }
 
 /* ---------------------------------------------------------------------- */
+/* Negative lookups                                                       */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * A lookup that finds a file costs a directory walk; a lookup that finds
+ * nothing costs the same walk and has nothing to show for it.  On a card that
+ * is milliseconds, and it is not a rare case: DOS-era programs look for one
+ * name in several directories in turn, so most of what they ask a filesystem
+ * is a question whose answer is no.  Fallout 2 drawing one frame of a map
+ * asked fifty-six times and was refused fifty-six times.
+ *
+ * So the noes are remembered.  An entry is a path that was not there; an entry
+ * marked `subtree` is a *directory* that was not there, which answers for
+ * everything below it too.  That second kind is what keeps the table small - a
+ * game hunting four hundred sprites in a directory that does not exist asks
+ * about the directory once and is refused four hundred times out of one entry.
+ *
+ * Two rules keep it honest.  Only whole-string matches count: a path is never
+ * boiled down to a number and assumed unique, because the failure that buys
+ * would be a file that exists being reported missing.  And anything that could
+ * make a remembered name exist empties the table - creating, renaming, making
+ * a directory, mounting.  Emptying rather than removing one entry is the
+ * conservative choice and costs nothing measurable: the table refills from the
+ * next few lookups.
+ *
+ * What it cannot see is a change made behind the VFS's back.  A mount where
+ * that is normal - the device registry, a host directory - says so with
+ * AG_MOUNT_VOLATILE and is never remembered against.
+ */
+
+/*
+ * Paths differing only in case name the same file here, as they do on FAT, so
+ * they have to hash and compare the same or the table would hold both.
+ */
+static char fold(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+static uint32_t hash_step(uint32_t h, char c)
+{
+    return (h ^ (uint8_t)fold(c)) * 16777619u;
+}
+
+/* Never 0, which the table uses to mean "empty". */
+static uint32_t hash_done(uint32_t h) { return (h == 0) ? 1u : h; }
+
+static bool neg_same(const ag_neg_t *e, const char *path, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (fold(e->path[i]) != fold(path[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Caller holds the lock. */
+static bool neg_probe(uint32_t h, const char *path, size_t len, bool dir_only)
+{
+    const ag_neg_t *e = &s_neg[h % AG_VFS_NEG_ENTRIES];
+    if (e->hash != h || e->len != len) {
+        return false;
+    }
+    if (dir_only && !e->subtree) {
+        return false;
+    }
+    return neg_same(e, path, len);
+}
+
+/*
+ * True when `canonical` is known to be absent - either because it was asked
+ * for before, or because a directory above it was.  Caller holds the lock.
+ */
+static bool miss_known(const char *canonical)
+{
+    uint32_t h = 2166136261u;
+
+    for (size_t i = 0; canonical[i] != '\0'; i++) {
+        /* The prefix ending here is a directory; a subtree entry answers. */
+        if (canonical[i] == '/' && i > 0 &&
+            neg_probe(hash_done(h), canonical, i, true)) {
+            s_neg_hits++;
+            return true;
+        }
+        h = hash_step(h, canonical[i]);
+    }
+
+    if (neg_probe(hash_done(h), canonical, strlen(canonical), false)) {
+        s_neg_hits++;
+        return true;
+    }
+    return false;
+}
+
+/* Caller holds the lock. */
+static void miss_remember(const char *path, size_t len, bool subtree)
+{
+    if (len == 0 || len >= AG_VFS_NEG_PATH) {
+        return;
+    }
+
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h = hash_step(h, path[i]);
+    }
+    h = hash_done(h);
+
+    ag_neg_t *e = &s_neg[h % AG_VFS_NEG_ENTRIES];
+    if (e->hash == 0) {
+        s_neg_count++;
+    }
+    e->hash = h;
+    e->len = (uint8_t)len;
+    e->subtree = subtree;
+    memcpy(e->path, path, len);
+}
+
+void ag_vfs_forget_misses(void)
+{
+    lock();
+    memset(s_neg, 0, sizeof(s_neg));
+    s_neg_count = 0;
+    unlock();
+}
+
+void ag_vfs_miss_stats(uint32_t *hits, uint32_t *entries)
+{
+    lock();
+    if (hits != NULL) {
+        *hits = s_neg_hits;
+    }
+    if (entries != NULL) {
+        *entries = s_neg_count;
+    }
+    unlock();
+}
+
+/* Caller holds the lock; used where the table is already being changed. */
+static void forget_misses_locked(void)
+{
+    if (s_neg_count != 0) {
+        memset(s_neg, 0, sizeof(s_neg));
+        s_neg_count = 0;
+    }
+}
+
+/*
+ * The path without its last component: "/sd/data/art/x.frm" -> "/sd/data/art",
+ * "/x.frm" -> "/".  Returns the length, so no copying is needed to ask about
+ * a parent.
+ */
+static size_t parent_len(const char *path, size_t len)
+{
+    while (len > 1 && path[len - 1] != '/') {
+        len--;
+    }
+    if (len > 1) {
+        len--; /* drop the separator, unless it is the root's own */
+    }
+    return len;
+}
+
+/*
+ * Record that `canonical` was not there.  If its parent directory is not there
+ * either, that is what gets recorded instead, and one entry then answers for
+ * every name under it - the case that matters, a program hunting hundreds of
+ * files in a directory that does not exist.
+ *
+ * The price is one extra stat the first time a directory is found missing, and
+ * nothing after.  Called with the lock released: the stat is a backend call
+ * and can be as slow as the open that just failed.  `rel` is written through.
+ */
+static void remember_absent(void *ctx, const ag_fs_ops_t *ops,
+                            const char *canonical, char *rel)
+{
+    const size_t canon_len = strlen(canonical);
+    const size_t rel_parent = parent_len(rel, strlen(rel));
+
+    /* rel_parent <= 1 means the parent is the mount root, which is there. */
+    if (ops->stat != NULL && rel_parent > 1) {
+        rel[rel_parent] = '\0';
+        ag_stat_t st;
+        if (ops->stat(ctx, rel, &st) == -AG_ENOENT) {
+            lock();
+            miss_remember(canonical, parent_len(canonical, canon_len), true);
+            unlock();
+            return;
+        }
+    }
+
+    lock();
+    miss_remember(canonical, canon_len, false);
+    unlock();
+}
+
+/* ---------------------------------------------------------------------- */
 /* Files                                                                  */
 /* ---------------------------------------------------------------------- */
 
@@ -422,6 +650,17 @@ ag_handle_t ag_vfs_open(const char *path, const char *cwd, uint32_t flags)
     }
 
     /*
+     * Reads of a name already known to be absent are answered here.  A write
+     * may create the name, so it always goes to the backend.
+     */
+    const bool cacheable = !is_write_flag(flags) &&
+                           (r.mount->flags & AG_MOUNT_VOLATILE) == 0;
+    if (cacheable && miss_known(r.canonical)) {
+        unlock();
+        return -AG_ENOENT;
+    }
+
+    /*
      * Drop the VFS lock across the backend open: HostFS (and slow SD) can block
      * for seconds.  Holding the lock that long makes Ctrl+\ return -AG_EBUSY
      * with no useful console feedback.
@@ -438,10 +677,22 @@ ag_handle_t ag_vfs_open(const char *path, const char *cwd, uint32_t flags)
     void *file = NULL;
     err = ops->open(ctx, rel_copy, flags, &file);
     if (err != AG_OK) {
+        if (err == -AG_ENOENT && cacheable) {
+            remember_absent(ctx, ops, r.canonical, rel_copy);
+        }
         return err;
     }
 
     lock();
+    /*
+     * An open that could create just did, and the name it created may be one
+     * somebody has been told is not there.  Cheaper to forget everything than
+     * to work out what.  Only AG_O_CREATE can bring a name into existence -
+     * writing to a file that is already there changes nothing to forget.
+     */
+    if ((flags & AG_O_CREATE) != 0) {
+        forget_misses_locked();
+    }
     if (!s_mounts[mount_index].used || s_mounts[mount_index].ejected) {
         if (ops->close != NULL) {
             unlock();
@@ -665,7 +916,22 @@ ag_err_t ag_vfs_stat(const char *path, const char *cwd, ag_stat_t *out)
         return -AG_ENOTSUP;
     }
 
+    const bool cacheable = (r.mount->flags & AG_MOUNT_VOLATILE) == 0;
+    if (cacheable && miss_known(r.canonical)) {
+        unlock();
+        return -AG_ENOENT;
+    }
+
     err = r.mount->ops->stat(r.mount->ctx, r.rel, out);
+    /*
+     * Only the plain fact, not the parent-directory shortcut that open() takes:
+     * that needs a second backend call, and this one holds the lock across the
+     * first.  The shortcut's entries serve stat all the same once open has
+     * made them.
+     */
+    if (err == -AG_ENOENT && cacheable) {
+        miss_remember(r.canonical, strlen(r.canonical), false);
+    }
     unlock();
     return err;
 }
@@ -740,6 +1006,9 @@ static ag_err_t mutate(const char *path, const char *cwd, mutate_op_t which)
     }
 
     err = fn(r.mount->ctx, r.rel);
+    if (err == AG_OK) {
+        forget_misses_locked();
+    }
     unlock();
     return err;
 }
@@ -798,6 +1067,9 @@ ag_err_t ag_vfs_rename(const char *from, const char *to, const char *cwd)
     from_rel[sizeof(from_rel) - 1] = '\0';
 
     err = rf.mount->ops->rename(rf.mount->ctx, from_rel, rt.rel);
+    if (err == AG_OK) {
+        forget_misses_locked();
+    }
     unlock();
     return err;
 }

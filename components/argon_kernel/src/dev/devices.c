@@ -33,9 +33,12 @@
 #include <argon/btinput.h>
 #include <argon/usbinput.h>
 #include <argon/port/bt.h>
+#include <argon/port/fault.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
+#include <argon/port/time.h>
 #include <argon/port/usb.h>
+#include <argon/port/net.h>
 #include <argon/port/wifi.h>
 
 #include "core/sysconfig.h"
@@ -45,8 +48,43 @@
 static ag_port_mutex_t s_dev_mutex;
 
 /*
- * One lock per device, held across a call into that device's driver in place of
- * the registry lock above.
+ * A second lock, held only across a display blit that blocks - a picture going
+ * out over a wire, hundreds of milliseconds at a time.
+ *
+ * The registry lock cannot be held across that, because it is the one lock
+ * every device shares: audio writes take it, the console takes it, and a blit
+ * that holds it for a third of a second stops the sound and the log for a
+ * third of a second - a whole second core wedged against the first when the
+ * blit runs on its own thread.  So the blit lets the registry lock go before
+ * it writes (display.c) and takes this one instead.
+ *
+ * It still has to answer the pin layer's one question - "is this the system
+ * writing, or whoever called in?" - because the io claim on the UART pins is
+ * held by the system and a write that looks like it came from the application
+ * is refused, which once put a whole frame into a single character cell.  So
+ * ag_dev_in_driver reports true for the holder of either lock.  Recursive, and
+ * separate, so two of the wire's own writes serialise here without ever
+ * touching the traffic on the registry lock.
+ */
+static ag_port_mutex_t s_blit_mutex;
+
+void ag_dev_blit_hold(void)
+{
+    if (s_blit_mutex != NULL) {
+        ag_port_mutex_take_recursive(s_blit_mutex, AG_PORT_FOREVER);
+    }
+}
+
+void ag_dev_blit_release(void)
+{
+    if (s_blit_mutex != NULL) {
+        ag_port_mutex_give_recursive(s_blit_mutex);
+    }
+}
+
+/*
+ * And one lock per device, held across a call into that device's driver in
+ * place of the registry lock.
  *
  * The registry lock is one lock for the whole machine, and a driver call is not
  * always short: a converter plays sound in real time, so a write to it returns
@@ -116,15 +154,41 @@ static void dev_call_release(void *ctx, void *iolock)
  * itself, and because the shell reads the registry from inside a listing it is
  * already walking.
  */
+/*
+ * Who holds the registry, since when, and inside which driver call.
+ *
+ * Written by the holder, read by a timer that takes no lock (see
+ * ag_dev_lockwatch): a torn read there costs a wrong number in a report, never
+ * anything worse, and the alternative - a lock around the record - would put
+ * the watch behind the thing it watches.  The depth is one counter and not one
+ * per task because a recursive mutex has one holder: whoever else calls
+ * dev_lock is asleep inside the take until that holder is gone.
+ */
+static volatile ag_port_task_t s_hold_task;
+static volatile int64_t        s_hold_since;
+static volatile uint32_t       s_hold_depth;
+static const char *volatile    s_note_dev;
+static const char *volatile    s_note_op;
+
 static void dev_lock(void *ctx)
 {
     (void)ctx;
     ag_port_mutex_take_recursive(s_dev_mutex, AG_PORT_FOREVER);
+    if (s_hold_depth++ == 0u) {
+        s_hold_task = ag_port_task_self();
+        s_hold_since = ag_port_us();
+    }
 }
 
 static void dev_unlock(void *ctx)
 {
     (void)ctx;
+    if (s_hold_depth != 0u && --s_hold_depth == 0u) {
+        s_hold_task = NULL;
+        s_hold_since = 0;
+        s_note_dev = NULL;
+        s_note_op = NULL;
+    }
     ag_port_mutex_give_recursive(s_dev_mutex);
 }
 
@@ -140,6 +204,56 @@ static void dev_count_unlock(void *ctx)
 {
     (void)ctx;
     (void)ag_port_mutex_give(s_count_mutex);
+}
+
+void ag_dev_note_call(const char *dev, const char *op)
+{
+    s_note_dev = dev;
+    s_note_op = op;
+}
+
+void ag_dev_note_done(void)
+{
+    s_note_dev = NULL;
+    s_note_op = NULL;
+}
+
+/*
+ * Runs on the port's timer, holding nothing.  Two seconds is an order of
+ * magnitude past the longest honest hold on this system (a whole-panel flush,
+ * tens of milliseconds); anything longer is a driver that has stopped, and
+ * this is the one voice left to say whose.
+ */
+#define AG_LOCKWATCH_AFTER_US 2000000ll
+
+void ag_dev_lockwatch(void)
+{
+    static int64_t said_at;
+
+    const ag_port_task_t who = s_hold_task;
+    const int64_t        since = s_hold_since;
+    if (who == NULL || since == 0) {
+        said_at = 0;
+        return;
+    }
+    const int64_t now = ag_port_us();
+    if (now - since < AG_LOCKWATCH_AFTER_US) {
+        return;
+    }
+    if (said_at != 0 && now - said_at < AG_LOCKWATCH_AFTER_US) {
+        return;
+    }
+    said_at = now;
+
+    const char *dev = s_note_dev;
+    const char *op = s_note_op;
+    ag_port_raw_print("\n[lockwatch] device registry held %u ms by '%s'%s%s%s%s\n",
+                      (unsigned)((now - since) / 1000ll),
+                      ag_port_task_name(who),
+                      (dev != NULL) ? " inside " : "",
+                      (dev != NULL) ? dev : "",
+                      (op != NULL) ? "." : "",
+                      (op != NULL) ? op : "");
 }
 
 /*
@@ -159,6 +273,9 @@ bool ag_dev_in_driver(void)
 {
     const void *self = ag_port_task_self();
     if (s_dev_mutex != NULL && ag_port_mutex_holder(s_dev_mutex) == self) {
+        return true;
+    }
+    if (s_blit_mutex != NULL && ag_port_mutex_holder(s_blit_mutex) == self) {
         return true;
     }
     /*
@@ -343,6 +460,12 @@ ag_err_t ag_devices_init(void)
             return -AG_ENOMEM;
         }
     }
+    if (s_blit_mutex == NULL) {
+        s_blit_mutex = ag_port_mutex_new_recursive();
+        if (s_blit_mutex == NULL) {
+            return -AG_ENOMEM;
+        }
+    }
 
     const ag_dev_lock_t lock = {
         .lock = dev_lock,
@@ -360,8 +483,13 @@ ag_err_t ag_devices_init(void)
         return err;
     }
 
+    /* The watch on that lock: see ag_dev_lockwatch.  Not fatal if the port
+     * cannot give a timer; the board is then as it was. */
+    (void)ag_port_lockwatch_start(ag_dev_lockwatch, 1000u);
+
     ag_devfs_reset();
-    err = ag_vfs_mount("/dev", ag_devfs_ops(), NULL, 0);
+    /* Volatile: a driver loading adds a device the VFS was not told about. */
+    err = ag_vfs_mount("/dev", ag_devfs_ops(), NULL, AG_MOUNT_VOLATILE);
     if (err != AG_OK) {
         return err;
     }
@@ -446,6 +574,30 @@ ag_err_t ag_devices_init(void)
         err = ag_net_init();
         if (err != AG_OK && err != -AG_ENOSYS) {
             ag_log(AG_LOG_WARN, "dev", "net init failed (%d)", (int)err);
+        }
+        /*
+         * A name on the network, so a phone opens http://argon.local:8765/
+         * rather than the address DHCP gave the board.  `argon` unless [net]
+         * hostname says otherwise; not fatal, and a build without mDNS just
+         * does without the name.
+         */
+        if (err == AG_OK &&
+            ag_cfg_get_bool(ag_sysconfig(), "net.mdns", true)) {
+            /*
+             * `[net] mdns = no` for a board too tight for it.  The mDNS
+             * responder costs a task and its buffers - on a part with no PSRAM
+             * that can be the kilobytes the supervisor stage then fails to get
+             * (stage 'supervisor' failed with -12).  A board that cannot spare
+             * them reaches the network by address instead of by name.
+             */
+            const char *host =
+                ag_cfg_get(ag_sysconfig(), "net.hostname", "argon");
+            const ag_err_t merr = ag_port_net_mdns(host);
+            if (merr == AG_OK) {
+                ag_log(AG_LOG_INFO, "net", "mdns: %s.local", host);
+            } else if (merr != -AG_ENOSYS) {
+                ag_log(AG_LOG_WARN, "net", "mdns failed (%d)", (int)merr);
+            }
         }
     }
 
@@ -543,6 +695,17 @@ ag_err_t ag_devices_init(void)
                        kbd);
             }
         }
+    } else if (ag_cfg_get_bool(ag_sysconfig(), "bt.release", false)) {
+        /*
+         * A board that will not use Bluetooth can have the controller's memory
+         * back - about sixty-four kilobytes it reserves whether or not anything
+         * uses it.  On a part with no PSRAM (the CYD) that is the difference
+         * between station Wi-Fi plus the phone server fitting and a driver
+         * failing to load with -12.  Opt-in, because after this the radio cannot
+         * be started until reset - a board that might want `bt on` leaves it out.
+         */
+        ag_port_bt_mem_release();
+        ag_log(AG_LOG_INFO, "bt", "controller memory released ([bt] release)");
     }
 #endif
 

@@ -1,0 +1,499 @@
+diff --git a/src/cache.h b/src/cache.h
+--- a/src/cache.h
++++ b/src/cache.h
+@@ -61,9 +61,18 @@
+     CacheReadProc* readProc;
+     CacheFreeProc* freeProc;
+     Heap heap;
++
++    /* ARGON: which cache this is - AG_CACHE_ART or AG_CACHE_SOUND, from
++     * port/ag_diag.h.  Both go through cacheLock, so without it every
++     * figure about misses is the two of them added together.  Passed to
++     * cacheInit rather than assigned afterwards because there are three calls
++     * to it and one of them is the sound cache coming back from being parked:
++     * a field that has to be set by hand is a field that gets missed there and
++     * mis-attributes half the traffic with nothing to show it. */
++    int ag_kind;
+ } Cache;
+ 
+-bool cacheInit(Cache* cache, CacheSizeProc* sizeProc, CacheReadProc* readProc, CacheFreeProc* freeProc, int maxSize);
++bool cacheInit(Cache* cache, CacheSizeProc* sizeProc, CacheReadProc* readProc, CacheFreeProc* freeProc, int maxSize, int agKind);
+ bool cacheFree(Cache* cache);
+ bool cacheLock(Cache* cache, int key, void** data, CacheEntry** cacheEntryPtr);
+ bool cacheUnlock(Cache* cache, CacheEntry* cacheEntry);
+diff --git a/src/cache.cc b/src/cache.cc
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -6,9 +6,15 @@
+ #include <string.h>
+ 
+ #include "debug.h"
++#include "game.h"
++#include "map.h"
+ #include "memory.h"
+ #include "sound.h"
+ 
++/* ARGON: the miss counters.  Outside the namespace on purpose - the port reads
++ * them and the port has no namespace. */
++#include "ag_diag.h"
++
+ namespace fallout {
+ 
+ // The initial number of cache entries in new cache.
+@@ -63,12 +69,172 @@
+ extern "C" unsigned ag_heap_system_blocks;
+ extern "C" unsigned ag_heap_system_bytes;
+ 
+-bool cacheInit(Cache* cache, CacheSizeProc* sizeProc, CacheReadProc* readProc, CacheFreeProc* freeProc, int maxSize)
++/*
++ * ARGON: which of the game's activities this lock happened during.
++ *
++ * getCurrentGameMode() is a static int and this is a handful of bit tests, so
++ * it is affordable on every lock - and a lock that misses is about to read a
++ * file off a card, which costs four orders of magnitude more.
++ *
++ * Most specific first, because these overlap: a loot window can be open in the
++ * middle of a fight, and a map load can begin with any of them still set.
++ *
++ * With no window open there are two possibilities and they must not be added
++ * together: walking a map, and sitting in the main menu.  The iso view tells
++ * them apart - it does not exist until a map is loaded, and mapLoad turns it
++ * off and on around itself.
++ */
++extern "C" int ag_doing_now(void)
++{
++    if (ag_map_loading != 0u) {
++        return AG_WHERE_MAPLOAD;
++    }
++
++    const int mode = GameMode::getCurrentGameMode();
++
++    if ((mode & (GameMode::kDialog | GameMode::kDialogReview | GameMode::kBarter)) != 0) {
++        return AG_WHERE_DIALOG;
++    }
++    if ((mode & (GameMode::kCombat | GameMode::kPlayerTurn)) != 0) {
++        return AG_WHERE_COMBAT;
++    }
++    if ((mode & GameMode::kWorldmap) != 0) {
++        return AG_WHERE_WORLDMAP;
++    }
++    if (mode != 0) {
++        return AG_WHERE_UI;
++    }
++    if (isoIsDisabled()) {
++        return AG_WHERE_MENU;
++    }
++    return AG_WHERE_WALK;
++}
++
++static int ag_cache_slot(Cache* cache)
++{
++    int kind = cache->ag_kind;
++    if (kind < 0 || kind >= AG_CACHE_KINDS) {
++        kind = AG_CACHE_OTHER;
++    }
++    return kind * AG_WHERES + ag_doing_now();
++}
++
++/*
++ * ARGON: the files that cost the most, merged by name.
++ *
++ * "Always a dip when I attack" wants a name, not a count: an attack loads the
++ * attack animation, and if that is the dip then this table says so in one row
++ * - the file, the times it has been read, and the total the game has stood
++ * still for it.  A row with a count of one is a cold cache and unavoidable; a
++ * row with a count of thirty is the same file read thirty times, which is the
++ * cache being too small for what the game is doing, and is fixable.
++ *
++ * Ten rows, replaced by total time, so a big rare read and a small frequent
++ * one can both be in it.  Linear scans of ten strings, on the miss path only.
++ */
++static void ag_top_note(int kind, int where, unsigned kb, unsigned ms)
++{
++    if (ag_miss_name[0] == '\0') {
++        return;
++    }
++
++    int spare = -1;
++    unsigned worst_of_the_least = 0xFFFFFFFFu;
++
++    for (int i = 0; i < AG_TOP_MISSES; i++) {
++        if (ag_top_name[i][0] == '\0') {
++            if (spare < 0) {
++                spare = i;
++                worst_of_the_least = 0;
++            }
++            continue;
++        }
++        if (strcmp(ag_top_name[i], ag_miss_name) == 0) {
++            ag_top_count[i]++;
++            ag_top_ms[i] += ms;
++            ag_top_kb[i] = kb;
++            ag_top_kind[i] = (unsigned char)kind;
++            ag_top_where[i] = (unsigned char)where;
++            return;
++        }
++        if (ag_top_ms[i] < worst_of_the_least) {
++            worst_of_the_least = ag_top_ms[i];
++            spare = i;
++        }
++    }
++
++    /* A new name only displaces a row that has cost less than this one has. */
++    if (spare < 0 || (ag_top_name[spare][0] != '\0' && ag_top_ms[spare] > ms)) {
++        return;
++    }
++
++    size_t i = 0;
++    for (; ag_miss_name[i] != '\0' && i + 1 < AG_NAME_MAX; i++) {
++        ag_top_name[spare][i] = ag_miss_name[i];
++    }
++    ag_top_name[spare][i] = '\0';
++    ag_top_count[spare] = 1;
++    ag_top_ms[spare] = ms;
++    ag_top_kb[spare] = kb;
++    ag_top_kind[spare] = (unsigned char)kind;
++    ag_top_where[spare] = (unsigned char)where;
++}
++
++/*
++ * ARGON: the keys this cache has thrown out lately, so a miss can say which
++ * kind of miss it is.
++ *
++ * "The cache missed" on its own does not distinguish the two cases that matter.
++ * A file the game has never asked for before has to come off the card whatever
++ * the cache's size is - that is the price of the game living on a card.  A file
++ * the cache *had*, evicted, and now needs again is the price of the cache being
++ * too small, and it is the only one worth spending arena on.
++ *
++ * A ring of the last few hundred evictions per cache, scanned linearly on a
++ * miss.  Two hundred and fifty-six integer compares against one file read off
++ * a FAT card is not a measurable cost, and the ring is 1 KB per cache in bss.
++ */
++#define AG_GONE_RING 256
++
++static int s_gone[AG_CACHE_KINDS][AG_GONE_RING];
++static unsigned s_gone_at[AG_CACHE_KINDS];
++static bool s_gone_ready[AG_CACHE_KINDS];
++
++static void ag_gone_add(int kind, int key)
++{
++    if (kind < 0 || kind >= AG_CACHE_KINDS) {
++        return;
++    }
++    if (!s_gone_ready[kind]) {
++        for (int i = 0; i < AG_GONE_RING; i++) {
++            s_gone[kind][i] = -1;
++        }
++        s_gone_ready[kind] = true;
++    }
++    s_gone[kind][s_gone_at[kind] % AG_GONE_RING] = key;
++    s_gone_at[kind]++;
++}
++
++static bool ag_gone_has(int kind, int key)
++{
++    if (kind < 0 || kind >= AG_CACHE_KINDS || !s_gone_ready[kind]) {
++        return false;
++    }
++    for (int i = 0; i < AG_GONE_RING; i++) {
++        if (s_gone[kind][i] == key) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool cacheInit(Cache* cache, CacheSizeProc* sizeProc, CacheReadProc* readProc, CacheFreeProc* freeProc, int maxSize, int agKind)
+ {
+     if (!heapInit(&(cache->heap), maxSize)) {
+         return false;
+     }
+ 
++    cache->ag_kind = agKind;
+     cache->size = 0;
+     cache->maxSize = maxSize;
+     cache->entriesLength = 0;
+@@ -127,22 +293,78 @@
+ 
+     *cacheEntryPtr = nullptr;
+ 
++    const int slot = ag_cache_slot(cache);
++
+     int index;
+     int rc = cacheFindIndexForKey(cache, key, &index);
+     if (rc == 2) {
+         // Use existing cache entry.
+         CacheEntry* cacheEntry = cache->entries[index];
+         cacheEntry->hits++;
++
++        /* ARGON: it was there.  Counted so that the miss beside it means
++         * something - a hundred misses is either one per cent of the traffic
++         * or all of it. */
++        ag_cache_hit[slot]++;
+     } else if (rc == 3) {
+         // New cache entry is required.
+         if (cache->entriesLength >= INT_MAX) {
+             return false;
+         }
+ 
+-        if (!cacheFetchEntryForKey(cache, key, &index)) {
++        /*
++         * ARGON: it was not there, and this is where the game stands still.
++         *
++         * Timed rather than just counted: a miss is a file off a FAT card
++         * through the shim's stdio, and whether that matters depends entirely
++         * on how long it takes and how often it happens.  The refetch test
++         * comes first because cacheFetchEntryForKey is what evicts, and by the
++         * time it returns this very key may be in the ring itself.
++         */
++        ag_cache_miss[slot]++;
++        if (ag_gone_has(cache->ag_kind, key)) {
++            ag_cache_refetch[slot]++;
++        }
++
++        /* The read proc writes the file's name in here as it goes; cleared
++         * first so that a proc which does not say leaves nothing behind from
++         * the miss before it. */
++        ag_miss_name[0] = '\0';
++
++        const unsigned began = ag_cache_now_us();
++        const bool got = cacheFetchEntryForKey(cache, key, &index);
++        const unsigned took_ms = (ag_cache_now_us() - began) / 1000u;
++        ag_cache_miss_ms[slot] += took_ms;
++
++        if (!got) {
++            /*
++             * ARGON: and this one the player sees.
++             *
++             * artLock hands cacheLock's failure straight back as a null Art
++             * and every caller in object.cc simply does not draw - so an
++             * object whose art will not load is invisible, is not clickable
++             * either (the hit test needs the art's size), and says nothing at
++             * all about itself.  Reported 8 September 2026 as "I cannot see a
++             * single pot on the map, and I remember they were there", which
++             * had no instrument behind it whatsoever.
++             *
++             * Printed rather than only counted, because it names the file and
++             * because it is supposed to be rare: a run where this line
++             * appears at all is a run with something missing on the screen.
++             */
++            ag_cache_failed[slot]++;
++            debugPrint("\nCACHE: %s (key %d) would not load - %d of %d KB in "
++                       "the cache is in use, %d entries\n",
++                ag_miss_name[0] != '\0' ? ag_miss_name : "?", key,
++                cache->size / 1024, cache->maxSize / 1024,
++                cache->entriesLength);
+             return false;
+         }
+ 
++        const unsigned kb = (unsigned)(cache->entries[index]->size / 1024);
++        ag_cache_miss_kb[slot] += kb;
++        ag_top_note(cache->ag_kind, slot % AG_WHERES, kb, took_ms);
++
+         _lock_sound_ticker %= 4;
+         if (_lock_sound_ticker == 0) {
+             soundContinueAll();
+@@ -278,6 +500,7 @@
+         if (!allocated) {
+             // ARGON: this is the expensive one - the whole cache goes.
+             ag_cache_flushes++;
++            ag_cache_flush[ag_cache_slot(cache)]++;
+             cacheFlush(cache);
+ 
+             allocated = true;
+@@ -578,6 +801,10 @@
+ 
+                 // ARGON: one entry thrown out to make room for another.
+                 ag_cache_evicted++;
++                ag_cache_out[ag_cache_slot(cache)]++;
++                /* And its key is remembered, so that reading it again is
++                 * counted as a refetch rather than a first read. */
++                ag_gone_add(cache->ag_kind, cacheEntry->key);
+ 
+                 // NOTE: Uninline.
+                 cacheEntryFree(cache, cacheEntry);
+diff --git a/src/art.cc b/src/art.cc
+--- a/src/art.cc
++++ b/src/art.cc
+@@ -14,6 +14,9 @@
+ #include "settings.h"
+ #include "sfall_config.h"
+ 
++/* ARGON: AG_CACHE_ART, for the miss counters. */
++#include "ag_diag.h"
++
+ namespace fallout {
+ 
+ typedef struct ArtListDescription {
+@@ -165,7 +168,7 @@
+         cacheBytes = ag_art_cache_kb << 10;
+         debugPrint("\nart: cache %d KB (from -artcache)\n", ag_art_cache_kb);
+     }
+-    if (!cacheInit(&gArtCache, artCacheGetFileSizeImpl, artCacheReadDataImpl, artCacheFreeImpl, cacheBytes)) {
++    if (!cacheInit(&gArtCache, artCacheGetFileSizeImpl, artCacheReadDataImpl, artCacheFreeImpl, cacheBytes, AG_CACHE_ART)) {
+         debugPrint("cache_init failed in art_init\n");
+         return -1;
+     }
+@@ -1012,6 +1015,24 @@
+ 
+     char* artFileName = artBuildFilePath(fid);
+     if (artFileName != nullptr) {
++        /* ARGON: so a dip can name the file it was waiting for.  The last
++         * component only - art\critters\hmwarraa.frm is a path every row of
++         * the report would repeat, and the interesting part is at the end.
++         * See port/ag_diag.h. */
++        {
++            const char* base = artFileName;
++            for (const char* p = artFileName; *p != '\0'; p++) {
++                if (*p == '\\' || *p == '/') {
++                    base = p + 1;
++                }
++            }
++            size_t i = 0;
++            for (; base[i] != '\0' && i + 1 < AG_NAME_MAX; i++) {
++                ag_miss_name[i] = base[i];
++            }
++            ag_miss_name[i] = '\0';
++        }
++
+         bool loaded = false;
+         if (gArtLanguageInitialized) {
+             char* pch = strchr(artFileName, '\\');
+diff --git a/src/sound_effects_cache.cc b/src/sound_effects_cache.cc
+--- a/src/sound_effects_cache.cc
++++ b/src/sound_effects_cache.cc
+@@ -15,6 +15,9 @@
+ #include "sound_decoder.h"
+ #include "sound_effects_list.h"
+ 
++/* ARGON: AG_CACHE_SOUND, for the miss counters. */
++#include "ag_diag.h"
++
+ namespace fallout {
+ 
+ #define SOUND_EFFECTS_CACHE_MIN_SIZE (0x40000)
+@@ -109,7 +112,7 @@
+         return -1;
+     }
+ 
+-    if (!cacheInit(gSoundEffectsCache, soundEffectsCacheGetFileSizeImpl, soundEffectsCacheReadDataImpl, soundEffectsCacheFreeImpl, cacheSize)) {
++    if (!cacheInit(gSoundEffectsCache, soundEffectsCacheGetFileSizeImpl, soundEffectsCacheReadDataImpl, soundEffectsCacheFreeImpl, cacheSize, AG_CACHE_SOUND)) {
+         internal_free(gSoundEffectsCache);
+         soundEffectsCacheFreeHandles();
+         soundEffectsListExit();
+@@ -204,7 +207,7 @@
+     }
+     if (!cacheInit(gSoundEffectsCache, soundEffectsCacheGetFileSizeImpl,
+             soundEffectsCacheReadDataImpl, soundEffectsCacheFreeImpl,
+-            gSoundEffectsCacheSize)) {
++            gSoundEffectsCacheSize, AG_CACHE_SOUND)) {
+         /* Still parked, and it will be tried again: an arena that cannot
+          * spare 257 KB now may be able to in a second, and the game plays
+          * without sound effects in the meantime rather than not at all. */
+@@ -424,6 +427,22 @@
+     char* name;
+     soundEffectsListGetFilePath(tag, &name);
+ 
++    /* ARGON: name the sound this miss is reading, for the same reason as the
++     * art one.  See port/ag_diag.h. */
++    if (name != nullptr) {
++        const char* base = name;
++        for (const char* p = name; *p != '\0'; p++) {
++            if (*p == '\\' || *p == '/') {
++                base = p + 1;
++            }
++        }
++        size_t i = 0;
++        for (; base[i] != '\0' && i + 1 < AG_NAME_MAX; i++) {
++            ag_miss_name[i] = base[i];
++        }
++        ag_miss_name[i] = '\0';
++    }
++
+     if (dbGetFileContents(name, data)) {
+         internal_free(name);
+         return -1;
+diff --git a/src/main.cc b/src/main.cc
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -60,6 +60,10 @@
+ extern volatile uint32_t ag_ml_laps;
+ }
+ 
++/* ARGON: ag_frame_note - the worst lap of the window, split by step.  See
++ * port/ag_diag.h for what a dip has to land in. */
++#include "ag_diag.h"
++
+ namespace fallout {
+ 
+ #define DEATH_WINDOW_WIDTH 640
+@@ -462,8 +466,22 @@
+         ag_ml_phase = 6;
+         sharedFpsLimiter.throttle();
+         ag_ml_laps++;
++        const uint32_t ml7 = ag_us();
+         ag_ml_present_us += ml6 - ml5;
+-        ag_ml_throttle_us += ag_us() - ml6;
++        ag_ml_throttle_us += ml7 - ml6;
++
++        /*
++         * ARGON: and the worst lap of the window, kept whole.
++         *
++         * The six accumulators above are averages by the time anything reads
++         * them, and an average cannot show a dip - that is what an average is
++         * for.  Maxim: "всегда есть просадка когда я атакую цель", and the
++         * only figure the port had about it was "eng 281 ms", which names no
++         * step at all.  This keeps the slowest lap's own six numbers, so the
++         * dip has to land in one of them.
++         */
++        ag_frame_note(ml1 - ml0, ml2 - ml1, ml3 - ml2, ml4 - ml3,
++            ml6 - ml5, ml7 - ml6, ag_doing_now());
+     }
+ 
+     scriptsDisable();
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -9,6 +9,10 @@
+ #include "art.h"
+ #include "automap.h"
+ #include "character_editor.h"
++/* ARGON: ag_map_loading, so a map change's cache misses are counted apart
++ * from a walk's.  See port/ag_diag.h. */
++#include "ag_diag.h"
++
+ /* ARGON: for aiMessagesRelease; see the release below. */
+ #include "combat_ai.h"
+ #include "color.h"
+@@ -818,6 +822,18 @@
+ // 0x482B74
+ static int mapLoad(File* stream)
+ {
++    /*
++     * ARGON: so that the cache misses of a map change are not counted as the
++     * cache misses of walking around.
++     *
++     * A map load reads a couple of hundred files by design - that is what
++     * _obj_preload_art_cache is for - and it would bury whatever the walking
++     * figure was underneath itself.  A counter rather than a flag because
++     * mapLoad is reached from mapLoadSaved as well and one day may nest.
++     * mapLoad has one exit, at the bottom, so this is paired there.
++     */
++    ag_map_loading++;
++
+     _map_save_in_game(true);
+     // ARGON: 14 rather than 13 - streamed, not decoded whole into memory.
+     //
+@@ -1129,6 +1145,11 @@
+ 
+     gMapHeader.version = 20;
+ 
++    /* ARGON: paired with the increment at the top. */
++    if (ag_map_loading != 0u) {
++        ag_map_loading--;
++    }
++
+     return rc;
+ }
+ 

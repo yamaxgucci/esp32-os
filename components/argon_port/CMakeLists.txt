@@ -135,6 +135,14 @@ idf_component_register(
              # see ARGON_ENABLE_BLE in argon_kernel.
              bt esp_hid)
 
+# mDNS, so net_hw.c can answer <hostname>.local.  The manifest fetches
+# espressif__mdns only when the build has a network (CONFIG_ARGON_ENABLE_NET),
+# so this is a requirement only when the component is actually present - which is
+# exactly what idf_component_optional_requires is for.  A plain REQUIRES cannot
+# be made conditional: REQUIRES is read in an early pass before CONFIG_ values
+# exist, so a guard on it is always empty.
+idf_component_optional_requires(PRIVATE espressif__mdns)
+
 # Analogue input, off by default: linking esp_adc runs a constructor that stops
 # the boot under QEMU, and QEMU is how this system is verified.
 # The UART's receive by DMA without stopping (uartdma_hw.c, AG_UART_DMA_RING)

@@ -151,6 +151,18 @@ typedef struct {
 #define AG_AXE_I_LO12_S 0x60000000u /* sw: imm split across 31..25 and 11..7 */
 
 /*
+ * How far past the end of its part an instruction's address may point.
+ *
+ * Not every address a pair builds is one that is read.  For a static bigger
+ * than a load's reach, GCC builds a BASE inside or past the object and
+ * reaches the fields from it with the load's signed 12-bit offset - PHONECL's
+ * state is `s + 8192`, 400 bytes past the end of the data part, and every
+ * field it reads through it is inside.  So the base may lie up to one
+ * offset's reach (2048) past the part; what is read never does.
+ */
+#define AG_AXE_I_REACH 2048u
+
+/*
  * An image built for one architecture will not run on the other.  The shell
  * says so by name rather than crashing, which is the whole reason this field
  * exists.

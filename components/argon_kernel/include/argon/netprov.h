@@ -50,6 +50,16 @@ int      ag_netprov_connect(uint32_t addr, uint16_t port, uint32_t timeout_ms);
 int32_t  ag_netprov_send(int fd, const void *buf, size_t len);
 int32_t  ag_netprov_recv(int fd, void *buf, size_t len);
 void     ag_netprov_close(int fd);
+
+/*
+ * Throw the connection away: a reset to the far end, the queue discarded, the
+ * memory back at once.  For a peer already judged gone - see api->net->reset.
+ *
+ * Only the built-in stack can do it; a radio on the other end of a wire has
+ * one close and that is the one it gets.  Falling back is right rather than
+ * refusing: the caller has decided this connection is finished either way.
+ */
+void     ag_netprov_close_hard(int fd);
 ag_err_t ag_netprov_nonblock(int fd, bool on);
 int      ag_netprov_wait_readable(int fd, uint32_t timeout_ms);
 int32_t  ag_netprov_recv_now(int fd, void *buf, size_t len);

@@ -84,6 +84,25 @@ int32_t  ag_port_uart_read(int port, void *buf, size_t len,
 int32_t  ag_port_uart_pending(int port);
 
 /*
+ * The same bytes, carried by hardware instead of by this thread.
+ *
+ * A hundred and fifty kilobytes a frame through ag_port_uart_write is a task
+ * copying into a ring and waking eighty times to do it, and on a busy machine
+ * that leaves the wire half idle - measured: 172 KB/s of a possible 400 while
+ * a game ran.  With DMA the peripheral pulls the buffer itself and the caller
+ * sleeps until it is gone.
+ *
+ * Not every chip has it (the ESP32 and the S2 do not), so a port may answer
+ * -AG_ENOTSUP and the caller must have the ordinary write to fall back on.
+ * The buffer may live in external RAM where the hardware allows it; alignment
+ * is the port's business to check, and a buffer it cannot take is
+ * -AG_EINVAL rather than a silent copy.
+ *
+ * Blocking: it returns when the last byte has left, or on error.  Interleaving
+ * it with ag_port_uart_write on the same port is the caller's problem - the
+ * two are different masters of the same transmitter.
+ */
+/*
  * Wait until everything handed to this port has actually left it - the
  * driver's own buffer and the peripheral's FIFO both empty.
  *

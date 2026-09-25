@@ -88,6 +88,8 @@ set(ARGON_INCLUDES
     "${ARGON_ROOT}/apps/common/grain"
     "${ARGON_ROOT}/apps/common/ckt"
     "${ARGON_ROOT}/apps/common/tube"
+    "${ARGON_ROOT}/apps/common/pixband"
+    "${ARGON_ROOT}/apps/common/ws"
     "${ARGON_ROOT}/apps/cktbench")
 
 # The NAM player has to agree with the reference implementation to the last bit -
@@ -150,6 +152,12 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/atproto/ag_atproto.c"
     test_rdcodec.c
     "${ARGON_ROOT}/components/argon_kernel/src/net/rdcodec.c"
+    # The link to a phone.  Unlike test_rempix.c, which mirrors REMDISP's codec
+    # in a copy because a .SYS for Xtensa will not link here, these two are the
+    # shipped files: what the test exercises is what PHONE.SYS runs.
+    test_phonelink.c
+    "${ARGON_ROOT}/apps/common/pixband/ag_pixband.c"
+    "${ARGON_ROOT}/apps/common/ws/ag_ws.c"
     test_espldr.c
     "${ARGON_ROOT}/apps/common/esp8266/ag_espldr.c"
     test_stm32ldr.c
@@ -205,6 +213,17 @@ target_include_directories(cchost PRIVATE
     ${ARGON_INCLUDES})
 
 target_compile_definitions(cchost PRIVATE AG_HOST=1)
+
+# A picture encoded by the real encoder, for tools/phonepage.py to replay at a
+# browser.  The page's three decoders are the half of the phone link that the
+# two-board rig cannot judge, and writing the encoder a second time in Python
+# to test them would be a second thing to be wrong - see ag_pixband.h.
+add_executable(pixband_sample
+    "${ARGON_ROOT}/tools/pixband_sample.c"
+    "${ARGON_ROOT}/apps/common/pixband/ag_pixband.c")
+
+target_include_directories(pixband_sample PRIVATE
+    "${ARGON_ROOT}/apps/common/pixband")
 
 # Listening files.  Not tests - ears catch things numbers do not - but they
 # are built here so the engines they render cannot quietly stop compiling.
@@ -370,8 +389,9 @@ foreach(smoke engine_smoke synth_smoke ckt_smoke ckt_play ir_check)
         "${ARGON_ROOT}/apps/common/ir")
 endforeach()
 
-foreach(target argon_tests vtdump cchost engine_smoke synth_smoke ckt_smoke
-        ckt_play ir_check wavdiff wavrate ckt_exact tube_render)
+foreach(target argon_tests vtdump cchost pixband_sample engine_smoke
+        synth_smoke ckt_smoke ckt_play ir_check wavdiff wavrate ckt_exact
+        tube_render)
     if(MSVC)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${target} PRIVATE /W4)

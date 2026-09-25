@@ -57,8 +57,14 @@ static const ag_display_ops_t *panel_ops(ag_device_t **out_dev)
  * Input devices that have to be asked rather than waited for.
  *
  * Here rather than in a file of its own because it is the same three lines of
- * registry walk as the panel above, on the same tick, for the same reason: a
- * loadable driver cannot own a task, so the kernel does the asking.
+ * registry walk as the panel above, on the same tick, for the same reason: the
+ * driver has nothing of its own that wakes up, so the kernel does the asking.
+ *
+ * Not because it *cannot* have one - it can, since ABI 0.48 and
+ * sys->module_task - but because a touch controller wants reading on a clock
+ * and a clock is exactly what this tick is.  A task per polled device would be
+ * a stack apiece for the same ten calls a second.  A driver with work that
+ * takes milliseconds is the other case, and that one asks for a task.
  */
 void ag_inputpoll_tick(void)
 {
@@ -245,12 +251,86 @@ void ag_textpanel_enable(bool on)
     }
 }
 
-static void render_locked(const ag_screen_t *screen)
+/*
+ * What one panel has been shown, so the next tick can send it only what
+ * changed.
+ *
+ * Per panel and not one set of variables, because there can be more than one:
+ * a board with glass of its own and a phone attached to it are two screens
+ * showing the same console, and they do not blink their carets in step.  Four
+ * of them is a bound rather than a list that grows - the same reasoning as
+ * AG_MODULE_MAX - and a fifth panel simply takes the first slot back, which
+ * costs that one a full repaint per tick and nothing worse.
+ */
+#define AG_TEXTPANEL_MAX 4
+
+typedef struct {
+    const ag_display_ops_t *ops;
+    uint16_t                caret_col;
+    uint16_t                caret_row;
+    /*
+     * The size this panel last said it was.  A panel is repainted in full when
+     * it first appears, and until this was remembered that was the only time -
+     * so a panel that changed its mind afterwards kept whatever it had.  The
+     * phone link does exactly that: it mirrors the console, the console is
+     * sized a second time once the board's own panel driver has loaded, and the
+     * mirror it lays out for the new size starts empty.  Reported as a screen
+     * that was blank until something happened to change on it.
+     */
+    uint16_t                said_cols;
+    uint16_t                said_rows;
+    bool                    caret_lit;
+    bool                    present; /* seen in this pass                    */
+} textpanel_t;
+
+static textpanel_t s_panels[AG_TEXTPANEL_MAX];
+
+/*
+ * The slot for this panel, and whether it is new.
+ *
+ * A driver is identified by its vtable, which is the one thing about it that
+ * survives being looked up afresh every tick and dies with `drv unload`.  New
+ * means "has nothing on it": a panel that has just arrived, or one whose driver
+ * was replaced by `drv install` over a running one.
+ */
+static textpanel_t *panel_slot(const ag_display_ops_t *ops, bool *is_new)
 {
-    static const ag_display_ops_t *s_seen;
-    static uint16_t                s_caret_col = 0xffffu;
-    static uint16_t                s_caret_row = 0xffffu;
-    static bool                    s_caret_lit;
+    textpanel_t *spare = NULL;
+
+    for (uint32_t i = 0; i < AG_TEXTPANEL_MAX; i++) {
+        if (s_panels[i].ops == ops) {
+            *is_new = false;
+            return &s_panels[i];
+        }
+        if (s_panels[i].ops == NULL && spare == NULL) {
+            spare = &s_panels[i];
+        }
+    }
+    if (spare == NULL) {
+        spare = &s_panels[0];
+    }
+    spare->ops = ops;
+    *is_new = true;
+    return spare;
+}
+
+static void panel_forget_all(void)
+{
+    for (uint32_t i = 0; i < AG_TEXTPANEL_MAX; i++) {
+        s_panels[i].ops = NULL;
+    }
+}
+
+static void render_one(const ag_screen_t *screen, const ag_display_ops_t *ops,
+                       textpanel_t *tp, bool full)
+{
+    /* `full` is decided again below for a panel that cannot scroll itself. */
+    if (full) {
+        tp->caret_col = 0xffffu;
+        tp->caret_row = 0xffffu;
+        tp->caret_lit = false;
+    }
+
     /*
      * One row of cells, copied out of the screen.  Copied rather than passed
      * by pointer because ag_cell_t is the kernel's type and ag_textcell_t is
@@ -267,43 +347,6 @@ static void render_locked(const ag_screen_t *screen)
     static ag_textcell_t *s_row;
     static uint16_t       s_row_cols;
 
-    if (screen == NULL || !s_enabled) {
-        return;
-    }
-
-    /*
-     * While an application holds the display the panel is showing its pixels,
-     * and a console row painted over them is a band of text through the middle
-     * of somebody's picture.  Releasing marks the whole screen dirty, so
-     * nothing has to be remembered here about what was missed.
-     */
-    if (ag_display_acquired()) {
-        s_seen = NULL; /* the panel is not ours; owe it a full repaint */
-        return;
-    }
-
-    const ag_display_ops_t *ops = panel_ops(NULL);
-    if (ops == NULL) {
-        s_seen = NULL;
-        return;
-    }
-
-    /*
-     * A panel that has just arrived has nothing on it, and the screen only
-     * offers what changed since the last tick - which, on a machine sitting at
-     * a prompt, is nothing at all.  So the first sight of a driver owes it the
-     * whole screen.  The same applies when a driver is replaced: `drv install`
-     * over a running one is a different panel as far as this is concerned.
-     */
-    const bool full = (ops != s_seen) || s_owe_full;
-    if (full) {
-        s_owe_full = false;
-        s_seen = ops;
-        s_caret_col = 0xffffu;
-        s_caret_row = 0xffffu;
-        s_caret_lit = false;
-    }
-
     uint16_t cols = screen->cols;
     uint16_t rows = screen->rows;
     /*
@@ -316,6 +359,11 @@ static void render_locked(const ag_screen_t *screen)
     if (ops->text_info != NULL) {
         uint16_t pcols = cols, prows = rows;
         if (ops->text_info(0, &pcols, &prows) == AG_OK) {
+            if (pcols != tp->said_cols || prows != tp->said_rows) {
+                tp->said_cols = pcols;
+                tp->said_rows = prows;
+                full = true; /* a panel of a new size has nothing on it */
+            }
             panel_rows = prows;
             if (pcols < cols) {
                 cols = pcols;
@@ -327,6 +375,41 @@ static void render_locked(const ag_screen_t *screen)
     }
     if (cols > AG_SCREEN_MAX_COLS) {
         cols = AG_SCREEN_MAX_COLS;
+    }
+
+    /*
+     * The scroll, before anything that changed on top of it.
+     *
+     * A driver that can move its own picture is told once and then given the
+     * rows that genuinely changed; one that cannot is given the whole screen,
+     * which is what every panel got for every printed line until now.  The
+     * screen's dirty set is shifted with the picture, so "repaint the dirty
+     * rows" without one of these two would leave stale text on the glass.
+     */
+    const uint16_t moved = ag_screen_scrolled(screen);
+    if (!full && moved > 0u) {
+        if (AG_HAS(ops, text_scroll) && ag_screen_scroll_usable(screen) &&
+            moved < rows) {
+            ag_dev_note_call("text panel", "text_scroll");
+            ops->text_scroll(0, moved);
+            ag_dev_note_done();
+            /*
+             * The caret moved with everything else, and this panel's record of
+             * where it left one is now a row too low.  Forgetting it costs one
+             * redraw and avoids rubbing out a character on the wrong row.
+             */
+            tp->caret_col = 0xffffu;
+            tp->caret_row = 0xffffu;
+            tp->caret_lit = false;
+        } else {
+            /* No scroll of its own: the whole screen, as before this existed.
+             * The caret went with the text, so what this panel remembers about
+             * it is a row out of date either way. */
+            full = true;
+            tp->caret_col = 0xffffu;
+            tp->caret_row = 0xffffu;
+            tp->caret_lit = false;
+        }
     }
 
     if (s_row == NULL || s_row_cols < cols) {
@@ -358,10 +441,12 @@ static void render_locked(const ag_screen_t *screen)
             s_row[x].ch = (uint8_t)src[x].ch;
             s_row[x].attr = src[x].attr;
         }
+        ag_dev_note_call("text panel", "text_row");
         ops->text_row(0, y, s_row, cols);
+        ag_dev_note_done();
         /* A repainted row has painted over the caret. */
-        if (y == s_caret_row) {
-            s_caret_lit = false;
+        if (y == tp->caret_row) {
+            tp->caret_lit = false;
         }
     }
 
@@ -406,23 +491,108 @@ static void render_locked(const ag_screen_t *screen)
     const uint16_t cx = screen->cur_x;
     const uint16_t cy = screen->cur_y;
 
-    if (lit == s_caret_lit && cx == s_caret_col && cy == s_caret_row) {
+    if (lit == tp->caret_lit && cx == tp->caret_col && cy == tp->caret_row) {
         return;
     }
-    if (s_caret_lit && (cx != s_caret_col || cy != s_caret_row) &&
-        s_caret_col < cols && s_caret_row < rows) {
-        const ag_cell_t old = ag_screen_at(screen, s_caret_col, s_caret_row);
+    if (tp->caret_lit && (cx != tp->caret_col || cy != tp->caret_row) &&
+        tp->caret_col < cols && tp->caret_row < rows) {
+        const ag_cell_t old = ag_screen_at(screen, tp->caret_col, tp->caret_row);
         const ag_textcell_t under = {(uint8_t)old.ch, old.attr};
-        ops->text_cursor(0, s_caret_col, s_caret_row, under, false);
+        ops->text_cursor(0, tp->caret_col, tp->caret_row, under, false);
     }
     if (cx < cols && cy < rows) {
         const ag_cell_t at = ag_screen_at(screen, cx, cy);
         const ag_textcell_t under = {(uint8_t)at.ch, at.attr};
         ops->text_cursor(0, cx, cy, under, lit);
     }
-    s_caret_col = cx;
-    s_caret_row = cy;
-    s_caret_lit = lit;
+    tp->caret_col = cx;
+    tp->caret_row = cy;
+    tp->caret_lit = lit;
+}
+
+/*
+ * Every panel, not the first one.
+ *
+ * CHANGED 13 September 2026, and written down here because somebody else is
+ * likely to arrive at this function next.  What it used to do: walk the device
+ * registry, take the FIRST display with a text_row, and render the console to
+ * that one alone.
+ *
+ * That was right for as long as a panel meant the glass soldered to the board.
+ * It stopped being right the moment a second screen could arrive from
+ * somewhere else.  With PHONE.SYS loaded on a board that has a display of its
+ * own, whichever of the two the registry happened to list first took the
+ * console and the other went dark - and which one that was depended on load
+ * order, which is not a thing anybody should have to reason about.  The same
+ * applies, unchanged, to a display on another node published into this registry
+ * as a remote device: it is a second panel and the old rule would have picked
+ * one of them by accident.  Two screens showing the same console is what was
+ * wanted every time it came up.
+ *
+ * What that needed: the state of "what this panel has already been shown" is
+ * per panel now (s_panels[], panel_slot()) rather than one set of file statics.
+ * Two screens do not blink their carets in step, and a caret remembered for the
+ * wrong panel rubs out a character on it.
+ *
+ * The cost is one `text_row` per changed row per panel, on the same tick, and a
+ * panel is a driver that has already said it can take them.
+ */
+static void render_locked(const ag_screen_t *screen)
+{
+    if (screen == NULL || !s_enabled) {
+        return;
+    }
+
+    /*
+     * While an application holds the display the panel is showing its pixels,
+     * and a console row painted over them is a band of text through the middle
+     * of somebody's picture.  Releasing marks the whole screen dirty, so
+     * nothing has to be remembered here about what was missed.
+     */
+    if (ag_display_acquired()) {
+        panel_forget_all(); /* the panels are not ours; they owe a full repaint */
+        return;
+    }
+
+    for (uint32_t i = 0; i < AG_TEXTPANEL_MAX; i++) {
+        s_panels[i].present = false;
+    }
+
+    const bool owed = s_owe_full;
+    s_owe_full = false;
+
+    for (uint32_t i = 0;; i++) {
+        ag_devinfo_t info;
+        if (ag_dev_info(i, AG_DEV_DISPLAY, &info) != AG_OK) {
+            break;
+        }
+        ag_device_t *dev = ag_dev_find(info.name);
+        if (dev == NULL || dev->class_ops == NULL) {
+            continue;
+        }
+        const ag_display_ops_t *ops = (const ag_display_ops_t *)dev->class_ops;
+        /*
+         * A vtable is only as long as the driver that wrote it: a display built
+         * against an older ABI has no text_row field at all, and reading one
+         * would be reading whatever follows its structure in memory.
+         */
+        if (!AG_HAS(ops, text_row) || ops->text_row == NULL) {
+            continue;
+        }
+
+        bool         fresh = false;
+        textpanel_t *tp = panel_slot(ops, &fresh);
+        tp->present = true;
+        render_one(screen, ops, tp, fresh || owed);
+    }
+
+    /* A driver that has gone takes its slot with it, so that a later one in the
+     * same place is a new panel and gets its full repaint. */
+    for (uint32_t i = 0; i < AG_TEXTPANEL_MAX; i++) {
+        if (!s_panels[i].present) {
+            s_panels[i].ops = NULL;
+        }
+    }
 }
 
 void ag_textpanel_render(const ag_screen_t *screen)

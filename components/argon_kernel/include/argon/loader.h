@@ -12,6 +12,15 @@
 extern "C" {
 #endif
 
+/*
+ * The guard past an application's data - see `guard` below and guard_arm in
+ * loader.c.  Sixteen bytes keeps the data part's 16-byte alignment for
+ * whatever the heap hands out next, and is wide enough that a plausible
+ * overrun lands in it rather than stepping over it.
+ */
+#define AG_APP_GUARD_BYTES 16u
+#define AG_APP_GUARD_BYTE  0xA5u
+
 typedef struct {
     ag_axe_header_t  header;
     ag_axe_place_t   place;
@@ -23,6 +32,17 @@ typedef struct {
      * released with it.
      */
     void *data_owned;
+
+    /*
+     * Sixteen bytes of a known pattern immediately past the application's
+     * data, inside an allocation this loader owns.  This chip has no memory
+     * protection unit, so an application that walks off the end of one of its
+     * own buffers writes into whatever the heap put next - and the board then
+     * dies minutes later, in an allocator, with nothing to point at.  The
+     * guard cannot stop that write; it is how the system finds out whose it
+     * was.  NULL for an image with no data part.
+     */
+    void *guard;
 
     /*
      * R-1 flash XIP: code runs from a mapped appfs slot.  `code_scratch` held
@@ -64,6 +84,17 @@ ag_err_t ag_loader_peek(const char *path, const char *cwd,
                         ag_axe_header_t *out);
 
 void ag_loader_unload(ag_loaded_app_t *app);
+
+/*
+ * Has anything written past this application's data?
+ *
+ * Cheap enough to ask on a timer (sixteen bytes), and safe to ask from
+ * anywhere that may read the application's memory: it takes no lock and
+ * allocates nothing.  `bytes_past`, when given, receives how far into the
+ * guard the damage reaches - a floor, not a measurement: a write that cleared
+ * the whole guard went further than the guard can see.
+ */
+bool ag_loader_guard_broken(const ag_loaded_app_t *app, size_t *bytes_past);
 
 /*
  * The code arena.  Running an image is the process layer's business (argon/proc.h);

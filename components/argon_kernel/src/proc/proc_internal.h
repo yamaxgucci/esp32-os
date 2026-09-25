@@ -27,7 +27,13 @@
 /* Bounds on what one process may hold.  A bound that is reached is a diagnosable
  * event; an unbounded list is a leak with extra steps (see argon/reslist.h). */
 #define AG_PROC_RES_MAX 32
-#define AG_PROC_ARGS_MAX 16
+/*
+ * Sixteen arguments and a 256-byte line were a shell's measure, not an
+ * application's: a game started with twenty-seven words got fifteen, and the
+ * switches past the cut looked broken rather than missing.
+ */
+#define AG_PROC_ARGS_MAX 48
+#define AG_PROC_ARGBUF   512
 
 /*
  * What the exception handler managed to write down.  Filled in an exception
@@ -56,13 +62,15 @@ typedef struct {
     ag_port_sem_t   done;
     int32_t           exit_code;
     bool              killed;
+    /* Its data guard has already been reported: say it once, not every tick. */
+    bool              guard_said;
     bool              has_waiter; /* somebody is in ag_proc_wait for it      */
     volatile bool     signalled;
     jmp_buf           exit_jump;
 
     int   argc;
     char *argv[AG_PROC_ARGS_MAX];
-    char  argbuf[AG_LINE_MAX];
+    char  argbuf[AG_PROC_ARGBUF];
 
     char cwd[AG_PATH_MAX];
     /* Path for deferred AXE load inside proc_task; empty for builtins. */

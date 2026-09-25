@@ -17,6 +17,27 @@ extern "C" {
 #endif
 
 /*
+ * What the two objects AG_APP defines have to be declared with in C++.
+ *
+ * Both are found by name: mkaxe looks up __ag_app_header to read the metadata
+ * and g_ag_api to tell the loader which word to write the syscall table into.
+ * A C++ definition at namespace scope would be mangled, and the const one
+ * would also be given internal linkage by the language - so both would come
+ * out as something like _ZL15__ag_app_header, the tool would find neither, and
+ * an image would be built with an empty name and no stack or heap request.
+ * That failed quietly, once, which is why this exists.
+ *
+ * The macro is used inside AG_APP_SIZED rather than wrapping the header,
+ * because the macro expands at the application's file scope, where this block
+ * has long since closed.
+ */
+#ifdef __cplusplus
+#define AG_LINKAGE extern "C"
+#else
+#define AG_LINKAGE
+#endif
+
+/*
  * Declares the application image header and the API pointer slot.  Put this
  * once at file scope in the application's main translation unit:
  *
@@ -55,8 +76,8 @@ extern "C" {
  */
 #define AG_APP_SIZED(app_name, app_version, app_author, app_flags,           \
                      app_stack, app_heap)                                    \
-    const ag_api_t *g_ag_api = NULL;                                         \
-    __attribute__((used, section(".ag_header")))                             \
+    AG_LINKAGE const ag_api_t *g_ag_api = NULL;                              \
+    AG_LINKAGE __attribute__((used, section(".ag_header")))                  \
     const ag_app_header_t __ag_app_header = {                                \
         .magic = AG_AXE_MAGIC,                                               \
         .abi_major = AG_ABI_MAJOR,                                           \
@@ -106,6 +127,25 @@ static inline void ag_module_on_unload(void (*fn)(void))
     if (AG_HAS(g_ag_api->sys, module_on_unload)) {
         g_ag_api->sys->module_on_unload(fn);
     }
+}
+
+/*
+ * ABI 0.48: a task that belongs to this module, from ag_driver_init only.
+ *
+ * For the work a driver cannot do on the caller's thread - a wire that takes
+ * milliseconds, a socket that has to be accepted, a sensor that has to be read
+ * on a clock.  Tell it to stop from the ag_module_on_unload hook and let it
+ * return; unload waits for it, and a task that does not return keeps the image
+ * loaded rather than being executed out of freed memory.
+ */
+static inline bool ag_module_task(void (*fn)(void *), void *arg,
+                                  const char *name, uint32_t stack,
+                                  int priority, uint32_t flags)
+{
+    if (!AG_HAS(g_ag_api->sys, module_task)) {
+        return false;
+    }
+    return g_ag_api->sys->module_task(fn, arg, name, stack, priority, flags);
 }
 
 #define ag_log(lvl, tag, ...) (g_ag_api->sys->log((lvl), (tag), __VA_ARGS__))
@@ -897,6 +937,18 @@ static inline ag_err_t ag_ble_adv_status(ag_ble_adv_status_t *out)
     return g_ag_api->ble->adv_status(out);
 }
 
+/* Push bytes to the connected client as a GATT notification (board->phone,
+ * ABI 0.52).  One packet (<= the ATT MTU, ~180 bytes usable); chunk anything
+ * larger.  -AG_ENODEV until a client is connected, -AG_ENOSYS on an older
+ * kernel or a build with no BLE peripheral. */
+static inline ag_err_t ag_ble_adv_notify(const void *data, uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_notify)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_notify(data, len);
+}
+
 /* ---- BLE general: observer + GATT client (ABI 0.38) --------------------- */
 
 /*
@@ -1096,6 +1148,40 @@ static inline ag_err_t ag_net_close(ag_handle_t sock)
         return -AG_ENOSYS;
     }
     return g_ag_api->net->close(sock);
+}
+
+/*
+ * Throw a connection away instead of closing it (ABI 0.50).
+ *
+ * `ag_net_close` promises TCP will deliver what is queued, and against a peer
+ * that has stopped reading that promise is kept for ever - the connection, its
+ * queue and every buffer on it are held until something takes the interface
+ * down.  This resets it: the far end is told, the queue goes, the memory comes
+ * back now.
+ *
+ * Only for a peer already judged gone.  -AG_ENOSYS on a kernel older than the
+ * call, so a caller that wants either may fall back to close.
+ */
+/*
+ * Bytes of stack this task has never used (ABI 0.51), or 0 on a kernel that
+ * does not offer it - so a caller that must have an answer treats 0 as "do not
+ * risk it" or as "cannot tell", whichever is safe for what it was about to do.
+ */
+static inline uint32_t ag_stack_left(void)
+{
+    const ag_task_api_t *t = g_ag_api->task;
+    if (t == NULL || !AG_HAS(t, stack_left)) {
+        return 0u;
+    }
+    return t->stack_left();
+}
+
+static inline ag_err_t ag_net_reset(ag_handle_t sock)
+{
+    if (g_ag_api->net == NULL || !AG_HAS(g_ag_api->net, reset)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->reset(sock);
 }
 
 static inline ag_err_t ag_net_set_nonblock(ag_handle_t sock, bool on)

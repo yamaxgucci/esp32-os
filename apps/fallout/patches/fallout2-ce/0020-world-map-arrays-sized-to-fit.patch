@@ -1,0 +1,143 @@
+diff --git a/src/worldmap.cc b/src/worldmap.cc
+--- a/src/worldmap.cc
++++ b/src/worldmap.cc
+@@ -318,7 +318,8 @@
+     int maps[6];
+     int field_48;
+     int entriesLength;
+-    EncounterTableEntry entries[41];
++    // ARGON: allocated to entriesLength; see wmReadEncounterType.
++    EncounterTableEntry* entries;
+ } EncounterTable;
+ 
+ typedef struct EncounterItem {
+@@ -350,7 +351,8 @@
+     int spacing;
+     int distance;
+     int entriesLength;
+-    EncounterEntry entries[10];
++    // ARGON: allocated to entriesLength; see wmReadEncBaseType.
++    EncounterEntry* entries;
+ } Encounter;
+ 
+ typedef struct SubtileInfo {
+@@ -1012,6 +1014,14 @@
+     wmMaxTileNum = 0;
+ 
+     if (wmEncounterTableList != nullptr) {
++        // ARGON: each table owns its entries now.
++        for (int index = 0; index < wmMaxEncounterInfoTables; index++) {
++            if (wmEncounterTableList[index].entries != nullptr) {
++                internal_free(wmEncounterTableList[index].entries);
++                wmEncounterTableList[index].entries = nullptr;
++            }
++        }
++
+         internal_free(wmEncounterTableList);
+         wmEncounterTableList = nullptr;
+     }
+@@ -1019,6 +1029,14 @@
+     wmMaxEncounterInfoTables = 0;
+ 
+     if (wmEncBaseTypeList != nullptr) {
++        // ARGON: and each encounter owns its own.
++        for (int index = 0; index < wmMaxEncBaseTypes; index++) {
++            if (wmEncBaseTypeList[index].entries != nullptr) {
++                internal_free(wmEncBaseTypeList[index].entries);
++                wmEncBaseTypeList[index].entries = nullptr;
++            }
++        }
++
+         internal_free(wmEncBaseTypeList);
+         wmEncBaseTypeList = nullptr;
+     }
+@@ -1211,9 +1229,21 @@
+         int encounterTableEntryIdx;
+ 
+         if (fileReadInt32(stream, &encounterTableIdx) == -1) return -1;
++        // ARGON: bounds, because the arrays are now exactly as long as
++        // worldmap.txt made them.  The indices come out of a save written
++        // against the same file, so this should never fire - but "should never"
++        // and "writes past the end of a 22-entry array" are not the same claim.
++        if (encounterTableIdx < 0
++            || encounterTableIdx >= wmMaxEncounterInfoTables) {
++            return -1;
++        }
+         EncounterTable* encounterTable = &(wmEncounterTableList[encounterTableIdx]);
+ 
+         if (fileReadInt32(stream, &encounterTableEntryIdx) == -1) return -1;
++        if (encounterTableEntryIdx < 0
++            || encounterTableEntryIdx >= encounterTable->entriesLength) {
++            return -1;
++        }
+         EncounterTableEntry* encounterTableEntry = &(encounterTable->entries[encounterTableEntryIdx]);
+ 
+         if (fileReadInt32(stream, &(encounterTableEntry->counter)) == -1) return -1;
+@@ -1411,6 +1441,32 @@
+         if (encounterTable->entriesLength >= 40) {
+             showMesageBox("\nwmConfigInit::Error: Encounter Table: Too many table indexes!!");
+             exit(1);
++        }
++
++/*
++ * ARGON: grown to fit rather than declared at the worst case.
++ *
++ * The world map holds 739 KB from startup to exit on every map, and most of it
++ * is two arrays sized for a table that does not exist.  EncounterTable carried
++ * entries[41] and 76 of them are parsed out of worldmap.txt; counted from the
++ * file itself, they use 22.3 of the 41 on average.  Encounter carried
++ * entries[10] and there are 110 of them, using 3.4.  So 45% of one and 66% of
++ * the other is empty on every map the player ever stands on - about 440 KB of
++ * an arena with 6340.
++ *
++ * These are parsed once at startup and never grow afterwards, so the cost is
++ * one realloc per entry while reading a file that is already being parsed -
++ * seventeen hundred of them, once, behind the loading screen.
++ */
++        {
++            EncounterTableEntry* grown = (EncounterTableEntry*)internal_realloc(
++                encounterTable->entries,
++                sizeof(*grown) * (size_t)(encounterTable->entriesLength + 1));
++            if (grown == nullptr) {
++                showMesageBox("\nwmConfigInit::Error loading Encounter Table!");
++                exit(1);
++            }
++            encounterTable->entries = grown;
+         }
+ 
+         pConfigCfg = config;
+@@ -1649,6 +1705,18 @@
+     strncpy(encounter->name, name, 40);
+ 
+     while (1) {
++        // ARGON: grown to fit; see the note in wmReadEncounterType.
++        {
++            EncounterEntry* grown = (EncounterEntry*)internal_realloc(
++                encounter->entries,
++                sizeof(*grown) * (size_t)(encounter->entriesLength + 1));
++            if (grown == nullptr) {
++                showMesageBox("\nwmConfigInit::Error loading Encounter!");
++                exit(1);
++            }
++            encounter->entries = grown;
++        }
++
+         if (wmParseEncBaseSubTypeStr(&(encounter->entries[encounter->entriesLength]), &string) == -1) {
+             return -1;
+         }
+@@ -1734,6 +1802,7 @@
+     encounter->spacing = 1;
+     encounter->distance = -1;
+     encounter->entriesLength = 0;
++    encounter->entries = nullptr;
+ 
+     return 0;
+ }
+@@ -1794,6 +1863,7 @@
+     encounterTable->mapsLength = 0;
+     encounterTable->field_48 = 0;
+     encounterTable->entriesLength = 0;
++    encounterTable->entries = nullptr;
+ 
+     return 0;
+ }

@@ -1,15 +1,20 @@
-/*
+﻿/*
  * ArgonOS - this machine's screen, sent down a wire to the board that has glass.
  *
  * The S3 on the desk has no display.  The board next to it is little else but
- * one, and two soldered pins join them (docs/09-esp32-cyd.md, "Провод к S3").
+ * one, and two soldered pins join them (docs/09-esp32-cyd.md, "РџСЂРѕРІРѕРґ Рє S3").
  * So the screen becomes a device like any other: this publishes a display whose
  * panel is a serial port, and nothing above it can tell the difference.
  *
- * It carries two kinds of traffic, because the kernel offers two and a screen
- * needs both:
+ * It carries three kinds of traffic - two because the kernel offers two and a
+ * screen needs both, and a third because the board at the other end has a
+ * speaker and this one does not:
  *
- *   Pixels (blit_rect, ABI 0.30) - the picture, in bands.  This is the part
+ *   Pixels (blit_rect, ABI 0.30) - the picture, in bands, sent from a task of
+ *   this driver's own (ABI 0.43).  What the caller pays is a copy into the
+ *   driver's frame; the wire is somebody else's problem after that, which is
+ *   the whole point - an application drawing on a screen should not be able to
+ *   tell that the screen is at the end of a cable.  This is the part
  *   that matters: it is a video link, the same idea as VGA or HDMI with a
  *   thinner cable, and the kernel hands it exactly what such a link wants.
  *   ag_blit_t is band-oriented by construction - the pixels belong to the
@@ -24,6 +29,14 @@
  *   for when no application holds the display.  A forty-column row is eighty
  *   bytes and a whole screen is four kilobytes, so this costs nothing next to
  *   the pixels, and without it the far end would go dark at every prompt.
+ *
+ *   Sound (a second device, /dev/pcmrem) - eight-bit mono, 22 KB/s of the
+ *   400 the wire carries.  The S3's own amplifier was unsoldered; the CYD has
+ *   one on its converter pin.  It is a stream in its own right: its own
+ *   buffers, laid out as wire packets exactly as the picture is, handed to the
+ *   same DMA and interleaved with the slices a block at a time.  See "sound"
+ *   below for why it is in this file and not in a .SYS of its own, which is
+ *   where it belongs by subject.
  *
  * What is NOT here, on purpose:
  *
@@ -54,7 +67,7 @@
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_DRV("REMDISP", "1.1", "argon");
+AG_DRV("REMDISP", "2.0", "argon");
 
 /* UART1: the console is UART0 on this board, and the numbering is the chip's. */
 #define LINK_PORT 1
@@ -64,14 +77,6 @@ AG_DRV("REMDISP", "1.1", "argon");
  * corrupt and zero lost blocks, where five megabaud corrupts 0.12% (apps/link,
  * and the table in docs/09-esp32-cyd.md).  Both ends must agree, so the same
  * number appears in remterm.c.
- */
-/*
- * THE DEFAULT IS NOT THE WIRE'S SPEED.  This cable has been measured at
- * 16 Mbaud - 1 599 966 B/s on the line, 1 132 730 B/s of payload after 24.7%
- * of blocks come back bad - and comparing anything against the 4 Mbaud below
- * compares it against 400 KB/s, which is that baud's ceiling and not the
- * wire's.  `[remdisp] baud` in SYSTEM.CFG moves it; the compiled-in number
- * stays where it was so a board that says nothing behaves as it did.
  */
 #ifndef LINK_BAUD
 #define LINK_BAUD 4000000u
@@ -114,7 +119,156 @@ AG_DRV("REMDISP", "1.1", "argon");
 #define FR_BAND   'B' /* a rectangle of pixels, RGB565 as they are           */
 #define FR_PACK   'P' /* the same, PackBits over the pixels                  */
 #define FR_IDX    'I' /* the same, as a palette and indices                  */
-#define FR_BULK   'B' /* anybody's bytes, in the shape that works            */
+#define FR_AUD    'A' /* sound: a rate, then unsigned 8-bit mono samples     */
+#define FR_IDX8   'X' /* a slice as one byte a pixel, into the palette below  */
+#define FR_PAL    'L' /* the palette itself: RGB565, up to 256 entries        */
+#define FR_HUF    'H' /* a slice as Huffman-coded indices                     */
+#define FR_HTAB   'T' /* the code lengths those bits are read with            */
+#define FR_HUFP   'P' /* the same, but only the blocks of it that moved       */
+#define FR_DONE   'Z' /* that frame is whole: which slices it was made of     */
+#define FR_END    'E' /* that frame is whole: its number, and how many bands */
+#define FR_RAW    'F' /* one slice of a whole frame, uncompressed           */
+
+/*
+ * The plain way, and for now the only way.
+ *
+ * Everything else in this file - the hash grid, the trimming to changed
+ * blocks, three encodings raced against each other, the byte budget - was
+ * built to make a slow wire carry a picture, and each piece of it works.
+ * Together they produced half a screen a second and a set of numbers nobody
+ * could reconcile with what was on the glass, because every one of them
+ * measured a different thing and two of them were wrong.
+ *
+ * So this is the floor to build back up from: copy the whole frame, cut it
+ * into numbered slices, send them all, and let the far end ask again for what
+ * it did not get.  A 320x240 frame is 150 KB and the wire carries 400 KB/s, so
+ * the ceiling is 2.7 frames a second - three times what all the cleverness was
+ * delivering, and every one of them a whole frame rather than a stripe.
+ *
+ * A slice is eight rows because that is what fits a frame on this wire, not
+ * for any reason to do with the picture.
+ */
+/*
+ * Above the applications again, and this time it is earned.
+ *
+ * It ran at 6 by habit and that was the bug: applications run at 5, and a task
+ * above them is promising to hand the core straight back, which a task writing
+ * a hundred and fifty kilobytes through a two-kilobyte ring cannot do.  It was
+ * dropped to 3 and the game came back - 40 fps instead of 1.5 - at the cost of
+ * the picture, which fell to one frame a second because the sender then had to
+ * queue behind everything.
+ *
+ * What changed is that the picture is carried by DMA now.  This task hands a
+ * slice to the hardware and sleeps; it needs about three milliseconds a frame
+ * for the sums and a handful of small writes, so the promise the priority
+ * makes is one it can keep.  And if it ever stops keeping it, the kernel says
+ * so and drops it below the applications until the window turns - see
+ * argon/budget.h.  Measured with all three in place: the game at 36-42 fps,
+ * the screen at 1.8-2.0 whole frames a second, and not one budget warning.
+ */
+#ifndef WIRE_PRIO
+#define WIRE_PRIO 6
+#endif
+
+#ifndef NO_AUDIO
+#define NO_AUDIO 0
+#endif
+
+/*
+ * -DIDX_MODE=0 sends the picture as RGB565, the way it went before the palette.
+ * It is the comparison, and it is one #define because that is what a claim of
+ * "twice as fast" has to be answerable by.
+ */
+#ifndef IDX_MODE
+#define IDX_MODE 1
+#endif
+
+/*
+ * -DHUF_MODE=0 sends the indices as they are, one byte a pixel.  The coder
+ * below is the difference between 77 KB a frame and 47, and it is one #define
+ * because that is what a claim about it has to be answerable by.
+ */
+#ifndef HUF_MODE
+#define HUF_MODE 1
+#endif
+
+/*
+ * -DDIFF_MODE=0 sends every pixel of every frame, whether it moved or not.
+ * With it on, a slice nothing has happened in is not sent at all.
+ */
+#ifndef DIFF_MODE
+#define DIFF_MODE 1
+#endif
+
+/*
+ * -DFRAME_DUMP=N: write the Nth frame this driver holds to A:\FRAME.RAW, once,
+ * and then never again.
+ *
+ * Not a feature and not meant to become one.  A compressor has to be chosen
+ * against a real picture, and the only real picture is the one sitting in this
+ * buffer: what a game actually draws, after the shim has averaged 640x480 down
+ * to 320x240, is not something to guess about.
+ *
+ * A file, and not the console, and that is the whole lesson of the two goes it
+ * took.  The console is a screen: it sends the far end repaints of its
+ * twenty-five rows, not every line handed to it, so anything that scrolls past
+ * between two repaints never leaves the board at all - eleven lines in every
+ * thirty-five, twice, silently.  A hundred and fifty kilobytes onto the card
+ * takes a moment and arrives whole, and comes back over HTTPD.AXE.
+ */
+#ifndef FRAME_DUMP
+#define FRAME_DUMP 0
+#endif
+#ifndef FRAME_DUMP_PATH
+#define FRAME_DUMP_PATH "a:\\FRAME.RAW"
+#endif
+
+#ifndef SEND_ALWAYS
+#define SEND_ALWAYS 0
+#endif
+
+#ifndef TICK_PRIO
+#define TICK_PRIO 5
+#endif
+
+#ifndef CORE_METER
+#define CORE_METER 0
+#endif
+
+#ifndef PORT_ON_SYS_CORE
+#define PORT_ON_SYS_CORE 0
+#endif
+
+#ifndef PORT_WRITE_MAX
+#define PORT_WRITE_MAX 0
+#endif
+
+#ifndef RAW_SILENT
+#define RAW_SILENT 0
+#endif
+
+#define RAW_ROWS 8u
+
+/*
+ * Why a frame needs an end.
+ *
+ * Until now the wire carried bands and nothing else, and a band is a stripe of
+ * the screen.  The far end put each one on the glass as it arrived, so a moving
+ * picture reached the eye as a wipe from the top - the stripes somebody
+ * watching calls running bands - and neither end could say how many *frames* a
+ * second the glass was showing, because neither end knew where one frame ended
+ * and the next began.  Every number about the picture was therefore about
+ * rectangles, which is not what a person looks at.
+ *
+ * So: one two-byte number per frame and the count of bands it was made of,
+ * four bytes at the end of every rectangle the driver sends.  It buys three
+ * things that could not be had before.  The far end can count frames.  A gap
+ * in the numbering names a frame that did not arrive, which no checksum can -
+ * loss used to be invisible here, there being nothing to miss.  And a frame
+ * that arrives with fewer bands than it promised is a frame that lost one,
+ * which is the difference between "the wire dropped a stripe" and "the wire
+ * dropped everything".
+ */
 
 /*
  * A band is at most eight rows, and the reason is the far end's panel rather
@@ -125,7 +279,7 @@ AG_DRV("REMDISP", "1.1", "argon");
  * end can hold without a framebuffer - and not having a framebuffer over there
  * is the whole reason this arrangement exists.
  */
-#define BAND_ROWS 12u
+#define BAND_ROWS 8u
 
 /*
  * The largest band, in pixels, and the frame that has to hold one.
@@ -143,198 +297,343 @@ AG_DRV("REMDISP", "1.1", "argon");
 static const ag_io_api_t *io;
 static bool               s_up;
 
+/* Which frame is being sent, and how many bands have gone into it. */
+static uint16_t s_frame_no;
+static uint16_t s_frame_bands;
+
+/*
+ * The handshake that keeps the driver from ever seeing half a frame.
+ *
+ * The game draws into the system surface and ends its frame with a flush, and
+ * that flush is the only moment anybody knows the picture is whole.  So the
+ * copy happens there - but only when this driver has asked for one.  The rest
+ * of the time the flush returns at once and the game waits for nothing, which
+ * is the point: the game is not paying for the wire, it is paying for one
+ * memcpy whenever the wire is ready for another frame.
+ */
+static volatile bool s_want_copy;   /* the driver would like a frame        */
+static volatile bool s_have_copy;   /* ...and here it is                    */
+
+/* What each stage costs, measured rather than reasoned about. */
+static uint32_t s_t_copy_us;     /* 2: the game held for the copy            */
+/*
+ * And every step after it, separately, because the sum said nothing.
+ *
+ * "Send" was 406-486 ms a frame and the wire alone accounts for 383 of it, so
+ * the interesting question - what the driver spends that is not the wire - was
+ * hidden inside one number.  Four timers instead: the gather out of the frame,
+ * the byte-at-a-time fill of the ring, the byte-at-a-time drain of it, and the
+ * write to the port.
+ */
+static uint32_t s_t_gather_us;   /* 3: frame -> the slice being sent          */
+static uint32_t s_t_ring_us;     /* 4: slice -> ring, a byte at a time        */
+static uint32_t s_t_out_us;      /* 5: ring -> out buffer, a byte at a time   */
+static uint32_t s_t_port_us;     /* 6: out buffer -> the wire                 */
+static uint32_t s_t_send_us;     /* the frame put on the wire                */
+static uint32_t s_t_wait_us;     /* the driver waiting for a frame boundary  */
+static uint32_t s_raw_frames;    /* frames sent whole                        */
+static uint32_t s_raw_resent;    /* slices the far end had to ask for again  */
+static uint64_t s_raw_bytes;
+
 /* One frame, built here and written in one call.  Static because the console
  * task's stack is not this driver's to spend, and the kernel serialises every
  * callback that uses it. */
-/* ---------------------------------------------------------------------- */
-/* The wire: a UART, or the SPI the same four pins can carry                */
-/* ---------------------------------------------------------------------- */
-/*
- * WHY THIS IS A SWITCH AND NOT A SECOND DRIVER.  Everything above and below
- * writes FRAMES - magic, length, payload, checksum - into a byte stream and
- * never asks what carries it.  That is the whole reason this path runs at the
- * wire's rate while the cluster link over the same copper manages a few
- * thousand bytes a second: there is no window, no acknowledgement and no
- * retransmission here, and a band that is damaged is a band redrawn on the
- * next frame.  Carrying the same stream over SPI is therefore a change of two
- * functions, not a change of design.
- *
- * AND SPI IS THE EASY CASE HERE, which is worth saying because it is the hard
- * case for the cluster link.  A link has to let the far end speak, so its
- * master clocks blocks whether or not it has anything to send - measured: 93%
- * of them empty.  A screen is ONE WAY.  This master clocks only when it has
- * pixels, so there are no empty blocks at all, and the reverse channel is one
- * byte that a poll ten times a second can collect.
- *
- * [remdisp] in SYSTEM.CFG:  wire = uart | spi, and for spi: bus, cs, khz,
- * block, gap_us.  The default is the UART, so a board that says nothing keeps
- * the behaviour it had.
- */
-#define RD_WIRE_UART 0
-#define RD_WIRE_SPI  1
-/*
- * A wire that throws everything away, and it is an instrument rather than a
- * joke: it is the only way to weigh what this driver costs against what the
- * transport costs.  With `wire = none` the frames are built exactly as usual
- * and then dropped, so whatever the sender still manages is its own ceiling.
- * The difference against the same run over SPI is the wire.
- */
-#define RD_WIRE_NONE 2
 
-static int      s_wire = RD_WIRE_UART;
-static uint64_t s_polled;   /* when the reverse channel was last read */
-static int      s_bus  = 2;
-static int      s_cs   = 10;
-static uint32_t s_khz  = 20000u;
-static uint32_t s_baud = LINK_BAUD;
-/*
- * THE BLOCK IS WHAT THE FAR END ARMS, so a write longer than one is truncated
- * at the slave and the rest is clocked into a chip whose transaction has
- * ended.  A frame here is up to 5194 bytes, so the write is CUT INTO BLOCKS
- * and the far end puts the stream back together the same way it does over a
- * UART - which it already knows how to do, because a UART has no blocks
- * either.
- *
- * 512 rather than the 8192 one transfer could carry: the kernel's slave
- * service was measured falling over at 4096 (123 stalls and 123 rebuilds of
- * the interface in one run), and this is not the place to find out why.
- */
-static uint32_t s_blk  = 512u;
-/*
- * Dead time between two blocks, because the far end has to have the next
- * transaction armed when the select falls and a master clocking back to back
- * leaves it no room.  The cluster link measured this as load-bearing on the
- * same pair; 0 is legal and worth trying, which is what the key is for.
- */
-static uint32_t s_gap  = 100u;
+/* What went and what did not.  Read back through the display's ioctl so the
+ * thing above the driver can put it in its own readout - a driver cannot
+ * print. */
+/* Whether a rectangle may be trimmed against what the far end is believed to
+ * have - see rem_ioctl.  On by default; the whole point of the switch is that
+ * it can be turned off from outside. */
+static bool s_trim = true;
+/* Whether a band may be packed or palettised before it goes.  Lossless either
+ * way, and stateless - turning it off buys nothing but certainty, which is
+ * sometimes the thing wanted. */
+static bool s_encode = true;
 
-static void wire_gap(void)
+static uint64_t s_sent_bytes;
+static uint32_t s_sent_frames;
+static uint32_t s_dropped; /* refused: the ring was full                     */
+/*
+ * Two counters, one per core, at the lowest priority there is.  They do
+ * nothing but add one, so the rate each of them manages is how much of that
+ * core nobody else wanted.  Read them in three states - the driver silent, the
+ * driver asleep instead of writing, the driver really sending - and the
+ * question "is a core being eaten, and which" stops being a matter of opinion.
+ *
+ * -DCORE_METER=1 builds them; they are off otherwise, because an idle-priority
+ * spinner is exactly the sort of thing that should not ship.
+ */
+static volatile uint32_t s_spin[2];
+
+#if CORE_METER
+static volatile uint32_t s_laps[2]; /* laps nobody else wanted, per core */
+#endif
+static uint32_t s_in_blit_us, s_in_text_us, s_in_pcm_us;
+static uint32_t s_t_huf_us; /* building the code and sending the table */
+static uint32_t s_t_wait_last, s_loops, s_loops_last;
+static uint32_t s_offers; /* full-surface presents the game made */
+
+/*
+ * What the game says it changed, since the last copy.
+ *
+ * The shim hands the display the rectangle the engine drew into and nothing
+ * more - "nothing drawn means nothing to send" is written in its own comment -
+ * so this is not a guess, it is the same contract a real panel gets.  Before
+ * it was used, the copy hashed all seventy-six thousand pixels to find the
+ * fifty blocks that had moved; the game knew which ones all along.
+ *
+ * Unioned across every present, including the ones this driver declines,
+ * because a rectangle it did not take a copy of is still a rectangle that
+ * changed.
+ */
+static uint32_t s_dam_x0, s_dam_y0, s_dam_x1, s_dam_y1; /* x1/y1 exclusive */
+static bool     s_dam_any;
+/*
+ * Whether the picture is carried by the UART's own DMA.  Decided once, when
+ * the wire task starts, and given up for good if the port ever refuses a
+ * transfer - see ABI 0.44 and the note there about which chips have it.
+ */
+static bool s_dma;
+static bool s_asked_recently; /* the far end wanted something last frame */
+
+/*
+ * Step four, taken apart.  Three hundred milliseconds a frame were going
+ * somewhere that neither the wire nor the processor could account for, and a
+ * total is no use for finding out which of five things it is.
+ */
+static uint32_t s_t_hdr_us, s_t_wait_hand_us, s_t_dma_us, s_t_sum_us,
+    s_t_rest_us;
+
+static uint32_t s_rx_bytes;   /* everything the far end sent us */
+static uint32_t s_t_fill_us;  /* step 3: PSRAM -> the internal buffer        */
+static uint32_t s_chunks;     /* how many buffer-fulls a frame took          */
+static uint32_t s_lost;    /* accepted, then the port would not take it       */
+
+/*
+ * True when every byte of the frame reached the port.
+ *
+ * It used to be void, on the grounds that there is nothing useful to do with a
+ * short write from inside a kernel callback.  That is still true of the write
+ * itself and false of the bookkeeping: the caller has just decided that the
+ * far end now has these pixels, and if the frame did not go, that decision is
+ * a lie that nothing corrects until the slow repair sweep comes round - up to
+ * seven and a half seconds of a rectangle showing the frame before it.  So the
+ * answer goes back and the hash is written only when it is true.
+ */
+
+/*
+ * Take, and give back only if it was taken.
+ *
+ * Every lock in this file used to be written as "take with a timeout, ignore
+ * the answer, give it back at the end", and that is two faults in one line.
+ * The give is from a task that does not hold it, which on FreeRTOS frees a
+ * mutex its real owner still believes it holds - so two tasks proceed, and the
+ * priority the first one inherited is handed back under it.  And what the two
+ * then share is s_frame, the one buffer every frame is assembled in, so the
+ * wire carries half of one frame followed by half of another.
+ *
+ * It could not happen while the only writer was whoever called blit_rect: the
+ * kernel held the device registry across that call and the console needed the
+ * same lock before it could print, so the two could never be inside here at
+ * once.  Giving this driver a task of its own took that accidental
+ * serialisation away, and both symptoms arrived together - a picture that was
+ * torn and dirty, and a board that stopped answering at all.
+ *
+ * So the wire lock is waited for without a limit: the holder always finishes,
+ * and there is nothing sensible to do with a refusal when what is being
+ * guarded is a buffer.  The others keep their timeout and honour the answer.
+ */
+static bool lock_take(ag_mutex_t m, uint32_t ms)
 {
-    if (s_gap == 0u) {
-        return;
-    }
-    const uint64_t t0 = ag_api()->time->us();
-    while ((uint32_t)(ag_api()->time->us() - t0) < s_gap) {
-        /* bounded by the number above: deliberate dead time, not a stall */
+    return (m != NULL) && ag_mutex_lock(m, ms);
+}
+
+static void lock_give(ag_mutex_t m, bool held)
+{
+    if (m != NULL && held) {
+        ag_mutex_unlock(m);
     }
 }
 
-static void wire_write(const uint8_t *p, uint32_t n)
+/*
+ * One task writes the port.  Everybody else leaves the frame here.
+ *
+ * The wire lock used to be held across the write itself, and the write blocks:
+ * uart_write_bytes waits for the peripheral to make room, and a port carrying
+ * a picture is full most of the time.  So whoever held it - the sender, the
+ * console drawing a row of text, the sound - held it for as long as the wire
+ * took, and everything else queued behind.  Twice that ended with a board that
+ * answered nothing at all: the console cannot print without this lock, and a
+ * machine that cannot print is a machine with no way to say what is wrong.
+ *
+ * The io layer learned this lesson before this file did, and wrote it down:
+ * "a thread blocked in a write to the picture link held the lock the console
+ * needed to print... the whole board went quiet at once".  It stopped holding
+ * its lock across the write.  This is the same answer one layer up.
+ *
+ * So a frame is assembled straight into a ring and the caller returns.  The
+ * ring is drained by the one task that owns the port, and nothing else ever
+ * touches it.  What is held while the wire is blocking is nothing at all.
+ *
+ * A frame that does not fit is dropped rather than waited for, and the caller
+ * is told so its idea of what the far end has stays true.  That is the right
+ * failure for a video link: a dropped band is a stale rectangle until the
+ * repair sweep comes round, where waiting is a stopped machine.
+ */
+#define TX_RING 24576u
+
+static uint8_t   *s_tx;
+static uint32_t   s_tx_r, s_tx_w, s_tx_used;
+static ag_mutex_t s_tx_lock;   /* the ring's own bookkeeping, held for bytes  */
+static ag_mutex_t s_drain_lock; /* the port itself, held across the write     */
+/*
+ * The buffer the port reads from, and the ring behind it, both want to be in
+ * internal SRAM rather than PSRAM.  Not for their own speed - they are small -
+ * but because the game is walking PSRAM at the same time on the other core,
+ * and every byte uart_write dribbles out of PSRAM is a byte the game does not
+ * get.  Measured: with the port write skipped the game ran at 20 fps, with it
+ * at 1.7, while the driver only ever occupied the other core.  So take as much
+ * internal memory as the system will part with, and fall back to the static
+ * two kilobytes if it will part with none.
+ */
+#define TX_OUT_STATIC 2048u
+static uint8_t    s_tx_out_fallback[TX_OUT_STATIC];
+static uint8_t   *s_tx_out = s_tx_out_fallback;
+static uint32_t   s_tx_out_sz = TX_OUT_STATIC;
+static bool       s_task_ok;   /* false: no task, so the caller drains        */
+
+static void tx_put(uint8_t b)
 {
-    if (s_wire == RD_WIRE_NONE) {
-        return;
+    s_tx[s_tx_w] = b;
+    s_tx_w = (s_tx_w + 1u) % TX_RING;
+    s_tx_used++;
+}
+
+/* Defined below: the one place that writes the port. */
+static uint32_t tx_drain(void);
+
+static bool send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
+{
+    if (!s_up || s_tx == NULL || len > FR_MAX_PAYLOAD) {
+        s_dropped++;
+        return false;
     }
-    if (s_wire == RD_WIRE_UART) {
-        (void)io->uart_write(LINK_PORT, p, n);
-        return;
+    const uint32_t want = 5u + len + 1u;
+
+    const bool held = lock_take(s_tx_lock, UINT32_MAX);
+    if (TX_RING - s_tx_used < want) {
+        /*
+         * The wire is behind.  Dropped, counted, and reported: the caller is
+         * about to write down that the far end has these pixels, and that has
+         * to stay true or the picture is wrong until the sweep repairs it.
+         */
+        lock_give(s_tx_lock, held);
+        s_dropped++;
+        return false;
     }
-    while (n > 0u) {
-        const uint32_t k = (n > s_blk) ? s_blk : n;
-        (void)io->spi_xfer(s_bus, s_cs, p, NULL, k);
-        p += k;
-        n -= k;
-        if (n > 0u) {
-            wire_gap();
+
+    tx_put(FR_MAGIC0);
+    tx_put(FR_MAGIC1);
+    tx_put(op);
+    tx_put((uint8_t)len);
+    tx_put((uint8_t)(len >> 8));
+
+    uint8_t sum = 0;
+    const uint64_t r0 = (uint64_t)ag_api()->time->us();
+    for (uint32_t i = 0; i < len; i++) {
+        tx_put(payload[i]);
+        sum = (uint8_t)(sum ^ payload[i]);
+    }
+    tx_put(sum);
+    s_t_ring_us += (uint32_t)((uint64_t)ag_api()->time->us() - r0);
+    lock_give(s_tx_lock, held);
+
+    s_sent_bytes += want;
+    s_sent_frames++;
+
+    /* With no task of its own this driver is what it always was: the caller
+     * carries the frame to the port and waits for it. */
+    if (!s_task_ok) {
+        (void)tx_drain();
+    }
+    return true;
+}
+
+/*
+ * Take what is waiting and put it on the wire.  Only the wire task calls this,
+ * and it holds no lock while the port blocks - the bytes are copied out first.
+ */
+static uint32_t tx_drain(void)
+{
+    uint32_t total = 0;
+
+    /*
+     * Only the wire task gets here while there is one, so this is uncontended
+     * and costs a take and a give.  It matters in the degraded case: with no
+     * task the callers drain for themselves, and two of them writing the port
+     * at once is the interleaved rubbish this whole arrangement exists to
+     * prevent.
+     */
+    const bool dheld = lock_take(s_drain_lock, UINT32_MAX);
+
+    for (;;) {
+        const bool held = lock_take(s_tx_lock, UINT32_MAX);
+        uint32_t   n = s_tx_used;
+        if (n > s_tx_out_sz) {
+            n = s_tx_out_sz;
+        }
+        const uint64_t o0 = (uint64_t)ag_api()->time->us();
+        for (uint32_t i = 0; i < n; i++) {
+            s_tx_out[i] = s_tx[s_tx_r];
+            s_tx_r = (s_tx_r + 1u) % TX_RING;
+            s_tx_used--;
+        }
+        s_t_out_us += (uint32_t)((uint64_t)ag_api()->time->us() - o0);
+        lock_give(s_tx_lock, held);
+
+        if (n == 0u) {
+            break;
+        }
+
+        /*
+         * Until every byte of what was taken is out, or the port refuses.
+         *
+         * These bytes have already left the ring, so a short write that is not
+         * finished is not a slow frame - it is a frame with a hole in it, and
+         * the receiver spends the rest of the second hunting for a header.
+         * That is exactly what it reported: seventeen bad frames and forty-five
+         * kilobytes of stray in a ten second window, where the same link had
+         * been carrying zero of each.
+         */
+        uint32_t off = 0;
+        const uint64_t p0 = (uint64_t)ag_api()->time->us();
+        /*
+         * RAW_SILENT=3: everything happens except the wire.  The frame is
+         * copied, gathered, put through the ring a byte at a time and taken
+         * out of it again - and then thrown away.  If the game is fast in this
+         * build the cost is the port; if it is slow, the cost is ours.
+         */
+#if RAW_SILENT == 3
+        off = n;
+#endif
+        while (off < n) {
+            const int32_t w = io->uart_write(LINK_PORT, s_tx_out + off, n - off);
+            if (w <= 0) {
+                s_lost += n - off; /* the hole, named rather than hidden */
+                break;
+            }
+            off += (uint32_t)w;
+        }
+        s_t_port_us += (uint32_t)((uint64_t)ag_api()->time->us() - p0);
+        total += off;
+        if (off != n) {
+            break;
         }
     }
-    /*
-     * AND AFTER THE LAST PIECE TOO, which used to be left out because the gap
-     * was thought of as something between the parts of one frame.  It is not:
-     * the far end has to ARM a block between transactions, and with a block
-     * big enough to hold a whole frame there is only ever one piece, so
-     * consecutive frames arrived back to back with no room at all.  The faster
-     * the clock the sooner the next one starts, which is why doubling the rate
-     * made it worse rather than better.
-     */
-    wire_gap();
-}
 
-/*
- * What the far end has said, which is one byte and rarely.  On SPI a receive
- * needs a clock, so this one clocks a short empty block; the zeros it reads
- * when nothing was queued are skipped by the caller, which is scanning for a
- * single character anyway.
- */
-static int32_t wire_read(uint8_t *p, uint32_t n)
-{
-    if (s_wire == RD_WIRE_NONE) {
-        return 0;
-    }
-    if (s_wire == RD_WIRE_UART) {
-        return io->uart_read(LINK_PORT, p, n, 0);
-    }
-    if (io->spi_xfer(s_bus, s_cs, NULL, p, n) != AG_OK) {
-        return 0;
-    }
-    return (int32_t)n;
-}
-
-/*
- * THE FRAME BUFFER IS DMA-CAPABLE WHEN THE WIRE IS SPI, and that is not a
- * micro-optimisation - it is the difference between a picture and nothing.
- *
- * The port splits any transfer longer than AG_PORT_SPI_BOUNCE (1024) into
- * separate transactions when it has to copy through its bounce buffer, and a
- * separate transaction means the chip select RISES between the pieces.  The
- * far end frames on exactly that, so a 5194-byte band arrived as six
- * fragments and was destroyed, while an 80-byte console row - one transaction
- * either way - arrived perfectly.  Measured: 24 rows, 0 rectangles, 2 511 644
- * bytes counted stray.
- *
- * io_hw.c takes a fast path for a write-only transfer FROM DMA-CAPABLE MEMORY:
- * no copy and no cap, so the whole frame crosses as one transaction.  A static
- * array in a loadable driver is not that memory, so the buffer is allocated.
- */
-static uint8_t *s_frame;
-
-static void send_frame(uint8_t op, const uint8_t *payload, uint32_t len)
-{
-    if (!s_up || len > FR_MAX_PAYLOAD) {
-        return;
-    }
-    s_frame[0] = FR_MAGIC0;
-    s_frame[1] = FR_MAGIC1;
-    s_frame[2] = op;
-    s_frame[3] = (uint8_t)len;
-    s_frame[4] = (uint8_t)(len >> 8);
-
-    /*
-     * A WORD AT A TIME, because this is every byte of every band.  It used to
-     * copy and checksum byte by byte, which at the rates this now runs at is
-     * a whole pass over five kilobytes per band spent on a loop the compiler
-     * cannot widen: the XOR of the bytes is the XOR of the words folded down,
-     * so the two can be done together on aligned words and the ends by hand.
-     */
-    memcpy(s_frame + 5u, payload, len);
-
-    uint32_t       acc = 0;
-    const uint8_t *q = payload;
-    uint32_t       n = len;
-    while (n != 0u && (((uintptr_t)q & 3u) != 0u)) {
-        acc ^= (uint32_t)*q++;
-        n--;
-    }
-    while (n >= 4u) {
-        uint32_t w;
-        memcpy(&w, q, sizeof(w));
-        acc ^= (w & 0xFFu) ^ ((w >> 8) & 0xFFu) ^ ((w >> 16) & 0xFFu) ^
-               (w >> 24);
-        q += 4;
-        n -= 4u;
-    }
-    while (n != 0u) {
-        acc ^= (uint32_t)*q++;
-        n--;
-    }
-    s_frame[5u + len] = (uint8_t)acc;
-
-    /*
-     * The result is ignored deliberately.  There is nothing useful to do with a
-     * short write from inside a kernel callback: printing is forbidden here, and
-     * stalling to retry would stop the console or the application for the sake
-     * of one rectangle.
-     */
-    wire_write(s_frame, 5u + len + 1u);
+    lock_give(s_drain_lock, dheld);
+    return total;
 }
 
 static void put16(uint8_t *p, uint32_t v)
@@ -346,81 +645,195 @@ static void put16(uint8_t *p, uint32_t v)
 /* ---- pixels ------------------------------------------------------------ */
 
 /*
- * The last frame the far end was given, so that pixels it already has cost
- * nothing but the comparison - and so that what *is* sent can be trimmed to the
- * part that moved.
+ * What the far end already has, so that pixels it has cost nothing to keep
+ * there - and so that what *is* sent is trimmed to the part that moved.
  *
  * This is the largest saving available and it is not compression: what a screen
  * does most of the time is not change.  A paused game, a menu, a status bar
  * along the bottom, the whole picture between two footsteps - bytes nobody
  * needs twice.  A flush of the whole surface is what an application does when
  * it does not track its own damage; this turns that back into damage tracking
- * without the application knowing.
+ * without the application knowing.  Measured: a full-surface flush of a still
+ * picture costs 12 ms instead of 190.
  *
- * 150 KB for 320x240, from the module's heap and so from PSRAM.  If it cannot
- * be had, everything is sent - slower, not broken.
+ * It used to be an actual copy of the frame - 150 KB of RGB565, compared pixel
+ * by pixel.  It is a hash per 8x8 block now, which is 4800 bytes, and the
+ * reason is that on this board those two numbers decide whether the game on the
+ * other side of the driver starts at all: 150 KB is a quarter of what Fallout 2
+ * was short of when it was refused its arena.  The screen driver was holding
+ * three per cent of the machine to answer a question that does not need the
+ * pixels themselves.
  *
- * What is deliberately NOT done with it: coding the difference against it.
- * That is what a video codec would do and it would win by a mile, but undoing
- * a difference needs the previous frame at the *receiving* end, and the far end
+ * What is lost with it: the bounding box is now in units of eight pixels rather
+ * than one, and within a band it is the whole eight rows.  A cursor that moved
+ * costs a couple of hundred pixels instead of a hundred.  What is gained
+ * besides the memory: the comparison reads one buffer instead of two.
+ *
+ * A hash can collide, and then a block that changed is not sent.  Thirty-two
+ * bits over sixty-four pixels puts that at about one block in four thousand
+ * million; at twelve hundred blocks and thirty frames a second it is once every
+ * few weeks, and what it costs is one stale 8x8 square for one frame.  Against
+ * a fixed 150 KB that is a good trade.
+ *
+ * Zero means "not known", and the hash is never allowed to be zero.  That is
+ * how a cold start, a reconnect and a partial blit all say the same thing
+ * without a flag: what this driver does not know about, it sends.  The previous
+ * version left the buffer uninitialised and called that "disagrees with the far
+ * end", which is wrong twice over - PSRAM survives a warm reset and can come
+ * back holding the last run's picture, and a buffer of zeros is a claim that
+ * the far end is showing black, which is exactly what a game fading in from
+ * black is about to send.  The symptom was a black screen with the menu
+ * appearing only under the mouse pointer, and every counter said the link was
+ * working perfectly.
+ *
+ * What is deliberately NOT done: coding the difference against the last frame.
+ * That is what a video codec would do and it would win by a mile, but undoing a
+ * difference needs the previous frame at the *receiving* end, and the far end
  * cannot hold one - 150 KB against a largest free block of about ninety is the
- * whole reason this arrangement exists.  Reading it back out of the panel's own
- * memory over SPI is slow and, on this controller, not dependable.  So the
- * shadow is used to decide what to send, never to encode it.
+ * whole reason this arrangement exists.
  */
-static uint16_t *s_prev;
-static uint32_t  s_prev_w;
-static uint32_t  s_prev_h;
+#define BLK 8u /* the block the hash covers; the same eight rows as a band */
 
-/*
- * WHEN THE SHADOW STOPS PAYING FOR ITSELF.
- *
- * Trimming a band to what actually moved is the whole reason a still screen
- * costs nothing, and on a picture that changes EVERYWHERE it is two passes
- * over the band - a comparison and an update - that never once save a byte.
- * That is the video case, and it is the case where the frame rate matters.
- *
- * So after enough bands in a row come back "all of it moved", the shadow is
- * dropped and the bands go whole; it is allowed back after a while, and the
- * first frame after that goes out whole anyway (the buffer is deliberately not
- * cleared), so nothing can be missed by letting go of it.
- */
-#define PREV_GIVE_UP   16u
-#define PREV_TRY_AGAIN 600u
+static uint32_t *s_hash;
+static uint32_t  s_hash_cols;
+static uint32_t  s_hash_rows;
+static uint32_t  s_surf_w;
+static uint32_t  s_surf_h;
 
-static uint32_t s_prev_full;  /* bands in a row where everything moved */
-static uint32_t s_prev_rest;  /* bands to wait before tracking again   */
+static void hash_forget(void)
+{
+    if (s_hash != NULL) {
+        for (uint32_t i = 0; i < s_hash_cols * s_hash_rows; i++) {
+            s_hash[i] = 0;
+        }
+    }
+}
 
 static bool prev_ready(uint32_t w, uint32_t h)
 {
-    if (s_prev_rest != 0u) {
-        s_prev_rest--;
-        if (s_prev != NULL) {
-            ag_free(s_prev);
-            s_prev = NULL;
-            s_prev_w = 0;
-            s_prev_h = 0;
-        }
-        return false;
-    }
-    if (s_prev != NULL && s_prev_w == w && s_prev_h == h) {
+    if (s_hash != NULL && s_surf_w == w && s_surf_h == h) {
         return true;
     }
-    ag_free(s_prev);
-    s_prev = (uint16_t *)ag_malloc((size_t)w * h * sizeof(uint16_t));
-    if (s_prev == NULL) {
-        s_prev_w = 0;
-        s_prev_h = 0;
+    ag_free(s_hash);
+    s_hash_cols = (w + BLK - 1u) / BLK;
+    s_hash_rows = (h + BLK - 1u) / BLK;
+    s_hash = (uint32_t *)ag_malloc((size_t)s_hash_cols * s_hash_rows *
+                                   sizeof(uint32_t));
+    if (s_hash == NULL) {
+        s_hash_cols = 0;
+        s_hash_rows = 0;
+        s_surf_w = 0;
+        s_surf_h = 0;
         return false;
     }
-    s_prev_w = w;
-    s_prev_h = h;
-    /*
-     * Deliberately not cleared.  Whatever is in it disagrees with the far end,
-     * so the first frame goes out whole - which is exactly what a far end that
-     * has just started listening needs.
-     */
+    s_surf_w = w;
+    s_surf_h = h;
+    hash_forget();
     return true;
+}
+
+/*
+ * FNV-1a over the block's pixels, and never zero, because zero is the word for
+ * "not known".  Sixteen bits at a time rather than eight: half the rounds for
+ * the same coverage, and the pixels are sixteen bits anyway.
+ */
+static uint32_t block_hash(const uint8_t *src, uint32_t stride, uint32_t rows,
+                           uint32_t cols)
+{
+    uint32_t h = 2166136261u;
+
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint16_t *px = (const uint16_t *)(src + (size_t)r * stride);
+        for (uint32_t i = 0; i < cols; i++) {
+            h ^= px[i];
+            h *= 16777619u;
+        }
+    }
+    return h != 0u ? h : 1u;
+}
+
+/*
+ * One band row forgotten every so often, so the picture repairs itself.
+ *
+ * A lost band is remembered as delivered - the grid records what was *sent*,
+ * and the link has no acknowledgement - so anything that goes missing on the
+ * wire stays wrong until that part of the picture changes again.  On a game
+ * that is usually soon; on a status bar or a menu it is never.  And things do
+ * go missing: measured with the game running, 123 KB of arriving bytes in forty
+ * seconds were thrown away by the receiver hunting for a frame header, because
+ * writing a band to the panel takes long enough for the UART's buffer to
+ * overflow and this link has no flow control.
+ *
+ * So it is the same answer the console path already uses two hundred lines
+ * below, for the same reason: a slow sweep that re-sends what is probably
+ * already right.  A quarter of a second per band row is one extra band in every
+ * fifty at the frame rates seen here, and it puts a ceiling of about eight
+ * seconds on how long any part of the picture can stay wrong.
+ *
+ * Driven from the rectangle that is going out rather than from a clock of its
+ * own: the point of forgetting a row is that it gets sent again, and a row
+ * nothing is sending is not sent again by forgetting it.  So while nothing is
+ * drawing nothing is repaired - which is the case that FR_HELLO covers.
+ */
+/*
+ * A quarter of a second was the first number and it is too slow to live with.
+ * Thirty-two rows of blocks at that rate is an eight second ceiling on how
+ * long a wrong rectangle stays on the glass, and eight seconds of dirt behind
+ * a mouse pointer is something a person reports as a fault however carefully
+ * it was reasoned about.  Sixty milliseconds is about two seconds for the
+ * whole screen and costs one band - two and a half kilobytes encoded - per
+ * sixty, which is under a tenth of the wire.
+ */
+#define HEAL_BAND_US 60000ull
+
+static uint32_t s_heal_band;
+static uint64_t s_heal_band_at;
+
+static void heal_a_band(uint32_t y, uint32_t h)
+{
+    if (s_hash == NULL || s_hash_rows == 0) {
+        return;
+    }
+    const uint64_t now = (uint64_t)ag_api()->time->us();
+    if (now < s_heal_band_at) {
+        return;
+    }
+    s_heal_band_at = now + HEAL_BAND_US;
+
+    /*
+     * A row of blocks inside the rectangle that is being sent right now, and
+     * not a row chosen by a counter of its own.
+     *
+     * The point of forgetting a row is that it gets sent again.  A row this
+     * blit does not cover is not sent again by this blit - it waits for a
+     * flush that reaches it, and once the application above only reports the
+     * pixels it really changed, that may be a long wait.  Forgetting a row
+     * inside the current rectangle makes the repair immediate: the blocks read
+     * as changed a few lines below and go out with everything else.
+     *
+     * Which leaves who covers the rest of the screen, and the answer is
+     * whoever is drawing: Fallout's port walks a strip of eight rows down the
+     * panel four times a second for exactly this reason, and the console path
+     * flushes full width anyway.  A row therefore comes round about every
+     * seven and a half seconds, which is the ceiling on how long any part of
+     * the picture can be wrong.
+     */
+    const uint32_t first = y / BLK;
+    if (first >= s_hash_rows) {
+        return;
+    }
+    uint32_t last = (y + (h ? h : 1u) - 1u) / BLK;
+    if (last >= s_hash_rows) {
+        last = s_hash_rows - 1u;
+    }
+    const uint32_t span = (last >= first) ? (last - first + 1u) : 1u;
+    const uint32_t r = first + (s_heal_band++ % span);
+    if (r >= s_hash_rows) {
+        return;
+    }
+    for (uint32_t c = 0; c < s_hash_cols; c++) {
+        s_hash[(size_t)r * s_hash_cols + c] = 0;
+    }
 }
 
 /*
@@ -433,94 +846,238 @@ static bool prev_ready(uint32_t w, uint32_t h)
  * shadow says the far end already has this frame, so on a screen where nothing
  * is moving nothing would ever be sent again and the glass would stay dark.
  *
- * So the receiver says one byte when it starts, and this drops the shadow.
- * prev_ready then allocates a fresh one that is deliberately not cleared,
- * which is exactly "disagrees with the far end" - the next frame goes out
- * whole.  No new state, no new code path: the reconnect uses the same road as
- * the first connection.
+ * So the receiver says one byte when it starts, and this forgets every block
+ * hash.  "Not known" is already the word for a block that has to be sent, so
+ * the reconnect needs no state and no code path of its own: it is the same
+ * road as a cold start.
  *
- * Polled rather than waited for, with a zero timeout, from the two callbacks
- * the kernel already makes often.  A driver cannot own a task.
+ * Polled rather than waited for, with a zero timeout, from the driver's own
+ * task, which comes round every two milliseconds whether or not anything is
+ * drawing.
  *
- * Which leaves one case out, and it is worth naming rather than discovering:
- * while an application holds the display the kernel stops calling text_cursor,
- * and it calls blit_rect only when that application draws.  An application
- * holding a picture that never changes therefore never reads this, and a
- * receiver that reconnects under one stays dark.  Measured, not assumed:
- * gfxdemo paints once and waits, and a receiver started after it got nothing.
- *
- * It does not matter for what this is for - a game redraws, and the console
- * repairs itself through the sweep below - so the fix is not made here.  What
- * it would be: register a second device of class AG_DEV_INPUT whose poll()
- * returns no events and services this instead.  The kernel calls that ten
- * times a second regardless of who owns the screen, and it exists precisely
- * because a loadable driver cannot own a task.
+ * It used to be polled from the two callbacks the kernel makes often, because
+ * a driver could not own a task, and that left a case out: while an
+ * application holds the display the kernel stops calling text_cursor and calls
+ * blit_rect only when the application draws, so an application holding a
+ * picture that never changes never read this and a receiver that reconnected
+ * under one stayed dark.  Measured, not assumed - gfxdemo paints once and
+ * waits, and a receiver started after it got nothing.  ABI 0.43 gave the
+ * module a task, and the case went with it.
  */
+/* Where the repair sweep has got to, and how many rows it still owes.
+ * poll_far_end sends it back to the top.  See sweep_step, far below. */
+/*
+ * Who painted last owns the glass.
+ *
+ * This driver carries two kinds of picture down one wire - an application's
+ * pixels and the console's characters - and the far end draws whichever
+ * arrives.  That was harmless while pixels only ever moved because an
+ * application drew them: when the console had the screen, nothing sent pixels.
+ *
+ * The repair sweep broke that.  It sends rows of the framebuffer on a clock of
+ * its own, so after an application exited - or was killed - it went on painting
+ * that application's last frame over the console's text.  What Maxim saw was a
+ * band of stale graphics crawling up the screen, one row of blocks every half
+ * second, thirty rows, fifteen seconds a lap, with the text winning where the
+ * two met.  A very accurate description of the bug, as it turned out.
+ *
+ * So the sweep asks who drew last.  Pixels newer than text: an application owns
+ * the screen and the sweep is repairing its picture.  Text newer than pixels:
+ * the console owns it, and there is nothing here to repair - the text path has
+ * a repair sweep of its own, two hundred lines below.
+ */
+static uint64_t s_last_blit_us;
+static uint64_t s_last_text_us;
+
+static uint64_t s_sweep_at;
+static uint32_t s_sweep_owed = 0xffffffffu; /* everything, until told otherwise */
+static uint64_t s_sweep_asked_at;           /* when the far end last complained */
+
 #define FR_HELLO 'H'
+/*
+ * And what the far end says about itself: 'S' then four little-endian
+ * counters - frames closed, bands presented, times the display was refused,
+ * times there was no memory for a band.
+ *
+ * It exists because the far end's own console is unreadable while it is
+ * drawing (it holds the display) and taking that console back stops it drawing
+ * for good.  So "it is drawing" and "it is wedged" were the same observation
+ * from over there, and the only way to tell them apart was to restart it.  Now
+ * it says so, here, into a console nobody is holding.
+ */
+#define FR_STAT  'S'
+/*
+ * And 'R' - "send slice N of frame M again".  Four bytes after it, little
+ * endian.  This is the whole of the recovery scheme for whole-frame mode: the
+ * far end knows which slices it has because they are numbered, so it can name
+ * what is missing instead of asking for the screen back.
+ */
+#define FR_RESEND 'R'
+static void raw_resend(uint32_t frame, uint32_t slice);
+
+/*
+ * What the far end says back, collected a byte at a time: a status frame of
+ * sixteen bytes, and a four-byte "send slice N of frame M again".
+ */
+static uint8_t  s_stat[16];
+static uint32_t s_stat_have = 0xffffffffu; /* not collecting */
+static uint8_t  s_req[4];
+static uint32_t s_req_have = 0xffffffffu;
+
+static uint32_t stat32(uint32_t at)
+{
+    return (uint32_t)s_stat[at] | ((uint32_t)s_stat[at + 1u] << 8) |
+           ((uint32_t)s_stat[at + 2u] << 16) |
+           ((uint32_t)s_stat[at + 3u] << 24);
+}
+
+/* Defined with the palette, far below; wanted here, by the far end's "again". */
+static void pal_owe(void);
 
 static void poll_far_end(void)
 {
     uint8_t buf[16];
-
-    /*
-     * TEN TIMES A SECOND AND NOT ONCE A BAND.
-     *
-     * This sits at the top of blit_rect, which is called for every band, and a
-     * read is the one thing that cannot be queued: it has to wait for the
-     * write already on the wire, so every poll turned an overlapped write back
-     * into a blocking one.  Measured at 40 MHz: with the poll per band the
-     * sender offered 2885 KB/s and the engine was idle half the time.  What
-     * comes back this way is a single byte saying a new screen has appeared,
-     * so a tenth of a second is far more often than it needs.
-     */
-    const uint64_t now = ag_api()->time->us();
-    if (s_polled != 0u && (uint32_t)(now - s_polled) < 100000u) {
-        return;
-    }
-    s_polled = now;
     for (;;) {
-        const int32_t n = wire_read(buf, sizeof(buf));
+        const int32_t n = io->uart_read(LINK_PORT, buf, sizeof(buf), 0);
         if (n <= 0) {
             return;
         }
+        /*
+         * Counted, because the far end says very little and anything else
+         * arriving is the wire talking to itself.  Two hand-soldered lines
+         * side by side, one of them swinging at four megabaud: if the receiver
+         * is picking that up, it is taking an interrupt for every few bytes of
+         * nothing, and that is a cost nobody has looked for.
+         */
+        s_rx_bytes += (uint32_t)n;
         for (int32_t i = 0; i < n; i++) {
+            if (s_stat_have != 0xffffffffu) {
+                s_stat[s_stat_have++] = buf[i];
+                if (s_stat_have < sizeof(s_stat)) {
+                    continue;
+                }
+                s_stat_have = 0xffffffffu;
+                ag_printf("REMTERM: %u frames whole, %u slices in, "
+                          "%u buffer pieces, %u resends asked\n",
+                          (unsigned)stat32(0), (unsigned)stat32(4),
+                          (unsigned)stat32(8), (unsigned)stat32(12));
+                continue;
+            }
+            if (s_req_have != 0xffffffffu) {
+                s_req[s_req_have++] = buf[i];
+                if (s_req_have < sizeof(s_req)) {
+                    continue;
+                }
+                s_req_have = 0xffffffffu;
+                raw_resend((uint32_t)s_req[0] | ((uint32_t)s_req[1] << 8),
+                           (uint32_t)s_req[2] | ((uint32_t)s_req[3] << 8));
+                continue;
+            }
+            if (buf[i] == (uint8_t)FR_STAT) {
+                s_stat_have = 0;
+                continue;
+            }
+            if (buf[i] == (uint8_t)FR_RESEND) {
+                s_req_have = 0;
+                continue;
+            }
             if (buf[i] == (uint8_t)FR_HELLO) {
-                ag_free(s_prev);
-                s_prev = NULL;
-                s_prev_w = 0;
-                s_prev_h = 0;
+                /*
+                 * "Send it again."  The far end says this when it starts, on
+                 * every frame it could not decode, and now also on every frame
+                 * that never arrived at all - which it can see because the
+                 * frames are numbered.
+                 *
+                 * What it triggers is one repair frame covering the screen.
+                 * Not hash_forget() on its own, which was too much and too
+                 * little at once: too much because forgetting the grid on every
+                 * complaint means the trimming never works - measured, the wire
+                 * went from 30 KB/s to 380 and the game from 45 fps to 2.4 -
+                 * and too little because forgetting only repairs the parts the
+                 * game happens to redraw next.  And not a row at a time either,
+                 * which is what replaced it: thirty rows is thirty frames and a
+                 * stripe crawling down the glass.
+                 *
+                 * Rate limited, and that is not a nicety: under load the link
+                 * loses a frame or two a second, and a full repaint per lost
+                 * frame is a repaint that loses the next one.  Two seconds is
+                 * the shortest interval at which a repaint (about 20 KB) costs
+                 * less than a tenth of the budget.
+                 */
+                const uint64_t now = (uint64_t)ag_api()->time->us();
+                if (s_sweep_asked_at == 0ull ||
+                    now - s_sweep_asked_at >= 2000000ull) {
+                    s_sweep_asked_at = now;
+                    s_sweep_at = 0;
+                    s_sweep_owed = 1u;
+                    /*
+                     * ARGON: and the colours with it, here rather than only in
+                     * the repair path.
+                     *
+                     * The repair path runs when the game is not drawing.  A
+                     * far end that restarted while the game *is* drawing is
+                     * the commoner case and was not covered: it receives
+                     * indices at 24 KB/s, has no palette to read them with,
+                     * and reports `pal 0/0, 0 blocks/s` for ever - measured,
+                     * exactly that, with the sender showing 17 frames a second
+                     * going out perfectly well.
+                     *
+                     * The palette otherwise rides along only when it changes
+                     * or on every sixty-fourth frame, and sixty-four frames of
+                     * undecodable pixels is four seconds of nothing at the one
+                     * moment somebody is watching to see whether it comes
+                     * back.  Asking is rate limited two lines above, so this
+                     * cannot become a palette per frame.
+                     */
+                    pal_owe();
+                }
             }
         }
-        /*
-         * ONE PASS ON SPI, AND THIS IS NOT A TIDY-UP.  The loop drains a UART
-         * buffer and ends when the buffer is empty, which a UART says by
-         * handing back less than was asked for.  SPI has no buffer and cannot
-         * say it: a read CLOCKS its bytes, so it always returns the full
-         * length, and this loop never ended.  The driver's ten-a-second hook
-         * stayed inside it for ever - measured on the boards at 43651
-         * transactions in twenty seconds, ONE of them carrying real bytes, and
-         * not a single band ever sent, because the hook never came back to
-         * send one.
-         */
-        if (s_wire == RD_WIRE_SPI || (uint32_t)n < sizeof(buf)) {
+        if ((uint32_t)n < sizeof(buf)) {
             return;
         }
     }
 }
 
 /*
- * Work space.  Static rather than automatic because these are kilobytes and the
- * task this runs on belongs to whoever flushed - an application's stack is not
- * the driver's to spend.  Safe as static because the kernel holds the device
- * registry across blit_rect, so two flushes cannot be inside here at once.
+ * Work space.  Static rather than automatic because these are kilobytes, and
+ * the task that used to run this belonged to whoever flushed - an
+ * application's stack is not the driver's to spend.  It is the driver's own
+ * task now, whose stack is the driver's, but the size is the reason either way.
+ *
+ * Two callers can reach this: the wire task with a rectangle out of the
+ * driver's frame, and blit_rect directly for a picture that frame cannot hold
+ * (see the note above rem_blit_rect).  So it is locked - one rectangle at a
+ * time, for as long as the rectangle takes.  It used to be the device registry
+ * that provided that, held across blit_rect by the kernel, and relying on
+ * somebody else's lock for one's own invariant is how this would have become a
+ * bug the day either side changed.
  */
+static ag_mutex_t s_send_lock;
+
+/*
+ * Where a band's time goes, because "seven milliseconds of encoding" was an
+ * inference from a frame rate and not a measurement, and the four candidates -
+ * comparing, gathering, packing, palettising - are all plausible and only one
+ * of them can be first.
+ */
+static uint32_t s_t_hash, s_t_gather, s_t_pack, s_t_idx, s_t_wire;
+static uint32_t s_bands;
+/* Pixels actually put on the wire, counted band by band as they go.  Declared
+ * here rather than beside the other window counters because the band loop is
+ * above them and it is the only place that may add to it. */
+static uint64_t s_win_px;
+
 static uint8_t  s_raw[FR_MAX_PAYLOAD];  /* geometry + pixels, uncompressed   */
-/* How many bands in a row refused to compress, and a counter to
- * re-test on.  See the note where they are used. */
-static uint32_t s_nocomp;
-static uint32_t s_bandseq;
 static uint8_t  s_cand[FR_MAX_PAYLOAD]; /* geometry + whatever encoded best  */
 static uint8_t  s_idx[BAND_MAX_PX];     /* one index per pixel, before packing */
+
+/* The hashes of the blocks in the band being built, held until the band goes.
+ * Wide enough for the widest surface this can carry - a band is at most 320
+ * pixels, so forty blocks, and the margin is free. */
+#define REM_MAX_COLS 64u
+static uint8_t  s_fresh_col[REM_MAX_COLS];
+static uint32_t s_fresh_hash[REM_MAX_COLS];
 static uint16_t s_pal[256];
 
 /*
@@ -736,11 +1293,11 @@ static uint32_t encode_indexed(const uint16_t *px, uint32_t n, uint8_t *out,
 /*
  * A rectangle of the picture, in bands, trimmed and encoded.
  *
- * Called on whichever task flushed or presented, with the device registry held,
- * and it blocks for as long as the wire needs.  That is deliberate: an
- * application that asks for more than the wire can carry runs at the speed of
- * the wire, which is honest and measurable.  What happens here is the wire being
- * asked to carry less, in three steps that multiply:
+ * Called on the driver's own task, from the damage rem_blit_rect left behind -
+ * or, for a picture the driver's frame cannot hold, on whoever presented it.
+ * It blocks for as long as the wire needs, which is why it is not the game's
+ * thread any more.  What happens here is the wire being asked to carry less, in
+ * three steps that multiply:
  *
  *   1. The band is compared with the shadow and reduced to the bounding box of
  *      what actually moved.  A caret, a line of text, a walking figure - each
@@ -753,9 +1310,19 @@ static uint32_t encode_indexed(const uint16_t *px, uint32_t n, uint8_t *out,
  *   3. Bands stay the transport unit, eight rows at a time, because on the far
  *      end every band is one window-setting on the panel.
  */
-static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
+/* Defined with the sound, below.  The wire task is the only caller of any of
+ * them: sound leaves this driver the way the picture does, and both are handed
+ * over from the one thread that owns the port. */
+static uint32_t aud_pump(uint32_t max);
+static void     aud_settle(void);
+static void     aud_close_idle(void);
+static void     aud_stats(void);
+static uint8_t *aud_take_blocks(void);
+
+static void send_rect_locked(const ag_blit_t *b);
+
+static void send_rect(const ag_blit_t *b)
 {
-    (void)h;
     if (b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
         return;
     }
@@ -764,11 +1331,65 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
     if ((uint32_t)b->w * BAND_ROWS > BAND_MAX_PX) {
         return;
     }
+    if (s_send_lock != NULL && !ag_mutex_lock(s_send_lock, 2000u)) {
+        return;
+    }
+    s_frame_bands = 0;
+    send_rect_locked(b);
 
-    poll_far_end();
+    /*
+     * The end marker goes out under the same lock as the bands it closes.
+     * Outside it, the fallback path in blit_rect could put a band of the next
+     * frame on the wire between the last band of this one and its end, and the
+     * far end would present a frame it had not finished receiving - which is
+     * the exact fault this marker exists to remove.
+     */
+    if (s_frame_bands != 0u) {
+        uint8_t end[4];
+        end[0] = (uint8_t)s_frame_no;
+        end[1] = (uint8_t)(s_frame_no >> 8);
+        end[2] = (uint8_t)s_frame_bands;
+        end[3] = (uint8_t)(s_frame_bands >> 8);
+        (void)send_frame(FR_END, end, sizeof(end));
+        s_frame_no++;
+    }
+    if (s_send_lock != NULL) {
+        ag_mutex_unlock(s_send_lock);
+    }
+}
+
+static void send_rect_locked(const ag_blit_t *b)
+{
 
     const uint8_t *src = (const uint8_t *)b->px;
-    bool           track = prev_ready(b->surf_w, b->surf_h);
+    /*
+     * The hash grid is in the surface's own coordinates and its blocks are
+     * eight pixels square, so a band can be compared against it only when it
+     * lines up - on a block boundary in both directions.  It does not have to
+     * span the surface: a rectangle that starts on a block boundary covers a
+     * run of grid columns and those are the ones it updates.
+     *
+     * It used to demand the full width, and that was fine while the only
+     * things driving this wire handed over the whole picture.  Then Fallout's
+     * blit learned to report the pixels it really changed, and every flush
+     * became a narrow rectangle - which took this branch, was sent whole, and
+     * made the rows it touched forget what the far end had.  Sixteen kilobytes
+     * a frame went down the wire where the grid had been sending almost
+     * nothing, and the frame rate fell from 21 to 14 for a change that was
+     * supposed to cut the traffic by ninety per cent.  It did cut it; it also
+     * turned the trimming off.
+     *
+     * A blit that still does not line up is sent whole and made to forget the
+     * rows it touched.  That is the conservative direction: sending too much
+     * is slow, and trimming against a grid that was only partly filled is a
+     * screen with holes in it that nothing ever repairs.
+     */
+    const uint32_t bx = (uint32_t)b->x;
+    const uint32_t gx0 = bx / BLK;
+    const uint32_t gcols = ((uint32_t)b->w + BLK - 1u) / BLK;
+    const bool aligned = s_trim && prev_ready(b->surf_w, b->surf_h) &&
+                         (bx % BLK) == 0u && ((uint32_t)b->y % BLK) == 0u &&
+                         gx0 + gcols <= s_hash_cols;
 
     for (uint32_t band = 0; band < b->h; band += BAND_ROWS) {
         uint32_t rows = b->h - band;
@@ -776,60 +1397,78 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
             rows = BAND_ROWS;
         }
 
-        uint32_t x0 = 0, x1 = (uint32_t)b->w - 1u;
-        uint32_t y0 = 0, y1 = rows - 1u;
+        /*
+         * A short band cannot be hashed, and this is not a nicety.
+         *
+         * The hash of a block row is stored as if it described all eight rows,
+         * so a band with fewer - the last one of a blit whose height is not a
+         * multiple of eight - would record a hash taken over four rows and then
+         * hide any later change in the other four.  What that looks like is a
+         * rectangle of the previous frame that never goes away, and the obvious
+         * place to see one is behind a moving mouse pointer, because a pointer
+         * is exactly the thing that makes small blits of arbitrary height.
+         */
+        const bool track = aligned && rows == BAND_ROWS;
+
+        uint32_t  x0 = 0, x1 = (uint32_t)b->w - 1u;
+        const uint32_t y0 = 0, y1 = rows - 1u;
+        uint32_t *row = NULL;
+        uint32_t  nfresh = 0;
 
         if (track) {
-            /* The bounding box of the difference, in the band's own
-             * coordinates.  Start inverted so "nothing moved" is detectable. */
+            /*
+             * Which blocks of this band differ from what the far end has, as a
+             * bounding box in the band's own coordinates.  Start inverted so
+             * that "nothing moved" is detectable.
+             *
+             * Vertically there is nothing to trim: a band is exactly one row of
+             * blocks, so any change in it costs all eight rows.  That is the
+             * price of the hash and it is a couple of hundred pixels.
+             */
+            const uint32_t th0 = (uint32_t)ag_api()->time->us();
+            row = s_hash + (size_t)(((uint32_t)b->y + band) / BLK) *
+                               s_hash_cols + gx0;
             x0 = (uint32_t)b->w;
             x1 = 0;
-            y0 = rows;
-            y1 = 0;
-            for (uint32_t r = 0; r < rows; r++) {
-                const uint16_t *want =
-                    (const uint16_t *)(src + (size_t)(band + r) * b->stride);
-                const uint16_t *have = s_prev +
-                                       (size_t)((uint32_t)b->y + band + r) *
-                                           s_prev_w + b->x;
-                for (uint32_t i = 0; i < (uint32_t)b->w; i++) {
-                    if (want[i] != have[i]) {
-                        if (i < x0) {
-                            x0 = i;
-                        }
-                        if (i > x1) {
-                            x1 = i;
-                        }
-                        if (r < y0) {
-                            y0 = r;
-                        }
-                        if (r > y1) {
-                            y1 = r;
-                        }
+            nfresh = 0;
+            for (uint32_t c = 0; c < gcols; c++) {
+                uint32_t cols = (uint32_t)b->w - c * BLK;
+                if (cols > BLK) {
+                    cols = BLK;
+                }
+                const uint32_t h =
+                    block_hash(src + (size_t)band * b->stride + c * BLK * 2u,
+                               b->stride, rows, cols);
+                if (h != row[c]) {
+                    /* Remembered, not written.  It is written when the band it
+                     * belongs to has actually gone down the wire - see
+                     * send_frame. */
+                    if (nfresh < REM_MAX_COLS) {
+                        s_fresh_col[nfresh] = (uint8_t)c;
+                        s_fresh_hash[nfresh] = h;
+                        nfresh++;
+                    }
+                    if (c * BLK < x0) {
+                        x0 = c * BLK;
+                    }
+                    if (c * BLK + cols - 1u > x1) {
+                        x1 = c * BLK + cols - 1u;
                     }
                 }
             }
+            s_t_hash += (uint32_t)ag_api()->time->us() - th0;
             if (x0 > x1) {
-                s_prev_full = 0;
                 continue; /* the far end already has this band */
             }
-            if (x0 == 0u && y0 == 0u && x1 == (uint32_t)b->w - 1u &&
-                y1 == rows - 1u) {
-                if (++s_prev_full >= PREV_GIVE_UP) {
-                    /*
-                     * Arm the rest and stop tracking for the rest of THIS
-                     * call.  The buffer itself is let go in prev_ready, which
-                     * is the only place that is not inside this loop: `track`
-                     * is decided once per blit, and freeing here left it true
-                     * with nothing behind it - a fault, found on the board the
-                     * first time this ran.
-                     */
-                    s_prev_full = 0;
-                    s_prev_rest = PREV_TRY_AGAIN;
-                    track = false;
+        } else if (s_hash != NULL && (uint32_t)b->y + band < s_surf_h) {
+            /* Sent whole, and the grid told so: these rows are no longer
+             * described by what is in it. */
+            const uint32_t first = ((uint32_t)b->y + band) / BLK;
+            const uint32_t last = ((uint32_t)b->y + band + rows - 1u) / BLK;
+            for (uint32_t r = first; r <= last && r < s_hash_rows; r++) {
+                for (uint32_t c = 0; c < s_hash_cols; c++) {
+                    s_hash[(size_t)r * s_hash_cols + c] = 0;
                 }
-            } else {
-                s_prev_full = 0;
             }
         }
 
@@ -837,23 +1476,19 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         const uint32_t rh = y1 - y0 + 1u;
         const uint32_t npx = rw * rh;
 
-        /* Gather the rectangle, and bring the shadow up to date with it. */
+        /* Gather the rectangle.  A row at a time and not a pixel at a time:
+         * the rows are contiguous at both ends and this is on the wire task's
+         * critical path. */
+        const uint32_t tg0 = (uint32_t)ag_api()->time->us();
         uint16_t *out = (uint16_t *)(s_raw + 12u);
         for (uint32_t r = 0; r < rh; r++) {
             const uint16_t *want =
                 (const uint16_t *)(src + (size_t)(band + y0 + r) * b->stride) +
                 x0;
-            /* A row at a time.  This used to be two per-pixel loops, which
-             * is the same work the compiler cannot widen - on the full-band
-             * case that is every pixel of every frame. */
             memcpy(out + (size_t)r * rw, want, (size_t)rw * sizeof(uint16_t));
-            if (track) {
-                uint16_t *have = s_prev +
-                                 (size_t)((uint32_t)b->y + band + y0 + r) *
-                                     s_prev_w + b->x + x0;
-                memcpy(have, want, (size_t)rw * sizeof(uint16_t));
-            }
         }
+        s_t_gather += (uint32_t)ag_api()->time->us() - tg0;
+        s_bands++;
 
         uint8_t geom[12];
         put16(geom + 0, (uint32_t)b->x + x0);
@@ -871,42 +1506,23 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
         uint8_t        best_op = FR_BAND;
         uint32_t       best_len = 0;
 
-        /*
-         * THE CAP IS THE CURRENT BEST, NOT THE BUFFER.  An encoding that has
-         * already grown past the raw pixels cannot win, and pack16 answers 0
-         * the moment it passes its cap - so on a picture that does not
-         * compress it now gives up after a few hundred bytes instead of
-         * walking all 5120 twice.  On a picture that does compress nothing
-         * changes: it never reaches the cap.
-         */
-        const uint32_t room = FR_MAX_PAYLOAD - 12u;
-        /*
-         * A PICTURE THAT DID NOT COMPRESS LAST TIME PROBABLY WILL NOT NOW.
-         *
-         * Both encoders walk the whole band before they can lose, and on
-         * moving photographic or noisy content they lose every time - two
-         * passes over five kilobytes per band, on the path that decides the
-         * frame rate.  So after enough failures in a row they are skipped, and
-         * one band in sixty-four still tries, which is what notices a picture
-         * that has become flat again.  A picture that compresses never reaches
-         * the threshold, so nothing changes for it.
-         */
-        const uint32_t p = (s_nocomp < 8u || (s_bandseq & 63u) == 0u)
-                               ? pack16(out, npx, s_cand + 12u,
-                                        (best < room) ? best : room)
-                               : 0u;
-        const bool tried = (s_nocomp < 8u || (s_bandseq & 63u) == 0u);
-        s_bandseq++;
+        const uint32_t tp0 = (uint32_t)ag_api()->time->us();
+        const uint32_t p =
+            s_encode ? pack16(out, npx, s_cand + 12u, FR_MAX_PAYLOAD - 12u) : 0u;
+        s_t_pack += (uint32_t)ag_api()->time->us() - tp0;
         if (p != 0 && p < best) {
             best = p;
             best_op = FR_PACK;
             best_len = p;
         }
-        const uint32_t used = (best_op == FR_PACK) ? p : 0u;
-        const uint32_t left = room - used;
-        const uint32_t q = tried ? encode_indexed(out, npx, s_cand + 12u + used,
-                                                  (best < left) ? best : left)
-                                 : 0u;
+        const uint32_t ti0 = (uint32_t)ag_api()->time->us();
+        const uint32_t q =
+            s_encode ? encode_indexed(out, npx,
+                                      s_cand + 12u + (best_op == FR_PACK ? p : 0u),
+                                      FR_MAX_PAYLOAD - 12u -
+                                          (best_op == FR_PACK ? p : 0u))
+                     : 0u;
+        s_t_idx += (uint32_t)ag_api()->time->us() - ti0;
         if (q != 0 && q < best) {
             /* It won; move it to the front of the candidate buffer. */
             uint8_t *from = s_cand + 12u + p;
@@ -918,24 +1534,2336 @@ static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
             best_len = q;
         }
 
-        if (tried) {
-            if (best_op == FR_BAND) {
-                if (s_nocomp < 255u) {
-                    s_nocomp++;
-                }
-            } else {
-                s_nocomp = 0;
-            }
-        }
+        const uint32_t tw0 = (uint32_t)ag_api()->time->us();
+        /*
+         * Put what is already queued on the wire before adding to it.
+         *
+         * A rectangle is up to thirty bands and each is a kilobyte or two, so a
+         * full screen is more than the ring holds - and the ring only used to
+         * be drained between rectangles.  The far end therefore lost the tail
+         * of every big rectangle: six thousand frames refused in a ten minute
+         * game, near enough a third of the picture, while the wire itself sat
+         * two thirds idle.
+         *
+         * Draining here paces the sender against the wire, which is what a
+         * sender should be paced against.  It costs nothing when the ring is
+         * empty - one lock, one look - and it is only ever this task and the
+         * fallback caller, which serialise on the drain lock.
+         */
+        (void)tx_drain();
 
+        bool went;
         if (best_op == FR_BAND) {
-            send_frame(FR_BAND, s_raw, 12u + raw);
+            went = send_frame(FR_BAND, s_raw, 12u + raw);
         } else {
             for (uint32_t i = 0; i < 12u; i++) {
                 s_cand[i] = geom[i];
             }
-            send_frame(best_op, s_cand, 12u + best_len);
+            went = send_frame(best_op, s_cand, 12u + best_len);
         }
+        s_t_wire += (uint32_t)ag_api()->time->us() - tw0;
+
+        /* Only now is it true that the far end has these blocks.  A band that
+         * did not go leaves its hashes as they were, so the next flush that
+         * reaches these rows sends it again. */
+        if (went && row != NULL) {
+            for (uint32_t i = 0; i < nfresh; i++) {
+                row[s_fresh_col[i]] = s_fresh_hash[i];
+            }
+        }
+        if (went) {
+            s_frame_bands++;
+            s_win_px += npx;
+        }
+    }
+
+}
+
+/* ---- the wire is not the caller's to wait for -------------------------- */
+/*
+ * Everything above is what has to happen to a rectangle before it can go down a
+ * serial line, and it is not fast: hashing, trimming, three encodings tried
+ * against each other, and then the write itself - a band is two and a half
+ * kilobytes at four megabaud, six milliseconds, and a full screen is thirty
+ * bands.  Until now all of it happened on whichever task called blit_rect,
+ * which is the task that drew the frame.  A game therefore ran at the speed of
+ * the wire: measured, three hundred milliseconds a frame with the whole picture
+ * moving, and the game had no idea it was talking to a wire at all.
+ *
+ * It should not have to know.  A screen at the end of a cable is still a
+ * screen, and what an application does with one is put pixels in it.
+ *
+ * So blit_rect now does the one thing that has to happen while the caller's
+ * pixels are still there - copy them - and marks the rectangle.  A task of the
+ * driver's own (ABI 0.43) picks the damage up and does the rest.  The copy is
+ * the price: a quarter of the screen is 38 KB and about two milliseconds of
+ * PSRAM, against six milliseconds for one band of the thirty that a frame used
+ * to cost the caller.
+ *
+ * The frame belongs to the driver for a second reason, which is correctness.
+ * ag_blit_t's pixels belong to the caller, and when they come from
+ * gfx->present they are an application's own memory, which the application is
+ * free to reuse the instant blit_rect returns.  Reading them later from another
+ * task would be reading whatever is there by then.
+ *
+ * What it costs, and what would remove it: a whole screen is 150 KB and about
+ * ten milliseconds of PSRAM, which is a third of a frame while a movie is
+ * playing, and the 150 KB is why the game's arena had to come down.  Both would
+ * go if the kernel said which blits point into a surface that outlives the call
+ * - the system framebuffer is allocated once at boot and never moves, so the
+ * driver could read it in place and keep no frame at all.  That is one flag in
+ * ag_blit_t and one line in display.c.
+ *
+ * Not done, and the reason is worth writing down rather than rediscovering: it
+ * turns a self-contained copy into a pointer this driver holds across time, and
+ * a pointer held across time is only as good as the promise that nothing frees
+ * it.  There is an unexplained intermittent wedge on this board (the console
+ * stops answering mid-game, with and without this driver loaded), and adding a
+ * lifetime assumption while that is outstanding is how a second unexplained
+ * fault gets built on top of the first.
+ *
+ * No lock around the copy, deliberately.  The sender may read a rectangle that
+ * is being written under it and send half of one frame and half of the next -
+ * which is what a video link does when it is not synchronised to the source,
+ * and it repairs itself: the hash it records is the hash of what it read, so
+ * the next change to those blocks reads as a change and goes out again.  A lock
+ * would put the caller back to waiting for the wire, which is the whole thing
+ * being fixed.
+ */
+/*
+ * The driver's copy of the picture, laid out as the wire wants it.
+ *
+ * Not a plain 320x240 array: thirty blocks, each of them a thirty-two byte
+ * header followed by eight rows of pixels.  The header is empty space as far
+ * as the game is concerned and the whole point as far as the wire is: a slice
+ * is then one unbroken run of memory, and one unbroken run can be handed to
+ * the DMA in a single transfer with no processor in the path at all.
+ *
+ * Thirty-two because that is this chip's data cache line, which is what the
+ * DMA demands of an address and a length in external memory.  A block is
+ * 32 + 5120 = 5152 bytes, a multiple of it, so every block after the first is
+ * aligned for free.  The cost is 32 bytes of padding on the wire per slice -
+ * six tenths of one per cent - and what it buys is the handover between the
+ * processor and the hardware, thirty times a frame, gone.
+ */
+#define PKT_HDR 32u
+
+static uint8_t   *s_pkt;     /* aligned; thirty header-and-payload blocks    */
+static uint8_t   *s_pkt_raw; /* what was actually allocated, for freeing     */
+static uint32_t   s_pkt_blk; /* PKT_HDR + one slice, in whichever form       */
+static uint32_t   s_blk_565; /* what a slice costs as RGB565                 */
+static uint32_t   s_blk_idx; /* and as one byte a pixel                      */
+
+/* Where slice c's block starts, and where its payload starts inside it. */
+static uint8_t *pkt_block(uint32_t c) { return s_pkt + (size_t)c * s_pkt_blk; }
+static uint16_t *pkt_pixels(uint32_t c)
+{
+    return (uint16_t *)(void *)(pkt_block(c) + PKT_HDR);
+}
+static uint8_t *pkt_bytes(uint32_t c) { return pkt_block(c) + PKT_HDR; }
+
+/* ---- the palette --------------------------------------------------------
+ *
+ * A whole frame of this game turns out to hold **146 different colours**.
+ *
+ * That is not a lucky sample and it is worth saying why: Fallout composes into
+ * an eight-bit surface, so the picture has 256 colours before anything else
+ * happens, and the shim's reduction of 640x480 to 320x240 averages four
+ * neighbours - which on dithered art lands back on the colours that were being
+ * dithered between.  Measured on a real map frame taken off the board: 146,
+ * and the commonest 64 of them cover 98.9% of the pixels.
+ *
+ * So the picture fits in one byte a pixel with **nothing lost at all**, and
+ * that is the whole of this: 153 600 bytes become 77 760, the wire's 386 ms
+ * become 194, and every pixel is the pixel the game drew.  Against that, JPEG
+ * measured on the same frame needed 80 KB to reach 35 dB - more than the
+ * lossless palette costs - because dither is noise and noise is what a
+ * discrete cosine transform is worst at.
+ *
+ * The map from colour to index is an open-addressed table of 512 slots, filled
+ * as colours are met.  One probe per pixel in the steady state, and the steady
+ * state is nearly always: a scene keeps its colours.
+ *
+ * When a scene does not fit, the arithmetic says so - s_pal_miss counts the
+ * pixels that found the table full - and the next frame starts the palette
+ * again.  Two frames in a row that overflow means the scene genuinely has more
+ * than 256 colours, and the picture goes back to RGB565 until something
+ * changes; both layouts live in the same arena, which is sized for the larger.
+ */
+#define PAL_N   256u
+#define PMAP_N  512u
+
+static uint16_t s_pal[PAL_N];
+static uint32_t s_pal_used;
+static uint16_t s_pal_gen;    /* bumped whenever an entry is added */
+static uint16_t s_pal_sent;   /* the generation the far end has been told */
+static uint32_t s_pal_miss;   /* pixels that found the palette full */
+static uint32_t s_pal_fails;  /* frames in a row that overflowed */
+static bool     s_pal_on = (IDX_MODE != 0); /* this frame is indices */
+/* (colour << 8) | index, and 0xffffffff for an empty slot: a colour is
+ * sixteen bits so the shifted key can never be the sentinel. */
+static uint32_t s_pmap[PMAP_N];
+static uint8_t *s_palpkt;     /* aligned, DMA-able, 544 bytes */
+static uint8_t *s_palpkt_raw; /* what was allocated, for freeing */
+
+/* ---- the entropy coder --------------------------------------------------
+ *
+ * The indices are not evenly used.  Measured over a real frame: 146 colours,
+ * and the arithmetic that says how much they are worth - the order-0 entropy -
+ * is **4.73 bits a pixel** rather than eight.  So a code that gives the common
+ * colours short bit strings and the rare ones long ones takes the frame from
+ * 77 760 bytes to about 46 500, which is 3.3 times what RGB565 costs, and it
+ * does it losslessly.
+ *
+ * Why Huffman and not deflate, which was measured at 3.9 times: the difference
+ * between them is matching, not coding, and matching is where the processor
+ * goes.  This costs a table lookup and a shift per pixel - about two
+ * milliseconds a frame here and three on the far end - against twenty to
+ * thirty for a deflate of the same bytes, on a core the game is also using.
+ * Four fifths of the saving for a twentieth of the cost.
+ *
+ * Counts are gathered during the copy the game already pays for.  The table is
+ * built once a frame, sent in its own packet ahead of the slices that use it,
+ * and carries the frame number: a slice whose table never arrived is dropped
+ * rather than decoded into rubbish.
+ */
+#define HUF_MAXLEN 15u
+#define HUF_BLKS   8u
+
+static uint32_t s_cnt[PAL_N];    /* how often each index was used this frame */
+static uint8_t  s_hlen[PAL_N];   /* code lengths, 0 for a colour not used    */
+static uint16_t s_hcode[PAL_N];  /* canonical codes, most significant first  */
+static bool     s_huf;           /* a table was built for this frame         */
+static uint8_t *s_hufpkt, *s_hufpkt_raw;  /* the table's own block */
+static uint8_t *s_donepkt;                /* and the one that closes a frame */
+static uint8_t *s_out, *s_out_raw;        /* where coded slices are built */
+static uint32_t s_out_blk, s_out_next;
+static uint32_t s_huf_bytes;     /* what the coded frame came to */
+
+/* ---- what moved ---------------------------------------------------------
+ *
+ * The largest saving on this wire is not a compressor: it is that most of a
+ * screen is the same as it was.  A man walking across a map changes his own
+ * eight by eight blocks and the ones his shadow crosses, and nothing else - a
+ * few dozen of the twelve hundred the screen is made of.
+ *
+ * What is kept is a hash of each block, not the block itself.  A hash is four
+ * bytes against sixty-four, and - which matters more - it is computed while
+ * the copy is already reading those pixels, so nothing is read twice.  Two
+ * arrays of twelve hundred words is nine and a half kilobytes; keeping the
+ * previous frame instead would be seventy-seven and a second walk of it.
+ *
+ * A hash can lie, and this one is thirty-two bits over sixty-four so it lies
+ * about once in four thousand million.  The insurance is a rolling repaint:
+ * one slice in thirty is sent whole whatever its hashes say, so the entire
+ * screen is refreshed every thirty frames whether anything asked for it or
+ * not, and any block that was ever wrong is right within five seconds.
+ */
+#define BLK_W    8u
+#define BLK_COLS (320u / BLK_W)      /* forty blocks across a slice */
+#define BLK_N    (BLK_COLS * 30u)    /* twelve hundred on a screen  */
+
+static uint32_t s_bhash[BLK_N];      /* this frame */
+static uint32_t s_bhash_old[BLK_N];  /* what the far end has been told */
+static uint64_t s_bmask[30];         /* which blocks of each slice moved */
+static uint32_t s_blocks_sent;       /* of BLK_N, in the last window */
+static uint32_t s_dam_seen;          /* blocks hashed, of BLK_N */
+/*
+ * The worst frame of the window, not the average.  A scroll changes the whole
+ * screen at once, and that frame is the one a person sees stutter; an average
+ * over five seconds of standing still says nothing about it.
+ */
+static uint32_t s_worst_bytes, s_worst_send_us, s_worst_blocks;
+static uint32_t s_frame_blocks;
+static uint32_t s_slices_sent;
+
+/*
+ * Lengths, by the two-queue method.
+ *
+ * "Take the two smallest, merge, repeat" is the algorithm; the question is how
+ * the two smallest are found.  Scanning for them is O(n^2) and was measured at
+ * **6.5 ms a frame** on this chip, which is most of what the coding itself
+ * costs - so instead the leaves are sorted once and the merged nodes come out
+ * already in order, and the smallest is the front of one queue or the other.
+ * One comparison a step, and the sort is 256 items.
+ */
+static bool huf_lengths(void)
+{
+    static int32_t wt[2u * PAL_N];
+    static int16_t kid0[2u * PAL_N], kid1[2u * PAL_N];
+    static int16_t leaf[PAL_N];   /* used symbols, lightest first */
+    static int16_t node[PAL_N];   /* merged nodes, in the order they are made */
+    static int16_t stack[2u * PAL_N];
+    static uint8_t depth[2u * PAL_N];
+
+    uint32_t used = 0, last = 0;
+    for (uint32_t i = 0; i < PAL_N; i++) {
+        s_hlen[i] = 0;
+        kid0[i] = -1;
+        kid1[i] = -1;
+        wt[i] = (int32_t)s_cnt[i];
+        if (s_cnt[i] != 0u) {
+            leaf[used++] = (int16_t)i;
+            last = i;
+        }
+    }
+    if (used == 0u) {
+        return false;
+    }
+    if (used == 1u) {
+        s_hlen[last] = 1; /* one symbol still needs a bit to be a symbol */
+        return true;
+    }
+
+    /* Insertion sort: 256 items, nearly sorted from one frame to the next. */
+    for (uint32_t i = 1; i < used; i++) {
+        const int16_t v = leaf[i];
+        const int32_t w = wt[v];
+        uint32_t      j = i;
+        while (j > 0u && wt[leaf[j - 1u]] > w) {
+            leaf[j] = leaf[j - 1u];
+            j--;
+        }
+        leaf[j] = v;
+    }
+
+    uint32_t li = 0, ni = 0, made = 0, n = PAL_N;
+    /* Leaves *left*, not leaves taken: li counts what has been consumed, and
+     * writing the condition the other way round built no tree at all, left
+     * every code length zero, and sent a whole session uncompressed while the
+     * timings said the coder had become eight times faster. */
+    while ((used - li) + (made - ni) > 1u) {
+        int16_t pick[2];
+        for (int k = 0; k < 2; k++) {
+            const bool have_leaf = li < used;
+            const bool have_node = ni < made;
+            if (have_leaf && (!have_node || wt[leaf[li]] <= wt[node[ni]])) {
+                pick[k] = leaf[li++];
+            } else {
+                pick[k] = node[ni++];
+            }
+        }
+        wt[n] = wt[pick[0]] + wt[pick[1]];
+        kid0[n] = pick[0];
+        kid1[n] = pick[1];
+        node[made++] = (int16_t)n;
+        n++;
+    }
+
+    /* Depths, from the root down, iteratively - the tree is 511 nodes and a
+     * recursion here would be a stack this driver has no business using. */
+    if (made == 0u) {
+        return false;
+    }
+    uint32_t top = 0;
+    stack[top] = node[made - 1u];
+    depth[node[made - 1u]] = 0;
+    top++;
+    while (top > 0u) {
+        const int16_t v = stack[--top];
+        const uint8_t d = depth[v];
+        if (kid0[v] < 0) {
+            s_hlen[v] = (d == 0u) ? 1u : d;
+            continue;
+        }
+        depth[kid0[v]] = (uint8_t)(d + 1u);
+        depth[kid1[v]] = (uint8_t)(d + 1u);
+        stack[top++] = kid0[v];
+        stack[top++] = kid1[v];
+    }
+    return true;
+}
+
+/* Canonical codes from the lengths, exactly as deflate defines them, so that
+ * the far end can rebuild them from the lengths alone. */
+static void huf_codes(void)
+{
+    uint16_t count[HUF_MAXLEN + 1u];
+    uint16_t next[HUF_MAXLEN + 1u];
+    memset(count, 0, sizeof(count));
+    for (uint32_t i = 0; i < PAL_N; i++) {
+        count[s_hlen[i]]++;
+    }
+    count[0] = 0;
+    uint16_t code = 0;
+    for (uint32_t l = 1; l <= HUF_MAXLEN; l++) {
+        code = (uint16_t)((code + count[l - 1u]) << 1);
+        next[l] = code;
+    }
+    for (uint32_t i = 0; i < PAL_N; i++) {
+        s_hcode[i] = s_hlen[i] ? next[s_hlen[i]]++ : 0u;
+    }
+}
+
+/*
+ * The whole table, and the one thing that can go wrong with it: a code longer
+ * than fifteen bits will not fit the four-bit lengths the far end is sent, and
+ * a distribution skewed enough to produce one is possible.  Halving the counts
+ * flattens the tree; repeated, it always converges, and it costs a rebuild of
+ * something that takes a fraction of a millisecond.
+ */
+static bool huf_build(void)
+{
+    for (int round = 0; round < 8; round++) {
+        if (!huf_lengths()) {
+            return false;
+        }
+        uint32_t longest = 0;
+        for (uint32_t i = 0; i < PAL_N; i++) {
+            if (s_hlen[i] > longest) {
+                longest = s_hlen[i];
+            }
+        }
+        if (longest <= HUF_MAXLEN) {
+            huf_codes();
+            return true;
+        }
+        for (uint32_t i = 0; i < PAL_N; i++) {
+            if (s_cnt[i] != 0u) {
+                s_cnt[i] = (s_cnt[i] >> 1) | 1u;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * The same coder, over only the blocks a mask names.
+ *
+ * Eight by eight at a time and in place: gathering the blocks into a buffer
+ * first would copy up to seventy-six kilobytes a frame that nobody needs, and
+ * the bit accumulator does not care whether the bytes it is fed are next to
+ * each other.
+ */
+static uint32_t huf_encode_blocks(const uint8_t *slice, uint64_t mask,
+                                  uint8_t *dst, uint32_t cap)
+{
+    uint32_t acc = 0, at = 0;
+    int      bits = 0;
+    for (uint32_t bx = 0; bx < BLK_COLS; bx++) {
+        if ((mask & (1ull << bx)) == 0ull) {
+            continue;
+        }
+        for (uint32_t r = 0; r < RAW_ROWS; r++) {
+            const uint8_t *const row = slice + (size_t)r * 320u + bx * BLK_W;
+            for (uint32_t k = 0; k < BLK_W; k++) {
+                const uint32_t s = row[k];
+                const uint32_t l = s_hlen[s];
+                if (l == 0u) {
+                    return 0u;
+                }
+                acc = (acc << l) | s_hcode[s];
+                bits += (int)l;
+                while (bits >= 8) {
+                    if (at >= cap) {
+                        return 0u;
+                    }
+                    bits -= 8;
+                    dst[at++] = (uint8_t)(acc >> bits);
+                }
+            }
+        }
+    }
+    if (bits > 0) {
+        if (at >= cap) {
+            return 0u;
+        }
+        dst[at++] = (uint8_t)(acc << (8 - bits));
+    }
+    return at;
+}
+
+/* One slice's worth of indices, coded.  Returns 0 if it would not be smaller,
+ * in which case the slice goes as it is - which is the honest answer for a
+ * band of noise and costs nothing to say. */
+static uint32_t huf_encode(const uint8_t *src, uint32_t n, uint8_t *dst,
+                           uint32_t cap)
+{
+    uint32_t acc = 0, at = 0;
+    int      bits = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t s = src[i];
+        const uint32_t l = s_hlen[s];
+        if (l == 0u) {
+            return 0u; /* a colour the table does not know: not this frame */
+        }
+        acc = (acc << l) | s_hcode[s];
+        bits += (int)l;
+        while (bits >= 8) {
+            if (at >= cap) {
+                return 0u;
+            }
+            bits -= 8;
+            dst[at++] = (uint8_t)(acc >> bits);
+        }
+    }
+    if (bits > 0) {
+        if (at >= cap) {
+            return 0u;
+        }
+        dst[at++] = (uint8_t)(acc << (8 - bits));
+    }
+    return at;
+}
+
+/*
+ * Every index means something different after this, and the hashes cannot
+ * see it: they are taken over the pixels the game drew, not over the indices,
+ * so a block whose colours have not changed keeps the same hash while the
+ * number standing for those colours has changed underneath it.  So the next
+ * frame is converted and sent whole, and s_force says so.
+ */
+static bool s_force = true;
+
+/*
+ * "You have no palette": say the colours again on the next frame, and send
+ * that frame whole.
+ *
+ * Whole matters as much as the colours do.  Trimming sends only the blocks
+ * that differ from what the far end is believed to hold, and a far end that
+ * has just restarted holds nothing - so a trimmed frame after a restart is a
+ * frame with almost nothing in it, on top of a screen with nothing on it.
+ */
+static void pal_owe(void)
+{
+    s_pal_sent = (uint16_t)(s_pal_gen - 1u);
+    s_force = true;
+}
+
+static void pal_clear(void)
+{
+    memset(s_pmap, 0xff, sizeof(s_pmap));
+    s_pal_used = 0;
+    s_pal_gen++;
+    s_force = true;
+}
+
+static uint32_t pal_index(uint16_t c)
+{
+    uint32_t h = ((uint32_t)c * 2654435761u) >> 23; /* 512 slots */
+    for (;;) {
+        const uint32_t e = s_pmap[h];
+        if (e == 0xffffffffu) {
+            break;
+        }
+        if ((uint16_t)(e >> 8) == c) {
+            return e & 0xffu;
+        }
+        h = (h + 1u) & (PMAP_N - 1u);
+    }
+    if (s_pal_used >= PAL_N) {
+        s_pal_miss++;
+        return 0u; /* one frame of the wrong colour, and then a new palette */
+    }
+    const uint32_t i = s_pal_used++;
+    s_pal[i] = c;
+    s_pmap[h] = ((uint32_t)c << 8) | i;
+    s_pal_gen++;
+    return i;
+}
+static uint32_t   s_fb_w, s_fb_h;
+static ag_mutex_t s_dmg_lock;
+static uint32_t   s_dmg_x0, s_dmg_y0, s_dmg_x1, s_dmg_y1; /* x1/y1 exclusive */
+static bool       s_dmg;
+static volatile bool s_stop;
+static uint32_t   s_late;    /* blits that went the old way, for `dev`      */
+/*
+ * ARGON: and the shape of the last one that was refused.
+ *
+ * The refusal below is silent and permanent: a blit whose surface is not the
+ * size this driver set itself up for is dropped, and if the game's surface has
+ * changed the driver never takes another frame - the picture on the far end
+ * freezes while the sound, which does not go through here, keeps playing.
+ * Reported on 7 September 2026 as "the game has hung", and it had not: it was
+ * drawing at 27 to 34 frames a second the whole time.
+ */
+static uint32_t   s_late_w, s_late_h;
+/* Consecutive five-second windows with no picture sent, so the report can back
+ * off and leave the console usable for asking the board anything else. */
+static uint32_t   s_quiet_windows;
+
+/* Waited for without a limit, for the same reason as the wire lock: what it
+ * guards is a buffer, and half of one is not a picture. */
+static bool dmg_lock(void) { return lock_take(s_dmg_lock, UINT32_MAX); }
+
+static void dmg_unlock(bool held) { lock_give(s_dmg_lock, held); }
+
+/*
+ * Snapped outward to the block grid, because the trimming above only runs on a
+ * rectangle that lines up with it - see `aligned` in send_rect.  A rectangle
+ * that does not is sent whole and makes those rows forget, which costs far more
+ * than the few pixels of rounding.
+ */
+static void dmg_add_locked(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    uint32_t x0 = (x / BLK) * BLK;
+    uint32_t y0 = (y / BLK) * BLK;
+    uint32_t x1 = ((x + w + BLK - 1u) / BLK) * BLK;
+    uint32_t y1 = ((y + h + BLK - 1u) / BLK) * BLK;
+
+    if (x1 > s_fb_w) {
+        x1 = s_fb_w;
+    }
+    if (y1 > s_fb_h) {
+        y1 = s_fb_h;
+    }
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+
+    if (!s_dmg) {
+        s_dmg_x0 = x0;
+        s_dmg_y0 = y0;
+        s_dmg_x1 = x1;
+        s_dmg_y1 = y1;
+        s_dmg = true;
+    } else {
+        if (x0 < s_dmg_x0) {
+            s_dmg_x0 = x0;
+        }
+        if (y0 < s_dmg_y0) {
+            s_dmg_y0 = y0;
+        }
+        if (x1 > s_dmg_x1) {
+            s_dmg_x1 = x1;
+        }
+        if (y1 > s_dmg_y1) {
+            s_dmg_y1 = y1;
+        }
+    }
+}
+
+/* True and the rectangle, or false and nothing to do. */
+static bool dmg_take(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
+{
+    bool got = false;
+
+    const bool held = dmg_lock();
+    if (s_dmg) {
+        *x = s_dmg_x0;
+        *y = s_dmg_y0;
+        *w = s_dmg_x1 - s_dmg_x0;
+        *h = s_dmg_y1 - s_dmg_y0;
+        s_dmg = false;
+        got = true;
+    }
+    dmg_unlock(held);
+    return got;
+}
+
+static void rem_blit_rect_inner(ag_handle_t h, const ag_blit_t *b)
+{
+    (void)h;
+    if (b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
+        return;
+    }
+
+    /*
+     * The damage lock covers the copy as well as the rectangle, and it is not
+     * the wire it is protecting against - the sender holds it for the few
+     * instructions it takes to pick the rectangle up, so nothing here ever
+     * waits on it.  What it settles is who may free the frame: the driver can
+     * be unloaded while an application is drawing, and a memcpy into memory
+     * that has just been handed back is the kind of fault that shows up
+     * somewhere else entirely.  See rem_stop.
+     */
+    const bool held = dmg_lock();
+
+    /*
+     * Anything that is not the system surface is ignored, and that is a change
+     * with a bruise on it.
+     *
+     * There used to be a fallback here: a blit of a different shape - which is
+     * what gfx->present hands over, an application's own surface - was encoded
+     * and sent from this thread, the caller's.  In whole-frame mode that path
+     * did something much worse than being slow.  It sent bands *and it
+     * advanced the frame number*, in the middle of a frame the wire task was
+     * halfway through sending.  The far end saw the number change on every
+     * slice, decided each one began a new frame, threw away what it had and
+     * asked for it all again: two thousand slices, no frames, and a hundred
+     * and fourteen thousand requests to resend in twenty seconds.
+     *
+     * The game calls both - flush for the screen and present for its own
+     * surfaces - so both arrive here, and only one of them is the picture.
+     */
+    if (s_pkt == NULL || b->surf_w != s_fb_w || b->surf_h != s_fb_h) {
+        dmg_unlock(held);
+        s_late++;
+        s_late_w = b->surf_w;
+        s_late_h = b->surf_h;
+        return;
+    }
+
+    s_last_blit_us = (uint64_t)ag_api()->time->us();
+    s_offers++;   /* the game offering the screen, whether or not it is wanted */
+
+    if (b->w != 0u && b->h != 0u) {
+        uint32_t x0 = b->x, y0 = b->y;
+        uint32_t x1 = x0 + b->w, y1 = y0 + b->h;
+        if (x1 > s_fb_w) {
+            x1 = s_fb_w;
+        }
+        if (y1 > s_fb_h) {
+            y1 = s_fb_h;
+        }
+        if (x0 < x1 && y0 < y1) {
+            if (!s_dam_any) {
+                s_dam_x0 = x0;
+                s_dam_y0 = y0;
+                s_dam_x1 = x1;
+                s_dam_y1 = y1;
+                s_dam_any = true;
+            } else {
+                if (x0 < s_dam_x0) {
+                    s_dam_x0 = x0;
+                }
+                if (y0 < s_dam_y0) {
+                    s_dam_y0 = y0;
+                }
+                if (x1 > s_dam_x1) {
+                    s_dam_x1 = x1;
+                }
+                if (y1 > s_dam_y1) {
+                    s_dam_y1 = y1;
+                }
+            }
+        }
+    }
+
+    /*
+     * This call is the end of the game's frame, and the only place anybody
+     * knows the picture is whole.  So the copy happens here - and only when
+     * the driver asked for one.
+     *
+     * Asked-for, rather than every frame, is the whole difference.  Before,
+     * every flush copied its rectangle into this driver's frame whether the
+     * wire wanted it or not: the game paid three to six milliseconds of PSRAM
+     * on every frame it drew, to feed a wire that could take two frames a
+     * second.  Now it pays that once per frame *sent*, and the rest of its
+     * flushes return in nanoseconds.
+     *
+     * The whole surface is copied, not the dirty rectangle, because the whole
+     * frame is what goes out.  b->px points into the middle of the surface -
+     * at the rectangle's corner - so the base is found by walking back.
+     */
+    if (!s_want_copy || s_have_copy) {
+        dmg_unlock(held);
+        return;
+    }
+    const uint64_t c0 = (uint64_t)ag_api()->time->us();
+    const uint8_t *base = (const uint8_t *)b->px -
+                          (size_t)b->y * b->stride -
+                          (size_t)b->x * sizeof(uint16_t);
+    const size_t row_bytes = (size_t)s_fb_w * sizeof(uint16_t);
+
+    /*
+     * Which shape this frame is, decided here and not in the middle of it: the
+     * sender is waiting for the copy, so the stride may change now and may not
+     * change again until the frame has gone.
+     */
+#if IDX_MODE
+    if (s_pal_miss != 0u) {
+        /* A scene this palette does not describe.  Start it again; twice in a
+         * row means the scene really has more than 256 colours. */
+        pal_clear();
+        s_pal_miss = 0;
+        s_pal_on = ++s_pal_fails < 2u;
+    } else {
+        s_pal_fails = 0;
+        if (!s_pal_on && (s_frame_no & 63u) == 0u) {
+            pal_clear(); /* try again now and then: scenes change */
+            s_pal_on = true;
+        }
+    }
+#endif
+    s_pkt_blk = s_pal_on ? s_blk_idx : s_blk_565;
+
+    /*
+     * Row by row into the blocks, which is what it was already doing - only
+     * the destination is the payload of slice r/8 rather than a flat frame.
+     *
+     * As indices this is a lookup per pixel instead of a memcpy, and it is
+     * worth it twice over: half the bytes on the wire, and the table is read
+     * far more often than it is written, so the lookup is one probe.
+     */
+    if (s_pal_on) {
+        /*
+         * Block by block, and this is the shape that matters.
+         *
+         * The first version walked the picture pixel by pixel, looked every
+         * one up in the palette, wrote it, and hashed it - seventeen and a
+         * half milliseconds on the *game's* own thread, thirteen times a
+         * second, and the game went from 45 frames to 29.  But only about
+         * fifty of the twelve hundred blocks move in a frame, so nearly all of
+         * that work was a lookup and a write for a pixel nobody was going to
+         * send.
+         *
+         * So: hash the eight by eight straight out of the game's surface,
+         * which costs a read and nothing else, and only if it has moved read
+         * it again - out of the cache, where the hash has just left it - to
+         * look the colours up and write the indices.  The counts the coder is
+         * built from then describe exactly the pixels that are going out,
+         * which is if anything the better table.
+         */
+        memset(s_cnt, 0, sizeof(s_cnt));
+        const uint32_t slices = (s_fb_h + RAW_ROWS - 1u) / RAW_ROWS;
+        const uint32_t refresh = (uint32_t)(s_frame_no % slices);
+
+        /* The band and column range the game says it drew in.  Everything
+         * outside it is the same as it was, on the game's own word. */
+        uint32_t s_lo = 0, s_hi = slices - 1u;
+        uint32_t b_lo = 0, b_hi = BLK_COLS - 1u;
+        if (s_dam_any && !s_force) {
+            s_lo = s_dam_y0 / RAW_ROWS;
+            s_hi = (s_dam_y1 - 1u) / RAW_ROWS;
+            b_lo = s_dam_x0 / BLK_W;
+            b_hi = (s_dam_x1 - 1u) / BLK_W;
+        }
+        s_dam_any = false;
+        s_dam_seen += (s_hi - s_lo + 1u) * (b_hi - b_lo + 1u);
+
+        for (uint32_t s = 0; s < slices; s++) {
+            /*
+             * The one slice in thirty that goes whole is hashed and converted
+             * whole too, even where nothing moved: it is what is sent, so its
+             * colours have to be in the counts the code is built from.
+             */
+            const bool whole = (s == refresh) || s_force;
+            if (!whole && (s < s_lo || s > s_hi)) {
+                s_bmask[s] = 0;
+                continue;
+            }
+            uint8_t *const  dst0 = pkt_bytes(s);
+            uint32_t *const hrow = &s_bhash[s * BLK_COLS];
+            uint32_t *const orow = &s_bhash_old[s * BLK_COLS];
+            const uint8_t *const band = base + (size_t)(s * RAW_ROWS) * b->stride;
+            uint64_t       m = 0;
+            const uint32_t lo = whole ? 0u : b_lo;
+            const uint32_t hi = whole ? BLK_COLS - 1u : b_hi;
+            for (uint32_t bx = lo; bx <= hi; bx++) {
+                uint32_t h = 2166136261u;
+                for (uint32_t r = 0; r < RAW_ROWS; r++) {
+                    const uint16_t *const sp =
+                        (const uint16_t *)(const void *)(band +
+                                                         (size_t)r * b->stride) +
+                        bx * BLK_W;
+                    for (uint32_t k = 0; k < BLK_W; k++) {
+                        h = (h ^ sp[k]) * 16777619u;
+                    }
+                }
+                hrow[bx] = h;
+                if (h == orow[bx] && !whole) {
+                    continue; /* the far end has this block already */
+                }
+                m |= 1ull << bx;
+                for (uint32_t r = 0; r < RAW_ROWS; r++) {
+                    const uint16_t *const sp =
+                        (const uint16_t *)(const void *)(band +
+                                                         (size_t)r * b->stride) +
+                        bx * BLK_W;
+                    uint8_t *const dp = dst0 + (size_t)r * 320u + bx * BLK_W;
+                    for (uint32_t k = 0; k < BLK_W; k++) {
+                        const uint32_t i = pal_index(sp[k]);
+                        dp[k] = (uint8_t)i;
+                        s_cnt[i]++;
+                    }
+                }
+            }
+            s_bmask[s] = m;
+        }
+        s_force = false;
+    } else {
+        for (uint32_t r = 0; r < s_fb_h; r++) {
+            uint8_t *dst = (uint8_t *)pkt_pixels(r / RAW_ROWS) +
+                           (size_t)(r % RAW_ROWS) * row_bytes;
+            memcpy(dst, base + (size_t)r * b->stride, row_bytes);
+        }
+    }
+    s_t_copy_us = (uint32_t)((uint64_t)ag_api()->time->us() - c0);
+    s_want_copy = false;
+    s_have_copy = true;
+    dmg_unlock(held);
+}
+
+/*
+ * The task.  One rectangle at a time, and the sound between them.
+ *
+ * Two milliseconds of sleep when there is nothing, which is a fortieth of the
+ * frame rate this link can carry and cheap enough not to matter; the wire is
+ * the bottleneck, not the polling.  Nothing is notified because nothing needs
+ * to be: a screen is a thing that is looked at, not waited on.
+ */
+static volatile bool s_wire_running;
+
+/*
+ * How much of the machine this driver may spend, and why it needs a limit.
+ *
+ * The wire carries four hundred kilobytes a second and the encoder can fill it.
+ * Neither of them is the scarce thing: both ends of every band are in PSRAM,
+ * and so is the game's picture, and so is the game's arena.  One bus, two
+ * cores.  Measured during the opening movie, where the whole screen changes and
+ * the driver was free to send 2.45 screens a second: the game's own blit - a
+ * palette conversion, pure memory - went from 2 ms to 354, its frame rate to
+ * 2.2, and in the end a frame took longer than the fifteen seconds its watchdog
+ * allows and the game was killed.  The driver had throttled the thing it exists
+ * to show.
+ *
+ * So: a budget in bytes a second, spent on whatever asks first - real damage
+ * before repair, as everywhere else here.
+ *
+ * Not a frame rate limit: what costs the machine is bytes, and a screen that
+ * changed in one corner is not the same as one that changed everywhere.
+ *
+ * The number was a hundred kilobytes because that is three times what a game
+ * standing on a map asks for (33 KB/s measured).  That yardstick was wrong,
+ * and it took somebody watching the glass to say so: a game standing still is
+ * not what anyone looks at.  When the picture *moves*, every frame is a whole
+ * screen - 150 KB of pixels, about 20 KB once encoded - so a hundred kilobytes
+ * a second is five whole screens a second and no more.  That is the lag on the
+ * glass, and it is this constant, not the wire: four megabaud would carry
+ * fifteen screens a second and eight would carry twenty-nine.
+ *
+ * So it is a build-time number now, to be swept rather than argued about, and
+ * what it should be is whatever the game can afford to give up.
+ */
+#ifndef WIRE_BUDGET_BPS
+#define WIRE_BUDGET_BPS 100000u
+#endif
+
+static uint64_t s_budget_at;
+static uint32_t s_budget_left = WIRE_BUDGET_BPS;
+static uint32_t s_budget_waits;
+
+static bool budget_ok(void)
+{
+    const uint64_t now = (uint64_t)ag_api()->time->us();
+
+    if (now >= s_budget_at) {
+        s_budget_at = now + 1000000ull;
+        s_budget_left = WIRE_BUDGET_BPS;
+    }
+    return s_budget_left != 0u;
+}
+
+static void budget_spend(uint32_t bytes)
+{
+    s_budget_left = (bytes >= s_budget_left) ? 0u : (s_budget_left - bytes);
+}
+
+/*
+ * A sweep that sends what nobody asked for.
+ *
+ * Everything above only ever puts on the wire what the application redrew.
+ * That is right for traffic and wrong for a screen: the parts of the picture
+ * the game does not touch are never sent, so whatever the far end had before
+ * stays on the glass - and on a map where only a lamp and a critter animate,
+ * that is most of it.  What Maxim saw was exactly this: an old frozen picture
+ * with a few rectangles moving inside it, filling in over ten seconds as the
+ * repair crept through.
+ *
+ * The old repair could not fix it, because it forgot a row of blocks *inside
+ * the rectangle being sent* - a row nothing is sending is not sent again by
+ * forgetting it.  That was the best a driver with no task of its own could do.
+ * With a task and a frame of its own, the honest thing is available: walk the
+ * screen, one row of blocks at a time, and send what is there.
+ *
+ * It used to walk one row of blocks per turn, and that was the wrong shape.
+ * Thirty rows meant thirty *frames*, each one row tall, twenty milliseconds
+ * apart - and what a person sees when a screen is repaired a row at a time is
+ * a stripe crawling down the glass for six hundred milliseconds, stopping
+ * wherever the budget runs out.  "Everything changes in stripes, and the
+ * stripes hang" is the exact report, and it was not a wire fault or a codec
+ * fault: it was this loop, drawing a stripe at a time because that was cheap
+ * to write.
+ *
+ * It also poisoned every measurement of the frame rate.  A repair row is one
+ * band, so most of what the far end counted as frames were repair rows: 354
+ * frames in twenty seconds carrying 296 bands between them, less than one band
+ * per frame.  Holding a frame's bands back to present them together - which is
+ * the right thing and was asked for - therefore changed nothing at all,
+ * because there was nothing to hold.
+ *
+ * So a repair is now one frame covering the whole screen, and it happens
+ * rarely instead of constantly.  The hash trimming means the bands that have
+ * not changed cost nothing to skip, so what actually goes out is only what the
+ * far end is missing; and it goes out as one frame, which is what a screen
+ * changing looks like.
+ *
+ * The hashes for the row are forgotten before it is sent, or the band would be
+ * compared against what the far end is *believed* to have and skipped - which
+ * is the belief being repaired.
+ */
+/*
+ * Two speeds, because the sweep is answering two different questions.
+ *
+ * "What has this receiver got?" - nothing, when it has just said hello or the
+ * driver has just loaded.  Then the whole screen is owed and it should go as
+ * fast as it can: thirty rows at one every twenty milliseconds is six tenths of
+ * a second, and until it has been paid the far end is showing somebody else's
+ * picture.
+ *
+ * "Has anything been lost since?" - and the answer is that it depends entirely
+ * on how hard this is being driven, which makes sweeping fast the wrong answer
+ * twice over.  Measured over five runs of the game, changing one thing at a
+ * time:
+ *
+ *   sweep 500 ms   game 46 fps   1.2 screens/s   31 KB/s   0 bad, 0 stray
+ *   sweep  60 ms   game 35 fps   1.7 screens/s   88 KB/s   ~2 bad frames/s
+ *
+ * Eleven frames a second of the game bought half a screen a second - and the
+ * link, which had been carrying thirty kilobytes without losing a byte, started
+ * losing two frames a second at eighty-eight.  This wire has no flow control,
+ * and the far end drops what arrives while it is writing a band to its panel.
+ * Sending less is not only cheaper, it is also more reliable, and the two
+ * compound: fewer bytes, fewer losses, fewer repairs needed.
+ *
+ * So the steady rate is a row every half second, and the fast rate is kept for
+ * the two moments that need it - this driver starting, and the far end saying
+ * it could not read something.  The second is rate limited to one full sweep in
+ * ten seconds, because the far end says that on every corrupt frame and the
+ * loop closes otherwise: a repaint per corrupt frame is a repaint that causes
+ * the next one, which the receiver's own source predicted and this driver then
+ * demonstrated at 2.4 fps.
+ */
+/*
+ * And it only happens when the far end says something is missing.
+ *
+ * A repair that runs on a clock has to forget the hashes to have any effect,
+ * and forgetting them means sending the whole screen again - so a timed sweep
+ * costs a full screen every time it fires, forever, on a picture that has not
+ * changed at all.  The old one hid that cost by spreading it over thirty turns;
+ * spreading it is what made the stripes.
+ *
+ * There is no need to guess any more.  Every frame is numbered now, so the far
+ * end can tell that one never arrived - a gap in the numbering - as well as
+ * that one arrived broken, and it says so.  Unasked, nothing is sent: a screen
+ * with nothing missing needs no repair, which is the whole point.
+ */
+/*
+ * ARGON, and the reason this is now called from the wire task rather than not
+ * at all.
+ *
+ * As written, sweep_step was defined, mentioned in a comment eight hundred
+ * lines above, and never invoked from anywhere.  So FR_HELLO set s_sweep_owed
+ * and nothing ever read it: the far end could ask for the picture as often as
+ * it liked and the answer was silence.  What that looks like from the desk is
+ * a monitor that was unplugged, or reset, or that lost the palette to a
+ * moment of noise, and then shows running console text for ever - which is
+ * exactly the report.
+ *
+ * The second half of the same bug is the text guard that used to be here:
+ *
+ *     if (s_last_blit_us == 0 || s_last_text_us > s_last_blit_us) return false;
+ *
+ * Text takes the glass two seconds after the last band of picture, and a game
+ * sitting on a modal dialogue paints nothing - so text owns the glass, the
+ * repair refuses to run because text owns the glass, and nothing can ever
+ * paint again.  A deadlock with no way out but restarting the game.
+ *
+ * The far end asking *is* the case for taking the glass back: it has nothing
+ * to show and is saying so.  So the guard now only refuses when no picture has
+ * ever been drawn - there is nothing to repair before the first frame - and
+ * who painted last decides everything else, as before.
+ */
+static bool sweep_due(void)
+{
+    if (s_hash == NULL || s_hash_rows == 0u || s_fb_w == 0u) {
+        return false;
+    }
+    if (s_last_blit_us == 0ull) {
+        return false; /* nobody has ever drawn a picture */
+    }
+    const uint64_t now = (uint64_t)ag_api()->time->us();
+
+    /*
+     * ARGON: and take the glass back from the console, on a clock.
+     *
+     * The rest of this function answers the far end asking - and the far end
+     * cannot ask.  Read the receiver: monitor.c has FR_RESEND for a slice
+     * missing out of a frame it is already decoding, and nothing whatever for
+     * "I have just started, send me everything".  FR_HELLO does not appear in
+     * its source at all.  So the sender's whole repair path was waiting on a
+     * message that is never sent.
+     *
+     * What that costs shows up the moment the picture stops moving.  Text
+     * takes the glass two seconds after the last band (TEXT_YIELDS_US), the
+     * game prints to its console every second, and a game sitting on a menu, a
+     * dialogue box or a pause draws nothing - so text wins, and keeps winning,
+     * because the only thing that could take the glass back is a picture and
+     * the only thing that sends a picture is the game drawing.  On the glass
+     * that is running console text where a game should be, for ever, and it is
+     * exactly what was reported twice today.
+     *
+     * So: while an application is alive and has drawn at some point, and the
+     * console currently owns the glass, put the picture back on it every few
+     * seconds.  A whole screen is about 20 KB against 400 KB/s of wire - half
+     * a per cent - and on a picture that has not changed the trimming makes
+     * the next one nearly free.  Sixty seconds since the last blit means the
+     * application has gone and the console should keep the screen.
+     */
+    /*
+     * Ten seconds, not sixty, and the difference is a flicker somebody had to
+     * watch.  Reported: "экран начал мигать - то текст, то игра".  The game
+     * had already been killed, and for a whole minute afterwards this clock
+     * kept putting the last frame back while the console kept printing over
+     * it - the picture every three seconds, text two seconds later, round and
+     * round.  A dead application should lose the screen at once and keep
+     * losing it.
+     *
+     * Ten seconds is longer than any gap between frames of a game that is
+     * merely slow - the worst measured is a 96 second load, and during that
+     * the engine is drawing nothing at all, which is the case this clock is
+     * for - so this is a compromise and not a fix.  What it buys is that a
+     * game which has stopped for good stops taking the screen back.
+     */
+    if (s_sweep_owed == 0u && s_last_text_us > s_last_blit_us &&
+        now - s_last_blit_us < 10000000ull && now - s_sweep_at >= 3000000ull) {
+        s_sweep_owed = 1u;
+        s_sweep_at = 0ull;
+    }
+
+    if (s_sweep_owed == 0u) {
+        return false; /* nothing is missing */
+    }
+    if (now < s_sweep_at) {
+        return false;
+    }
+    s_sweep_at = now;
+    s_sweep_owed = 0u;
+
+    /*
+     * The whole screen, and every hash forgotten with it.  Forgetting is what
+     * makes the trimming send a block again, so this is the only way to
+     * recover a band the far end never got - and doing it for the whole screen
+     * at once is what makes the recovery look like a frame rather than a
+     * stripe.  What it costs is only the blocks that actually differ from what
+     * the far end has, because the trimming still runs: on a still picture the
+     * first repair sends everything and the next one sends nothing.
+     */
+    hash_forget();
+
+    /*
+     * And the colours, because a far end that has just started has no palette
+     * and cannot read a single index without one.  The palette normally rides
+     * along every sixty-fourth frame, which is fine while frames are being
+     * produced and no use at all when the game has stopped drawing - which is
+     * the case this whole function exists for.  Measured on the receiver in
+     * that state: `pal 0/0, 0 blocks/s, 28396 B/s in (91631 stray)` - bytes
+     * arriving perfectly well and every one of them undecodable.
+     *
+     * s_force also makes the frame go out whole rather than trimmed against a
+     * belief about the far end that a restarted far end does not share.
+     */
+    pal_owe();
+    return s_fb_w != 0u && s_fb_h != 0u;
+}
+
+/*
+ * What the wire did with the last five seconds, printed from the task itself.
+ *
+ * Not from a callback - printing from one is the deadlock the header warns
+ * about - and not while any lock is held.  It exists because "the picture is
+ * slow" is four different faults with one appearance: too much asked for, too
+ * little compressed away, a wire that cannot carry it, or a sender that never
+ * catches up.  One line separates them, and without it the argument is about
+ * impressions.
+ *
+ * Silent when nothing is drawing, so an idle board stays quiet.
+ */
+#define STAT_US 5000000ull
+
+static uint32_t s_win_rects;
+static uint64_t s_win_wire;
+static uint32_t s_win_worst_us;
+static uint32_t s_win_behind;
+
+
+
+static void wire_stats(void)
+{
+    static uint64_t at;
+    const uint64_t  now = (uint64_t)ag_api()->time->us();
+
+    if (at == 0ull) {
+        at = now + STAT_US;
+        return;
+    }
+    if (now < at) {
+        return;
+    }
+    at = now + STAT_US;
+    if (s_win_rects == 0u) {
+        return;
+    }
+    /*
+     * And not while the console owns the glass, which is the case the guard
+     * above does not cover: repair frames keep s_win_rects moving after an
+     * application exits, so these lines went on printing - into the console,
+     * which at that moment *is* the far end's screen.  Four lines every five
+     * seconds, scrolling the very picture they describe.  What a person saw
+     * was a screen full of the driver shouting about itself.
+     */
+    if (s_last_text_us > s_last_blit_us) {
+        return;
+    }
+
+    const uint64_t secs = STAT_US / 1000000ull;
+    const uint32_t px_kb = (uint32_t)(s_win_px * 2ull / 1024ull / secs);
+    const uint32_t wire_kb = (uint32_t)(s_win_wire / 1024ull / secs);
+
+    /*
+     * Screens a second, not rectangles a second.  A rectangle is whatever part
+     * of the picture moved, so "thirteen a second" says nothing at all about
+     * how often the screen is right - which is the only question the person
+     * looking at the glass is asking.  Pixels sent over pixels there are.
+     */
+    const uint32_t full = ((uint32_t)s_fb_w * s_fb_h != 0u)
+                              ? (uint32_t)(s_win_px * 100ull /
+                                           ((uint64_t)s_fb_w * s_fb_h) / secs)
+                              : 0u;
+
+    ag_printf("REMDISP: %u.%02u screens/s (%u rect/s), %u KB/s of pixels -> "
+              "%u KB/s on the wire (%u%%), worst rect %u ms, behind %u\n",
+              (unsigned)(full / 100u), (unsigned)(full % 100u),
+              (unsigned)(s_win_rects / (uint32_t)secs), (unsigned)px_kb,
+              (unsigned)wire_kb,
+              (unsigned)((px_kb != 0u) ? (wire_kb * 100u / px_kb) : 0u),
+              (unsigned)(s_win_worst_us / 1000u), (unsigned)s_win_behind);
+
+    if (s_budget_waits != 0u) {
+        ag_printf("REMDISP: %u turns waiting for the budget\n",
+                  (unsigned)s_budget_waits);
+        s_budget_waits = 0;
+    }
+    if (s_dropped != 0u || s_lost != 0u || s_late != 0u) {
+        ag_printf("REMDISP: %u frames refused (ring full), %u bytes lost in "
+                  "the port, %u blits the old way\n",
+                  (unsigned)s_dropped, (unsigned)s_lost, (unsigned)s_late);
+    }
+
+    if (s_bands != 0u) {
+        ag_printf("REMDISP: %u bands, us each: compare %u, gather %u, pack %u, "
+                  "palette %u, wire %u\n",
+                  (unsigned)s_bands, (unsigned)(s_t_hash / s_bands),
+                  (unsigned)(s_t_gather / s_bands), (unsigned)(s_t_pack / s_bands),
+                  (unsigned)(s_t_idx / s_bands), (unsigned)(s_t_wire / s_bands));
+    }
+    s_bands = 0;
+    s_t_hash = 0;
+    s_t_gather = 0;
+    s_t_pack = 0;
+    s_t_idx = 0;
+    s_t_wire = 0;
+
+    s_win_rects = 0;
+    s_win_px = 0;
+    s_win_wire = 0;
+    s_win_worst_us = 0;
+    s_win_behind = 0;
+}
+
+
+/*
+ * There used to be a raw_send_slice here: it copied a slice into a staging
+ * buffer, framed it, and pushed it through the ring a byte at a time.  The
+ * frame is laid out as wire packets now - see pkt_block - so a slice needs
+ * no staging and no framing at send time, and the only user this had left
+ * was the resend, which hands the same block over again.
+ */
+
+static uint32_t raw_slices(void)
+{
+    return (s_fb_h + RAW_ROWS - 1u) / RAW_ROWS;
+}
+
+/* ---- steps 3 and 4: PSRAM to internal memory, internal memory to the wire -
+ *
+ * Maxim's shape, and it exists to settle one question and no other: does
+ * reading and writing PSRAM slow the game down?  So PSRAM is touched exactly
+ * once beyond the copy of step 2, and touched the way hardware likes it -
+ * straight through, largest run we can hold.  Fill as much of an internal
+ * buffer as it will take with finished frames, hand the port that buffer, and
+ * go round again until the picture is out.  No slice staged in PSRAM, no ring.
+ *
+ * If the game is still slow in this shape, PSRAM is not what is slowing it,
+ * and the hypothesis is dead rather than wounded.
+ */
+/*
+ * Fill in one slice's header, in place, and return the sum it carries.
+ *
+ * The header lives in the block, ahead of the pixels it describes, so filling
+ * it in is the last thing that happens before the whole block is handed over
+ * as one transfer.  The sum travels inside the header rather than after the
+ * payload for exactly that reason: a byte at the end would have to be written
+ * by somebody, and the only somebody available after the pixels is the
+ * processor, which is what this shape exists to keep out of the way.
+ */
+static void pkt_head(uint32_t c, uint32_t slices, uint32_t y0, uint32_t rows)
+{
+    uint8_t *const q   = pkt_block(c);
+    const uint32_t px  = rows * s_fb_w;
+    const uint32_t len = s_pkt_blk - 5u; /* everything after the five */
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = s_pal_on ? (uint8_t)FR_IDX8 : (uint8_t)FR_RAW;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_frame_no);
+    put16(q + 7, c);
+    put16(q + 9, slices);
+    put16(q + 11, s_fb_w);
+    put16(q + 13, y0);
+    put16(q + 15, rows);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u); /* the padding is sent, so it is known */
+
+    /*
+     * A word at a time over the geometry and the pixels together - they are
+     * contiguous now, which is the other thing this layout buys.  The four
+     * lanes fold to the same answer a byte-wise xor would give, because both
+     * runs are multiples of four.
+     */
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)(q + PKT_HDR);
+    const uint32_t  words = (px * (s_pal_on ? 1u : 2u)) / 4u;
+    for (uint32_t i = 0; i < words; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+}
+
+/*
+ * The palette, when the far end has an older one than this.
+ *
+ * Its own block, aligned and DMA-able like every other, and always the full
+ * 512 bytes so that the transfer is a whole number of cache lines and the
+ * length never has to be thought about.  544 bytes = seventeen lines.
+ *
+ * Sent ahead of the slices that use it, which is the only ordering that
+ * matters: a slice whose colours the far end cannot look up is a slice of the
+ * wrong picture.  Nothing acknowledges it - the far end says nothing about
+ * anything - so it is repeated every sixty-four frames as well, which costs a
+ * ten-thousandth of the wire and covers a receiver that was plugged in late.
+ */
+#define PAL_BLK (PKT_HDR + PAL_N * 2u)
+
+static void pal_send(void)
+{
+    if (s_palpkt == NULL) {
+        return;
+    }
+    uint8_t *const q = s_palpkt;
+    const uint32_t len = PAL_BLK - 5u;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_PAL;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_pal_gen);
+    put16(q + 7, s_pal_used);
+    put16(q + 9, 0);
+    put16(q + 11, 0);
+    put16(q + 13, 0);
+    put16(q + 15, 0);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    memset(q + PKT_HDR, 0, PAL_N * 2u);
+    for (uint32_t i = 0; i < s_pal_used; i++) {
+        put16(q + PKT_HDR + i * 2u, s_pal[i]);
+    }
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)(q + PKT_HDR);
+    for (uint32_t i = 0; i < (PAL_N * 2u) / 4u; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+
+    bool sent = false;
+    if (s_dma) {
+        sent = io->uart_dma_submit(LINK_PORT, q, PAL_BLK) >= 0;
+    }
+    if (!sent) {
+        (void)io->uart_write(LINK_PORT, q, PAL_BLK);
+    }
+    s_pal_sent = s_pal_gen;
+    s_sent_bytes += PAL_BLK;
+}
+
+static void raw_resend(uint32_t frame, uint32_t slice)
+{
+    if (frame != s_frame_no || s_pkt == NULL) {
+        return; /* that frame is gone; the next whole one will do instead */
+    }
+    const uint32_t slices = raw_slices();
+    if (slice >= slices) {
+        return;
+    }
+    const uint32_t y0 = slice * RAW_ROWS;
+    uint32_t rows = RAW_ROWS;
+    if (y0 + rows > s_fb_h) {
+        rows = s_fb_h - y0;
+    }
+
+    /*
+     * The block is still sitting there with the pixels the far end missed, so
+     * a resend is the same transfer again - fill the header in (the frame
+     * number has not moved yet) and hand it over.
+     */
+    pkt_head(slice, slices, y0, rows);
+    if (s_dma) {
+        (void)io->uart_tx_wait(LINK_PORT, 1000u);
+        if (io->uart_dma_write(LINK_PORT, pkt_block(slice), s_pkt_blk) >= 0) {
+            s_raw_resent++;
+            return;
+        }
+    }
+    if (io->uart_write(LINK_PORT, pkt_block(slice), s_pkt_blk) > 0) {
+        s_raw_resent++;
+    }
+}
+
+#if FRAME_DUMP
+static void frame_dump(void)
+{
+    static uint32_t seen;
+    static bool     done;
+    if (done || s_pkt == NULL || ++seen < (uint32_t)FRAME_DUMP) {
+        return;
+    }
+    done = true;
+
+    const ag_handle_t f = ag_open(FRAME_DUMP_PATH, AG_O_WRONLY | AG_O_CREATE |
+                                                       AG_O_TRUNC);
+    if (f < 0) {
+        ag_printf("REMDISP: cannot write %s (%s)\n", FRAME_DUMP_PATH,
+                  ag_strerror((ag_err_t)f));
+        return;
+    }
+    /*
+     * Slice by slice, because that is how the picture is laid out - the
+     * headers between the bands are not part of it and must not go in.
+     */
+    uint32_t wrote = 0;
+    const uint32_t slices = raw_slices();
+    for (uint32_t c = 0; c < slices; c++) {
+        uint32_t rows = RAW_ROWS;
+        if (c * RAW_ROWS + rows > s_fb_h) {
+            rows = s_fb_h - c * RAW_ROWS;
+        }
+        const uint32_t n = rows * s_fb_w * (uint32_t)sizeof(uint16_t);
+        const int32_t  w = ag_write(f, pkt_pixels(c), n);
+        if (w < 0) {
+            ag_printf("REMDISP: %s died at %u bytes (%d)\n", FRAME_DUMP_PATH,
+                      (unsigned)wrote, (int)w);
+            break;
+        }
+        wrote += (uint32_t)w;
+    }
+    (void)ag_close(f);
+    ag_printf("--FRAME %s %u %u %u--\n", FRAME_DUMP_PATH, (unsigned)s_fb_w,
+              (unsigned)s_fb_h, (unsigned)wrote);
+}
+#endif
+
+/*
+ * The code lengths, ahead of the slices that are read with them.
+ *
+ * Two lengths to a byte, which is all four bits are needed for - the longest
+ * code is fifteen and the builder guarantees it - so the whole table is 128
+ * bytes and the packet is 160, five cache lines.  It carries the frame number
+ * because a slice decoded with the wrong table is not a slightly wrong slice,
+ * it is noise, and the far end has to be able to tell.
+ */
+#define HTAB_BLK (PKT_HDR + PAL_N / 2u)
+
+static void huf_send_table(void)
+{
+    uint8_t *const q = s_hufpkt;
+    const uint32_t len = HTAB_BLK - 5u;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_HTAB;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_frame_no);
+    put16(q + 7, PAL_N);
+    put16(q + 9, 0);
+    put16(q + 11, 0);
+    put16(q + 13, 0);
+    put16(q + 15, 0);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    for (uint32_t i = 0; i < PAL_N / 2u; i++) {
+        q[PKT_HDR + i] =
+            (uint8_t)(s_hlen[i * 2u] | (uint8_t)(s_hlen[i * 2u + 1u] << 4));
+    }
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)(q + PKT_HDR);
+    for (uint32_t i = 0; i < (PAL_N / 2u) / 4u; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+
+    bool sent = false;
+    if (s_dma) {
+        sent = io->uart_dma_submit(LINK_PORT, q, HTAB_BLK) >= 0;
+    }
+    if (!sent) {
+        (void)io->uart_write(LINK_PORT, q, HTAB_BLK);
+    }
+    s_sent_bytes += HTAB_BLK;
+}
+
+/*
+ * One coded slice, into the next of the rotating output blocks.
+ *
+ * Rotating and not one per slice: eight blocks of 2592 bytes is twenty
+ * kilobytes against seventy-six for a second whole frame, and eight is more
+ * than the four the DMA queue can hold, so a block is never written while the
+ * hardware is still reading it.
+ *
+ * Returns the bytes to hand over, or 0 if the slice would not be smaller
+ * coded, in which case the caller sends the indices as they are.
+ */
+static uint32_t huf_slice(uint32_t c, uint32_t y0, uint32_t rows,
+                          uint32_t slices, uint8_t **out)
+{
+    uint8_t *const q = s_out + (size_t)(s_out_next % HUF_BLKS) * s_out_blk;
+    const uint32_t npx = rows * s_fb_w;
+    const uint32_t body =
+        huf_encode(pkt_bytes(c), npx, q + PKT_HDR, s_out_blk - PKT_HDR);
+    if (body == 0u || body >= npx) {
+        return 0u;
+    }
+    s_out_next++;
+
+    const uint32_t pad = (body + (PKT_HDR - 1u)) & ~(PKT_HDR - 1u);
+    memset(q + PKT_HDR + body, 0, pad - body);
+    const uint32_t len = (PKT_HDR - 5u) + pad;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_HUF;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_frame_no);
+    put16(q + 7, c);
+    put16(q + 9, slices);
+    put16(q + 11, y0);
+    put16(q + 13, rows);
+    put16(q + 15, body);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)(q + PKT_HDR);
+    for (uint32_t i = 0; i < pad / 4u; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+
+    *out = q;
+    return PKT_HDR + pad;
+}
+
+/*
+ * A slice with only the blocks that moved in it.
+ *
+ * The mask travels in the body rather than the header - the twelve summed
+ * bytes of the header are full, and five more of them would be a change to
+ * every packet on the wire for the sake of one kind.  The far end reads five
+ * bytes of mask and then decodes sixty-four symbols for each bit that is set,
+ * putting them where the bit says.
+ */
+static uint32_t huf_slice_part(uint32_t c, uint32_t y0, uint32_t rows,
+                               uint32_t slices, uint64_t mask, uint8_t **out)
+{
+    uint8_t *const q = s_out + (size_t)(s_out_next % HUF_BLKS) * s_out_blk;
+    uint8_t *const body = q + PKT_HDR;
+
+    for (uint32_t i = 0; i < 5u; i++) {
+        body[i] = (uint8_t)(mask >> (i * 8u));
+    }
+    const uint32_t bits = huf_encode_blocks(pkt_bytes(c), mask, body + 5u,
+                                            s_out_blk - PKT_HDR - 5u);
+    if (bits == 0u) {
+        return 0u;
+    }
+    s_out_next++;
+
+    const uint32_t blen = 5u + bits;
+    const uint32_t pad = (blen + (PKT_HDR - 1u)) & ~(PKT_HDR - 1u);
+    memset(body + blen, 0, pad - blen);
+    const uint32_t len = (PKT_HDR - 5u) + pad;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_HUFP;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_frame_no);
+    put16(q + 7, c);
+    put16(q + 9, slices);
+    put16(q + 11, y0);
+    put16(q + 13, rows);
+    put16(q + 15, blen);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)body;
+    for (uint32_t i = 0; i < pad / 4u; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+
+    *out = q;
+    return PKT_HDR + pad;
+}
+
+/*
+ * That frame is whole, and here is what it was made of.
+ *
+ * Necessary the moment a slice can be left out: the far end used to know a
+ * frame was finished because all thirty had arrived, and now most of them
+ * never will.  Thirty-two bytes, once a frame, carrying the set of slices that
+ * were sent - so the receiver knows both when to paint and, if one of them is
+ * missing, which one to ask for.
+ */
+static void send_done(uint32_t mask)
+{
+    uint8_t *const q = s_donepkt;
+    if (q == NULL) {
+        return;
+    }
+    const uint32_t len = PKT_HDR - 5u;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_DONE;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_frame_no);
+    put16(q + 7, mask & 0xffffu);
+    put16(q + 9, mask >> 16);
+    put16(q + 11, 0);
+    put16(q + 13, 0);
+    put16(q + 15, 0);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+
+    bool sent = false;
+    if (s_dma) {
+        sent = io->uart_dma_submit(LINK_PORT, q, PKT_HDR) >= 0;
+    }
+    if (!sent) {
+        (void)io->uart_write(LINK_PORT, q, PKT_HDR);
+    }
+    s_sent_bytes += PKT_HDR;
+}
+
+static void raw_send_direct(void)
+{
+    const uint32_t slices = raw_slices();
+
+    /*
+     * The console goes first, all of it, and then the port is the hardware's
+     * until the picture is out.
+     *
+     * Console text travels by the ring and the ring is written by the
+     * processor, which is the other master of this transmitter; handing over
+     * between the two costs a wait for the port to empty.  Done once at the
+     * top of a frame that is one wait; done between slices, as it used to be,
+     * it was thirty, and they cost more than the bytes they carried.
+     *
+     * Sound is not in this list any more, and that is the point of the change:
+     * it leaves by DMA now, so it needs no handover at all and can go out
+     * between the slices where it belongs.
+     */
+    const uint64_t t0 = (uint64_t)ag_api()->time->us();
+    aud_close_idle();
+    (void)tx_drain();
+    if (s_dma) {
+        (void)io->uart_tx_wait(LINK_PORT, 1000u);
+    }
+    s_t_rest_us += (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+
+    /* The colours before the pixels that name them, and again now and then for
+     * a receiver that was not listening when they changed. */
+    if (s_pal_on && (s_pal_sent != s_pal_gen || (s_frame_no & 63u) == 0u)) {
+        pal_send();
+    }
+
+    /*
+     * The code for this frame's colours.  Built here rather than in the copy
+     * because the copy runs on the game's thread and this does not have to.
+     */
+    s_huf = false;
+#if HUF_MODE
+    if (s_pal_on && s_hufpkt != NULL && s_out != NULL) {
+        const uint64_t h0 = (uint64_t)ag_api()->time->us();
+        s_huf = huf_build();
+        if (s_huf) {
+            huf_send_table();
+        } else {
+            static bool moaned;
+            if (!moaned) {
+                moaned = true;
+                ag_printf("REMDISP: no code could be built for this "
+                          "picture; it goes as one byte a pixel\n");
+            }
+        }
+        s_t_huf_us += (uint32_t)((uint64_t)ag_api()->time->us() - h0);
+    }
+#endif
+    s_huf_bytes = 0;
+
+    uint32_t fill_us = 0;
+    uint32_t port_us = 0;
+    uint32_t sent = 0;
+
+    const uint64_t all_blocks = (1ull << BLK_COLS) - 1ull;
+    uint32_t       donemask = 0;
+    s_frame_blocks = 0;
+
+    for (uint32_t c = 0; c < slices && !s_stop; c++) {
+        const uint32_t y0 = c * RAW_ROWS;
+        uint32_t rows = RAW_ROWS;
+        if (y0 + rows > s_fb_h) {
+            rows = s_fb_h - y0;
+        }
+
+        uint64_t mask = all_blocks;
+#if DIFF_MODE
+        if (s_pal_on) {
+            /*
+             * The copy decided this, because the copy is where the pixels were
+             * looked at - including the one slice in thirty that goes whole
+             * whatever its hashes say.  That slice is three per cent of the
+             * wire and it is what makes a hash safe to believe: anything the
+             * hash was ever wrong about, or that a lost packet left stale, is
+             * right again within thirty frames.
+             */
+            mask = s_bmask[c];
+            if (mask == 0ull) {
+                continue; /* nothing happened here; the far end has it right */
+            }
+        }
+#endif
+        donemask |= 1u << c;
+        s_slices_sent++;
+        for (uint32_t bx = 0; bx < BLK_COLS; bx++) {
+            if (mask & (1ull << bx)) {
+                s_blocks_sent++;
+                s_frame_blocks++;
+            }
+        }
+
+        /*
+         * Coded if that is smaller, and as it stands if it is not - decided
+         * per slice, because a band of the interface codes to a fifth of its
+         * size and a band of dithered ground sometimes to none at all.  Every
+         * packet says which it is in its opcode, so the two mix freely.
+         */
+        const uint64_t f0 = (uint64_t)ag_api()->time->us();
+        uint8_t *blk = pkt_block(c);
+        uint32_t blen = s_pkt_blk;
+        if (s_huf) {
+            uint8_t *hq = NULL;
+#if DIFF_MODE
+            const uint32_t hn =
+                huf_slice_part(c, y0, rows, slices, mask, &hq);
+#else
+            const uint32_t hn = huf_slice(c, y0, rows, slices, &hq);
+#endif
+            if (hn != 0u) {
+                blk = hq;
+                blen = hn;
+                s_huf_bytes += hn;
+            } else {
+                pkt_head(c, slices, y0, rows);
+            }
+        } else {
+            pkt_head(c, slices, y0, rows);
+        }
+        fill_us += (uint32_t)((uint64_t)ag_api()->time->us() - f0);
+
+        const uint64_t p0 = (uint64_t)ag_api()->time->us();
+#if RAW_SILENT == 4
+        ag_delay((uint32_t)(((uint64_t)blen * 10ull * 1000ull) /
+                            (uint64_t)LINK_BAUD));
+#else
+        if (s_dma) {
+            /*
+             * Handed over and left with the hardware: the queue is what keeps
+             * the transmitter fed while this task is being scheduled again.
+             * The block belongs to the DMA until the drain at the end of the
+             * frame, which is fine - nothing writes it until the next copy,
+             * and the next copy cannot happen until this frame is out.
+             */
+            const int32_t w = io->uart_dma_submit(LINK_PORT, blk, blen);
+            if (w < 0) {
+                s_dma = false;
+                ag_printf("REMDISP: the port will not take a DMA transfer "
+                          "(%d); sending by hand\n", (int)w);
+                (void)io->uart_write(LINK_PORT, blk, blen);
+            }
+        } else {
+            (void)io->uart_write(LINK_PORT, blk, blen);
+        }
+#endif
+        port_us += (uint32_t)((uint64_t)ag_api()->time->us() - p0);
+
+        sent += blen;
+        s_sent_frames++;
+        s_chunks++;
+
+        /*
+         * And a block of sound, into the same queue, if one is ready.
+         *
+         * This is where the evenness comes from.  Seventeen blocks of sound
+         * fit in the 386 ms a picture takes, and there are thirty slices to
+         * put them between - so each one is 544 bytes slipped in behind 5152,
+         * and the far end's converter is fed steadily right through the frame
+         * instead of being handed the lot at the top of it.  Two, not one, so
+         * that a burst after a pause is cleared inside a frame rather than
+         * trailing the picture for several.
+         */
+        (void)aud_pump(2u);
+
+        /*
+         * Stand aside between slices, but do not touch the port: the kernel
+         * work the game leans on is served on this core, and a yield costs
+         * nothing when there is nobody waiting for it.
+         */
+        ag_yield();
+    }
+
+    /*
+     * And wait for what is still in the air.  Until this returns the blocks
+     * are the hardware's, so nothing may draw into them - which is exactly the
+     * order the frame handshake already keeps.
+     */
+    /*
+     * And say the frame is finished, before waiting for it to leave: the far
+     * end paints on this and on nothing else now that slices can be left out.
+     */
+    send_done(donemask);
+    memcpy(s_bhash_old, s_bhash, sizeof(s_bhash_old));
+
+    if (sent > s_worst_bytes) {
+        s_worst_bytes = sent;
+    }
+    if (s_frame_blocks > s_worst_blocks) {
+        s_worst_blocks = s_frame_blocks;
+    }
+
+    if (s_dma) {
+        const uint64_t w0 = (uint64_t)ag_api()->time->us();
+        (void)io->uart_dma_drain(LINK_PORT);
+        port_us += (uint32_t)((uint64_t)ag_api()->time->us() - w0);
+    }
+    aud_settle();
+
+    s_t_fill_us += fill_us;
+    s_t_port_us += port_us;
+    s_t_dma_us += port_us;
+    s_sent_bytes += sent;
+}
+
+
+static void raw_stats(void)
+{
+    static uint64_t at;
+    const uint64_t  now = (uint64_t)ag_api()->time->us();
+    if (at == 0ull) {
+        at = now + STAT_US;
+        return;
+    }
+    if (now < at) {
+        return;
+    }
+    at = now + STAT_US;
+    if (s_raw_frames == 0u) {
+        /*
+         * ARGON: the first three windows, then once a minute.
+         *
+         * Printed every window this line made the console unusable within a
+         * minute of a game that had stopped drawing - and the console is how
+         * everything else about the board is asked, so a diagnostic that
+         * drowns it costs more than it tells.  Three in a row says what the
+         * state is; after that it is the same sentence and once a minute is
+         * enough to show it is still true.
+         */
+        s_quiet_windows++;
+        if (s_quiet_windows > 3u && (s_quiet_windows % 12u) != 0u) {
+            return;
+        }
+        /*
+         * ARGON: say why, instead of saying nothing.
+         *
+         * This used to return here, so the one state worth a report - the wire
+         * has sent no picture for five seconds - was the state in which the
+         * driver went quiet.  On 7 September 2026 the far end showed a frozen
+         * frame and kept playing sound, the game was drawing at 27 to 34
+         * frames a second, and the driver's log held its two startup lines and
+         * nothing else.  There was no way to tell from outside whether the
+         * game had stopped offering the screen, whether its offers were being
+         * refused, or whether the sender was starved.
+         *
+         * Not suppressed by the glass check below either: if no picture has
+         * gone out for five seconds then nothing is being scrolled over.
+         */
+        ag_printf("RAW: nothing sent in %us: %u offers, %u refused (last "
+                  "%ux%u against %ux%u), %u loops, want %u have %u, "
+                  "frame %s, text %s picture\n",
+                  (unsigned)(STAT_US / 1000000ull), (unsigned)s_offers,
+                  (unsigned)s_late, (unsigned)s_late_w, (unsigned)s_late_h,
+                  (unsigned)s_fb_w, (unsigned)s_fb_h, (unsigned)s_loops,
+                  (unsigned)s_want_copy, (unsigned)s_have_copy,
+                  (s_pkt != NULL) ? "held" : "none",
+                  (s_last_text_us > s_last_blit_us) ? "after" : "before");
+        s_offers = 0;
+        s_late = 0;
+        return;
+    }
+    s_quiet_windows = 0;
+#if RAW_SILENT == 0 && !SEND_ALWAYS
+    if (s_last_text_us > s_last_blit_us) {
+        return; /* the console has the glass; do not scroll it */
+    }
+#endif
+    /* In a bisection build nothing reaches the monitor, so the console always
+     * owns the glass and the report above would never be printed - and silence
+     * there is indistinguishable from a driver that did no work at all. */
+
+    const uint32_t secs = (uint32_t)(STAT_US / 1000000ull);
+    const uint32_t fps100 = s_raw_frames * 100u / secs;
+    const uint32_t kbs = (uint32_t)(s_raw_bytes / 1024ull / secs);
+    /* What the copy costs in megabytes a second, which is the number that
+     * says whether PSRAM or the code is the problem. */
+    const uint32_t copy_kbs =
+        (s_t_copy_us != 0u)
+            ? (uint32_t)((uint64_t)s_fb_w * s_fb_h * 2ull * 1000000ull /
+                         s_t_copy_us / 1024ull)
+            : 0u;
+
+    ag_printf("RAW: %u.%02u frames/s, %u KB/s; copy %u us (%u KB/s), "
+              "send %u us, wait %u us, %u resent\n",
+              (unsigned)(fps100 / 100u), (unsigned)(fps100 % 100u),
+              (unsigned)kbs, (unsigned)s_t_copy_us, (unsigned)copy_kbs,
+              (unsigned)s_t_send_us, (unsigned)s_t_wait_last,
+              (unsigned)s_raw_resent);
+    ag_printf("RAW: the game offered the screen %u times a second\n",
+              (unsigned)(s_offers / (STAT_US / 1000000ull)));
+    s_offers = 0;
+    ag_printf("RAW: %u turns round the loop waiting for the game\n",
+              (unsigned)s_loops_last);
+    /* Per frame, so it can be read against the copy and the wire. */
+    ag_printf("RAW: per frame us: step2 copy %u, step3 fill %u, step4 port %u"
+              " (%u chunks of %u B); ring %u, out %u\n",
+              (unsigned)(s_t_copy_us),
+              (unsigned)(s_t_fill_us / s_raw_frames),
+              (unsigned)(s_t_port_us / s_raw_frames),
+              (unsigned)(s_chunks / s_raw_frames),
+              (unsigned)s_tx_out_sz,
+              (unsigned)(s_t_ring_us / s_raw_frames),
+              (unsigned)(s_t_out_us / s_raw_frames));
+#if CORE_METER
+    {
+        static uint32_t was[2];
+        const uint32_t  a = s_laps[0], b = s_laps[1];
+        ag_printf("RAW: free laps per second: sys %u, app %u\n",
+                  (unsigned)((a - was[0]) / (unsigned)(STAT_US / 1000000ull)),
+                  (unsigned)((b - was[1]) / (unsigned)(STAT_US / 1000000ull)));
+        was[0] = a;
+        was[1] = b;
+    }
+#endif
+    ag_printf("RAW: worst us the caller spent inside: blit %u, text %u, "
+              "pcm %u\n",
+              (unsigned)s_in_blit_us, (unsigned)s_in_text_us,
+              (unsigned)s_in_pcm_us);
+    s_in_blit_us = 0;
+    s_in_text_us = 0;
+    s_in_pcm_us = 0;
+    ag_printf("RAW: palette %u colours, generation %u, %u pixels missed; "
+              "coded %u B a frame, %u us to build\n",
+              (unsigned)s_pal_used, (unsigned)s_pal_gen,
+              (unsigned)s_pal_miss, (unsigned)s_huf_bytes,
+              (unsigned)(s_t_huf_us / s_raw_frames));
+    ag_printf("RAW: moved %u of %u blocks a frame, %u of %u slices; "
+              "looked at %u\n",
+              (unsigned)(s_blocks_sent / s_raw_frames), (unsigned)BLK_N,
+              (unsigned)(s_slices_sent / s_raw_frames), 30u,
+              (unsigned)(s_dam_seen / s_raw_frames));
+    ag_printf("RAW: worst frame of the window: %u blocks, %u B, %u us to send\n",
+              (unsigned)s_worst_blocks, (unsigned)s_worst_bytes,
+              (unsigned)s_worst_send_us);
+    s_dam_seen = 0;
+    s_worst_blocks = 0;
+    s_worst_bytes = 0;
+    s_worst_send_us = 0;
+    s_t_huf_us = 0;
+    s_blocks_sent = 0;
+    s_slices_sent = 0;
+    aud_stats();
+    ag_printf("RAW: bytes in from the far end: %u\n", (unsigned)s_rx_bytes);
+    ag_printf("RAW: step4 apart, us per frame: header %u, handover %u, dma %u, "
+              "sum %u, between %u\n",
+              (unsigned)(s_t_hdr_us / s_raw_frames),
+              (unsigned)(s_t_wait_hand_us / s_raw_frames),
+              (unsigned)(s_t_dma_us / s_raw_frames),
+              (unsigned)(s_t_sum_us / s_raw_frames),
+              (unsigned)(s_t_rest_us / s_raw_frames));
+    s_t_hdr_us = 0;
+    s_t_wait_hand_us = 0;
+    s_t_dma_us = 0;
+    s_t_sum_us = 0;
+    s_t_rest_us = 0;
+    s_rx_bytes = 0;
+    s_t_gather_us = 0;
+    s_t_fill_us = 0;
+    s_chunks = 0;
+    s_t_ring_us = 0;
+    s_t_out_us = 0;
+    s_t_port_us = 0;
+    if (s_dropped != 0u || s_lost != 0u) {
+        ag_printf("RAW: %u slices refused (ring full), %u bytes lost in the "
+                  "port\n", (unsigned)s_dropped, (unsigned)s_lost);
+    }
+    s_raw_frames = 0;
+    s_raw_bytes = 0;
+    s_raw_resent = 0;
+}
+
+#if CORE_METER
+/*
+ * How much of each core nobody wanted: one counter per core, below every
+ * application, counting laps.  The number means nothing on its own - only
+ * against the same build in the other state, which is why it is always run
+ * twice: driver asleep, driver sending.
+ *
+ * It stands aside every few thousand laps.  The first version did not, and two
+ * tasks that never yield silenced the whole board.
+ */
+static void spin_task(void *arg)
+{
+    const uint32_t which = (uint32_t)(uintptr_t)arg;
+    uint32_t       n = 0;
+    while (!s_stop) {
+        s_laps[which]++;
+        if (++n >= 4096u) {
+            n = 0;
+            ag_yield();
+        }
+    }
+}
+#endif
+
+#if CORE_METER
+/*
+ * A clock with no hands, on the game's own core.
+ *
+ * It asks to be woken every hundred milliseconds and reports how late it was,
+ * measured against when the tick was due rather than against the previous one,
+ * so a stall is reported once at its true size.  It waits on nothing but the
+ * clock: no wire, no screen, no card.  If this is late while a frame is going
+ * out, the system is not running the application core's threads, which is
+ * Maxim's reading; if it is punctual while the game crawls, then nothing is
+ * being starved and the game is waiting on something of its own.
+ */
+static void tick_task(void *arg)
+{
+    (void)arg;
+    ag_printf("RAW: tick task alive\n");
+    const uint64_t us0 = (uint64_t)ag_api()->time->us();
+    uint64_t due = us0;
+    uint32_t n = 0, worst = 0;
+    while (!s_stop) {
+        due += 100000ull;
+        const uint64_t now = (uint64_t)ag_api()->time->us();
+        if (due > now) {
+            ag_delay((uint32_t)((due - now) / 1000ull));
+        }
+        const uint64_t woke = (uint64_t)ag_api()->time->us();
+        const uint32_t late =
+            (woke > due) ? (uint32_t)((woke - due) / 1000ull) : 0u;
+        if (late > worst) {
+            worst = late;
+        }
+        if (++n >= 10u) {
+            ag_printf("RAW: app-core tick: worst late %u ms of 10\n",
+                      (unsigned)worst);
+            worst = 0;
+            n = 0;
+        }
+    }
+}
+#endif
+
+/*
+ * The gaps: whatever is waiting, while there is no picture to send.
+ *
+ * Sound goes by DMA like the picture, so it goes first and the hardware is
+ * given back before the console is written - the console still travels by
+ * hand, and the processor must not be at the port while a transfer is in the
+ * air.
+ */
+static void wire_idle_traffic(void)
+{
+    aud_close_idle();
+    if (aud_pump(4u) != 0u) {
+        if (s_dma) {
+            (void)io->uart_dma_drain(LINK_PORT);
+        }
+        aud_settle();
+    }
+    if (s_tx_used != 0u) {
+        (void)tx_drain();
+    }
+}
+
+static void wire_task(void *arg)
+{
+    (void)arg;
+    s_wire_running = true;
+
+    /*
+     * Asked here rather than at load: the port is open by now, and on a chip
+     * without UHCI - the original ESP32, the S2 - this is simply false and the
+     * ordinary write carries the picture as it always did.
+     */
+    s_dma = (io->uart_dma_ready != NULL) && io->uart_dma_ready(LINK_PORT) &&
+            (io->uart_dma_submit != NULL) && (io->uart_dma_drain != NULL) &&
+            (io->uart_tx_wait != NULL);
+    ag_printf("REMDISP: picture by %s\n",
+              s_dma ? "DMA" : "the processor");
+#if PORT_ON_SYS_CORE
+    {
+        const ag_err_t e = io->uart_config(LINK_PORT, LINK_BAUD, 8, 0, 1);
+        ag_printf("REMDISP: port opened from the wire task: %s\n",
+                  ag_strerror(e));
+        s_up = (e == AG_OK);
+    }
+#endif
+    while (!s_stop) {
+        poll_far_end();
+        (void)tx_drain();
+        raw_stats();
+
+        /*
+         * Ask for a frame, and wait at the door rather than reaching in.  The
+         * game copies it at the end of its own frame - see rem_blit_rect - so
+         * what arrives here is never half drawn.
+         */
+        /*
+         * Built with -DRAW_SILENT=1 this driver publishes its devices, takes
+         * its task and its frame, and sends nothing at all - no copy, no
+         * slices, no port.  It exists to answer one question that three
+         * arithmetically impossible explanations failed to: is what costs the
+         * game the *sending*, or merely this driver being here?  One variable,
+         * and the game's own eng says which.
+         */
+#if RAW_SILENT == 1
+        ag_delay(20);
+        continue;
+#endif
+        /*
+         * -DSEND_ALWAYS=1: do not wait for anybody to draw.  The buffer is
+         * whatever it happens to hold, and it goes out again and again, which
+         * is all that is wanted from a test whose question is what a busy wire
+         * does to everything else.  With this the game need not be running at
+         * all, so nothing of the game's own can be blamed or credited.
+         */
+        if (!s_have_copy && !SEND_ALWAYS) {
+            /*
+             * Unless the far end has asked for the picture and the game is not
+             * going to draw one.  The driver is holding the last frame - that
+             * is what the 150 KB here is - so it can answer by itself, and the
+             * ordinary path below sends it.  Without this the answer to
+             * "I have nothing, send it again" is to wait for a game that is
+             * sitting on a dialogue box, which is for ever.
+             */
+            if (!sweep_due()) {
+                const uint64_t w0 = (uint64_t)ag_api()->time->us();
+                s_want_copy = true;
+                s_loops++;
+                wire_idle_traffic();
+                ag_delay(2);
+                s_t_wait_us += (uint32_t)((uint64_t)ag_api()->time->us() - w0);
+                continue;
+            }
+            s_have_copy = true;
+        }
+        /* What the last frame actually waited for the game, kept whole: the
+         * running total was being printed mid-wait and read as the answer. */
+        s_t_wait_last = s_t_wait_us;
+        s_t_wait_us = 0;
+        s_loops_last = s_loops;
+        s_loops = 0;
+
+        if (s_pkt == NULL) {
+            s_have_copy = false;
+            continue;
+        }
+
+#if FRAME_DUMP
+        frame_dump();
+#endif
+        const uint64_t t0 = (uint64_t)ag_api()->time->us();
+        const uint64_t b0 = s_sent_bytes;
+        raw_send_direct();
+        s_t_send_us = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+        if (s_t_send_us > s_worst_send_us) {
+            s_worst_send_us = s_t_send_us;
+        }
+        s_raw_bytes += s_sent_bytes - b0;
+        s_raw_frames++;
+
+        /*
+         * A moment for the far end to say what it missed, while the frame is
+         * still here to resend.  Once the next copy happens these pixels are
+         * gone, and a slice asked for after that is answered by the next whole
+         * frame instead - which is not worse, only later.
+         */
+        /*
+         * A moment for the far end to say what it missed, and a shorter one
+         * than it was.  Thirty milliseconds of every frame is seven per cent
+         * of the wire spent on insurance; ten is enough for a request that is
+         * already sitting in the receive buffer, and the far end has asked for
+         * nothing at all since the frames started arriving whole.
+         */
+        /*
+         * Only for a far end that has been asking.  The window is dead time on
+         * the wire - ten milliseconds of every four hundred - and it is there
+         * to catch a request for a slice that is about to be overwritten.  A
+         * receiver that has asked for nothing in the last few frames is not
+         * about to start between two of them, and if it does the next whole
+         * frame answers it anyway, one frame later.
+         */
+        const uint32_t window_ms = (s_raw_resent != 0u || s_asked_recently) ? 10u : 0u;
+        s_asked_recently = (s_raw_resent != 0u);
+        const uint64_t until =
+            (uint64_t)ag_api()->time->us() + (uint64_t)window_ms * 1000ull;
+        while ((uint64_t)ag_api()->time->us() < until && !s_stop) {
+            poll_far_end();
+            wire_idle_traffic();
+            ag_delay(2);
+        }
+
+        s_frame_no++;
+        s_have_copy = false;
+    }
+
+    /* Whatever is still queued, before the port stops being ours - and the
+     * transfers in the air first, because rem_stop is about to give their
+     * memory back. */
+    if (s_dma) {
+        (void)io->uart_dma_drain(LINK_PORT);
+    }
+    aud_settle();
+    (void)tx_drain();
+    s_wire_running = false;
+}
+
+/*
+ * Unload, in the one order that is safe.
+ *
+ * The kernel calls this while the image is still mapped and then waits for the
+ * task; what has to be settled before it frees the frame is that nobody is
+ * inside it.  Two users: the sender, which stops when it sees the flag, and
+ * blit_rect, which copies into the frame under the damage lock.  So the pointer
+ * is taken away under that lock - after which every blit takes the old path -
+ * and only then is the memory given back, once the sender has said it has
+ * gone.
+ *
+ * Not freeing it would be the other choice, and it is worse than it looks: a
+ * driver replaced twice would be holding three hundred kilobytes of a board
+ * that has eight megabytes and a game that wants six.
+ */
+static void rem_stop(void)
+{
+    s_stop = true;
+
+    const bool held = dmg_lock();
+    uint8_t *fb = s_pkt_raw;
+    s_pkt = NULL;
+    s_pkt_raw = NULL;
+    s_up = false; /* nothing more goes into the ring once it may be freed */
+    s_fb_w = 0;
+    s_fb_h = 0;
+    s_dmg = false;
+    dmg_unlock(held);
+
+    /*
+     * The sound's blocks the same way and for the same reason: taken away
+     * under the lock its producer holds, so a write already inside finishes
+     * into memory that is still there and every write after it finds NULL and
+     * counts a drop.  Freed below, once the sender has gone - the sender is
+     * what hands them to the DMA.
+     */
+    uint8_t *const ab = aud_take_blocks();
+
+    for (int i = 0; i < 200 && s_wire_running; i++) {
+        ag_delay(5);
+    }
+    if (!s_wire_running) {
+        ag_free(fb);
+        ag_free(ab);
+        ag_free(s_palpkt_raw);
+        s_palpkt = NULL;
+        s_palpkt_raw = NULL;
+        ag_free(s_hufpkt_raw);
+        s_hufpkt = NULL;
+        s_hufpkt_raw = NULL;
+        ag_free(s_out_raw);
+        s_out = NULL;
+        s_out_raw = NULL;
+        ag_free(s_tx);
+        s_tx = NULL;
+
+        /*
+         * And the grid, which nothing has ever given back: it is five
+         * kilobytes, and a driver loaded and replaced a dozen times over an
+         * afternoon of `drv install` had leaked sixty by the end.  Same
+         * ordering as the frame - after the sender has gone, because the
+         * sender is what reads it.
+         */
+        ag_free(s_hash);
+        s_hash = NULL;
+        s_hash_cols = 0;
+        s_hash_rows = 0;
+        s_surf_w = 0;
+        s_surf_h = 0;
     }
 }
 
@@ -977,7 +3905,58 @@ static ag_err_t rem_text_info(ag_handle_t h, uint16_t *cols, uint16_t *rows)
     return AG_OK;
 }
 
+/*
+ * How long a picture owns the glass after the last band of it went out.
+ *
+ * "Whoever painted last owns the glass" was already the rule here, and it was
+ * only ever applied to the repair sweep.  The console rows went out whatever
+ * was happening - so a game that prints to its own console, which is every
+ * game with a log or a frame counter, sent five rows a second down the wire
+ * beside its picture, and the far end switched to text for each of them.  On
+ * the glass that is not a picture with text over it: it is text, running,
+ * with the picture appearing between the lines.  Which is exactly the report -
+ * "no picture, only text running" - while this end's counters showed 26
+ * rectangles a second going out perfectly well.
+ *
+ * Two seconds, because it has to outlast the gap between two frames of a game
+ * that has slowed down, and be short enough that a game which exits gives the
+ * console its screen back without a wait anybody notices.
+ */
+#define TEXT_YIELDS_US 2000000ull
+
+/* True while the picture has the glass and the console has been going into the
+ * shadow unsent.  What it buys is the repaint below: rows are only sent when
+ * they change, so a console that changed while nobody was showing it would
+ * come back a line at a time over the top of the old picture. */
+static bool s_text_held;
+
+static void send_row_now(uint16_t row);
+
 static void send_row(uint16_t row)
+{
+    /*
+     * Not while an application is painting.  The text still goes into the
+     * shadow, so the whole console can be put out at once when the picture
+     * stops - which is the next thing that happens here.
+     */
+    const uint64_t now = (uint64_t)ag_api()->time->us();
+    if (s_last_blit_us != 0ull && now - s_last_blit_us < TEXT_YIELDS_US) {
+        s_text_held = true;
+        return;
+    }
+    if (s_text_held) {
+        s_text_held = false;
+        s_last_text_us = now;
+        for (uint32_t r = 0; r < REM_ROWS; r++) {
+            send_row_now((uint16_t)r);
+        }
+        return; /* this row went with the rest of them */
+    }
+    s_last_text_us = now;
+    send_row_now(row);
+}
+
+static void send_row_now(uint16_t row)
 {
     const uint32_t count = s_shadow_cols[row];
     if (count == 0) {
@@ -993,7 +3972,7 @@ static void send_row(uint16_t row)
     send_frame(FR_ROW, payload, 2u + count * 2u);
 }
 
-static void rem_text_row(ag_handle_t h, uint16_t row,
+static void rem_text_row_inner(ag_handle_t h, uint16_t row,
                          const ag_textcell_t *cells, uint16_t count)
 {
     (void)h;
@@ -1064,6 +4043,504 @@ static void rem_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
  * the far end's glass, because that is what a caller placing a picture needs to
  * know, and it is not the same as the console size above.
  */
+/* ---- sound -------------------------------------------------------------- */
+/*
+ * The same wire, one more opcode, and the far end becomes a sound card as well
+ * as a screen.  It has to be the same wire: the CYD breaks out three pins and
+ * two of them are already this link.
+ *
+ * Why this lives inside the display driver rather than in a .SYS of its own,
+ * which is where it belongs by subject: two modules writing one UART interleave
+ * their frames and neither arrives.  One module owning the port is the whole of
+ * the arrangement.
+ *
+ * Eight-bit mono on the wire, converted here rather than there.  Not a
+ * compromise for bandwidth - 88 KB/s of 22 kHz stereo would fit in 400 - but
+ * because that is what the far end plays: its output is one DAC pin into a
+ * small speaker, and sending sixteen-bit stereo would be sending three bytes
+ * out of four to be thrown away by the receiver's own conversion.  22 KB/s is
+ * five percent of the link, which is what leaves the picture alone.
+ *
+ * No pacing here, deliberately.  A sink that accepts everything instantly makes
+ * the program above it run its mixer as fast as the processor allows (the
+ * lesson written up over pcmnull's clock in dev/audio.c) - but that clock is
+ * upstream of this device, in api->audio, and it governs whatever reaches
+ * pcmmix.  A second one here would only fight it.  What this does instead is
+ * drop: if the wire cannot take the samples, they are counted and gone, because
+ * a sound device that blocks stops the game.
+ *
+ * ---- sound is the picture with a different payload -----------------------
+ *
+ * It used to be the odd one out, and the odd one out is what costs.  A write
+ * from the mixer was converted into a ring; a drain copied a chunk of that ring
+ * into a staging buffer; send_frame copied the staging buffer into the transmit
+ * ring a byte at a time, computing an xor as it went; tx_drain copied the
+ * transmit ring into the port's own buffer; and uart_write carried that to the
+ * hardware with the processor.  Four copies and a byte-wise checksum for five
+ * per cent of the traffic.
+ *
+ * The copies were not the worst of it.  The processor writing the port is a
+ * second master of a transmitter whose other master is the DMA, and the two
+ * cannot be interleaved - so every handover between them costs a wait for the
+ * port to go empty.  Sound between the slices meant thirty of those a frame,
+ * and they were measured to cost more than the bytes they carried; the cure at
+ * the time was to send all of the sound at the top of a frame and none of it
+ * during, which is 386 ms of jitter on a stream that has to arrive evenly.
+ *
+ * So sound is laid out exactly as the picture is: blocks of [thirty-two byte
+ * header][samples], aligned, contiguous, each of them a finished packet.  The
+ * mixer's write converts straight into a block, nothing copies it again, and
+ * the wire task hands it to the same DMA queue the slices go into.  Packets
+ * from the two streams interleave on the wire in the order they were queued,
+ * which is what a packet header is for - and a block of sound now costs the
+ * wire its own 544 bytes and nothing else whatever.
+ */
+#define AUD_RATE_DEFAULT 22050u
+
+/*
+ * 512 samples is 23 ms at 22 kHz, and 32 + 512 = 544 bytes is seventeen cache
+ * lines - so every block after the first lands aligned for free, which is the
+ * same arithmetic that makes the picture's blocks work.
+ *
+ * Why 23 ms and not the 11.6 the mixer hands down: a block is one transfer and
+ * one header, and at this size the sound is seventeen transfers in the time the
+ * picture takes thirty.  Halving it would double the queue traffic to buy an
+ * evenness the far end's own buffer already provides.
+ *
+ * Thirty-two blocks is 745 ms of cushion and seventeen kilobytes.  It has to be
+ * more than one picture's worth: a block handed to the DMA is not the
+ * producer's again until the frame's drain, so a whole frame of sound - all
+ * seventeen blocks of it - can be in the air at once, and the ring has to hold
+ * that much again to keep filling while it is.
+ */
+#define AUD_PKT_SAMPLES 512u
+#define AUD_PKT_BLK     (PKT_HDR + AUD_PKT_SAMPLES)
+#define AUD_PKTS        32u
+
+static ag_audio_fmt_t s_afmt;
+static bool           s_afmt_set;
+static uint64_t       s_abytes_in;
+static uint64_t       s_abytes_sent;
+static uint32_t       s_adropped;   /* samples the wire had no room for       */
+
+static uint8_t   *s_apkt;      /* aligned; AUD_PKTS header-and-samples blocks */
+static uint8_t   *s_apkt_raw;  /* what was actually allocated, for freeing    */
+static uint16_t   s_alen[AUD_PKTS]; /* real samples in each finished block    */
+static uint32_t   s_arate;
+static uint32_t   s_afill;     /* samples written into the block in hand      */
+static uint64_t   s_awrote_at; /* when the mixer last put a sample here       */
+/*
+ * Three counters, all of them counting blocks since the driver loaded and none
+ * of them ever reset: what matters is the difference between two, and unsigned
+ * arithmetic wraps the right way round.
+ *
+ *   below s_a_done          finished, the producer's again
+ *   s_a_done .. s_a_sent    handed to the hardware, still in the air
+ *   s_a_sent .. s_a_filled  finished packets waiting their turn
+ *   s_a_filled              the one being written into
+ *
+ * The producer only ever touches the block at s_a_filled, and only while
+ * s_a_filled - s_a_done is under AUD_PKTS; everything else is either the
+ * hardware's or queued behind it.  That is the whole of the concurrency here,
+ * and it is why no sample is ever copied twice.
+ */
+static uint32_t   s_a_filled, s_a_sent, s_a_done;
+static ag_mutex_t s_aud_lock;
+
+static uint8_t *apkt_block(uint32_t i)
+{
+    return s_apkt + (size_t)(i % AUD_PKTS) * AUD_PKT_BLK;
+}
+
+/*
+ * The header, filled in the moment before the block leaves - the same shape as
+ * the picture's, so the far end reads both with one piece of code: five bytes
+ * of framing, twelve of what-this-is, the sum at seventeen, zeroes to
+ * thirty-two.  Here the twelve say a rate, a count of samples and a sequence
+ * number, so a receiver can tell a gap from a reorder.
+ *
+ * Returns how many bytes to hand over.  That is rounded up to a cache line,
+ * because a transfer out of external memory has to be a whole number of them;
+ * the padding is whatever the block held last time round the ring and is not
+ * played, since the header says how many samples are real.  Thirty-one samples
+ * is a millisecond and a half, and only the last block of a sound is ever
+ * short.
+ */
+static uint32_t apkt_head(uint32_t idx, uint32_t samples)
+{
+    uint8_t *const q   = apkt_block(idx);
+    const uint32_t pad = (samples + (PKT_HDR - 1u)) & ~(PKT_HDR - 1u);
+    const uint32_t len = (PKT_HDR - 5u) + pad;
+
+    q[0] = FR_MAGIC0;
+    q[1] = FR_MAGIC1;
+    q[2] = FR_AUD;
+    q[3] = (uint8_t)len;
+    q[4] = (uint8_t)(len >> 8);
+    put16(q + 5, s_arate & 0xffffu);
+    put16(q + 7, s_arate >> 16);
+    put16(q + 9, samples);
+    put16(q + 11, idx & 0xffffu);
+    put16(q + 13, 0);
+    put16(q + 15, 0);
+    q[17] = 0;
+    memset(q + 18, 0, PKT_HDR - 18u);
+
+    uint32_t acc = 0;
+    for (uint32_t i = 5; i < 17u; i++) {
+        acc ^= (uint32_t)q[i] << (((i - 5u) & 3u) * 8u);
+    }
+    const uint32_t *w = (const uint32_t *)(const void *)(q + PKT_HDR);
+    for (uint32_t i = 0; i < pad / 4u; i++) {
+        acc ^= w[i];
+    }
+    q[17] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
+    return PKT_HDR + pad;
+}
+
+/* Everything handed over has left, so the blocks behind it are the producer's
+ * again.  Only ever called where the transfers are known to be finished. */
+static void aud_settle(void)
+{
+    if (s_a_done == s_a_sent) {
+        return;
+    }
+    const bool held = lock_take(s_aud_lock, 100u);
+    s_a_done = s_a_sent;
+    lock_give(s_aud_lock, held);
+}
+
+/*
+ * Hand over what is ready, up to a limit, and say how many went.
+ *
+ * The block is taken out of the queue under the lock and only then filled in
+ * and submitted, so a block the producer can still see is never one the
+ * hardware is about to read.  Called from the wire task and nowhere else -
+ * one writer of the port, which is the rule this whole driver is built on.
+ */
+static uint32_t aud_pump(uint32_t max)
+{
+    if (s_apkt == NULL) {
+        return 0u;
+    }
+    uint32_t went = 0;
+    while (went < max) {
+        const bool     held = lock_take(s_aud_lock, 100u);
+        const bool     any  = (s_a_filled - s_a_sent) != 0u;
+        const uint32_t idx  = s_a_sent;
+        const uint32_t n    = any ? s_alen[idx % AUD_PKTS] : 0u;
+        if (any) {
+            s_a_sent++;
+        }
+        lock_give(s_aud_lock, held);
+        if (!any) {
+            break;
+        }
+
+        const uint32_t bytes = apkt_head(idx, n);
+        bool sent = false;
+        if (s_dma) {
+            const int32_t w =
+                io->uart_dma_submit(LINK_PORT, apkt_block(idx), bytes);
+            if (w < 0) {
+                s_dma = false;
+                ag_printf("REMDISP: the port will not take a DMA transfer "
+                          "(%d); sound by hand\n", (int)w);
+            } else {
+                sent = true;
+            }
+        }
+        if (!sent) {
+            /* No DMA on this chip, or it has just refused one.  The block is
+             * a finished packet either way, so there is nothing to do here but
+             * carry it: no staging, no framing, no checksum. */
+            (void)io->uart_write(LINK_PORT, apkt_block(idx), bytes);
+            aud_settle();
+        }
+        s_abytes_sent += (uint64_t)n;
+        s_sent_frames++;
+        went++;
+    }
+    return went;
+}
+
+/*
+ * A block that has stopped filling.
+ *
+ * A sound ending part-way through one would otherwise sit here until the next
+ * sound started - the tail of a line of speech arriving behind the silence
+ * after it.  A tenth of a second with nothing written is the end of something,
+ * so close the block and let it go short.
+ */
+static void aud_close_idle(void)
+{
+    if (s_apkt == NULL || s_afill == 0u) {
+        return;
+    }
+    if ((uint64_t)ag_api()->time->us() - s_awrote_at < 100000ull) {
+        return;
+    }
+    const bool held = lock_take(s_aud_lock, 100u);
+    if (s_afill != 0u && (s_a_filled - s_a_done) < AUD_PKTS) {
+        s_alen[s_a_filled % AUD_PKTS] = (uint16_t)s_afill;
+        s_afill = 0;
+        s_a_filled++;
+    }
+    lock_give(s_aud_lock, held);
+}
+
+/*
+ * One line in the five-second report, and only when there is something to say.
+ * What matters here is whether the sound is keeping up: bytes a second says
+ * whether the mixer above is producing at its rate, the queue depth says
+ * whether the wire is taking them at that rate, and anything dropped says it
+ * stopped being true.
+ */
+static void aud_stats(void)
+{
+    static uint64_t was;
+    const uint32_t  n = (uint32_t)(s_abytes_sent - was);
+    was = s_abytes_sent;
+    if (n == 0u && s_adropped == 0u) {
+        return;
+    }
+    const uint32_t secs = (uint32_t)(STAT_US / 1000000ull);
+    ag_printf("RAW: sound %u B/s, %u blocks, %u waiting, %u dropped\n",
+              (unsigned)(n / secs),
+              (unsigned)((n + AUD_PKT_SAMPLES - 1u) / AUD_PKT_SAMPLES),
+              (unsigned)(s_a_filled - s_a_sent), (unsigned)s_adropped);
+    s_adropped = 0;
+}
+
+/*
+ * Unload: take the blocks away from the producer and say what to free.
+ *
+ * Under the lock, so a write already inside finishes into memory that is still
+ * there; every write after this finds NULL and counts a drop.  The memory is
+ * not freed here - the sender may still have blocks in the air, and rem_stop
+ * gives them back once it has gone.
+ */
+static uint8_t *aud_take_blocks(void)
+{
+    const bool held = lock_take(s_aud_lock, 1000u);
+    uint8_t *const raw = s_apkt_raw;
+    s_apkt = NULL;
+    s_apkt_raw = NULL;
+    lock_give(s_aud_lock, held);
+    return raw;
+}
+
+static void aud_default_fmt(ag_audio_fmt_t *out)
+{
+    out->rate = AUD_RATE_DEFAULT;
+    out->channels = 2;
+    out->bits = 16;
+}
+
+static int aud_fmt_ok(const ag_audio_fmt_t *fmt)
+{
+    return fmt != NULL && fmt->rate >= 8000u && fmt->rate <= 48000u &&
+           fmt->bits == 16u && (fmt->channels == 1u || fmt->channels == 2u);
+}
+
+static ag_err_t rem_pcm_open(ag_device_t *dev, uint32_t flags)
+{
+    (void)dev;
+    (void)flags;
+    if (!s_afmt_set) {
+        aud_default_fmt(&s_afmt);
+        s_afmt_set = true;
+    }
+    return s_up ? AG_OK : -AG_ENODEV;
+}
+
+static ag_err_t rem_pcm_close(ag_device_t *dev)
+{
+    (void)dev;
+    return AG_OK;
+}
+
+/*
+ * Signed 16-bit to unsigned 8-bit is the top byte with the sign flipped, and
+ * two channels become one by averaging rather than by dropping the right - the
+ * same arithmetic the far end's DAC driver does, moved to this side of the
+ * wire.  An effect that lives in one channel would otherwise vanish, and there
+ * is no stereo at the other end to lose it in.
+ */
+static int32_t rem_pcm_write_inner(ag_device_t *dev, const void *buf, size_t len,
+                             uint64_t off)
+{
+    (void)dev;
+    (void)off;
+
+    if (buf == NULL || len < 2u) {
+        return -AG_EINVAL;
+    }
+    if (!s_afmt_set) {
+        aud_default_fmt(&s_afmt);
+        s_afmt_set = true;
+    }
+
+    const uint32_t chans = s_afmt.channels ? s_afmt.channels : 2u;
+    const size_t   frame_bytes = (size_t)chans * sizeof(int16_t);
+    const size_t   frames = len / frame_bytes;
+    if (frames == 0u) {
+        return -AG_EINVAL;
+    }
+    s_abytes_in += (uint64_t)(frames * frame_bytes);
+
+    /*
+     * Converted straight into the block that will leave by DMA - there is no
+     * second buffer between this and the wire.  It returns at once and holds
+     * nothing across the port, which is the whole point: a sound device that
+     * waits stops the game above it.
+     */
+    const int16_t *src   = (const int16_t *)buf;
+    const bool     wheld = lock_take(s_aud_lock, 100u);
+    s_arate = s_afmt.rate;
+    if (s_apkt == NULL) {
+        s_adropped += (uint32_t)frames;
+    } else {
+        for (size_t i = 0; i < frames; i++) {
+            uint8_t m;
+            if (chans == 2u) {
+                const int32_t mono =
+                    ((int32_t)src[i * 2u] + src[i * 2u + 1u]) / 2;
+                m = (uint8_t)((mono + 32768) >> 8);
+            } else {
+                m = (uint8_t)(((int32_t)src[i] + 32768) >> 8);
+            }
+            if (s_afill == 0u && (s_a_filled - s_a_done) >= AUD_PKTS) {
+                if (s_a_filled == s_a_sent) {
+                    /* Every block is in the air at once, which takes a frame
+                     * of picture far longer than one should ever be.  There is
+                     * nowhere to put this sample. */
+                    s_adropped++;
+                    continue;
+                }
+                /*
+                 * Otherwise: three quarters of a second is queued and the wire
+                 * is not going to catch up.  Playing the backlog out in order
+                 * would only keep the sound that far behind the picture for
+                 * ever, so the queue is thrown away and the sound starts again
+                 * from now.  What is in the air is left alone - it belongs to
+                 * the hardware until the frame's drain.
+                 */
+                s_adropped += (s_a_filled - s_a_sent) * AUD_PKT_SAMPLES;
+                s_a_filled = s_a_sent;
+            }
+            apkt_block(s_a_filled)[PKT_HDR + s_afill] = m;
+            s_afill++;
+            if (s_afill == AUD_PKT_SAMPLES) {
+                s_alen[s_a_filled % AUD_PKTS] = (uint16_t)AUD_PKT_SAMPLES;
+                s_afill = 0;
+                s_a_filled++;
+            }
+        }
+        s_awrote_at = (uint64_t)ag_api()->time->us();
+    }
+    lock_give(s_aud_lock, wheld);
+
+    /*
+     * Always a full accept.  What did not reach the glass is in the counters,
+     * and a short return here would only make the mixer above offer it again.
+     */
+    return (int32_t)(frames * frame_bytes);
+}
+
+static ag_err_t rem_pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
+                              size_t arglen)
+{
+    (void)dev;
+
+    if (cmd == AG_IOC_AUDIO_GETFMT) {
+        if (arg == NULL || arglen < sizeof(ag_audio_fmt_t)) {
+            return -AG_EINVAL;
+        }
+        if (!s_afmt_set) {
+            aud_default_fmt(&s_afmt);
+            s_afmt_set = true;
+        }
+        *(ag_audio_fmt_t *)arg = s_afmt;
+        return AG_OK;
+    }
+    if (cmd == AG_IOC_AUDIO_SETFMT) {
+        if (arg == NULL || arglen < sizeof(ag_audio_fmt_t)) {
+            return -AG_EINVAL;
+        }
+        if (!aud_fmt_ok((const ag_audio_fmt_t *)arg)) {
+            return -AG_EINVAL;
+        }
+        s_afmt = *(const ag_audio_fmt_t *)arg;
+        s_afmt_set = true;
+        return AG_OK;
+    }
+    if (cmd == AG_IOC_AUDIO_GETSTATS) {
+        if (arg == NULL || arglen < sizeof(ag_audio_stats_t)) {
+            return -AG_EINVAL;
+        }
+        ag_audio_stats_t *st = (ag_audio_stats_t *)arg;
+        memset(st, 0, sizeof(*st));
+        st->bytes_in = s_abytes_in;
+        st->bytes_sent = s_abytes_sent;
+        return AG_OK;
+    }
+    if (cmd == AG_IOC_FLUSH || cmd == AG_IOC_RESET) {
+        return AG_OK;
+    }
+    return -AG_ENOTSUP;
+}
+
+/* ---- how long the caller spends in here ---------------------------------
+ *
+ * Everything the game asks of this driver goes through one of these three, so
+ * timing them from the outside answers the question the whole investigation
+ * came down to: while a frame is on the wire the game's engine step grows from
+ * 20 ms to 580, its own core is provably free, and a thread of priority twelve
+ * on that core wakes on time.  So the game is waiting somewhere, and if it is
+ * waiting in here, this is where it shows.  Worst case per window, because an
+ * average would hide exactly the stall being hunted.
+ */
+static void rem_blit_rect(ag_handle_t h, const ag_blit_t *b)
+{
+    const uint64_t t0 = (uint64_t)ag_api()->time->us();
+    rem_blit_rect_inner(h, b);
+    const uint32_t d = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+    if (d > s_in_blit_us) {
+        s_in_blit_us = d;
+    }
+}
+
+static void rem_text_row(ag_handle_t h, uint16_t row,
+                         const ag_textcell_t *cells, uint16_t count)
+{
+    const uint64_t t0 = (uint64_t)ag_api()->time->us();
+    rem_text_row_inner(h, row, cells, count);
+    const uint32_t d = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+    if (d > s_in_text_us) {
+        s_in_text_us = d;
+    }
+}
+
+static int32_t rem_pcm_write(ag_device_t *dev, const void *buf, size_t len,
+                             uint64_t off)
+{
+    const uint64_t t0 = (uint64_t)ag_api()->time->us();
+    const int32_t  r = rem_pcm_write_inner(dev, buf, len, off);
+    const uint32_t d = (uint32_t)((uint64_t)ag_api()->time->us() - t0);
+    if (d > s_in_pcm_us) {
+        s_in_pcm_us = d;
+    }
+    return r;
+}
+
+static const ag_dev_ops_t k_pcm_ops = {
+    .open = rem_pcm_open,
+    .close = rem_pcm_close,
+    .write = rem_pcm_write,
+    .ioctl = rem_pcm_ioctl,
+};
+
 static ag_err_t rem_info(ag_handle_t h, ag_gfxinfo_t *out)
 {
     (void)h;
@@ -1090,55 +4567,47 @@ static const ag_display_ops_t k_display_ops = {
     .blit_rect = rem_blit_rect,
 };
 
-static const ag_dev_ops_t k_dev_ops = {
-    .ioctl = NULL,
-};
-
 /*
- * THE WIRE AS A PIPE, and this is the whole point of the driver rather than a
- * sideline.
+ * The only switch this driver has, and it turns the cleverness off.
  *
- * What this driver does for a screen - build a frame as big as the transport
- * will take, hand it over in ONE transaction, and check it at the far end with
- * a checksum - is not about pixels.  Measured on this pair at 40 MHz it moves
- * 2.68 MB/s with one bad frame in 6043.  The cluster link over the same four
- * wires moves about 20 KB/s, and the difference is not the data and not the
- * copper: it cuts the stream into 248-byte frames and waits for an
- * acknowledgement of each, so the bytes in flight are a window of 5.9 KB
- * against a measured round trip of 25 to 45 ms.
+ * Everything else here is arithmetic that cannot disagree with itself.  The
+ * hash grid is not: it is a claim about a machine at the other end of a wire,
+ * and when the claim is wrong - a frame the line lost, a receiver that missed
+ * a byte - the picture stays wrong until the slow repair sweep reaches those
+ * rows.  With the trimming off every rectangle is sent whole, which is a
+ * quarter of a second for a full screen and cannot be wrong at all.
  *
- * So the shape is offered to everybody else as a character device.  Write to
- * /dev/wire0 and the bytes cross in frames of FR_MAX_PAYLOAD, one transaction
- * each.  What it does NOT do, and the caller must know: there is no
- * acknowledgement and nothing is sent again.  A frame that fails its checksum
- * at the far end is counted and dropped.  That is the right trade for pixels
- * and for anything idempotent or checkpointed above; it is the wrong one for a
- * file transfer that must not lose a byte, and the answer for those is a
- * batched acknowledgement on top of this, not a return to 248-byte frames.
+ * It is the floor to measure against, and the first thing to try when a
+ * picture is misbehaving and nobody knows whose fault it is.
  */
-static int32_t pipe_write(ag_device_t *dev, const void *buf, size_t len,
-                          uint64_t off)
+static ag_err_t rem_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
+                          size_t arglen)
 {
     (void)dev;
-    (void)off;
-    if (!s_up || buf == NULL) {
-        return -AG_ENODEV;
+    if (cmd != AG_IOC_DISPLAY_TRIM) {
+        return -AG_ENOTSUP;
     }
-
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t         left = len;
-    while (left > 0u) {
-        const uint32_t n =
-            (left > FR_MAX_PAYLOAD) ? FR_MAX_PAYLOAD : (uint32_t)left;
-        send_frame(FR_BULK, p, n);
-        p += n;
-        left -= n;
+    if (arg == NULL || arglen < sizeof(int)) {
+        return -AG_EINVAL;
     }
-    return (int32_t)len;
+    /*
+     * A level, not a flag: 0 is raw bands and no memory of the far end, 1 is
+     * lossless packing with no memory, 2 is everything.  The bottom level is
+     * the one the whole switch exists for - what arrives is exactly what was
+     * in the buffer, band by band, and there is nothing left in this driver
+     * that could disagree with the screen.
+     */
+    const int level = *(const int *)arg;
+    s_encode = level >= 1;
+    s_trim = level >= 2;
+    if (!s_trim) {
+        hash_forget();
+    }
+    return AG_OK;
 }
 
-static const ag_dev_ops_t k_pipe_ops = {
-    .write = pipe_write,
+static const ag_dev_ops_t k_dev_ops = {
+    .ioctl = rem_ioctl,
 };
 
 ag_err_t ag_driver_init(void)
@@ -1146,6 +4615,12 @@ ag_err_t ag_driver_init(void)
     io = ag_api()->io;
     if (io == NULL || !AG_HAS(io, uart_write)) {
         return -AG_ENOTSUP;
+    }
+    if (ag_api()->task != NULL && ag_api()->task->mutex_create != NULL) {
+        s_tx_lock = ag_api()->task->mutex_create();
+        s_drain_lock = ag_api()->task->mutex_create();
+        s_aud_lock = ag_api()->task->mutex_create();
+        s_send_lock = ag_api()->task->mutex_create();
     }
 
     /*
@@ -1155,66 +4630,25 @@ ag_err_t ag_driver_init(void)
      * header warns about.  Failing now also means the fault arrives as a driver
      * that did not load rather than as a screen that stays dark for no reason.
      */
-    /* Which wire, before anything is opened.  A board that says nothing gets
-     * the UART, which is what every board that has one has had. */
-    char wire[8];
-    ag_strlcpy(wire, "uart", sizeof(wire));
-    if (ag_api()->cfg != NULL && AG_HAS(ag_api()->cfg, get_str)) {
-        (void)ag_api()->cfg->get_str("remdisp.wire", wire, sizeof(wire));
-    }
-    if (wire[0] == 's' || wire[0] == 'S') {
-        s_wire = RD_WIRE_SPI;
-    } else if (wire[0] == 'n' || wire[0] == 'N') {
-        s_wire = RD_WIRE_NONE;
-    }
-    if (ag_api()->cfg != NULL && AG_HAS(ag_api()->cfg, get_int)) {
-        s_bus = ag_api()->cfg->get_int("remdisp.bus", s_bus);
-        s_cs = ag_api()->cfg->get_int("remdisp.cs", s_cs);
-        s_khz = (uint32_t)ag_api()->cfg->get_int("remdisp.khz", (int32_t)s_khz);
-        s_baud = (uint32_t)ag_api()->cfg->get_int("remdisp.baud",
-                                                  (int32_t)s_baud);
-        s_blk = (uint32_t)ag_api()->cfg->get_int("remdisp.block",
-                                                 (int32_t)s_blk);
-        const int32_t g = ag_api()->cfg->get_int("remdisp.gap_us",
-                                                 (int32_t)s_gap);
-        s_gap = (g > 0) ? (uint32_t)g : 0u;
-    }
-    if (s_blk == 0u || s_blk > 8192u) {
-        s_blk = 512u;
-    }
-
-    s_frame = (uint8_t *)ag_malloc_caps(5u + FR_MAX_PAYLOAD + 1u,
-                                        (s_wire == RD_WIRE_SPI) ? AG_MEM_DMA
-                                                                : AG_MEM_DEFAULT);
-    if (s_frame == NULL) {
-        ag_printf("REMDISP: no room for a %u byte frame buffer\n",
-                  (unsigned)(5u + FR_MAX_PAYLOAD + 1u));
-        return -AG_ENOMEM;
-    }
-
-    ag_err_t err;
-    if (s_wire == RD_WIRE_SPI) {
-        if (!AG_HAS(io, spi_xfer) || !AG_HAS(io, spi_config)) {
-            ag_printf("REMDISP: this kernel has no io->spi_xfer\n");
-            return -AG_ENOTSUP;
-        }
-        err = io->spi_config(s_bus, s_cs, s_khz);
-        if (err != AG_OK) {
-            ag_printf("REMDISP: spi%d cs%d at %u kHz: %s\n", s_bus, s_cs,
-                      (unsigned)s_khz, ag_strerror(err));
-            ag_printf("REMDISP: set [spi%d] sck/mosi/miso in C:\\BOARD.CFG\n",
-                      s_bus);
-            return err;
-        }
-    } else {
-        err = io->uart_config(LINK_PORT, s_baud, 8, 0, 1);
-        if (err != AG_OK) {
-            ag_printf("REMDISP: uart%d at %u baud: %s\n", LINK_PORT,
-                      (unsigned)s_baud, ag_strerror(err));
-            ag_printf("REMDISP: set [uart%d] tx/rx in C:\\BOARD.CFG\n",
-                      LINK_PORT);
-            return err;
-        }
+    /*
+     * Where this call is made decides which core the UART's interrupt lands
+     * on: uart_driver_install allocates it on the calling core, and this
+     * function runs on the console's - which is the game's.  At four megabaud
+     * the transmitter empties its FIFO every 320 us, so that is three thousand
+     * interrupts a second into whichever core is unlucky.  Built with
+     * -DPORT_ON_SYS_CORE=1 the port is opened by the wire task instead, which
+     * is pinned to the system core, and nothing else changes.
+     */
+#if PORT_ON_SYS_CORE
+    const ag_err_t err = AG_OK;
+#else
+    const ag_err_t err = io->uart_config(LINK_PORT, LINK_BAUD, 8, 0, 1);
+#endif
+    if (err != AG_OK) {
+        ag_printf("REMDISP: uart%d at %u baud: %s\n", LINK_PORT,
+                  (unsigned)LINK_BAUD, ag_strerror(err));
+        ag_printf("REMDISP: set [uart%d] tx/rx in C:\\BOARD.CFG\n", LINK_PORT);
+        return err;
     }
     s_up = true;
 
@@ -1233,43 +4667,257 @@ ag_err_t ag_driver_init(void)
     }
 
     /*
-     * Which wire, said out loud.  It used to say `uart` whichever one was
-     * open, and a banner that names the wrong transport is worse than none:
-     * a run over SPI printed `uart1 at 4000000 baud` and cost an hour of
-     * looking for a fault in the wrong half of the system.
+     * The sound card that shares the wire.  A separate device rather than a
+     * second face of rem0, because that is what the mixer looks for: pcmmix
+     * picks its sink by name, and `pcmrem` is in that list ahead of pcm0 -
+     * which on a board whose amplifier was unsoldered is a converter playing to
+     * nothing.  Registered second and not fatal if it fails: a screen with no
+     * sound is worth having, the other way round is not.
      */
-    if (s_wire == RD_WIRE_NONE) {
-        ag_printf("REMDISP: no wire - frames are built and dropped; "
-                  "%ux%u cells, pixels in %u-row bands\n",
-                  (unsigned)REM_COLS, (unsigned)REM_ROWS,
-                  (unsigned)BAND_ROWS);
-    } else if (s_wire == RD_WIRE_SPI) {
-        ag_printf("REMDISP: spi%d cs%d at %u kHz, blocks of %u; %ux%u cells, "
-                  "pixels in %u-row bands\n",
-                  s_bus, s_cs, (unsigned)s_khz, (unsigned)s_blk,
-                  (unsigned)REM_COLS, (unsigned)REM_ROWS,
-                  (unsigned)BAND_ROWS);
-    } else {
-        ag_printf("REMDISP: uart%d at %u baud; %ux%u cells, "
-                  "pixels in %u-row bands\n",
-                  LINK_PORT, (unsigned)s_baud, (unsigned)REM_COLS,
-                  (unsigned)REM_ROWS, (unsigned)BAND_ROWS);
-    }
-    /*
-     * And the same wire as a pipe.  A failure to publish it is not a failure
-     * to be a screen, so it is noted and the driver stays up.
-     */
-    const ag_dev_add_t pipe_desc = {
-        .name = "wire0",
-        .driver = "REMDISP",
-        .cls = AG_DEV_CHAR,
-        .flags = 0,
-        .ops = &k_pipe_ops,
-        .priv = NULL,
-    };
-    if (ag_dev_add(&pipe_desc) != AG_OK) {
-        ag_printf("REMDISP: /dev/wire0 could not be published\n");
+    {
+        const ag_dev_add_t pcm = {
+            .name = "pcmrem",
+            .driver = "REMDISP",
+            .cls = AG_DEV_AUDIO,
+            .flags = AG_DEVF_EXCLUSIVE,
+            .ops = &k_pcm_ops,
+            .priv = NULL,
+        };
+        /*
+         * -DNO_AUDIO=1 leaves the speaker unpublished, so the game finds no
+         * sink on this wire and its sound goes nowhere.  One variable, and it
+         * decides whether what stalls the game is the picture leaving or the
+         * sound trying to leave beside it: the game paces itself on audio, and
+         * audio here shares the wire with a hundred and fifty kilobytes.
+         */
+#if NO_AUDIO
+        const ag_err_t pcm_added = -AG_EINVAL;
+#else
+        const ag_err_t pcm_added = ag_dev_add(&pcm);
+#endif
+        if (pcm_added != AG_OK) {
+            ag_printf("REMDISP: no pcmrem (%s); the screen still works\n",
+                      ag_strerror(pcm_added));
+        }
     }
 
+    /*
+     * Take the hash grid now, at boot, rather than on the first band.
+     *
+     * It is only 4800 bytes since it stopped being a copy of the frame, so this
+     * is no longer about the memory - it is about *when*.  Asking lazily means
+     * asking after whatever application is now on the screen has taken its
+     * arena, and on this board that is a game holding six megabytes of the
+     * eight; the screen would then quietly stop trimming at the one moment
+     * there was finally something to look at, and nothing would say why.  A
+     * display driver owns its frame memory and does not queue behind the
+     * programs it is showing.
+     *
+     * 320x240 is what rem_info advertises, so it is what the kernel's own
+     * surface will be.  An application that presents something bigger still
+     * works: prev_ready reallocates, and if that fails the picture is sent
+     * whole - slower, not broken.
+     */
+    if (!prev_ready(320u, 240u)) {
+        ag_printf("REMDISP: no damage grid; every band will be sent whole\n");
+    }
+
+    /*
+     * The frame, and the task that sends it - both taken here, at boot, and for
+     * the same two reasons the grid above is.
+     *
+     * When: a hundred and fifty kilobytes asked for lazily is a hundred and
+     * fifty kilobytes asked for after the game has taken six megabytes of the
+     * eight, and the answer would be no at exactly the moment there was
+     * finally something worth showing.
+     *
+     * Whose: memory asked for from inside blit_rect is charged to whoever
+     * called in, because that is what a process arena is - so a display driver
+     * allocating there would be spending the game's memory to show the game.
+     * ag_driver_init runs on no process, and what is asked for here comes from
+     * the system heap.
+     */
+    s_fb_w = 320u;
+    s_fb_h = 240u;
+    /*
+     * Internal first, and as big a mouthful as it will give: 32 KB means one
+     * uart_write per two slices instead of seventy-five per frame, and the
+     * port stops reading PSRAM altogether.  Whatever is refused falls back to
+     * what was there before, so a system with no internal memory to spare
+     * still gets a picture - just the slow one.
+     */
+    /*
+     * Eight kilobytes now, not thirty-two: this buffer carries console text
+     * and nothing else since the picture started leaving by DMA, and the
+     * internal memory it was holding is worth more to the coder's output
+     * blocks, which are written by the processor once a slice.
+     */
+    static const uint32_t want[] = { 8192u, 4096u, 2048u };
+    for (uint32_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        uint8_t *fast = (uint8_t *)ag_malloc_caps(want[i], AG_MEM_FAST);
+        if (fast != NULL) {
+            s_tx_out    = fast;
+            s_tx_out_sz = want[i];
+            break;
+        }
+    }
+    /* The ring stays where it was on purpose: one variable per measurement,
+     * and this run is about the buffer the port reads from. */
+    s_tx = (uint8_t *)ag_malloc(TX_RING);
+    ag_printf("REMDISP: port buffer %u B %s, ring %u B\n",
+              (unsigned)s_tx_out_sz,
+              (s_tx_out == s_tx_out_fallback) ? "in PSRAM (none spare)"
+                                              : "internal",
+              (unsigned)TX_RING);
+    /*
+     * One block per slice, and thirty-one bytes of slack so the first block
+     * can be pushed up to the alignment the DMA wants.  ag_malloc promises
+     * nothing about alignment and does not have to: this is the only place
+     * that cares.
+     */
+    /*
+     * Two strides in one arena.  A slice as RGB565 is 32 + 5120 = 5152 bytes
+     * and as indices 32 + 2560 = 2592, both whole numbers of cache lines, and
+     * the arena is sized for the larger so that a scene the palette cannot
+     * describe can still be sent the old way without asking for memory in the
+     * middle of a game.
+     */
+    s_blk_565 = PKT_HDR + RAW_ROWS * s_fb_w * (uint32_t)sizeof(uint16_t);
+    s_blk_idx = PKT_HDR + RAW_ROWS * s_fb_w;
+    s_pkt_blk = s_pal_on ? s_blk_idx : s_blk_565;
+    pal_clear();
+    {
+        const size_t want =
+            (size_t)((s_fb_h + RAW_ROWS - 1u) / RAW_ROWS) * s_blk_565;
+        s_pkt_raw = (uint8_t *)ag_malloc(want + PKT_HDR - 1u);
+        s_pkt = (s_pkt_raw == NULL)
+                    ? NULL
+                    : (uint8_t *)(((uintptr_t)s_pkt_raw + PKT_HDR - 1u) &
+                                  ~(uintptr_t)(PKT_HDR - 1u));
+    }
+    /*
+     * And the sound's own blocks, by the same arithmetic: 32 + 512 is a whole
+     * number of cache lines, so aligning the front of the run aligns every one
+     * of them.  Seventeen kilobytes.  A driver that cannot have them still
+     * shows a picture - it simply has nowhere to put sound, and says so in the
+     * counters rather than in a fault.
+     */
+    s_apkt_raw =
+        (uint8_t *)ag_malloc((size_t)AUD_PKTS * AUD_PKT_BLK + PKT_HDR - 1u);
+    s_apkt = (s_apkt_raw == NULL)
+                 ? NULL
+                 : (uint8_t *)(((uintptr_t)s_apkt_raw + PKT_HDR - 1u) &
+                               ~(uintptr_t)(PKT_HDR - 1u));
+    if (s_apkt == NULL) {
+        ag_printf("REMDISP: no blocks for the sound (%u KB); the picture goes "
+                  "out alone\n",
+                  (unsigned)(AUD_PKTS * AUD_PKT_BLK / 1024u));
+    }
+
+    /* And one more block for the palette. */
+    s_palpkt_raw = (uint8_t *)ag_malloc(PAL_BLK + PKT_HDR - 1u);
+    s_palpkt = (s_palpkt_raw == NULL)
+                   ? NULL
+                   : (uint8_t *)(((uintptr_t)s_palpkt_raw + PKT_HDR - 1u) &
+                                 ~(uintptr_t)(PKT_HDR - 1u));
+    if (s_palpkt == NULL) {
+        s_pal_on = false; /* no palette to send means no indices to send */
+    }
+
+    /*
+     * The coder's table packet, and eight rotating blocks to code slices into.
+     * Twenty-one kilobytes; without them the picture still goes, as indices.
+     */
+    /* Room for the table and, behind it, the thirty-two bytes that close a
+     * frame - HTAB_BLK is a whole number of cache lines, so the second block
+     * is aligned by being where it is. */
+    s_hufpkt_raw = (uint8_t *)ag_malloc(HTAB_BLK + PKT_HDR + PKT_HDR - 1u);
+    s_hufpkt = (s_hufpkt_raw == NULL)
+                   ? NULL
+                   : (uint8_t *)(((uintptr_t)s_hufpkt_raw + PKT_HDR - 1u) &
+                                 ~(uintptr_t)(PKT_HDR - 1u));
+    s_donepkt = (s_hufpkt == NULL) ? NULL : s_hufpkt + HTAB_BLK;
+    /*
+     * Internal memory if there is any: the coder writes these by hand, a byte
+     * at a time, while the game is walking PSRAM on the other core - and every
+     * byte written to PSRAM here is a byte the game does not get.  The DMA
+     * reads internal memory just as happily.
+     */
+    s_out_blk = s_blk_idx;
+    s_out_raw = (uint8_t *)ag_malloc_caps(
+        (size_t)HUF_BLKS * s_out_blk + PKT_HDR - 1u, AG_MEM_FAST);
+    if (s_out_raw == NULL) {
+        s_out_raw = (uint8_t *)ag_malloc((size_t)HUF_BLKS * s_out_blk +
+                                         PKT_HDR - 1u);
+    }
+    s_out = (s_out_raw == NULL)
+                ? NULL
+                : (uint8_t *)(((uintptr_t)s_out_raw + PKT_HDR - 1u) &
+                              ~(uintptr_t)(PKT_HDR - 1u));
+    if (s_hufpkt == NULL || s_out == NULL) {
+        ag_printf("REMDISP: no room to code the picture (%u KB); it goes as "
+                  "one byte a pixel\n",
+                  (unsigned)((HUF_BLKS * s_out_blk + HTAB_BLK) / 1024u));
+    }
+
+    if (s_pkt == NULL || s_tx == NULL) {
+        s_fb_w = 0;
+        s_fb_h = 0;
+        ag_printf("REMDISP: no frame of my own (%u KB); the wire will be fed "
+                  "by whoever draws, and they will wait for it\n",
+                  (unsigned)(320u * 240u * 2u / 1024u));
+    } else {
+        memset(s_pkt, 0,
+               (size_t)((s_fb_h + RAW_ROWS - 1u) / RAW_ROWS) * s_blk_565);
+        if (ag_api()->task != NULL && ag_api()->task->mutex_create != NULL) {
+            s_dmg_lock = ag_api()->task->mutex_create();
+        }
+        /*
+         * Six kilobytes of stack: send_rect's work space is static (see the
+         * note above it), so what is on the stack here is the band loop's own
+         * arithmetic and a twelve byte header.  Priority above the default so
+         * the wire keeps being fed while a game holds both cores; it spends its
+         * life blocked on a UART, so preferring it costs nothing.
+         */
+        s_stop = false;
+#if CORE_METER
+        /*
+         * One probe, not three.  A module is allowed two tasks, and the wire
+         * needs one of them: asking for more took the wire's slot and the
+         * driver quietly fell back to sending from whoever draws - which sent
+         * nothing at all, and made a run that looked like a cure.
+         */
+        ag_printf("RAW: tick probe: %s\n",
+                  ag_module_task(tick_task, NULL, "remtick", 3072u, TICK_PRIO,
+                                 AG_THREAD_APP_CORE)
+                      ? "yes" : "no");
+#endif
+        /*
+         * The priority is a knob because it is a claim, not a fact: six is
+         * above every ordinary application, and a task above applications is
+         * promising to block at once.  This one does not - it sits in a write
+         * that lasts most of a frame.  -DWIRE_PRIO=3 puts it below them and
+         * says whether that promise is what the game is paying for.
+         */
+        if (!ag_module_task(wire_task, NULL, "remwire", 6144u, WIRE_PRIO,
+                            AG_THREAD_SYS_CORE)) {
+            ag_free(s_pkt_raw);
+            s_pkt = NULL;
+            s_pkt_raw = NULL;
+            s_fb_w = 0;
+            s_fb_h = 0;
+            ag_printf("REMDISP: no task of my own; sending from the caller\n");
+        } else {
+            s_task_ok = true;
+            ag_module_on_unload(rem_stop);
+        }
+    }
+
+    ag_printf("REMDISP: uart%d at %u baud, budget %u B/s; %ux%u cells, "
+              "pixels in %u-row bands%s, %s\n",
+              LINK_PORT, (unsigned)LINK_BAUD, (unsigned)WIRE_BUDGET_BPS,
+              (unsigned)REM_COLS, (unsigned)REM_ROWS, (unsigned)BAND_ROWS,
+              (s_pkt != NULL) ? ", sent from a task of its own" : "",
+              s_pal_on ? "one byte a pixel" : "RGB565");
     return AG_OK;
 }

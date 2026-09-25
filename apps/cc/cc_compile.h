@@ -34,7 +34,7 @@ extern "C" {
 #define API_OFF_TIME  40
 #define API_OFF_PROC  48
 #define API_OFF_AUDIO 60
-#define API_OFF_CLU   84
+#define API_OFF_CLU   88 /* after main's store, since the 0.63 merge */
 
 #define MEM_OFF_ALLOC   4
 #define MEM_OFF_REALLOC 12
@@ -151,7 +151,7 @@ extern "C" {
 #define ABI_MINOR_GFX25  25
 #define ABI_MINOR_GFX26  26
 #define ABI_MINOR_FOCUS  20
-#define ABI_MINOR_CLUSTER 52
+#define ABI_MINOR_CLUSTER 63 /* 0.52 on main's line is a kernel without clu */
 #define ABI_MINOR_MIGRATE 53
 
 /*

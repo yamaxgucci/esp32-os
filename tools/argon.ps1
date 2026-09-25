@@ -78,7 +78,13 @@ ArgonOS
                            (FAT16 snapshot; then: argon run -Sd)
   argon get GUEST [OUT]    copy a file out of build\sdcard.img to the host
                            (e.g. argon get shot.ppm)
+  argon fallout [args]     build FALLOUT2.AXE (apps/fallout/build.py) with
+                           the IDF toolchain on PATH; -game 1 for Fallout 1
   argon test [-Send ...]   automated boot test; prints the resulting screen
+                           (a guest command must not END in a backslash:
+                            PowerShell escapes it into the next argument and
+                            the guest sees the two glued together.  Write
+                            "copy a:\x.cfg c:\x.cfg", never "... c:\")
   argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
   argon match CAPTURE.nam  fit a model's voicing to a capture of the real
@@ -108,6 +114,18 @@ Machine specific paths live in tools\local-env.ps1, which is not committed.
 }
 
 function Resolve-HostPython {
+    # A path given by hand wins over anything found by searching: on a machine
+    # where PATH leads to the Windows Store stub, the search below burns a
+    # process and prints "Python" to stderr before failing, which reads like a
+    # broken interpreter rather than an absent one.  tools\local-env.ps1 sets
+    # this; ARGON_PYTHON is its name there, IDF_PYTHON is what an IDF shell
+    # leaves behind.
+    foreach ($named in @($env:ARGON_PYTHON, $env:IDF_PYTHON)) {
+        if ($named -and (Test-Path -LiteralPath $named)) {
+            return @{ Exe = $named; Prefix = @() }
+        }
+    }
+
     # Prefer a real interpreter over the Windows Store stub (exit 9009).
     foreach ($name in @('python', 'python3', 'py')) {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue
@@ -278,6 +296,8 @@ switch ($Command.ToLowerInvariant()) {
                           $chip = 'esp32' }
             'esp32-probe' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.probe'
                             $chip = 'esp32' }
+            'esp32-cyd' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.cyd'
+                          $chip = 'esp32' }
             'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
             'esp32s3-board' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board'
                               $chip = 'esp32s3' }
@@ -285,7 +305,11 @@ switch ($Command.ToLowerInvariant()) {
                             $chip = 'esp32s3' }
             'esp32s3-zero' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.zero'
                              $chip = 'esp32s3' }
-            'esp32s3-lcd2' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.lcd2'
+            # Waveshare ESP32-S3-Touch-LCD-2.  main called the same board
+            # esp32s3-touch-lcd-2 (sdkconfig.esp32s3.wslcd2) while this line
+            # called it esp32s3-lcd2; the merge of 25 Sep 2026 kept one build
+            # and both names.
+            { $_ -in 'esp32s3-lcd2', 'esp32s3-touch-lcd-2' } { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.lcd2'
                              $chip = 'esp32s3' }
             'esp32c6'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c6' }
             'esp32c3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3' }
@@ -366,11 +390,30 @@ switch ($Command.ToLowerInvariant()) {
         exit 0
     }
 
+    'fallout' {
+        # apps/fallout/build.py wants xtensa-esp32s3-elf-gcc on PATH, which is
+        # what Initialize-Environment is for.  Doing it by hand is three lines
+        # of PowerShell that have to be right, and getting them wrong fails as
+        # 'FileNotFoundError' from inside subprocess with no mention of a
+        # compiler.
+        Initialize-Environment
+        # Resolve-HostPython hands back the interpreter and the arguments it
+        # needs in front of a script ('py -3'), not a bare path.
+        $py = Resolve-HostPython
+        $script = Join-Path $PSScriptRoot '../apps/fallout/build.py'
+        & $py.Exe @($py.Prefix + @($script) + $Rest)
+        exit $LASTEXITCODE
+    }
+
     'sync' {
         # idf-env often puts a working Python on PATH (avoids the Store stub).
         Initialize-Environment
         if ($Rest.Count -lt 1) {
-            Write-Host 'Usage: argon sync <host-folder> [-SizeMB 64] [-Out build\sdcard.img]'
+            # -Image, not -Out: PowerShell binds -Out to its own common
+            # parameters before this script sees it, and the error it gives is
+            # "AmbiguousParameter" with no hint that the option was ours.  -Out
+            # still works when it survives that far.
+            Write-Host 'Usage: argon sync <host-folder> [-SizeMB 64] [-Image build\sdcard.img]'
             exit 1
         }
         $dir = $Rest[0]
@@ -379,7 +422,8 @@ switch ($Command.ToLowerInvariant()) {
         for ($i = 1; $i -lt $Rest.Count; $i++) {
             if ($Rest[$i] -match '^(?i)-SizeMB$' -and ($i + 1) -lt $Rest.Count) {
                 $sizeMb = [int]$Rest[$i + 1]; $i++
-            } elseif ($Rest[$i] -match '^(?i)-Out$' -and ($i + 1) -lt $Rest.Count) {
+            } elseif ($Rest[$i] -match '^(?i)-(Out|Image)$' -and
+                      ($i + 1) -lt $Rest.Count) {
                 $out = $Rest[$i + 1]; $i++
             } elseif ($Rest[$i] -like '-*') {
                 throw "Unknown sync option: $($Rest[$i])"
@@ -419,6 +463,8 @@ switch ($Command.ToLowerInvariant()) {
                 $runOpts['NoBuild'] = $true
             } elseif ($a -match '^(?i)-NoNet$') {
                 $runOpts['NoNet'] = $true
+            } elseif ($a -match '^(?i)-Lan$') {
+                $runOpts['Lan'] = $true
             } elseif ($a -match '^(?i)-NetPort$' -and ($i + 1) -lt $Rest.Count) {
                 $runOpts['NetPort'] = [int]$Rest[$i + 1]
                 $i++
@@ -427,6 +473,9 @@ switch ($Command.ToLowerInvariant()) {
                 $i++
             } elseif ($a -match '^(?i)-SdImage$' -and ($i + 1) -lt $Rest.Count) {
                 $runOpts['SdImage'] = $Rest[$i + 1]
+                $i++
+            } elseif ($a -match '^(?i)-Psram$' -and ($i + 1) -lt $Rest.Count) {
+                $runOpts['Psram'] = [int]$Rest[$i + 1]
                 $i++
             } else {
                 throw "Unknown run option: $a"
@@ -437,6 +486,13 @@ switch ($Command.ToLowerInvariant()) {
     }
 
     'virt' {
+        # local-env.ps1 is where the machine's real interpreter is named, and
+        # without it this command lands on the Store stub.  Sourced directly
+        # rather than through Initialize-Environment: the input helpers need
+        # Python and nothing else, and pulling in the whole IDF environment to
+        # start them takes seconds that a person is sitting through.
+        $localEnv = Join-Path $PSScriptRoot 'local-env.ps1'
+        if (Test-Path $localEnv) { . $localEnv }
         $py = Resolve-HostPython
         $script = Join-Path $PSScriptRoot 'virt.py'
         & $py.Exe @($py.Prefix) $script @Rest
@@ -462,7 +518,7 @@ switch ($Command.ToLowerInvariant()) {
         # first positional parameter instead of as a switch.
         #
         $valued = @('marker', 'timeoutsec', 'port', 'sdimage', 'quietms',
-                    'logpath', 'put', 'hostfs', 'hostfsport', 'radioport')
+                    'logpath', 'put', 'hostfs', 'hostfsport', 'radioport', 'psram')
         $send = @()
         $opts = @{}
         # -cp says which code page the screen bytes are in, for the dump only:
@@ -504,7 +560,12 @@ switch ($Command.ToLowerInvariant()) {
         # after being right on every earlier one.
         $wasOut = [Console]::OutputEncoding
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-        & cmd /c "build-host\vtdump.exe 80 25 $codepage < build\qemu-boot.log"
+        # The log this run was told to write, not the default one.  Printing
+        # build\qemu-boot.log whatever -LogPath said shows the screen of some
+        # earlier run - confidently, and with nothing to say it has done so.
+        $screen = 'build\qemu-boot.log'
+        if ($opts.ContainsKey('logpath')) { $screen = $opts['logpath'] }
+        & cmd /c "build-host\vtdump.exe 80 25 $codepage < ""$screen"""
         [Console]::OutputEncoding = $wasOut
         exit $bootStatus
     }

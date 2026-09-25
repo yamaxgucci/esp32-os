@@ -19,6 +19,7 @@
 #include <argon/loader.h>
 #include <argon/power.h>
 #include <argon/log.h>
+#include <argon/net.h>
 #include <argon/path.h>
 #include <argon/shell.h>
 #include <argon/vfs.h>
@@ -320,8 +321,20 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
     }
 
     if (required) {
-        ag_log(AG_LOG_ERROR, "proc", "%s asked for a %u KB arena; there is none",
-               p->name, (unsigned)(requested / 1024u));
+        /*
+         * Say what there was, not only that there was not enough.  "There is
+         * none" sends whoever reads it to work out the shortfall by
+         * subtraction - image data, driver buffers, whatever the kernel took
+         * at boot - and the answer to that arithmetic was wrong three times in
+         * one evening while the number itself was one call away.  A block is
+         * what is asked for and a block is what is reported.
+         */
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s asked for a %u KB arena; the largest block is %u KB "
+               "(%u KB free)",
+               p->name, (unsigned)(requested / 1024u),
+               (unsigned)(ag_port_mem_largest(AG_MEM_SLOW) / 1024u),
+               (unsigned)(ag_port_mem_free(AG_MEM_SLOW) / 1024u));
         return -AG_ENOMEM;
     }
 
@@ -428,6 +441,17 @@ static void reap(proc_t *p)
         ag_audio_api_table.close();
     }
 
+    /*
+     * Its sockets, before anything else about it is let go.
+     *
+     * A process that exits closes its own; one that is killed, faults or runs
+     * out of stack does not, and until this was here nothing else did either.
+     * The far end of such a socket sees a peer that is alive and reading
+     * nothing for ever - which cost this board forty kilobytes a time, with
+     * `net sockets` showing two connections open and no application running.
+     */
+    (void)ag_net_close_owned_by(p->pid);
+
     const bool restore_tty = (ag_session_focused_pid() == p->pid);
     ag_session_unbind(p->pid);
     if (restore_tty) {
@@ -472,6 +496,25 @@ static void reap(proc_t *p)
     if (restore_tty && !ag_log_echo()) {
         ag_console_printf("%s (pid %u) returned %d\n", p->name,
                           (unsigned)p->pid, (int)p->exit_code);
+    }
+
+    /*
+     * The last look at its memory, and often the only one anybody gets: an
+     * application that writes past its own data usually stands on its own
+     * feet first and faults, long before a supervisor tick could notice.
+     * Measured on the test program - eight bytes past its buffer reached the
+     * image's own remaining bss, overwrote a pointer, and the next line read
+     * it.  A memcmp on a path that is already freeing memory, and it turns
+     * "the application faulted" into "the application faulted after writing
+     * past the end of its own data".
+     */
+    size_t guard_past = 0;
+    if (!p->guard_said && ag_loader_guard_broken(&p->app, &guard_past)) {
+        p->guard_said = true;
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s (pid %u) wrote past the end of its own data by at least %u "
+               "bytes - a bug in %s, not in the board",
+               p->name, (unsigned)p->pid, (unsigned)guard_past, p->name);
     }
 
     ag_loader_unload(&p->app);
@@ -626,15 +669,59 @@ void ag_proc_record_panic(const ag_port_panic_t *panic)
     s_crash_waiting = true;
 }
 
-static void crash_record(proc_t *p, const char *reason)
+/*
+ * `may_lock` is false on the fault path.  See the note below: the heap query
+ * is the one thing in here that takes a lock, and on that path it is the
+ * difference between a recorded fault and a reset board.
+ */
+/*
+ * The hardware watch: asked for by `guard watch`, spent on the next
+ * application that starts.
+ *
+ * There is one watchpoint to give (the chip has two per core and FreeRTOS may
+ * hold the other for stack overflow), so it is not a mode the system runs in -
+ * it is a single shot, aimed deliberately.  Four bytes inside the guard are
+ * enough: an overrun that reaches the guard at all reaches its first word, and
+ * four bytes is a size and an alignment the hardware accepts everywhere.
+ */
+static bool s_guard_watch_armed;
+
+void ag_proc_guard_watch(bool on) { s_guard_watch_armed = on; }
+bool ag_proc_guard_watching(void) { return s_guard_watch_armed; }
+
+static void guard_watch_take(const proc_t *p, int core)
+{
+    if (!s_guard_watch_armed || p->app.guard == NULL) {
+        return;
+    }
+    /* The guard sits past the data, which need not leave it word-aligned. */
+    const uintptr_t at = ((uintptr_t)p->app.guard + 3u) & ~(uintptr_t)3u;
+
+    s_guard_watch_armed = false;
+    if (!ag_port_watch_write(core, (const void *)at, 4u)) {
+        ag_log(AG_LOG_WARN, "proc",
+               "%s: could not arm the hardware watch on its data guard; the "
+               "guard is still checked every tick",
+               p->name);
+        return;
+    }
+    ag_log(AG_LOG_WARN, "proc",
+           "%s: hardware watch armed at %p - a write past its data will stop "
+           "the board and print the instruction that did it",
+           p->name, (void *)at);
+}
+
+static void crash_record(proc_t *p, const char *reason, bool may_lock)
 {
     const uint32_t up_ms = now_ms() - (uint32_t)(p->started / 1000);
     size_t         used = 0;
+    bool           used_known = false;
 
-    if (p->heap != NULL) {
+    if (may_lock && p->heap != NULL) {
         ag_port_heap_info_t info;
         ag_port_heap_info(p->heap, &info);
         used = info.allocated;
+        used_known = true;
     }
 
     /*
@@ -645,17 +732,34 @@ static void crash_record(proc_t *p, const char *reason)
      * board (a double fault / interrupt-watchdog reset).  So the record is built
      * only into the lock-free crash buffer; the supervisor drains it to the
      * console and to /sys/crash.log from a safe context (write_crash_record).
+     *
+     * The heap query above is the same rule and was the same bug: it does not
+     * read like a lock, and inside IDF it enters a critical section on the
+     * heap's spinlock.  Measured on the board - an application faulted while
+     * the picture animated, and the machine reset with the watchdog standing
+     * on crash_record -> ag_port_heap_info -> spinlock_acquire.  Hence
+     * `may_lock`, and hence a record that says "arena unknown" rather than one
+     * that costs the board.
      */
     s_crash_text[0] = '\0';
     crash_printf("%s (pid %u) killed at %u ms uptime: %s\n", p->name,
                  (unsigned)p->pid, (unsigned)now_ms(),
                  (reason != NULL) ? reason : "no reason given");
-    crash_printf("  %s for %u ms, %u B of a %u KB arena, %u resource(s), "
-                 "%u B code at %p\n",
-                 ag_proc_state_name(p->state), (unsigned)up_ms, (unsigned)used,
-                 (unsigned)(p->heap_size / 1024u),
-                 (unsigned)ag_reslist_count(&p->res),
-                 (unsigned)p->app.header.code.size, p->app.place.code);
+    if (used_known) {
+        crash_printf("  %s for %u ms, %u B of a %u KB arena, %u resource(s), "
+                     "%u B code at %p\n",
+                     ag_proc_state_name(p->state), (unsigned)up_ms,
+                     (unsigned)used, (unsigned)(p->heap_size / 1024u),
+                     (unsigned)ag_reslist_count(&p->res),
+                     (unsigned)p->app.header.code.size, p->app.place.code);
+    } else {
+        crash_printf("  %s for %u ms, arena use unknown (fault path), %u KB "
+                     "arena, %u resource(s), %u B code at %p\n",
+                     ag_proc_state_name(p->state), (unsigned)up_ms,
+                     (unsigned)(p->heap_size / 1024u),
+                     (unsigned)ag_reslist_count(&p->res),
+                     (unsigned)p->app.header.code.size, p->app.place.code);
+    }
     s_crash_waiting = true;
 
     /*
@@ -916,8 +1020,9 @@ static ag_err_t copy_args(proc_t *p, int argc, char **argv)
     size_t at = 0;
 
     p->argc = 0;
+    /* Refuse rather than truncate: a dropped argument is invisible. */
     if (argc > AG_PROC_ARGS_MAX) {
-        argc = AG_PROC_ARGS_MAX;
+        return -AG_ERANGE;
     }
 
     for (int i = 0; i < argc; i++) {
@@ -1104,6 +1209,9 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
     if (out_pid != NULL) {
         *out_pid = p->pid;
     }
+
+    /* On the core this task was pinned to, before it has run an instruction. */
+    guard_watch_take(p, core);
 
     const ag_pid_t bound_pid = p->pid;
     char           bound_name[32];
@@ -1470,6 +1578,50 @@ ag_err_t ag_proc_signal(ag_pid_t pid)
     return AG_OK;
 }
 
+uint32_t ag_proc_check_guards(void)
+{
+    ag_pid_t caught[AG_PROC_MAX];
+    size_t   past[AG_PROC_MAX];
+    char     names[AG_PROC_MAX][32];
+    uint32_t n = 0;
+
+    /*
+     * Looked at under the lock, killed outside it: ag_proc_kill waits for the
+     * task to leave the kernel and takes the lock itself, and this runs on the
+     * supervisor, which must not be the task holding it while that happens.
+     */
+    lock();
+    for (uint32_t i = 0; i < AG_PROC_MAX && n < AG_PROC_MAX; i++) {
+        proc_t *p = &s_procs[i];
+        if (!p->used || p->state == AG_PS_ZOMBIE || p->guard_said) {
+            continue;
+        }
+        size_t bytes = 0;
+        if (!ag_loader_guard_broken(&p->app, &bytes)) {
+            continue;
+        }
+        p->guard_said = true; /* once per process, not once per tick */
+        caught[n] = p->pid;
+        past[n] = bytes;
+        snprintf(names[n], sizeof(names[n]), "%s", p->name);
+        n++;
+    }
+    unlock();
+
+    for (uint32_t i = 0; i < n; i++) {
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s (pid %u) wrote past the end of its own data by at least "
+               "%u bytes - stopping it before the damage is used",
+               names[i], (unsigned)caught[i], (unsigned)past[i]);
+        ag_log(AG_LOG_ERROR, "proc",
+               "  this is a bug in %s, not in the board: a buffer of its own "
+               "was written off the end, into whatever the heap put next",
+               names[i]);
+        (void)ag_proc_kill(caught[i], "wrote past its own data");
+    }
+    return n;
+}
+
 ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
 {
     lock();
@@ -1527,7 +1679,7 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
         return -AG_EBUSY;
     }
 
-    crash_record(p, reason);
+    crash_record(p, reason, true);
 
     ag_port_task_delete(task);
     p->task = NULL;
@@ -1921,7 +2073,7 @@ void ag_proc_fault_exit(void)
         return;
     }
 
-    crash_record(p, "faulted");
+    crash_record(p, "faulted", false);   /* mid-fault: nothing here may lock */
     p->killed = true;
     p->exit_code = -AG_EKILLED;
 

@@ -1,0 +1,304 @@
+diff --git a/src/game_mouse.cc b/src/game_mouse.cc
+--- a/src/game_mouse.cc
++++ b/src/game_mouse.cc
+@@ -33,6 +33,9 @@
+ #include "tile.h"
+ #include "window_manager.h"
+ 
++/* The microsecond clock, as the other instrumented files take it. */
++extern "C" uint32_t ag_us(void);
++
+ namespace fallout {
+ 
+ typedef enum ScrollableDirections {
+@@ -295,6 +298,30 @@ static int dword_518D9C = -1;
+ // file move the same object.  Comparing where the object actually ended up
+ // means anything that moves it invalidates this without having to know that
+ // this exists.
++/*
++ * ARGON: and what this handler costs, because it turned out to be the answer.
++ *
++ * The freeze census of 16 September 2026 named it: of 112 freezes while
++ * walking, 70 were laps whose largest single cost was gameMouseRefresh, and
++ * the worst of those laps was 247 ms.  The guard below already stops it
++ * refreshing for a cursor that has not changed - that was worth 8.5 ms of a
++ * 22 ms frame while STANDING - but while walking the view scrolls, so
++ * everything about the cursor changes every frame and the guard passes every
++ * time.  What it then does is re-render a rectangle of the isometric map:
++ * floor, walls, objects, roof and light.
++ *
++ * Before changing any of that, these say which half of it costs the money -
++ * moving the cursor or redrawing the map behind it - and how often the guard
++ * fires at all.  A fix aimed at the wrong half would look like it worked, on
++ * a measurement that was never taken.
++ */
++extern "C" {
++unsigned ag_hexc_calls, ag_hexc_fired;
++unsigned ag_hexc_move_us, ag_hexc_rfsh_us, ag_hexc_tail_us;
++unsigned ag_hexc_move_worst, ag_hexc_rfsh_worst, ag_hexc_tail_worst;
++unsigned ag_hexc_rfsh_px, ag_hexc_rfsh_worst_px;
++}
++
+ static int ag_hex_mouse_x = -1;
+ static int ag_hex_mouse_y = -1;
+ static int ag_hex_elevation = -1;
+@@ -507,7 +534,38 @@ int _gmouse_is_scrolling()
+ }
+ 
+ // 0x44B684
++/*
++ * ARGON: the timed wrapper, so the rest of the handler is accounted for
++ * without putting a clock in front of each of its fifteen returns.
++ *
++ * "Rest" is everything that is not moving the cursor and is not redrawing the
++ * map behind it: the scroll-edge test, the window test, and the hover test
++ * with the object outlining at the end.  It is a subtraction and it is named
++ * as one - what it must not be is silently zero.
++ */
++static void ag_gmouse_refresh_inner();
++
+ void gameMouseRefresh()
++{
++    const uint32_t ag_g0 = ag_us();
++    const unsigned ag_m0 = ag_hexc_move_us;
++    const unsigned ag_r0 = ag_hexc_rfsh_us;
++
++    ag_hexc_calls++;
++    ag_gmouse_refresh_inner();
++
++    const uint32_t took = ag_us() - ag_g0;
++    const unsigned inner = (ag_hexc_move_us - ag_m0)
++        + (ag_hexc_rfsh_us - ag_r0);
++    const unsigned rest = (took > inner) ? (took - inner) : 0u;
++
++    ag_hexc_tail_us += rest;
++    if (rest > ag_hexc_tail_worst) {
++        ag_hexc_tail_worst = rest;
++    }
++}
++
++static void ag_gmouse_refresh_inner()
+ {
+     if (!gGameMouseInitialized) {
+         return;
+@@ -689,11 +747,35 @@ void gameMouseRefresh()
+         || gGameMouseHexCursor->tile != ag_hex_tile
+         || gGameMouseHexCursor->sx != ag_hex_sx
+         || gGameMouseHexCursor->sy != ag_hex_sy) {
++        ag_hexc_fired++;
++
+         Rect r1;
+-        if (_gmouse_3d_move_to(mouseX, mouseY, gElevation, &r1) == 0) {
++        const uint32_t ag_h0 = ag_us();
++        const int      ag_moved = _gmouse_3d_move_to(mouseX, mouseY, gElevation, &r1);
++        const uint32_t ag_h1 = ag_us();
++
++        if (ag_moved == 0) {
+             tileWindowRefreshRect(&r1, gElevation);
+         }
+ 
++        const uint32_t ag_h2 = ag_us();
++
++        ag_hexc_move_us += ag_h1 - ag_h0;
++        ag_hexc_rfsh_us += ag_h2 - ag_h1;
++        if (ag_h1 - ag_h0 > ag_hexc_move_worst) {
++            ag_hexc_move_worst = ag_h1 - ag_h0;
++        }
++        if (ag_h2 - ag_h1 > ag_hexc_rfsh_worst) {
++            ag_hexc_rfsh_worst = ag_h2 - ag_h1;
++            ag_hexc_rfsh_worst_px = (ag_moved == 0)
++                ? (unsigned)((r1.right - r1.left + 1) * (r1.bottom - r1.top + 1))
++                : 0u;
++        }
++        if (ag_moved == 0) {
++            ag_hexc_rfsh_px +=
++                (unsigned)((r1.right - r1.left + 1) * (r1.bottom - r1.top + 1));
++        }
++
+         ag_hex_mouse_x = mouseX;
+         ag_hex_mouse_y = mouseY;
+         ag_hex_elevation = gElevation;
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -237,7 +237,6 @@ void _process_bk()
+     const uint32_t t2 = ag_us();
+ 
+     ag_bk_tickers_us += t1 - t0;
+-    ag_lap_tickers_us += t1 - t0;
+     ag_bk_mouse_us += t2 - t1;
+     ag_lap_mouse_us += t2 - t1;
+ 
+@@ -358,6 +357,14 @@ void tickersExecute()
+             curr->proc();
+             const uint32_t dt = ag_us() - t0;
+             ag_ticker_now = NULL;
++            /* ARGON: and into the lap, so one freeze can name the
++             * handler it was in.  Every call site of tickersExecute adds
++             * here, not only the one in _process_bk. */
++            ag_lap_tickers_us += dt;
++            if (dt > ag_lap_tick_worst_us) {
++                ag_lap_tick_worst_us = dt;
++                ag_lap_tick_who = (void*)curr->proc;
++            }
+             for (int i = 0; i < 12; i++) {
+                 if (ag_ticker_who[i] == nullptr) {
+                     ag_ticker_who[i] = (void*)curr->proc;
+@@ -382,8 +389,46 @@ void tickersExecute()
+ }
+ 
+ // 0x4C8D74
+-void tickersAdd(TickerProc* proc)
++/*
++ * ARGON: proc -> the name it was registered as.  Sixteen is twice what a
++ * live map has; an unknown pointer answers "?" rather than reading past the
++ * end, because this is called from a report and a report must not crash.
++ */
++#define AG_TICKNAMES 16
++static TickerProc *ag_tick_proc[AG_TICKNAMES];
++static const char *ag_tick_name[AG_TICKNAMES];
++
++extern "C" const char *ag_ticker_name_of(void *proc)
+ {
++    for (int i = 0; i < AG_TICKNAMES; i++) {
++        if (ag_tick_proc[i] == nullptr) {
++            break;
++        }
++        if ((void *)ag_tick_proc[i] == proc) {
++            return ag_tick_name[i];
++        }
++    }
++    return "?";
++}
++
++static void ag_tick_remember(TickerProc *proc, const char *name)
++{
++    for (int i = 0; i < AG_TICKNAMES; i++) {
++        if (ag_tick_proc[i] == proc) {
++            return;
++        }
++        if (ag_tick_proc[i] == nullptr) {
++            ag_tick_proc[i] = proc;
++            ag_tick_name[i] = name;
++            return;
++        }
++    }
++}
++
++void tickersAddNamed(TickerProc* proc, const char* name)
++{
++    ag_tick_remember(proc, name);
++
+     TickerListNode* curr = gTickerListHead;
+     while (curr != nullptr) {
+         if (curr->proc == proc) {
+diff --git a/src/input.h b/src/input.h
+--- a/src/input.h
++++ b/src/input.h
+@@ -15,7 +15,19 @@ void _process_bk();
+ void enqueueInputEvent(int a1);
+ void inputEventQueueReset();
+ void tickersExecute();
+-void tickersAdd(TickerProc* fn);
++/*
++ * ARGON: a ticker registers under the name it is written as.
++ *
++ * The per-ticker timings were keyed on the function pointer, on the theory
++ * that addr2line would turn an address into a name after the run - and it
++ * does, but only if an ELF of exactly that link is still on disk, and only
++ * after a slide has been worked out from a base address printed for the
++ * purpose.  That was three steps and a stale-ELF trap between a report and
++ * the answer, on the report that says which background handler froze the
++ * game.  The name is known at the call site; the macro carries it there.
++ */
++void tickersAddNamed(TickerProc* fn, const char* name);
++#define tickersAdd(fn) tickersAddNamed((fn), #fn)
+ void tickersRemove(TickerProc* fn);
+ void tickersEnable();
+ void tickersDisable();
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -725,6 +725,11 @@ int mapScroll(int dx, int dy)
+     windowRefresh(gIsoWindow);
+     const uint32_t ag_t5 = ag_us();
+ 
++    /* ARGON: and the whole step into the lap, so the freeze census can name
++     * the scroll instead of naming the handler it happens to be called from.
++     * It is nested inside a ticker, so the ticker row subtracts it. */
++    ag_lap_scroll_us += ag_t5 - ag_t0;
++
+     ag_scroll_steps++;
+     ag_scroll_mouse_us += ag_t1 - ag_t0;
+     ag_scroll_move_us += ag_t3 - ag_t2;
+diff --git a/src/svga.cc b/src/svga.cc
+--- a/src/svga.cc
++++ b/src/svga.cc
+@@ -20,6 +20,9 @@ extern "C" int ag_palette_blit_wanted(void);
+ extern "C" void ag_palette_only_begin(void);
+ extern "C" void ag_palette_only_end(void);
+ 
++/* The microsecond clock, as the other instrumented files take it. */
++extern "C" uint32_t ag_us(void);
++
+ namespace fallout {
+ 
+ static bool createRenderer(int width, int height);
+@@ -328,10 +331,36 @@ unsigned char* directDrawGetPalette()
+ }
+ 
+ // 0x4CB850
++/*
++ * ARGON: the two halves of this, because the same pixels go past three times.
++ *
++ * One step of the map scrolling costs 60 ms on the board, and 30 of them are
++ * charged to "windowRefresh of the whole iso window".  Following that down:
++ * _GNW_win_refresh copies the window's buffer into _screen_buffer, then this
++ * copies _screen_buffer into gSdlSurface, and then SDL_BlitSurface turns
++ * gSdlSurface into the panel's pixels.  Three passes over a quarter of a
++ * megabyte, of which the middle one exists only because the original port
++ * kept an eight-bit staging surface beside the screen buffer that already
++ * holds exactly the same pixels in exactly the same layout.
++ *
++ * Before removing a copy from the path every frame goes through, measure it:
++ * these two say how much of the 30 ms is the copy and how much is the
++ * conversion that has to happen either way.
++ */
++extern "C" {
++unsigned ag_show_calls, ag_show_px;
++unsigned ag_show_copy_us, ag_show_blit_us;
++unsigned ag_show_copy_worst, ag_show_blit_worst, ag_show_worst_px;
++}
++
+ void _GNW95_ShowRect(unsigned char* src, int srcPitch, int a3, int srcX, int srcY, int srcWidth, int srcHeight, int destX, int destY)
+ {
++    const uint32_t ag_s0 = ag_us();
++
+     blitBufferToBuffer(src + srcPitch * srcY + srcX, srcWidth, srcHeight, srcPitch, (unsigned char*)gSdlSurface->pixels + gSdlSurface->pitch * destY + destX, gSdlSurface->pitch);
+ 
++    const uint32_t ag_s1 = ag_us();
++
+     SDL_Rect srcRect;
+     srcRect.x = destX;
+     srcRect.y = destY;
+@@ -342,6 +371,20 @@ void _GNW95_ShowRect(unsigned char* src, int srcPitch, int a3, int srcX, int src
+     destRect.x = destX;
+     destRect.y = destY;
+     SDL_BlitSurface(gSdlSurface, &srcRect, gSdlTextureSurface, &destRect);
++
++    const uint32_t ag_s2 = ag_us();
++
++    ag_show_calls++;
++    ag_show_px += (unsigned)(srcWidth * srcHeight);
++    ag_show_copy_us += ag_s1 - ag_s0;
++    ag_show_blit_us += ag_s2 - ag_s1;
++    if (ag_s1 - ag_s0 > ag_show_copy_worst) {
++        ag_show_copy_worst = ag_s1 - ag_s0;
++        ag_show_worst_px = (unsigned)(srcWidth * srcHeight);
++    }
++    if (ag_s2 - ag_s1 > ag_show_blit_worst) {
++        ag_show_blit_worst = ag_s2 - ag_s1;
++    }
+ }
+ 
+ // Clears drawing surface.

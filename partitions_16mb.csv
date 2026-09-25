@@ -1,0 +1,22 @@
+# ArgonOS partition table - 16 MB flash, the N16R8 boards.
+#
+# Every offset up to 0x800000 is IDENTICAL to partitions.csv on purpose: the
+# 8 MB table was never the chip, it was a baseline, and this board has always
+# had 16 MB with the upper half unaddressed.  Keeping the offsets means moving
+# to this table does not erase anything - C: (sysfs) and the relocated .AXE
+# code in appfs survive, and only the table sector itself is rewritten.
+#
+# artfs is the new half: raw data, subtype 0x41, not a filesystem.  It holds
+# decompressed game art so that a cache miss costs a memory-mapped read at
+# 302 cycles instead of an SD read plus an inflate.  It is written at map load
+# and read during play, never the other way round: erasing a sector takes tens
+# of milliseconds AND disables the cache while it runs, which would stall
+# everything executing from flash - exactly the stutter this is meant to cure.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x300000,
+sysfs,      data, littlefs, 0x310000, 0x100000,
+appfs,      data, 0x40,     0x410000, 0x3F0000,
+artfs,      data, 0x41,     0x800000, 0x800000,

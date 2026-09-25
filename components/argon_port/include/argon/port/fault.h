@@ -71,6 +71,7 @@
 #define ARGON_PORT_FAULT_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include <argon/abi.h>
@@ -154,5 +155,43 @@ bool ag_port_fault_last_panic(ag_port_panic_t *out);
  * the machine goes down again before it could say anything.
  */
 void ag_port_fault_panic_reported(void);
+
+/*
+ * Trap the next write to `bytes` at `addr`, on the given core.
+ *
+ * For watching a guard word: the hardware catches the instruction that writes,
+ * which is the one thing a pattern in memory cannot tell you.  There is one
+ * such watch in the system at a time (the chip has two per core and the RTOS
+ * may hold one for stack overflow), so arming a second replaces the first.
+ *
+ * `bytes` must be a power of two, 1 to 64, and `addr` aligned to it.  `core`
+ * is the core the watched task runs on; a watchpoint set on one core does not
+ * exist on the other.
+ *
+ * A trap here is a debug exception, and a debug exception takes the panic
+ * path: the board stops, prints the address of the writing instruction, and
+ * reboots.  That is the trade - the machine for the culprit - so this is a
+ * deliberate switch, not a defence.  The defence is the guard itself, which
+ * the kernel checks on a timer.
+ */
+bool ag_port_watch_write(int core, const void *addr, size_t bytes);
+
+/* Drop the watch set by ag_port_watch_write, if any. */
+void ag_port_watch_clear(int core);
+
+/*
+ * Print past everything: no console, no log, no lock - straight to the UART
+ * through the ROM.  For the report that has to come out of a machine whose
+ * console is behind the very lock being reported on.  Busy-waits on the UART,
+ * so it is for a line a second, not for logging.
+ */
+void ag_port_raw_print(const char *fmt, ...);
+
+/*
+ * Call `fn` every `period_ms` from a context that holds none of the kernel's
+ * locks and does not wait for any of them, so that it still runs when the
+ * kernel does not.  One such timer; a second call replaces the first.
+ */
+bool ag_port_lockwatch_start(void (*fn)(void), uint32_t period_ms);
 
 #endif /* ARGON_PORT_FAULT_H */

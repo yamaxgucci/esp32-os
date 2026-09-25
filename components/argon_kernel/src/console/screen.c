@@ -48,12 +48,54 @@ void ag_screen_mark_all_dirty(ag_screen_t *s)
     for (size_t i = 0; i < n; i++) {
         s->dirty[i] = 0xffffffffu;
     }
+    /*
+     * And no scroll is worth doing on top of it: everything is about to be
+     * repainted anyway, and a scroll before a full repaint is only flicker.
+     */
+    s->scrolled = 0;
     s->generation++;
 }
 
 void ag_screen_clear_dirty(ag_screen_t *s)
 {
     memset(s->dirty, 0, dirty_words(s->rows) * sizeof(uint32_t));
+    s->scrolled = 0;
+}
+
+uint16_t ag_screen_scrolled(const ag_screen_t *s)
+{
+    return (s != NULL) ? s->scrolled : 0u;
+}
+
+bool ag_screen_scroll_usable(const ag_screen_t *s)
+{
+    return s != NULL && s->scrolled > 0u && s->scrolled < s->rows;
+}
+
+/*
+ * The dirty set moves with the picture.
+ *
+ * A row that had changed and has not been drawn yet is still the same row of
+ * text; it is simply higher up the screen now.  Shifting the bits rather than
+ * setting them all is the whole of this change: after it, "row 29 changed"
+ * beside "everything moved up one" is the truth a scroll actually carries.
+ */
+static void shift_dirty_up(ag_screen_t *s, uint16_t lines)
+{
+    if (lines == 0u || lines >= s->rows) {
+        return;
+    }
+    for (uint16_t y = 0; y + lines < s->rows; y++) {
+        const uint16_t from = (uint16_t)(y + lines);
+        if ((s->dirty[from / 32u] & ((uint32_t)1u << (from % 32u))) != 0u) {
+            s->dirty[y / 32u] |= (uint32_t)1u << (y % 32u);
+        } else {
+            s->dirty[y / 32u] &= ~((uint32_t)1u << (y % 32u));
+        }
+    }
+    for (uint16_t y = (uint16_t)(s->rows - lines); y < s->rows; y++) {
+        s->dirty[y / 32u] |= (uint32_t)1u << (y % 32u);
+    }
 }
 
 bool ag_screen_row_dirty(const ag_screen_t *s, uint16_t y)
@@ -197,10 +239,18 @@ void ag_screen_scroll_up(ag_screen_t *s, uint16_t lines)
     const size_t moved = (size_t)(s->rows - lines) * s->cols;
     memmove(s->cells, s->cells + (size_t)lines * s->cols,
             moved * sizeof(ag_cell_t));
+    /*
+     * The marks move with the text, and before the new rows are written: they
+     * are marked by fill_row below, and shifting after that would carry those
+     * marks up onto rows that did not change while leaving the new ones clean.
+     */
+    shift_dirty_up(s, lines);
     for (uint16_t y = (uint16_t)(s->rows - lines); y < s->rows; y++) {
         fill_row(s, y, 0, s->cols, ' ', s->attr);
     }
-    ag_screen_mark_all_dirty(s);
+    const uint32_t total = (uint32_t)s->scrolled + lines;
+    s->scrolled = (total < s->rows) ? (uint16_t)total : s->rows;
+    s->generation++;
 }
 
 static void scroll_down(ag_screen_t *s, uint16_t lines)

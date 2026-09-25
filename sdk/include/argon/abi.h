@@ -170,6 +170,8 @@ extern "C" {
  *      worktree-usb-kvm calls its 0.45.  Whichever of those lands next has
  *      to RENUMBER rather than assume its number is free - and the check is
  *      one line: `git show <branch>:sdk/include/argon/abi.h | grep MINOR`.
+ *
+ *      ---- worktree-cluster's line, 0.48-0.62 (the numbers it used) ----
  * 0.48 ag_net_ops_t grew a station half - wifi_start/stop/scan/connect/
  *      disconnect/status - so that a radio at the far end of a wire answers
  *      `wifi scan` and `wifi connect` too, not only sockets.  Without it the
@@ -383,9 +385,56 @@ extern "C" {
  *      (ag_linkprov_stats, src/net/linkprov.c) now does that before it calls a
  *      driver's stats(), so an older driver leaves zeros here and not stack
  *      garbage.  Any future append needs the same guarantee and has it.
+ *
+ *      ---- main's line, 0.48-0.52 (fallout-cxx, phone, BLE) ----
+ * 0.52 appended ble->adv_notify: the peripheral pushes bytes to the connected
+ *      client as a GATT notification (board->phone), the direction the phone
+ *      link over BLE needs - a client cannot poll fast enough for a screen.
+ * 0.51 appended task->stack_left: how much of the current task's stack has
+ *      never been touched, for code that runs on a stack it does not own.  A
+ *      driver called from a display callback spends the drawing application's,
+ *      and PHONE.SYS on a board with no framebuffer spends a band encoder and
+ *      all of lwIP of it - three board resets in seventeen runs, each one a
+ *      stack overflow in the application that drew.  A rectangle not sent is a
+ *      screen that does not update; a stack overflow is a board that reboots.
+ * 0.50 appended net->reset: a connection thrown away rather than closed, for
+ *      a peer that has stopped reading.  `close` promises to deliver what is
+ *      queued and TCP keeps that promise indefinitely, so a deaf peer holds the
+ *      block and every buffer on it - 11520 bytes queued and 32 KB of heap,
+ *      measured, returned only by taking the interface down.  Needs
+ *      CONFIG_LWIP_SO_LINGER, now on in sdkconfig.defaults.
+ * 0.49 appended text_scroll to ag_display_ops_t: the console moved up by so
+ *      many rows, for a panel that can move its own picture.  Before it, a
+ *      scroll was reported to every renderer as damage to every row - true,
+ *      and the most expensive true thing available: on the CYD an application
+ *      printing eleven lines a second made the console send each of them 23
+ *      times, 9.4 KB/s of an 11.5 KB/s line, with the shell's own echo queued
+ *      behind it.  Optional; a driver that leaves it NULL is sent every row as
+ *      before.
+ * 0.48 sys->module_task: a task that belongs to a loadable driver rather than
+ *      to a process, so a driver can do work that takes milliseconds without
+ *      charging it to whoever called in.  Until this, every driver was a
+ *      collection of callbacks on the caller's thread, and a screen at the end
+ *      of a wire made the game that drew a frame wait for the frame to go out.
+ *      The module owns the task and unload waits for it.
+ *
+ *      This is the renumbering the paragraph above asks for: the work is
+ *      commit 2ec139a on `worktree-fallout-cxx`, where it was written as 0.43
+ *      and board-verified in that shape, and 0.43 was spoken for here by
+ *      ag_net_ops_t before it could land.  Nothing about it changed but the
+ *      number.
+ *
+ * 0.63 the two lines above, merged (25 Sep 2026), as 0.47 merged two before
+ *      them: each had numbered 0.48 onwards for itself.  main's members
+ *      keep their places - Fallout's engine is built outside the tree and
+ *      carries main's offsets - and the cluster's come after them in every
+ *      struct both lines grew: io (uart_dma_* then spi_slave/spi_link/
+ *      uart_link), task (stack_left then svc_start/svc_stopping) and the
+ *      api root (store then clu, usbd).  Every in-tree image is rebuilt;
+ *      one built on the cluster line before this reads the wrong members.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 62u
+#define AG_ABI_MINOR 63u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -510,6 +559,38 @@ typedef struct ag_sys_api {
      * already has something in it.
      */
     int32_t (*prompt_in_slot)(int slot, const char *cwd);
+
+    /*
+     * ABI 0.48: during ag_driver_init only — a task of the module's own.
+     *
+     * task->create is the application's, and it refuses a caller with no
+     * process: a thread belongs to a process and dies with it, and a driver has
+     * no process to belong to.  So every driver in this system has been a
+     * collection of callbacks running on whoever called in - which is right for
+     * a register write and wrong for anything that takes milliseconds.  A
+     * screen at the end of a serial wire is the case that forced this: three
+     * hundred milliseconds of a frame going out, charged to the game that drew
+     * it, when the wire could just as well be fed from a task of its own.  A
+     * screen at the end of a network is the same case again, with an accept()
+     * and an HTTP request in it.
+     *
+     * The module owns it.  Unload calls the module_on_unload hook first - which
+     * is where the driver tells its task to stop - and then waits for the task
+     * to return before the image is unmapped, because unmapping code a task is
+     * still inside is a fault that names the wrong culprit.  A task that will
+     * not return refuses the unload rather than taking the machine down.
+     *
+     * The task must therefore watch a flag and return.  Do not call exit.
+     *
+     * `flags` is ag_thread_flags, the same three an application's thread gets,
+     * and the choice is not cosmetic: the foreground application is pinned to
+     * the app core, so a driver doing real work there is a second runnable task
+     * on the one core already busy.  A driver that takes milliseconds asks for
+     * AG_THREAD_SYS_CORE.  `priority` at 5 or below cannot starve an
+     * application; above that it can, and nothing in this build says so.
+     */
+    bool (*module_task)(void (*fn)(void *), void *arg, const char *name,
+                        uint32_t stack, int priority, uint32_t flags);
 } ag_sys_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1090,9 +1171,12 @@ typedef struct ag_gfx_api {
  * Class vtable for AG_DEV_INPUT devices that have to be asked (ABI 0.28).
  *
  * A touchscreen on a slow bus does not interrupt with an event; it holds a
- * voltage, and somebody has to read it.  Doing that from the driver would need
- * a task inside a loadable module - the one thing a .SYS has no way to own -
- * so the kernel asks instead, from the console tick it already runs.
+ * voltage, and somebody has to read it.  So the kernel asks, from the console
+ * tick it already runs, rather than each such driver keeping a task to sleep
+ * and wake on a clock.  (When this was written a .SYS had no way to own a task
+ * at all; since 0.48 it has - sys->module_task - and that is the right answer
+ * for a driver whose work takes milliseconds.  A device that only needs looking
+ * at ten times a second is still better served here.)
  *
  * poll() fills at most `max` events and returns how many, or a negative error.
  * Zero is the normal answer and must be cheap: it is called ten times a second
@@ -1204,6 +1288,30 @@ typedef struct ag_display_ops {
      * with something to say says it from ag_driver_init.
      */
     void (*blit_rect)(ag_handle_t h, const ag_blit_t *b);
+
+    /*
+     * ABI 0.49: the console moved up, rather than every row of it changing.
+     *
+     * A scroll used to reach a panel as text_row for every row on the glass,
+     * because that is what the screen model reported and it is true - each row
+     * now holds different characters.  It is also the most expensive way to
+     * say it.  Measured on the CYD: an application printing eleven lines a
+     * second had the console sending each of them 23 times, 9.4 KB/s of an
+     * 11.5 KB/s serial line, and over the phone link thirty rows of Wi-Fi
+     * traffic per printed line.
+     *
+     * `lines` rows leave the top, the same number of blank rows arrive at the
+     * bottom, and nothing else about the picture has changed.  A driver that
+     * can move its own pixels - a memmove of a framebuffer, a hardware
+     * scrolling region, a page moving its own rows - does that and then takes
+     * the text_row calls that follow for the rows that genuinely changed.
+     *
+     * Optional, and its absence costs nothing but speed: a driver that leaves
+     * it NULL is sent every row exactly as before.  Called on the console tick
+     * with `h` zero and the registry held, before the text_row calls for the
+     * same tick, and under the same rule as those - it must not print.
+     */
+    void (*text_scroll)(ag_handle_t h, uint16_t lines);
 } ag_display_ops_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1281,6 +1389,26 @@ enum ag_ioctl_cmd {
      * which is not an error - it is the answer.
      */
     AG_IOC_DISPLAY_BACKLIGHT = AG_IOC(AG_DEV_DISPLAY, 1),
+
+    /*
+     * Optional: arg is a pointer to an int, non-zero to let the driver send
+     * only the part of a rectangle that differs from what it believes the
+     * screen already has.
+     *
+     * It exists to be turned *off*.  A driver at the end of a wire keeps a
+     * record of the far end so that a screen which has not changed costs
+     * nothing, and that record is the only piece of state in the whole path
+     * that can be wrong: when it says the far end has a block it does not, the
+     * picture stays wrong until some slow repair reaches it.  Turning the
+     * trimming off sends every rectangle whole - one full screen is a quarter
+     * of a second of a four megabaud line, and it cannot be wrong.  That is
+     * the floor to measure everything else against, and the answer when a
+     * picture is misbehaving and nobody knows whose fault it is.
+     *
+     * A driver that always sends everything anyway answers -AG_ENOTSUP, which
+     * is not an error - it is the answer.
+     */
+    AG_IOC_DISPLAY_TRIM = AG_IOC(AG_DEV_DISPLAY, 2),
 
     AG_IOC_AUDIO_GETFMT = AG_IOC(AG_DEV_AUDIO, 1),
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
@@ -1780,6 +1908,45 @@ typedef struct ag_io_api {
     ag_err_t (*spi_config)(int bus, int cs, uint32_t khz);
 
     /*
+     * ABI 0.44: the same port, driven by the UART's own DMA.
+     *
+     * uart_write is a thread copying into a ring and waking whenever the
+     * peripheral has room, which is right for a console and wrong for a
+     * picture: a hundred and fifty kilobytes a frame is eighty wake-ups, and
+     * on a busy board that left the wire half idle - 172 KB/s carried of a
+     * possible 400 while a game ran.  dma_write hands the buffer to the
+     * hardware once and returns when the last byte has gone.
+     *
+     * dma_ready says whether this chip and port can: the original ESP32 and
+     * the S2 have no UHCI, and a caller must keep the ordinary write for them.
+     * The buffer may be in extended memory where the hardware allows it, but
+     * alignment is checked and refused rather than worked around - -AG_EINVAL
+     * means "give me an aligned buffer", not "it did not work".
+     *
+     * The two are different masters of one transmitter: do not have a write
+     * in flight on the same port when this is called.
+     */
+    /*
+     * Wait until everything given to this port has left it.  Not a flush -
+     * that word is taken by the call that throws away what has *arrived* -
+     * but the handover between the two masters of one transmitter: whoever
+     * mixes uart_write with uart_dma_write calls this in between.
+     */
+    ag_err_t (*uart_tx_wait)(int port, uint32_t timeout_ms);
+    bool (*uart_dma_ready)(int port);
+    int32_t (*uart_dma_write)(int port, const void *buf, size_t len);
+
+    /*
+     * The same in two halves, for a caller with more than one thing to send:
+     * submit hands a buffer to the hardware and returns, drain waits for
+     * everything still out.  Waiting for each transfer in turn leaves the wire
+     * idle between them - about a quarter of a frame, measured - because the
+     * next one cannot start until a task has been scheduled to start it.  The
+     * buffers stay the hardware's until drain returns.
+     */
+    int32_t (*uart_dma_submit)(int port, const void *buf, size_t len);
+    ag_err_t (*uart_dma_drain)(int port);
+    /*
      * ABI 0.56: the bus from the other end of the clock, appended past
      * spi_config so that a driver built before this reads exactly what it did.
      *
@@ -1853,33 +2020,6 @@ typedef struct ag_io_api {
      */
     ag_err_t (*spi_link_stats)(int bus, ag_spilink_stats_t *out);
 
-    /*
-     * ABI 0.58: the UART by DMA, carried over from worktree-fallout-cxx
-     * (4b67339 and 9745482, where it was numbered 0.44 - a number this
-     * branch had already spent on something else, so it is appended here
-     * rather than renumbered).  A .AXE built before this finds the
-     * members absent through AG_HAS and falls back to uart_write.
-     */
-    /*
-     * Wait until everything given to this port has left it.  Not a flush -
-     * that word is taken by the call that throws away what has *arrived* -
-     * but the handover between the two masters of one transmitter: whoever
-     * mixes uart_write with uart_dma_write calls this in between.
-     */
-    ag_err_t (*uart_tx_wait)(int port, uint32_t timeout_ms);
-    bool (*uart_dma_ready)(int port);
-    int32_t (*uart_dma_write)(int port, const void *buf, size_t len);
-
-    /*
-     * The same in two halves, for a caller with more than one thing to send:
-     * submit hands a buffer to the hardware and returns, drain waits for
-     * everything still out.  Waiting for each transfer in turn leaves the wire
-     * idle between them - about a quarter of a frame, measured - because the
-     * next one cannot start until a task has been scheduled to start it.  The
-     * buffers stay the hardware's until drain returns.
-     */
-    int32_t (*uart_dma_submit)(int port, const void *buf, size_t len);
-    ag_err_t (*uart_dma_drain)(int port);
     /* ABI 0.59: receive by DMA into the caller's buffer. */
     int32_t (*uart_dma_read)(int port, void *buf, size_t len,
                              uint32_t timeout_ms);
@@ -2037,6 +2177,25 @@ typedef struct ag_task_api {
     /* Disable preemption on the current core; keep it short. */
     void (*critical_enter)(void);
     void (*critical_exit)(void);
+
+    /*
+     * ABI 0.51: bytes of stack the current task has never touched.
+     *
+     * For code that runs on a stack it does not own.  A driver called from a
+     * display callback, a filesystem hook or an input poll is spending the
+     * caller's, and the caller declared its size for its own work rather than
+     * for whatever a driver might do next.  PHONE.SYS on a board with no
+     * framebuffer sends the picture from inside blit_rect - the band encoder,
+     * the WebSocket framing and all of lwIP - and eight kilobytes, which is
+     * what an application gets by default, is not enough for that: three board
+     * resets in seventeen runs, every one a stack overflow in the drawing
+     * application.
+     *
+     * A watermark, not a live figure: it is the low tide of this task since it
+     * started, so it is conservative in the right direction.  Zero if the port
+     * cannot tell.
+     */
+    uint32_t (*stack_left)(void);
 
     /*
      * A TASK A LOADABLE DRIVER MAY OWN (ABI 0.50).
@@ -2318,6 +2477,22 @@ typedef struct ag_net_api {
      * resolve, -AG_EAGAIN before the interface has an address of its own.
      */
     ag_err_t (*resolve)(const char *host, uint32_t *addr_out);
+
+    /*
+     * ABI 0.50: throw this connection away instead of closing it.
+     *
+     * `close` is a promise to deliver what is already queued, and TCP keeps
+     * that promise for as long as it takes - which against a peer that has
+     * stopped reading is for ever.  Measured on the CYD: a client killed with
+     * its socket open left 11520 bytes queued on our side and 32 KB of heap
+     * held, and nothing but taking the interface down returned it.
+     *
+     * This sends a reset: the far end is told, the queue is discarded, the
+     * memory comes back now.  Use it only for a peer already judged gone - a
+     * send that has stalled past its deadline, a client that has proved
+     * nothing for half a minute.  Everything else should close.
+     */
+    ag_err_t (*reset)(ag_handle_t sock);
 } ag_net_api_t;
 
 /*
@@ -2587,6 +2762,16 @@ typedef struct ag_ble_api {
      * adv_start and this share one advertising instance - use one at a time.
      */
     ag_err_t (*adv_raw)(const uint8_t addr[6], const void *data, uint32_t len);
+
+    /*
+     * ABI 0.52 - the peripheral pushes bytes to the connected client as a GATT
+     * notification on its read characteristic (NULL without the peripheral
+     * build).  This is the board->phone direction for a link over BLE: a client
+     * cannot be made to poll fast enough for a live screen.  One packet, at most
+     * an ATT MTU's worth (~180 bytes after overhead); the caller chunks more.
+     * -AG_ENODEV until a client is connected.
+     */
+    ag_err_t (*adv_notify)(const void *data, uint32_t len);
 } ag_ble_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -3282,6 +3467,85 @@ typedef struct ag_usbd_api {
 
 /* ------------------------------------------------------------------------ */
 /* Root table                                                               */
+
+/* ------------------------------------------------------------------------ */
+/* Raw flash stores                                                         */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * A partition an application may use as its own storage, with no filesystem
+ * in the way: it reads, writes and erases bytes at offsets, and it may ask
+ * for a span to appear in the address space so that reading costs a load
+ * instruction instead of a call.
+ *
+ * This exists because a game's art, a synthesiser's samples and a logger's
+ * ring all want the same thing - a few megabytes of flash that survive a
+ * reboot and can be read without copying - and none of them wants a
+ * filesystem's directories, names or write amplification.
+ *
+ * Only partitions of type data with subtype 0x41 can be opened.  That is
+ * deliberate and it is the whole safety story: C: (littlefs), nvs and the
+ * firmware itself are all excluded, so a wrong label cannot destroy the
+ * machine's configuration or the OS.  Add a store to the partition table to
+ * create one; see partitions_16mb.csv.
+ *
+ * What the hardware costs, because it decides how a store may be used:
+ *
+ *   - reading is cheap, and mapped reading is nearly free: the bytes go
+ *     through the same cache the processor's own code does.
+ *   - writing needs the sector erased first, tens of milliseconds for each
+ *     4 KB, and on this class of part the cache is DISABLED while an erase or
+ *     a program runs.  Everything executing from flash stops for that time.
+ *
+ * So a store is filled at a moment the program is already standing still - a
+ * level load, a startup, an explicit save - and read during the parts that
+ * have to be smooth.  A write in an animation loop will be visible as a
+ * freeze, and no amount of buffering hides it.
+ */
+typedef const void *ag_store_t;     /* an open store, NULL when there is none */
+typedef uintptr_t   ag_store_map_t; /* a live mapping, 0 when there is none   */
+
+typedef struct ag_store_api {
+    uint32_t size;
+
+    /*
+     * Open the store with this label, or NULL when the partition table has no
+     * such raw store.  The handle is a description, not a lock: opening the
+     * same store twice is allowed and the two callers share the bytes.
+     */
+    ag_store_t (*open)(const char *label);
+
+    /* Bytes in the store, and the granularity erase() works in (4096 here). */
+    uint64_t (*bytes)(ag_store_t s);
+    uint32_t (*erase_size)(ag_store_t s);
+
+    ag_err_t (*read)(ag_store_t s, uint64_t off, void *buf, size_t len);
+
+    /*
+     * Write bytes that have already been erased.  Flash only clears bits, so
+     * writing over live data without erasing first gives the AND of the two,
+     * silently: erase the span, then write it.
+     */
+    ag_err_t (*write)(ag_store_t s, uint64_t off, const void *buf, size_t len);
+
+    /* Erase whole sectors.  off and len must be multiples of erase_size(). */
+    ag_err_t (*erase)(ag_store_t s, uint64_t off, size_t len);
+
+    /*
+     * Put a span in the address space, read only, and hand back a pointer to
+     * it.  Nothing is copied and no memory is spent: the pointer reaches
+     * flash through the cache.
+     *
+     * It can fail even when the store is fine - the address window for mapped
+     * flash is finite and shared with everything else mapped - so a caller
+     * that needs to work either way should fall back to read() rather than
+     * treat AG_ERR_NOMEM as fatal.  Unmap what is no longer needed.
+     */
+    ag_err_t (*map)(ag_store_t s, uint64_t off, size_t len, const void **addr,
+                    ag_store_map_t *out);
+    void (*unmap)(ag_store_map_t h);
+} ag_store_api_t;
+
 /* ------------------------------------------------------------------------ */
 
 typedef struct ag_api {
@@ -3329,6 +3593,10 @@ typedef struct ag_api {
      * CONFIG_ARGON_ENABLE_CAMERA. */
     const ag_cam_api_t *cam;
 
+    /* ABI 0.45+: raw flash stores.  Never NULL, but open() answers NULL on a
+     * machine whose partition table declares no store. */
+    const ag_store_api_t *store;
+
     /*
      * ABI 0.52+: threads of one program across the nodes.  Never NULL - a board
      * with no link answers "one node, this one" and runs every thread locally,
@@ -3342,7 +3610,6 @@ typedef struct ag_api {
      * unless CONFIG_ARGON_USB_MSC (off by default) - probe with AG_HAS. */
     const ag_usbd_api_t *usbd;
 } ag_api_t;
-
 /* ------------------------------------------------------------------------ */
 /* Executable image header                                                  */
 /* ------------------------------------------------------------------------ */

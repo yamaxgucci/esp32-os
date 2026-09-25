@@ -41,14 +41,17 @@
  */
 #include <argon/port/fault.h>
 
+/* Wanted by both halves: the watchpoint at the end of this file is portable. */
+#include "esp_cpu.h"
+#include "esp_ipc.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #if defined(__XTENSA__)
 
 #include <xtensa/corebits.h>
 
-#include "esp_ipc.h"
 #include "esp_rom_sys.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "xtensa_api.h"
 
 #include <argon/port/task.h>
@@ -693,3 +696,128 @@ void ag_port_fault_panic_reported(void)
 }
 
 #endif /* __XTENSA__ */
+
+/* ------------------------------------------------------------------------ */
+/* Watching one address                                                       */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * The same on both architectures - esp_cpu_set_watchpoint is the portable
+ * call - so it is written once, below the two halves above.
+ *
+ * Watchpoint 0: IDF takes number 1 for the end-of-stack watch when
+ * CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK is on, and that one is worth more
+ * than this one.
+ */
+#define AG_WATCH_SLOT 0
+
+struct watch_req {
+    const void *addr;
+    size_t      bytes;
+    bool        set;
+    bool        ok;
+};
+
+static void watch_here(void *arg)
+{
+    struct watch_req *r = (struct watch_req *)arg;
+
+    if (!r->set) {
+        esp_cpu_clear_watchpoint(AG_WATCH_SLOT);
+        r->ok = true;
+        return;
+    }
+    r->ok = (esp_cpu_set_watchpoint(AG_WATCH_SLOT, r->addr, r->bytes,
+                                    ESP_CPU_WATCHPOINT_STORE) == ESP_OK);
+}
+
+static bool watch_on_core(int core, struct watch_req *r)
+{
+#if portNUM_PROCESSORS > 1
+    if (core >= 0 && core != (int)xPortGetCoreID()) {
+        if (esp_ipc_call_blocking((uint32_t)core, watch_here, r) != ESP_OK) {
+            return false;
+        }
+        return r->ok;
+    }
+#else
+    (void)core;
+#endif
+    watch_here(r);
+    return r->ok;
+}
+
+bool ag_port_watch_write(int core, const void *addr, size_t bytes)
+{
+    /* The hardware's own rules: a power of two up to 64, aligned to itself. */
+    if (addr == NULL || bytes == 0u || bytes > 64u ||
+        (bytes & (bytes - 1u)) != 0u ||
+        ((uintptr_t)addr & (uintptr_t)(bytes - 1u)) != 0u) {
+        return false;
+    }
+    struct watch_req r = {.addr = addr, .bytes = bytes, .set = true,
+                          .ok = false};
+    return watch_on_core(core, &r);
+}
+
+void ag_port_watch_clear(int core)
+{
+    struct watch_req r = {.addr = NULL, .bytes = 0, .set = false, .ok = false};
+    (void)watch_on_core(core, &r);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Speaking past the kernel                                                  */
+/* ------------------------------------------------------------------------ */
+
+#include <stdarg.h>
+#include <stdio.h>
+
+#include "esp_rom_sys.h"
+#include "esp_timer.h"
+
+void ag_port_raw_print(const char *fmt, ...)
+{
+    char    buf[160];
+    va_list ap;
+
+    va_start(ap, fmt);
+    (void)vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    esp_rom_printf("%s", buf);
+}
+
+static esp_timer_handle_t s_lockwatch;
+static void (*s_lockwatch_fn)(void);
+
+static void lockwatch_tick(void *arg)
+{
+    (void)arg;
+    if (s_lockwatch_fn != NULL) {
+        s_lockwatch_fn();
+    }
+}
+
+bool ag_port_lockwatch_start(void (*fn)(void), uint32_t period_ms)
+{
+    if (fn == NULL || period_ms == 0u) {
+        return false;
+    }
+    s_lockwatch_fn = fn;
+    if (s_lockwatch == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = lockwatch_tick,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "lockwatch",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &s_lockwatch) != ESP_OK) {
+            return false;
+        }
+    } else {
+        (void)esp_timer_stop(s_lockwatch);
+    }
+    return esp_timer_start_periodic(s_lockwatch,
+                                    (uint64_t)period_ms * 1000ull) == ESP_OK;
+}

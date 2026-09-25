@@ -317,10 +317,10 @@ bool ag_axe_ireloc_apply(const ag_axe_header_t *header, uint8_t *code_bytes,
         return false;
     }
     if (to_data) {
-        if (entry.target > header->data.size) {
+        if (entry.target > header->data.size + AG_AXE_I_REACH) {
             return false;
         }
-    } else if (entry.target > header->code.size) {
+    } else if (entry.target > header->code.size + AG_AXE_I_REACH) {
         return false;
     }
     if (at < code_off) {

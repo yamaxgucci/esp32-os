@@ -454,8 +454,13 @@ function Get-QemuMachineArgs {
         [string]$FlashPath = 'build\qemu_flash.bin',
         [string]$EfuseOverride = '',
         # As in Resolve-Qemu: which machine, when it is not the one built last.
-        [string]$Chip = ''
+        [string]$Chip = '',
+        # 8 or 16 and nothing else - see the note by -m below.
+        [int]$PsramMb = 8
     )
+    if ($PsramMb -ne 8 -and $PsramMb -ne 16) {
+        throw "PSRAM must be 8 or 16 MB (asked for $PsramMb)."
+    }
     if ($EfuseOverride) { $EfusePath = $EfuseOverride }
     $chip = if ($Chip) { $Chip } else { Get-QemuTarget }
     if ($chip -ne 'esp32s3') {
@@ -482,12 +487,18 @@ function Get-QemuMachineArgs {
         # like a port problem and is not one.  A guest this size never fills
         # 64 MB of translated code.
         '-accel', 'tcg,tb-size=64'
-        # 8 MB, matching an N16R8 module.  Not a detail: the S3 reaches flash
-        # and PSRAM through one 32 MB window on the data bus, so 32 MB of PSRAM
-        # leaves no address space to map flash into, and esp_partition - which
-        # reads the partition table through a mapping rather than a read - then
-        # finds no partitions at all.
-        '-m', '8M'
+        # 8 MB by default, matching an N16R8 module.  Not a detail: the S3
+        # reaches flash and PSRAM through one 32 MB window on the data bus, so
+        # 32 MB of PSRAM leaves no address space to map flash into, and
+        # esp_partition - which reads the partition table through a mapping
+        # rather than a read - then finds no partitions at all.
+        #
+        # 16 is the other size a real module comes in, and 16 + 8 of flash
+        # still fits the window.  Ask for it when the guest genuinely needs it:
+        # Fallout 2 does, and nothing else in the tree does, so the default
+        # stays at the smaller part where a shortage shows up rather than
+        # hiding until somebody flashes a board.
+        '-m', "${PsramMb}M"
         '-drive', "file=$FlashPath,if=mtd,format=raw"
         '-drive', "file=$EfusePath,if=none,format=raw,id=efuse"
         '-global', 'driver=nvram.esp32s3.efuse,property=drive,value=efuse'
@@ -498,14 +509,32 @@ function Get-QemuMachineArgs {
 
 # OpenEth user-mode NIC + hostfwd so Windows can reach guest TCP listeners.
 # 5558 = PCMVIRT / pcmplay.py; 5559 = MIDIVIRT / midikbd.py;
-# 5560 = MOUSEVIRT; 5561 = KBDVIRT / kbdvirt.py.
+# 5560 = MOUSEVIRT; 5561 = KBDVIRT / kbdvirt.py; 8765 = PHONE.SYS, which is
+# where a browser on this PC stands in for the phone.
 function Get-QemuNetArgs {
-    param([int]$HostPort = 5558, [int]$GuestPort = 5558)
-    $fwd = "hostfwd=tcp:127.0.0.1:{0}-:{1}" -f $HostPort, $GuestPort
+    param([int]$HostPort = 5558, [int]$GuestPort = 5558, [switch]$Lan)
+    # Which address the forwards listen on.
+    #
+    # 127.0.0.1 by default, and that is not timidity: every one of these ports
+    # is an unauthenticated way into the guest - its console (telnet), its
+    # keyboard (KBDVIRT), its screen and keyboard (PHONE.SYS) - and a default
+    # that listens on the network is a default that hands them to it.
+    #
+    # -Lan opens them to the local network, which is what a real phone needs:
+    # a phone cannot reach this PC's loopback.  It also needs a hole in the
+    # Windows firewall, which is asked for separately and on purpose.
+    $bind = if ($Lan) { '0.0.0.0' } else { '127.0.0.1' }
+    $fwd = "hostfwd=tcp:{0}:{1}-:{2}" -f $bind, $HostPort, $GuestPort
     if ($HostPort -eq 5558 -and $GuestPort -eq 5558) {
         # 5558-5561: PCM / MIDI / mouse / kbd virt helpers.  2323->23: reach the
         # guest's telnet console from the host (CONFIG_ARGON_NET_TELNET).
-        $fwd = "hostfwd=tcp:127.0.0.1:5558-:5558,hostfwd=tcp:127.0.0.1:5559-:5559,hostfwd=tcp:127.0.0.1:5560-:5560,hostfwd=tcp:127.0.0.1:5561-:5561,hostfwd=tcp:127.0.0.1:2323-:23,hostfwd=tcp:127.0.0.1:2222-:22"
+        $ports = @(
+            @(5558, 5558), @(5559, 5559), @(5560, 5560), @(5561, 5561),
+            @(2323, 23), @(2222, 22), @(8765, 8765)
+        )
+        $fwd = ($ports | ForEach-Object {
+            "hostfwd=tcp:{0}:{1}-:{2}" -f $bind, $_[0], $_[1]
+        }) -join ','
     }
     return @(
         '-nic', ("user,model=open_eth,id=argon0,{0}" -f $fwd)

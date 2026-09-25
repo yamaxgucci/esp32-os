@@ -42,6 +42,11 @@
  * entries and the kernel reports no radio.  That is why this needed no protocol
  * version bump - the capability bitmask already says who can do what.
  *
+ *   The coprocessor owns its own radio, so the guest names the network to join
+ *   by handing the credentials to START (proto v2).  A coprocessor that keeps
+ *   its own stored network - or the QEMU fake, which rides the host's - ignores
+ *   them; a guest with none sends START empty, meaning "use what you have".
+ *
  * A CHANNEL is the coprocessor's own small-integer socket id (0..N).  It is the
  * `ch` field; the guest's kernel wraps it into an ag_handle_t exactly as it
  * wraps a port fd (src/net/net.c adopt_fd), and because only one provider is
@@ -63,7 +68,10 @@
  *   NONBLOCK req : ch = channel, a0 = (on ? 1 : 0)  rep : status
  *   READY    req : (none)        rep : status = 1 ready / 0 not
  *   IFADDR   req : (none)        rep : a0 = host-order IPv4, status
- *   START    req : (none)        rep : status
+ *   START    req : a0 = ssid length; payload = ssid bytes then passphrase bytes
+ *                  (passphrase = payload[a0 ..]).  len == 0 => no credentials,
+ *                  join the coprocessor's own stored/host network.
+ *            rep : status
  *   HELLO    req : a0 = RL_PROTO_VERSION the guest speaks
  *            rep : a0 = version the coprocessor speaks, a1 = capability bitmask
  *   DATA    push : ch = channel, payload = received bytes; RL_F_EOF => far side
@@ -101,7 +109,7 @@
 #include <stdint.h>
 
 #define RL_MAGIC         0x4B4E4C52u /* 'RLNK' little-endian on the wire */
-#define RL_PROTO_VERSION 1u
+#define RL_PROTO_VERSION 2u /* v2: START carries Wi-Fi credentials (see above) */
 
 /* Header is fixed length; the payload (len bytes) follows it. */
 #define RL_HDR_SIZE 28u

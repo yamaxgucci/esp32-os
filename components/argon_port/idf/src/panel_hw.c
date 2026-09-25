@@ -6,6 +6,16 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
+/*
+ * Before the #if, and that is the whole point: nothing else here pulls
+ * sdkconfig.h in - panel.h is two standard headers - so without this the
+ * option below is simply undefined, the stub compiles, ag_port_panel_open
+ * always answers false, and `argon run -Gfx` shows a black window with no
+ * error printed anywhere.  camera_hw.c and usb_hw.c include it for the same
+ * reason; this file did not.
+ */
+#include "sdkconfig.h"
+
 #include <argon/port/panel.h>
 
 /*

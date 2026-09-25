@@ -190,7 +190,25 @@ bool ag_dev_in_driver(void);
  * hold it for microseconds.
  */
 void ag_dev_lock_hold(void);
+
+/*
+ * Which driver call is in flight under the registry, for the watch that
+ * reports a hold gone long (ag_dev_lockwatch).  Called around a call into a
+ * driver's vtable; `dev` and `op` must outlive the call (registry names and
+ * string literals do).
+ */
+void ag_dev_note_call(const char *dev, const char *op);
+void ag_dev_note_done(void);
+
+/* The report: runs on a port timer that holds nothing.  See devices.c. */
+void ag_dev_lockwatch(void);
 void ag_dev_lock_release(void);
+
+/* Held across a blocking display blit instead of the registry lock, so the
+ * wire does not stop audio and the console; carries the "system is writing"
+ * signal to the pin layer.  See devices.c. */
+void ag_dev_blit_hold(void);
+void ag_dev_blit_release(void);
 
 /*
  * Adds a device.  -AG_EEXIST for a name already taken, -AG_EINVAL for a name

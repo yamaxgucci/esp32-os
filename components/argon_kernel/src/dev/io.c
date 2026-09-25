@@ -47,14 +47,65 @@
  * the same count for the same bytes; an overrun gives the same count for the
  * same *time*, which is what this was.
  *
- * Eight kilobytes is twenty milliseconds at four megabaud, which is longer than
- * anything a driver does between reads.  Transmit stays small on purpose: a
- * short transmit buffer makes a large write block until the wire has taken it,
- * and being paced by the wire is the correct behaviour for whoever is filling
- * it - the alternative is buffering a frame the far end cannot yet draw.
+ * Eight kilobytes is twenty milliseconds at four megabaud, and twenty
+ * milliseconds turned out not to be longer than everything a driver does
+ * between reads.  Running a game down the link, the receiver threw away about
+ * 200 KB of arriving pixels in forty seconds hunting for a frame header - it
+ * falls behind while putting a band on its panel, and a lost band is a
+ * rectangle of the last frame that stays on the glass until something redraws
+ * it.  Sixteen kilobytes is forty milliseconds, which covers a band, a write to
+ * a converter and a filesystem call together.
+ *
+ * Thirty-two was tried first and is too much for the board that needs it: the
+ * CYD has 179 KB and no PSRAM, and after a `wifi off` the free memory is there
+ * but not in one piece, so uart_driver_install failed and the receiver came up
+ * with `uart1 at 4000000 baud: input/output error` - a screen that stayed dark
+ * for want of a buffer twice the size of the one that works.
+ *
+ * Transmit used to stay at two kilobytes on purpose, so that a large write
+ * blocked until the wire had taken it - being paced by the wire is the correct
+ * behaviour for whoever is filling it.  That is still true and it is not the
+ * same as *waiting* for it.  With a buffer this size a write copies and
+ * returns, and the peripheral's interrupt empties it while the caller draws
+ * the next frame; the pacing comes back the moment the buffer is full, which
+ * on a picture that does not fit in it is one frame later.  On the link
+ * between the two boards that is the difference between a game that works
+ * while the picture goes out and a game that stops for it.
+ *
+ * Big on receive, small on transmit, and the asymmetry is the point.  A board
+ * carrying a picture is either the sender or the receiver: the sender pushes
+ * bands and reads back the odd byte, the receiver takes four megabaud and sends
+ * the odd byte.  So both want a large receive ring - thirty-two kilobytes,
+ * about a hundred and forty milliseconds, which is what stops the receiver
+ * dropping bands under load - and neither wants a large transmit one.
+ *
+ * The transmit buffer was thirty-two kilobytes for a while, for an experiment
+ * that let the sender's write return before the wire had taken it; that
+ * experiment is gone (the wire is synchronous now), and the two rings together
+ * were sixty-four kilobytes, which the CYD - 179 KB, no PSRAM - could not
+ * allocate on top of the receiver's own audio ring: `UART driver malloc
+ * error`, and a screen that stayed dark.  Two kilobytes is what a synchronous
+ * writer needs; it paces on the wire, which is correct.  The port halves each
+ * until they fit, transmit first, so a board that still cannot have the receive
+ * ring gets a smaller one rather than failing to open the port.
  */
-#define AG_IO_UART_RX_BUF 8192
+#define AG_IO_UART_RX_BUF 32768
 #define AG_IO_UART_TX_BUF 2048
+/* And what the console keeps: a shell's worth, the sizes that were the only
+ * sizes until the picture link needed more. */
+#define AG_IO_UART_CON_RX_BUF 4096
+#define AG_IO_UART_CON_TX_BUF 2048
+/*
+ * Thirty-two for receive as well, now.  The note above about the CYD not
+ * having 32 KB in one piece was true while that board also started a Wi-Fi
+ * stack at boot; it does not any more - it is a monitor, and the radio was
+ * costing it seventy kilobytes to do nothing - and with 108 KB in its largest
+ * block the ring fits.  The port halves each buffer until the pair fits,
+ * transmit first, so a board that still cannot have it gets a smaller one and
+ * works rather than failing to open the port.  What the sixteen was costing:
+ * eight per cent of the picture's bands corrupted at full load and none at a
+ * fifth of it, which is a receiver falling behind, not a line.
+ */
 /*
  * A port whose link goes by DMA reads and writes neither ring: the DMA takes
  * the FIFO itself.  The driver stays installed (the line's settings go
@@ -1106,8 +1157,20 @@ static bool uart_cfg_same(const ag_port_uart_cfg_t *a,
 
 static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
 {
-    return uart_bring_up_sized(port, want, AG_IO_UART_RX_BUF,
-                               AG_IO_UART_TX_BUF);
+    /*
+     * The big rings are for a port that carries a picture.  The console
+     * is UART0 on every board here and carries a shell; giving it the same
+     * 64 KB of buffering cost the CYD the memory to load the very program
+     * that reads the picture - `load remterm.axe failed (-12)` - on a
+     * board with 179 KB to its name.  So port 0 keeps what a console
+     * needs, and the rest get the rings, halved until they fit.  A caller
+     * that knows what its port carries (a framed link) says so through
+     * uart_bring_up_sized instead.
+     */
+    const bool console = (port == 0);
+    return uart_bring_up_sized(
+        port, want, console ? AG_IO_UART_CON_RX_BUF : AG_IO_UART_RX_BUF,
+        console ? AG_IO_UART_CON_TX_BUF : AG_IO_UART_TX_BUF);
 }
 
 static ag_err_t uart_bring_up_sized(int port, const ag_port_uart_cfg_t *want,
@@ -1211,17 +1274,32 @@ static int32_t io_uart_write(int port, const void *buf, size_t len)
         return -AG_EINVAL;
     }
 
+    /*
+     * The lock covers the bring-up and nothing else.
+     *
+     * It used to be held across the write as well, and the write blocks: with
+     * a transmit buffer, uart_write_bytes waits for the peripheral to make
+     * room, and a port carrying a picture at four megabaud is full most of
+     * the time.  One io lock covers every UART, and the console is a UART.  So
+     * a thread blocked in a write to the picture link held the lock the
+     * console needed to print, and anything that then printed - the game's
+     * readout, the shell, the kernel's own log - waited behind the wire.  The
+     * evening it was found, the whole board went quiet at once: no readout, no
+     * prompt, not even Ctrl+\, with the game and the kernel both alive and
+     * both waiting on a mutex held by a task that was waiting on a UART.
+     *
+     * The port's write is safe to call without this lock - the driver
+     * serialises writes to one port itself - and two ports have nothing to
+     * serialise between them.
+     */
     lock();
-    ag_err_t err = uart_bring_up(port, NULL);
-    int32_t  n = err;
-    if (err == AG_OK) {
-        n = ag_port_uart_write(port, buf, len);
-        if (n < 0) {
-            n = -AG_EIO;
-        }
-    }
+    const ag_err_t err = uart_bring_up(port, NULL);
     unlock();
-    return n;
+    if (err != AG_OK) {
+        return err;
+    }
+    const int32_t n = ag_port_uart_write(port, buf, len);
+    return (n < 0) ? -AG_EIO : n;
 }
 
 static int32_t io_uart_read(int port, void *buf, size_t len,
@@ -1435,6 +1513,11 @@ const ag_io_api_t ag_io_api_table = {
     .i2c_probe = io_i2c_probe,
     .spi_xfer = io_spi_xfer,
     .uart_write = io_uart_write,
+    .uart_tx_wait = io_uart_tx_wait,
+    .uart_dma_write = io_uart_dma_write,
+    .uart_dma_submit = io_uart_dma_submit,
+    .uart_dma_drain = io_uart_dma_drain,
+    .uart_dma_ready = io_uart_dma_ready,
     .uart_read = io_uart_read,
     .uart_config = io_uart_config,
 #if AG_PORT_HAS_ADC
@@ -1448,11 +1531,6 @@ const ag_io_api_t ag_io_api_table = {
     .spi_slave_open = io_spi_slave_open,
     .spi_slave_xfer = io_spi_slave_xfer,
     .spi_link_open = io_spi_link_open,
-    .uart_tx_wait = io_uart_tx_wait,
-    .uart_dma_ready = io_uart_dma_ready,
-    .uart_dma_write = io_uart_dma_write,
-    .uart_dma_submit = io_uart_dma_submit,
-    .uart_dma_drain = io_uart_dma_drain,
     .uart_dma_read = io_uart_dma_read,
     .spi_link_close = io_spi_link_close,
     .spi_link_write = io_spi_link_write,

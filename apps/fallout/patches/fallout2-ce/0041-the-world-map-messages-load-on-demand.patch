@@ -1,0 +1,152 @@
+diff --git a/src/worldmap.cc b/src/worldmap.cc
+--- a/src/worldmap.cc
++++ b/src/worldmap.cc
+@@ -788,6 +788,50 @@
+ // 0x672FB0
+ static MessageList wmMsgFile;
+ 
++/*
++ * ARGON: the world map's messages, loaded when something reads one.
++ *
++ * 739 KB in 1585 blocks, resident from startup to exit on every map, measured
++ * 2 September 2026 - and worldmap.msg is read only while the world map is on
++ * screen or an encounter is being rolled.  The arena it sits in is 6000 KB and
++ * the temple runs out at 5977, so this is the largest single thing that can be
++ * given back.
++ *
++ * messageListFree leaves the list as messageListInit does, so this can happen
++ * as often as the player opens and closes the map.
++ */
++static bool wmMsgLoaded = false;
++
++static MessageList* wmMsgs()
++{
++    if (!wmMsgLoaded) {
++        char path[COMPAT_MAX_PATH];
++        snprintf(path, sizeof(path), "%s%s", asc_5186C8, "worldmap.msg");
++        if (!messageListLoad(&wmMsgFile, path)) {
++            debugPrint("\nwmMsgs: worldmap.msg would not load\n");
++            return &wmMsgFile;
++        }
++        wmMsgLoaded = true;
++        messageListRepositorySetStandardMessageList(
++            STANDARD_MESSAGE_LIST_WORLDMAP, &wmMsgFile);
++    }
++    return &wmMsgFile;
++}
++
++/* Called from mapLoad, beside the art and sound cache flushes: a local map is
++ * being built and nothing on it reads a world map message. */
++void wmMessagesRelease()
++{
++    if (!wmMsgLoaded) {
++        return;
++    }
++    messageListRepositorySetStandardMessageList(
++        STANDARD_MESSAGE_LIST_WORLDMAP, nullptr);
++    messageListFree(&wmMsgFile);
++    messageListInit(&wmMsgFile);
++    wmMsgLoaded = false;
++}
++
+ // 0x672FB8
+ static int wmFreqValues[6];
+ 
+@@ -855,11 +899,8 @@
+         return -1;
+     }
+ 
+-    snprintf(path, sizeof(path), "%s%s", asc_5186C8, "worldmap.msg");
+-
+-    if (!messageListLoad(&wmMsgFile, path)) {
+-        return -1;
+-    }
++    /* ARGON: not here.  See wmMsgs() - the texts are 739 KB and are read only
++     * while the world map is on screen. */
+ 
+     if (wmConfigInit() == -1) {
+         return -1;
+@@ -885,7 +926,7 @@
+         citySizeDescription->fid = buildFid(OBJ_TYPE_INTERFACE, 336 + citySize, 0, 0, 0);
+     }
+ 
+-    messageListRepositorySetStandardMessageList(STANDARD_MESSAGE_LIST_WORLDMAP, &wmMsgFile);
++    /* ARGON: wmMsgs() does this when it loads. */
+ 
+     return 0;
+ }
+@@ -3577,8 +3618,8 @@
+         const char* title = gWorldmapEncDefaultMsg[0];
+         const char* body = gWorldmapEncDefaultMsg[1];
+ 
+-        title = getmsg(&wmMsgFile, &messageListItem, 2999);
+-        body = getmsg(&wmMsgFile, &messageListItem, 3000 + 50 * wmGenData.encounterTableId + wmGenData.encounterEntryId);
++        title = getmsg(wmMsgs(), &messageListItem, 2999);
++        body = getmsg(wmMsgs(), &messageListItem, 3000 + 50 * wmGenData.encounterTableId + wmGenData.encounterEntryId);
+         if (showDialogBox(title, &body, 1, 169, 116, _colorTable[32328], nullptr, _colorTable[32328], DIALOG_BOX_LARGE | DIALOG_BOX_YES_NO) == 0) {
+             wmGenData.encounterIconIsVisible = false;
+             wmGenData.encounterMapId = -1;
+@@ -3739,8 +3780,8 @@
+     char formattedText[512];
+     snprintf(formattedText, sizeof(formattedText),
+         "%s %s",
+-        getmsg(&wmMsgFile, &messageListItem, 2998),
+-        getmsg(&wmMsgFile, &messageListItem, 3000 + 50 * wmGenData.encounterTableId + wmGenData.encounterEntryId));
++        getmsg(wmMsgs(), &messageListItem, 2998),
++        getmsg(wmMsgs(), &messageListItem, 3000 + 50 * wmGenData.encounterTableId + wmGenData.encounterEntryId));
+     displayMonitorAddMessage(formattedText);
+ 
+     int gameDifficulty = settings.preferences.game_difficulty;
+@@ -5478,7 +5519,7 @@
+             // NOTE: Uninline.
+             wmGetAreaName(city, name);
+         } else {
+-            strncpy(name, getmsg(&wmMsgFile, &messageListItem, 1004), 40);
++            strncpy(name, getmsg(wmMsgs(), &messageListItem, 1004), 40);
+         }
+ 
+         int width = fontGetStringWidth(name);
+@@ -6007,7 +6048,7 @@
+ 
+         MessageListItem messageListItem;
+         messageListItem.num = 200 + 10 * wmTownMapCurArea + index;
+-        if (messageListGetItem(&wmMsgFile, &messageListItem)) {
++        if (messageListGetItem(wmMsgs(), &messageListItem)) {
+             if (messageListItem.text != nullptr) {
+                 int width = fontGetStringWidth(messageListItem.text);
+                 // CE: Slightly increase whitespace between marker and entrance name.
+@@ -6117,7 +6158,7 @@
+ 
+     if (wmGenData.carFuel <= 0) {
+         // The car is out of power.
+-        char* msg = getmsg(&wmMsgFile, &messageListItem, 1502);
++        char* msg = getmsg(wmMsgs(), &messageListItem, 1502);
+         displayMonitorAddMessage(msg);
+         return -1;
+     }
+diff --git a/src/worldmap.h b/src/worldmap.h
+--- a/src/worldmap.h
++++ b/src/worldmap.h
+@@ -238,6 +238,8 @@
+ extern unsigned char* circleBlendTable;
+ 
+ int wmWorldMap_init();
++/* ARGON: drop the world map's 739 KB of messages; mapLoad calls it. */
++void wmMessagesRelease();
+ void wmWorldMap_exit();
+ int wmWorldMap_reset();
+ int wmWorldMap_save(File* stream);
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -924,6 +924,10 @@
+      */
+     soundEffectsCacheFlush();
+ 
++    /* And the world map's messages: 739 KB in 1585 blocks that no local map
++     * reads.  They come back the moment the world map is opened. */
++    wmMessagesRelease();
++
+     if (gMapHeader.globalVariablesCount < 0) {
+         gMapHeader.globalVariablesCount = 0;
+     }

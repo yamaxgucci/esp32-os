@@ -1,0 +1,148 @@
+diff --git a/src/memory.cc b/src/memory.cc
+--- a/src/memory.cc
++++ b/src/memory.cc
+@@ -74,28 +74,40 @@
+ }
+ 
+ // 0x4C5AD8
++/*
++ * ARGON: no guard header and no guard footer.
++ *
++ * Every allocation the engine makes carried a MemoryBlockHeader in front and a
++ * MemoryBlockFooter behind - twelve bytes, rounded up to sixteen - holding two
++ * magic words and the block size.  The magic words are only ever read by
++ * memoryBlockValidate(), which prints a line when they are wrong; the size is
++ * only ever read to keep gMemoryBlocksCurrentSize, which is only ever printed
++ * by mem_check().  Nothing functional depends on either.
++ *
++ * They are not cheap here.  Fallout 2 allocates in tens of thousands of tiny
++ * pieces: on BROKEN2.MAP a live-block census found 47062 outstanding blocks,
++ * of which 35304 came from three places - the map's objects, the prototype
++ * lists and the AI message lists - averaging twenty-six bytes each.  At
++ * sixteen bytes of guard apiece that is over half a megabyte of an arena with
++ * 6100 KB in it, spent on debug checks for a build that has no debugger
++ * attached.
++ *
++ * The block count stays, because it costs nothing.  The byte total cannot,
++ * because without a header there is nowhere to remember a block's size - so
++ * mem_check() reports the count and says the total is not tracked, which is
++ * more honest than a number that would now be wrong.
++ */
+ static void* memoryBlockMallocImpl(size_t size)
+ {
+     void* ptr = nullptr;
+ 
+     if (size != 0) {
+-        size += sizeof(MemoryBlockHeader) + sizeof(MemoryBlockFooter);
+-        size += sizeof(int) - size % sizeof(int);
+-
+-        unsigned char* block = (unsigned char*)malloc(size);
+-        if (block != nullptr) {
+-            // NOTE: Uninline.
+-            ptr = mem_prep_block(block, size);
+-
++        ptr = malloc(size);
++        if (ptr != nullptr) {
+             gMemoryBlocksCurrentCount++;
+             if (gMemoryBlocksCurrentCount > gMemoryBlockMaximumCount) {
+                 gMemoryBlockMaximumCount = gMemoryBlocksCurrentCount;
+             }
+-
+-            gMemoryBlocksCurrentSize += size;
+-            if (gMemoryBlocksCurrentSize > gMemoryBlocksMaximumSize) {
+-                gMemoryBlocksMaximumSize = gMemoryBlocksCurrentSize;
+-            }
+         }
+     }
+ 
+@@ -111,34 +123,14 @@
+ // 0x4C5B58
+ static void* memoryBlockReallocImpl(void* ptr, size_t size)
+ {
++    // ARGON: see memoryBlockMallocImpl.  The block is what the caller has, and
++    // a size of zero still means free - which is what realloc() does with it.
+     if (ptr != nullptr) {
+-        unsigned char* block = (unsigned char*)ptr - sizeof(MemoryBlockHeader);
+-
+-        MemoryBlockHeader* header = (MemoryBlockHeader*)block;
+-        size_t oldSize = header->size;
+-
+-        gMemoryBlocksCurrentSize -= oldSize;
+-
+-        memoryBlockValidate(block);
+-
+-        if (size != 0) {
+-            size += sizeof(MemoryBlockHeader) + sizeof(MemoryBlockFooter);
+-            size += sizeof(int) - size % sizeof(int);
+-        }
+-
+-        unsigned char* newBlock = (unsigned char*)realloc(block, size);
+-        if (newBlock != nullptr) {
+-            gMemoryBlocksCurrentSize += size;
+-            if (gMemoryBlocksCurrentSize > gMemoryBlocksMaximumSize) {
+-                gMemoryBlocksMaximumSize = gMemoryBlocksCurrentSize;
+-            }
+-
+-            // NOTE: Uninline.
+-            ptr = mem_prep_block(newBlock, size);
++        void* newPtr = realloc(ptr, size);
++        if (newPtr != nullptr) {
++            ptr = newPtr;
+         } else {
+             if (size != 0) {
+-                gMemoryBlocksCurrentSize += oldSize;
+-
+                 debugPrint("%s,%u: ", __FILE__, __LINE__); // "Memory.c", 195
+                 debugPrint("Realloc failure.\n");
+             } else {
+@@ -162,16 +154,10 @@
+ // 0x4C5C2C
+ static void memoryBlockFreeImpl(void* ptr)
+ {
++    // ARGON: see memoryBlockMallocImpl.
+     if (ptr != nullptr) {
+-        void* block = (unsigned char*)ptr - sizeof(MemoryBlockHeader);
+-        MemoryBlockHeader* header = (MemoryBlockHeader*)block;
+-
+-        memoryBlockValidate(block);
+-
+-        gMemoryBlocksCurrentSize -= header->size;
+         gMemoryBlocksCurrentCount--;
+-
+-        free(block);
++        free(ptr);
+     }
+ }
+ 
+@@ -179,15 +165,19 @@
+ void mem_check()
+ {
+     if (gMallocProc == memoryBlockMallocImpl) {
+-        debugPrint("Current memory allocated: %6d blocks, %9u bytes total\n", gMemoryBlocksCurrentCount, gMemoryBlocksCurrentSize);
+-        debugPrint("Max memory allocated:     %6d blocks, %9u bytes total\n", gMemoryBlockMaximumCount, gMemoryBlocksMaximumSize);
++        // ARGON: bytes are no longer tracked; see memoryBlockMallocImpl.
++        debugPrint("Current memory allocated: %6d blocks (bytes not tracked)\n", gMemoryBlocksCurrentCount);
++        debugPrint("Max memory allocated:     %6d blocks\n", gMemoryBlockMaximumCount);
+     }
+ }
+ 
+ // NOTE: Inlined.
+ //
+ // 0x4C5CC4
+-static void* mem_prep_block(void* block, size_t size)
++// ARGON: nothing calls these two any more - the guards they maintain are gone.
++// Kept, so that the difference from upstream stays small and so that turning
++// the guards back on is a matter of undoing one patch.
++__attribute__((unused)) static void* mem_prep_block(void* block, size_t size)
+ {
+     MemoryBlockHeader* header;
+     MemoryBlockFooter* footer;
+@@ -207,7 +197,7 @@
+ // [block] is a pointer to the the memory block itself, not it's data.
+ //
+ // 0x4C5CE4
+-static void memoryBlockValidate(void* block)
++__attribute__((unused)) static void memoryBlockValidate(void* block)
+ {
+     MemoryBlockHeader* header = (MemoryBlockHeader*)block;
+     if (header->guard != MEMORY_BLOCK_HEADER_GUARD) {

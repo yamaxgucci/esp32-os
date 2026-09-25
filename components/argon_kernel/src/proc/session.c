@@ -20,7 +20,25 @@
 #include <argon/port/time.h>
 #include <argon/port/task.h>
 
-#define AG_BREAKIN_DOUBLE_US 1000000ll
+/*
+ * How long the second Ctrl+backslash has to arrive in.
+ *
+ * A second, until it was measured against the case it exists for.  An
+ * application that will not stop is usually one that is also printing,
+ * and the console was carrying eleven lines a second of it - each line
+ * repainting the screen, so nine kilobytes a second on a line that
+ * holds eleven.  Keystrokes queue behind that.  Two presses eight
+ * hundred milliseconds apart were seen more than a second apart, the
+ * second counted as another first, and the board printed its offer
+ * again instead of taking it - which from a chair is the board
+ * ignoring you twice.
+ *
+ * Three seconds.  The cost is that two separate visits to the system
+ * shell within three seconds stop an application; the board says
+ * whose name it is about to take before it takes it, which is the
+ * other half of this change.
+ */
+#define AG_BREAKIN_DOUBLE_US 3000000ll
 
 /*
  * A slot is a stack, not a process.
@@ -644,7 +662,28 @@ bool ag_session_enter_system(void)
     }
 
     (void)ag_session_focus(AG_SESSION_SYSTEM);
-    ag_console_puts("Ctrl+\\ again = kill last app\n");
+    /*
+     * And say what the second press will do, by name.
+     *
+     * "kill last app" is only useful to somebody who already knows which
+     * one that is.  The evening this changed, an application was left
+     * spinning because Ctrl+C at this prompt does nothing to it - Ctrl+C
+     * belongs to the shell in front of you, and that is not the shell it
+     * is running in - and the only line on the screen said "last app"
+     * without saying that there was one, which one, or that this was the
+     * way to stop it.  Three facts for one printf.
+     */
+    if (s_last_user != AG_PID_KERNEL) {
+        const char *name = (s_slots != NULL && is_user_slot(s_last_user_slot) &&
+                            s_slots[s_last_user_slot].name[0] != '\0')
+                               ? s_slots[s_last_user_slot].name
+                               : "the last application";
+        ag_console_printf("Ctrl+\\ again = stop %s (pid %u)\n", name,
+                          (unsigned)s_last_user);
+    } else {
+        ag_console_puts("Ctrl+\\ again = stop the last application "
+                        "(none is running)\n");
+    }
     return false;
 }
 

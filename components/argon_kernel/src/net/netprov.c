@@ -387,6 +387,16 @@ void ag_netprov_close(int fd)
     h.ops->net_close(h.dev, fd);
     let_go(&h);
 }
+/* net->reset (ABI 0.50): a connection thrown away rather than closed.  The
+ * built-in stack can; a provider across a wire has only its close. */
+void ag_netprov_close_hard(int fd)
+{
+    if (ag_netprov_is_builtin()) {
+        ag_port_net_close_hard(fd);
+        return;
+    }
+    ag_netprov_close(fd);
+}
 ag_err_t ag_netprov_nonblock(int fd, bool on)
 {
     held_t h;

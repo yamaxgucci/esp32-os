@@ -13,6 +13,7 @@
 #include <argon/board.h>
 #include <argon/cmdline.h>
 #include <argon/codepage.h>
+#include <argon/budget.h>
 #include <argon/console.h>
 #include <argon/textpanel.h>
 #include <argon/session.h>
@@ -459,6 +460,16 @@ static int cmd_mem(int argc, char **argv)
     const size_t int_block = ag_port_mem_largest(AG_MEM_FAST);
     const size_t psram_free = ag_port_mem_free(AG_MEM_SLOW);
     const size_t psram_total = ag_port_mem_total(AG_MEM_SLOW);
+    /*
+     * Extended memory has a largest block too, and leaving it out cost an
+     * evening.  An application that asks for a size gets one contiguous
+     * block or it does not start, so `free` is not the number that decides
+     * anything - Fallout 2 was refused six megabytes three times with this
+     * command reporting more than six free, and the arithmetic to explain
+     * the gap was guesswork every time because the figure that settles it
+     * was the one not printed.  It is the same call as the other two rows.
+     */
+    const size_t psram_block = ag_port_mem_largest(AG_MEM_SLOW);
 
     /*
      * And the same question asked the way an image asks it.
@@ -486,9 +497,10 @@ static int cmd_mem(int argc, char **argv)
                           (unsigned)(byte_free / 1024),
                           (unsigned)(byte_block / 1024));
         if (psram_total > 0) {
-            ag_console_printf("extended %5uK  %5uK\n",
+            ag_console_printf("extended %5uK  %5uK  %5uK\n",
                               (unsigned)(psram_total / 1024),
-                              (unsigned)(psram_free / 1024));
+                              (unsigned)(psram_free / 1024),
+                              (unsigned)(psram_block / 1024));
         } else {
             ag_console_puts("extended  none\n");
         }
@@ -503,9 +515,10 @@ static int cmd_mem(int argc, char **argv)
                           (unsigned)(byte_free / 1024),
                           (unsigned)(byte_block / 1024));
         if (psram_total > 0) {
-            ag_console_printf("  extended  %8u KB  %8u KB\n",
+            ag_console_printf("  extended  %8u KB  %8u KB  %8u KB\n",
                               (unsigned)(psram_total / 1024),
-                              (unsigned)(psram_free / 1024));
+                              (unsigned)(psram_free / 1024),
+                              (unsigned)(psram_block / 1024));
         } else {
             ag_console_puts("  extended         none\n");
         }
@@ -1179,16 +1192,25 @@ static int spawn_in_slot(const char *path, int argc, char **argv,
     }
 
     const int slot = ag_session_slot_of(pid);
-    ag_console_printf("started pid %u in slot %d (loading)\n", (unsigned)pid,
-                      slot >= 0 ? ag_session_display_number(slot) : -1);
 
     /*
      * Focus the new app only if the user stayed on the launch slot.  Alt+N
      * during a long load must not yank them back from another slot.
+     *
+     * Before the line that announces it, and that order is load-bearing.  An
+     * application that starts printing at once fills the console, and the
+     * announcement then waits its turn - measured at eight seconds on the CYD
+     * with an application printing twelve thousand characters a second.  With
+     * the focus taken after it, those eight seconds are a running application
+     * in a focused slot with no foreground process, so Ctrl+C reaches nothing
+     * and the board looks like it is ignoring the keyboard.  It was.
      */
     if (!detach_only && slot >= 0 && ag_session_focused() == target_slot) {
         (void)ag_session_focus(slot);
     }
+
+    ag_console_printf("started pid %u in slot %d (loading)\n", (unsigned)pid,
+                      slot >= 0 ? ag_session_display_number(slot) : -1);
     return 0;
 }
 
@@ -1697,6 +1719,30 @@ static int cmd_ps(int argc, char **argv)
     if (shown == 0) {
         ag_console_puts("  no applications loaded\n");
     }
+
+    /*
+     * And the driver tasks that run above applications, with what they spent
+     * of their budget in the window that just closed.  They are not processes
+     * and have no pid, but they are the only things on this machine that can
+     * starve one, so this is where a person looks when an application is slow
+     * for no reason it can see.
+     */
+    for (uint32_t i = 0;; i++) {
+        const char *name = NULL;
+        uint32_t    used = 0, budget = 0;
+        bool        demoted = false;
+        if (!ag_budget_report(i, &name, &used, &budget, &demoted)) {
+            break;
+        }
+        if (i == 0) {
+            ag_console_puts(
+                "  driver tasks above applications, per 100 ms window:\n");
+        }
+        ag_console_printf("  %-17s used %3u ms of %3u%s\n", name,
+                          (unsigned)used, (unsigned)budget,
+                          demoted ? "  (held down)" : "");
+    }
+
     return 0;
 }
 
@@ -2632,6 +2678,15 @@ static int cmd_drv(int argc, char **argv)
         const ag_err_t err = ag_module_unload(argv[2]);
         if (err == -AG_ENOENT) {
             ag_console_printf("%s: not loaded\n", argv[2]);
+            return 1;
+        }
+        if (err == -AG_EBUSY) {
+            /* A module with a task of its own that did not stop when it was
+             * told to.  The image is deliberately left loaded: unmapping code
+             * a task is still inside is a fault that names the wrong culprit. */
+            ag_console_printf("%s: a task of its own has not stopped; "
+                              "still loaded\n",
+                              argv[2]);
             return 1;
         }
         if (err != AG_OK) {
@@ -4802,8 +4857,40 @@ static int cmd_usb(int argc, char **argv)
         ag_console_puts("host up, nothing plugged in\n");
         break;
     case AG_USB_OPEN:
-        ag_console_printf("keyboard %04x:%04x, %u reports\n", st.vid, st.pid,
-                          (unsigned)st.reports);
+        /*
+         * ARGON: what it is, not "keyboard" for anything that opened - and one
+         * line per HID interface, with the endpoint's last transfer status.
+         *
+         * "keyboard 046d:c542, 249 reports" was the whole of it, and every word
+         * was misleading at once: the device was a mouse, the count had been
+         * frozen for ten minutes, and the endpoint had been halted since.
+         */
+        ag_console_printf("device %04x:%04x, %u reports total, %u loops, "
+                          "quiet for %u ms, prodded %u times\n",
+                          st.vid, st.pid, (unsigned)st.reports,
+                          (unsigned)st.loops, (unsigned)st.silent_ms,
+                          (unsigned)st.prods);
+        for (uint32_t i = 0; i < st.pipes; i++) {
+            const char *what = "hid";
+            if (st.pipe[i].usage == AG_USB_USAGE_KEYBOARD) {
+                what = "keyboard";
+            } else if (st.pipe[i].usage == AG_USB_USAGE_MOUSE) {
+                what = "mouse";
+            }
+            ag_console_printf("  %-8s interface %u ep 0x%02x: %s",
+                              what, (unsigned)st.pipe[i].itf,
+                              (unsigned)st.pipe[i].ep,
+                              (st.pipe[i].last != NULL) ? st.pipe[i].last
+                                                        : "?");
+            if (st.pipe[i].errors != 0u) {
+                ag_console_printf(", cleared %u time(s)",
+                                  (unsigned)st.pipe[i].errors);
+            }
+            if (st.pipe[i].dead) {
+                ag_console_puts(", NOT ANSWERING");
+            }
+            ag_console_puts("\n");
+        }
         break;
     default:
         break;
@@ -4899,8 +4986,40 @@ static int cmd_io(int argc, char **argv)
         uint8_t   tx[64];
         uint8_t   rx[64];
         size_t    n = 0;
+        int       first = 3;
+        int       cs = -1;
 
-        for (int i = 3; i < argc; i++) {
+        /*
+         * ARGON: and with a chip select, if one is named - `io spi 2 cs41 ...`
+         *
+         * Without it this reaches only a device that answers with no select at
+         * all, which in practice means nothing on a shared bus.  The question
+         * that comes up on every new board is the opposite one: there are four
+         * wires and a guess at which pin selects the card, and the cheapest
+         * possible test is to assert that pin and see whether anything at all
+         * comes back other than 0xff.
+         *
+         * 400 kHz, because the one device anybody probes this way is an SD
+         * card and that is the speed a card's own initialisation runs at; a
+         * panel at 80 MHz on the same bus is a different device with a clock
+         * of its own, which is what the per-chip-select configuration is for.
+         */
+        if (argc >= 5 && (argv[3][0] == 'c' || argv[3][0] == 'C')
+                && (argv[3][1] == 's' || argv[3][1] == 'S')) {
+            cs = atoi(argv[3] + 2);
+            first = 4;
+            if (io->spi_config != NULL) {
+                const ag_err_t cfg = io->spi_config(bus, cs, 400);
+
+                if (cfg != AG_OK) {
+                    ag_console_printf("spi%d cs %d: %s\n", bus, cs,
+                                      ag_loader_api()->sys->strerror(cfg));
+                    return 1;
+                }
+            }
+        }
+
+        for (int i = first; i < argc; i++) {
             if (n >= sizeof(tx)) {
                 ag_console_printf("io spi: at most %u bytes\n",
                                   (unsigned)sizeof(tx));
@@ -4909,7 +5028,7 @@ static int cmd_io(int argc, char **argv)
             tx[n++] = (uint8_t)strtoul(argv[i], NULL, 16);
         }
 
-        const ag_err_t err = io->spi_xfer(bus, -1, tx, rx, n);
+        const ag_err_t err = io->spi_xfer(bus, cs, tx, rx, n);
         if (err != AG_OK) {
             ag_console_printf("spi%d: %s\n", bus,
                               ag_loader_api()->sys->strerror(err));
@@ -5418,11 +5537,28 @@ static int cmd_beep(int argc, char **argv)
             }
             buf[i] = (int16_t)((v * gain) >> 8);
         }
-        const int32_t wrote =
-            ag_dev_write(dev, buf, (size_t)n * sizeof(int16_t), 0);
-        if (wrote <= 0) {
-            ag_console_printf("pcm0 write: %d\n", (int)wrote);
-            break;
+        /*
+         * A sink may take less than it is offered - that is how it says "wait"
+         * without stopping the machine that asked - so what was accepted is
+         * what counts.  This used to advance by the whole buffer whatever came
+         * back, which silently shortened the tone, and treated a zero as an
+         * error, which ended it.  Both showed up the day /dev/pcm0 stopped
+         * blocking.
+         */
+        uint32_t at = 0;
+        while (at < n) {
+            const int32_t wrote = ag_dev_write(
+                dev, buf + at, (size_t)(n - at) * sizeof(int16_t), 0);
+            if (wrote < 0) {
+                ag_console_printf("pcm0 write: %d\n", (int)wrote);
+                sent = total;
+                break;
+            }
+            if (wrote == 0) {
+                ag_port_task_delay(ag_port_ms_to_ticks(5));
+                continue;
+            }
+            at += (uint32_t)wrote / sizeof(int16_t);
         }
         sent += n;
     }
@@ -5528,10 +5664,48 @@ static int cmd_uartbridge(int argc, char **argv)
     /* not reached */
 }
 
+/*
+ * The data guards, and the hardware watch on the next one.
+ *
+ * Every loaded application has sixteen bytes of pattern past its data and the
+ * supervisor checks them on its tick; that part is not optional and has no
+ * switch.  `guard watch` arms a CPU watchpoint on the guard of the next
+ * application to start, so that the write is caught at the instruction rather
+ * than noticed a tick later - at the price of the board, because a watchpoint
+ * hit is a debug exception and that path reboots.  Off by default, said
+ * plainly when armed.
+ */
+static int cmd_guard(int argc, char **argv)
+{
+    if (argc >= 2 && ag_path_icmp(argv[1], "watch") == 0) {
+        const bool on = (argc < 3) || ag_path_icmp(argv[2], "off") != 0;
+        ag_proc_guard_watch(on);
+        ag_console_printf(on ? "the next application to start gets a hardware watch on "
+                       "its data guard.\n"
+                       "a write past it will stop the board and print the "
+                       "instruction that did it.\n"
+                     : "hardware watch off; the guards are still checked every "
+                       "tick.\n");
+        return 0;
+    }
+    if (argc >= 2) {
+        ag_console_printf("usage: guard [watch [off]]\n");
+        return 1;
+    }
+
+    ag_console_printf("data guards: %u bytes past every application's data, checked "
+              "on the supervisor tick\n", (unsigned)AG_APP_GUARD_BYTES);
+    ag_console_printf("hardware watch: %s\n",
+              ag_proc_guard_watching() ? "armed for the next application"
+                                       : "off ('guard watch' arms it)");
+    return 0;
+}
+
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
     {"mem", "[/t]", "memory usage; /t: every task and its stack", cmd_mem},
+    {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
      cmd_boot},
     {"log", "[-n N|clear]", "system journal", cmd_log},
@@ -5578,7 +5752,8 @@ static const ag_command_t k_commands[] = {
     {"link", "[use <dev>|none | run | get | mount [N:] | ping [n]]",
      "the wire to another node of this system", ag_cmd_link},
 #if AG_HAS_NET
-    {"net", "[wait|resolve <name>]", "address, waiting, and names into addresses",
+    {"net", "[wait|resolve <name>|sockets]",
+     "address, waiting, names into addresses, and what the stack holds",
      ag_cmd_net},
     {"wget", "<url> [file]", "fetch a file over http or ftp",
      ag_cmd_wget},
@@ -5740,6 +5915,15 @@ int ag_shell_execute(const char *line)
     int argc = ag_cmdline_split(work, argv, AG_ARGV_MAX);
     if (argc == 0) {
         return 0;
+    }
+    /*
+     * A line that fills every slot has probably lost its tail, and a lost
+     * tail is invisible: the command runs, and the options that were dropped
+     * simply look as though they do nothing.  Say so.
+     */
+    if (argc == AG_ARGV_MAX) {
+        ag_console_printf("warning: command line cut at %d words; the rest "
+                          "was dropped\n", AG_ARGV_MAX);
     }
 
     ag_handle_t redirect = AG_INVALID_HANDLE;

@@ -1,0 +1,32 @@
+diff --git a/src/art.cc b/src/art.cc
+--- a/src/art.cc
++++ b/src/art.cc
+@@ -1380,7 +1380,15 @@ void artStoreTopUp(void)
+ {
+     /* ARGON: sixty-four at a time, until the list is empty.  It used to take
+      * one batch and leave the rest, which was fine when the list was a handful
+-     * of save-panel pictures and useless now that a map names eight hundred. */
++     * of save-panel pictures and useless now that a map names eight hundred.
++     *
++     * Bounded, because this loop can feed itself: reading a picture off the
++     * card puts it back on the want list, and a picture the store refuses to
++     * keep never leaves it.  The gate in ag_art_store_want is the cure; this
++     * is the guard, so that the next refusal nobody foresaw costs a printed
++     * line instead of a board that has to be unplugged. */
++    unsigned done = 0;
++
+     for (;;) {
+         int wanted[64];
+         const unsigned n = ag_art_store_wanted(wanted, 64);
+@@ -1388,6 +1396,11 @@ void artStoreTopUp(void)
+         if (n == 0u) {
+             break;
+         }
++        done += n;
++        if (done > 4096u) {
++            ag_art_store_want_spinning(done);
++            break;
++        }
+ 
+     for (unsigned i = 0; i < n; i++) {
+         int size = 0;

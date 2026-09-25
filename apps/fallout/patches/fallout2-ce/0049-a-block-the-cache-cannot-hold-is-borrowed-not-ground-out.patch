@@ -1,0 +1,143 @@
+diff --git a/src/cache.cc b/src/cache.cc
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -480,6 +480,53 @@
+         }
+ 
+         bool allocated = false;
++
++        /*
++         * ARGON: a large block the cache's own memory has no room for is
++         * borrowed from the arena rather than ground out of the cache.
++         *
++         * The loop below made an entry the size of a critter animation about
++         * as expensive as it is possible to make it.  heapBlockAllocate with
++         * a4 of 1 will not spill, so a block that does not fit failed ten
++         * times over - and each failure costs a rebuild of the free block
++         * list, a qsort of it, a qsort of the moveable extents, and then a
++         * cacheEnsureSize, which mallocs a copy of the entry array, sorts that
++         * and sweeps it.  Ten rounds.  Then the whole cache was emptied for
++         * the one entry, so every other piece of art on the screen had to come
++         * off the card again: a second storm behind the first.
++         *
++         * Measured in Maxim's play on 8 September 2026 - three sizes, going
++         * round and round:
++         *
++         *     57  Heap Warning: Could not allocate block of 119808 bytes.
++         *     56  Heap Warning: Could not allocate block of 169960 bytes.
++         *     43  Heap Warning: Could not allocate block of 193892 bytes.
++         *
++         * A hundred and fifty-six times, against a cache of 1800 KB which,
++         * once a map's worth of small art is in it, has no hole anything like
++         * 190 KB and cannot make one: the blocks in the way are locked by the
++         * objects on the screen, and a locked block does not move.
++         *
++         * So: after the *first* failure - one failure is enough to know there
++         * is no hole this big, and nine more will not make one - a block from
++         * a sixteenth of the cache upwards is asked of the arena instead.
++         * That is 112 KB in an 1800 KB cache, which is what these three are.
++         * The small entries the cache is good at are untouched, and if the
++         * arena says no the old path runs exactly as before.
++         *
++         * A borrow, not a leak: heapBlockDeallocate gives a SYSTEM block back
++         * to the arena when the entry is evicted, like any other.  Bounded,
++         * because an unbounded spill is its own bug and has been suspected
++         * here once already - the heap keeps what it has out on loan in
++         * systemSize, and past a quarter of the cache's own size this stops
++         * asking.  And cacheEnsureSize is called first, so the cache goes on
++         * holding about maxSize whatever its blocks are made of: a spilled
++         * block counts against cache->size like any other, and skipping the
++         * accounting would let the cache grow past its budget and then evict
++         * half of itself on the next small entry.
++         */
++        bool borrowed = false;
++
+         int cacheEntrySize = size;
+         for (int attempt = 0; attempt < 10; attempt++) {
+             if (heapBlockAllocate(&(cache->heap), &(cacheEntry->heapHandleIndex), size, 1)) {
+@@ -487,6 +534,17 @@
+                 break;
+             }
+ 
++            if (!borrowed
++                && size >= cache->maxSize / 16
++                && cache->heap.systemSize + size <= cache->maxSize / 4) {
++                borrowed = true;
++                cacheEnsureSize(cache, size);
++                if (heapBlockAllocate(&(cache->heap), &(cacheEntry->heapHandleIndex), size, 0)) {
++                    allocated = true;
++                    break;
++                }
++            }
++
+             cacheEntrySize = (int)((double)cacheEntrySize + (double)size * 0.25);
+             if (cacheEntrySize > cache->maxSize) {
+                 break;
+diff --git a/src/sound.cc b/src/sound.cc
+--- a/src/sound.cc
++++ b/src/sound.cc
+@@ -20,6 +20,9 @@
+ #include "debug.h"
+ #include "platform_compat.h"
+ 
++/* ARGON: the [sfx] counters - see soundLoad, which is where they are taken. */
++#include "ag_diag.h"
++
+ namespace fallout {
+ 
+ typedef enum SoundStatusFlags {
+@@ -642,13 +645,53 @@
+         return gSoundLastError;
+     }
+ 
++    /*
++     * ARGON: timed, because this is where a sound actually costs something and
++     * no counter could see it.
++     *
++     * The sound effects cache holds the compressed file, so a "hit" saves the
++     * card and nothing else: the read below goes through the ACM decoder into
++     * a buffer of the file's size, which is then copied into an audio buffer
++     * and thrown away.  Every play pays for the decode again.  See
++     * port/ag_diag.h - reported as the [sfx] line.
++     */
++    {
++        const char* base = filePath ? filePath : "?";
++        for (const char* p = base; *p != '\0'; p++) {
++            if (*p == '\\' || *p == '/') {
++                base = p + 1;
++            }
++        }
++        size_t i = 0;
++        for (; base[i] != '\0' && i + 1 < AG_NAME_MAX; i++) {
++            ag_sfx_name[i] = base[i];
++        }
++        ag_sfx_name[i] = '\0';
++    }
++    const unsigned began = ag_cache_now_us();
++
+     sound->io.fd = sound->io.open(gSoundFileNameMangler(filePath), &(sound->rate));
+     if (sound->io.fd == -1) {
+         gSoundLastError = SOUND_FILE_NOT_FOUND;
+         return gSoundLastError;
+     }
+ 
+-    return _preloadBuffers(sound);
++    const int rc = _preloadBuffers(sound);
++
++    const unsigned took = (ag_cache_now_us() - began) / 1000u;
++    ag_sfx_loads++;
++    ag_sfx_ms += took;
++    ag_sfx_kb += (unsigned)(sound->fileSize / 1024);
++    if (took > ag_sfx_worst_ms) {
++        ag_sfx_worst_ms = took;
++        size_t i = 0;
++        for (; ag_sfx_name[i] != '\0' && i + 1 < AG_NAME_MAX; i++) {
++            ag_sfx_worst[i] = ag_sfx_name[i];
++        }
++        ag_sfx_worst[i] = '\0';
++    }
++
++    return rc;
+ }
+ 
+ // 0x4AD504

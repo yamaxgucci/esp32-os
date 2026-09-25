@@ -17,19 +17,34 @@
  * corruption is counted separately from loss, and a receiver that has lost its
  * place finds the next block instead of reporting every byte after it as bad.
  *
- *   link send <baud> [kb]      push kb kilobytes (default 256) and time it
- *   link recv <baud> [secs]    take what comes for secs seconds (default 15)
- *   link info                  what BOARD.CFG says uart1 is wired to
+ *   link send <baud> [kb] [block]    push kb kilobytes (default 256), time it
+ *   link recv <baud> [secs] [block]  take what comes for secs seconds
+ *
+ * Neither end watches the keyboard.  It used to: a key stopped a run early,
+ * which is a kindness at a desk.  But `kbhit` is true for *any* input event,
+ * and the board at the far end of this wire has a touchscreen - one stray pen
+ * interrupt and a run stopped after eight kilobytes, reported as the wire
+ * having delivered nothing.  A run is bounded by its own argument; that is
+ * enough, and a measurement that can be ended by a fingerprint is not.
+ *   link info                        what BOARD.CFG says uart1 is wired to
  *
  * Start the receiver first.  It reports as it goes, so a run that gets nothing
  * is distinguishable from a run that gets rubbish.
+ *
+ * The block size is the whole block on the wire, header and checksum included,
+ * and it is an argument rather than a constant because it is the one dial worth
+ * sweeping: a corrupt block costs the rest of itself plus the hunt for the next
+ * header, so what a line's error rate really costs depends on how big the
+ * blocks are.  Both ends must be given the same number - a mismatch reads as
+ * everything corrupt, which is the honest answer for a receiver framing at the
+ * wrong size.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
 #include <argon/argon.h>
 #include <argon/libc.h>
 
-AG_APP("LINK", "1.0", "argon", 0);
+AG_APP("LINK", "1.3", "argon", 0);
 
 /*
  * UART1.  UART0 is the console on both of these boards, and the port numbering
@@ -37,8 +52,19 @@ AG_APP("LINK", "1.0", "argon", 0);
  */
 #define LINK_PORT 1
 
-#define BLK_PAYLOAD 248u
-#define BLK_TOTAL   (8u + BLK_PAYLOAD + 4u) /* magic, seq, payload, sum */
+#define BLK_OVERHEAD 12u   /* magic 4, seq 4, sum 4                          */
+#define BLK_MIN      16u   /* the overhead plus four bytes worth checking     */
+#define BLK_MAX      1040u /* one block on the stack; the UART FIFO is 128    */
+#define BLK_DEFAULT  260u  /* what every measurement before 4 Sep 2026 used   */
+
+/*
+ * Set once from the command line before anything touches the wire, and read
+ * everywhere after.  A file-scope pair rather than a parameter threaded through
+ * payload_fill and payload_sum: those two are the inner loop, and the loop
+ * around them is the thing being measured.
+ */
+static uint32_t g_total = BLK_DEFAULT;
+static uint32_t g_payload = BLK_DEFAULT - BLK_OVERHEAD;
 
 /*
  * Two bytes would be enough to frame this, but four alternating ones are much
@@ -67,21 +93,24 @@ static uint32_t get32(const uint8_t *p)
  * repeats every byte - all zeros, all 0x55 - would hide a stuck line, which is
  * exactly the failure a new solder joint has.
  */
-static uint32_t payload_fill(uint8_t *p, uint32_t seq)
+static void payload_fill(uint8_t *p, uint32_t seq)
 {
-    uint32_t sum = 0;
-    for (uint32_t j = 0; j < BLK_PAYLOAD; ++j) {
-        const uint8_t b = (uint8_t)(seq * 13u + j);
-        p[j] = b;
-        sum += b;
+    for (uint32_t j = 0; j < g_payload; ++j) {
+        p[j] = (uint8_t)(seq * 13u + j);
     }
-    return sum;
 }
 
-static uint32_t payload_sum(const uint8_t *p)
+/*
+ * Over the sequence number as well as the payload, and that is not tidiness.
+ * With the checksum covering only the payload, a block whose *number* was
+ * mangled still passed - and since the number is what loss is counted from, a
+ * single flipped bit in it reported four billion blocks lost.  Whatever a
+ * checksum does not cover is a field nobody is checking.
+ */
+static uint32_t block_sum(const uint8_t *p)
 {
     uint32_t sum = 0;
-    for (uint32_t j = 0; j < BLK_PAYLOAD; ++j) {
+    for (uint32_t j = 0; j < 4u + g_payload; ++j) {
         sum += p[j];
     }
     return sum;
@@ -133,59 +162,72 @@ static ag_err_t open_link(uint32_t baud)
     return err;
 }
 
+/*
+ * Both ends move a buffer, not a block.
+ *
+ * The block size is the thing being swept, and if each block were also one
+ * call to the port then a run with small blocks would be measuring the cost of
+ * a system call rather than the cost of the wire - at 800 KB/s a 20-byte block
+ * is forty thousand calls a second at each end, and the answer would come out
+ * "small blocks are slow" for a reason that has nothing to do with the line.
+ * So the sender packs whole blocks into a buffer of about a kilobyte and
+ * writes that, and the receiver reads whatever has arrived and frames what it
+ * finds inside it.  Which is also what a real driver does.
+ */
+#define IO_BUF 1024u
+
 static int do_send(uint32_t baud, uint32_t kb)
 {
     if (open_link(baud) != AG_OK) {
         return 1;
     }
 
-    uint8_t blk[BLK_TOTAL];
-    memcpy(blk, k_magic, sizeof(k_magic));
+    static uint8_t buf[IO_BUF + BLK_MAX];
+    const uint32_t per_write = (g_total >= IO_BUF) ? 1u : (IO_BUF / g_total);
+    const uint32_t chunk = per_write * g_total;
 
     const uint32_t target = kb * 1024u;
     uint32_t       sent = 0;
     uint32_t       seq = 0;
-    bool           stopped = false;
 
-    ag_printf("send: %u KB at %u baud, blocks of %u\n", (unsigned)kb,
-              (unsigned)baud, (unsigned)BLK_TOTAL);
+    /*
+     * Every line this prints is kept under forty characters on purpose: the
+     * CYD's console is forty columns wide, and a line that wraps arrives at
+     * the laptop cut in half with a cursor move through the middle of it.
+     */
+    ag_printf("send: %u KB %u baud blk %u\n", (unsigned)kb, (unsigned)baud,
+              (unsigned)g_total);
 
     const ag_time_t t0 = g_ag_api->time->us();
     while (sent < target) {
-        put32(blk + 4, seq);
-        const uint32_t sum = payload_fill(blk + 8, seq);
-        put32(blk + 8 + BLK_PAYLOAD, sum);
+        for (uint32_t i = 0; i < per_write; ++i) {
+            uint8_t *const blk = buf + i * g_total;
+            memcpy(blk, k_magic, sizeof(k_magic));
+            put32(blk + 4, seq);
+            payload_fill(blk + 8, seq);
+            put32(blk + 8 + g_payload, block_sum(blk + 4));
+            seq++;
+        }
 
-        const int32_t n = ag_uart_write(LINK_PORT, blk, BLK_TOTAL);
+        const int32_t n = ag_uart_write(LINK_PORT, buf, chunk);
         if (n < 0) {
-            ag_printf("write failed at block %u: %s\n", (unsigned)seq,
+            ag_printf("tx failed at %u: %s\n", (unsigned)seq,
                       ag_strerror((ag_err_t)n));
             return 1;
         }
         sent += (uint32_t)n;
-        seq++;
-
-        /* Every sixty-odd blocks: let the watchdog see us, and let a key out. */
-        if ((seq & 0x3fu) == 0) {
-            ag_heartbeat();
-            if (ag_kbhit()) {
-                (void)ag_getch();
-                stopped = true;
-                break;
-            }
-        }
+        ag_heartbeat();
     }
     const uint64_t us = (uint64_t)(g_ag_api->time->us() - t0);
 
+    ag_printf("tx bytes=%u ms=%u bps=%u\n", (unsigned)sent,
+              (unsigned)(us / 1000u), (unsigned)rate_bps(sent, us));
     /*
-     * `sent` is what the driver ACCEPTED, not what left the wire: there is no
-     * drain in the ABI, so the last block is normally still in the transmit
-     * ring when this returns.  Blocks are reported beside it because they are
-     * the quantity the two ends can actually be compared on.
+     * The same in blocks, for tools/nodetest.ps1.  `sent` is what the driver
+     * ACCEPTED, not what left the wire: there is no drain in the ABI, so the
+     * last block is normally still in the transmit ring when this returns.
      */
-    ag_printf("sent %u bytes in %u blocks in %u ms = %u B/s%s\n",
-              (unsigned)sent, (unsigned)seq, (unsigned)(us / 1000u),
-              (unsigned)rate_bps(sent, us), stopped ? " (stopped)" : "");
+    ag_printf("sent %u bytes in %u blocks\n", (unsigned)sent, (unsigned)seq);
     return 0;
 }
 
@@ -195,11 +237,12 @@ static int do_recv(uint32_t baud, uint32_t secs)
         return 1;
     }
 
-    ag_printf("recv: %u s at %u baud, any key stops\n", (unsigned)secs,
-              (unsigned)baud);
+    ag_printf("recv: %u s %u baud blk %u\n", (unsigned)secs, (unsigned)baud,
+              (unsigned)g_total);
 
-    uint8_t  blk[BLK_TOTAL];
-    uint32_t have = 0;   /* bytes of the current block already in blk    */
+    static uint8_t io[IO_BUF];
+    static uint8_t blk[BLK_MAX];
+    uint32_t have = 0;   /* bytes of the current block already framed    */
     uint32_t ok = 0;     /* blocks whose checksum came out               */
     uint32_t bad = 0;    /* blocks that arrived corrupt                  */
     uint32_t lost = 0;   /* blocks the sequence numbers say never came   */
@@ -217,19 +260,9 @@ static int do_recv(uint32_t baud, uint32_t secs)
         if ((uint64_t)(g_ag_api->time->us() - t0) >= window) {
             break;
         }
-        if (ag_kbhit()) {
-            (void)ag_getch();
-            break;
-        }
-
-        /*
-         * Read into the block, then decide.  A short read is the normal case:
-         * the line delivers when it delivers, and a block spans several.
-         */
-        const int32_t n = ag_uart_read(LINK_PORT, blk + have,
-                                       (size_t)(BLK_TOTAL - have), 200);
+        const int32_t n = ag_uart_read(LINK_PORT, io, sizeof(io), 200);
         if (n < 0) {
-            ag_printf("read failed: %s\n", ag_strerror((ag_err_t)n));
+            ag_printf("rx failed: %s\n", ag_strerror((ag_err_t)n));
             return 1;
         }
         ag_heartbeat();
@@ -241,47 +274,61 @@ static int do_recv(uint32_t baud, uint32_t secs)
         }
         last = g_ag_api->time->us();
         bytes += (uint32_t)n;
-        have += (uint32_t)n;
 
         /*
-         * Hunting the header.  Only the first four bytes are checked here; a
-         * mismatch drops one byte and slides, which is what lets a receiver
-         * that came up mid-block find the start of the next one.
+         * Frame what arrived, one byte at a time.  The first four bytes are
+         * the only ones that have to match anything, so a receiver that has
+         * lost its place spends one comparison per byte until it finds a
+         * header - and a byte that is not the header byte expected may still
+         * be the first byte of the next one, which is the case the naive
+         * version gets wrong on a line whose corruption looks like magic.
          */
-        while (have >= 4 && (blk[0] != k_magic[0] || blk[1] != k_magic[1] ||
-                             blk[2] != k_magic[2] || blk[3] != k_magic[3])) {
-            for (uint32_t i = 1; i < have; ++i) {
-                blk[i - 1] = blk[i];
+        for (int32_t i = 0; i < n; ++i) {
+            const uint8_t b = io[i];
+            if (have < 4u) {
+                if (b == k_magic[have]) {
+                    blk[have++] = b;
+                } else if (b == k_magic[0]) {
+                    stray += have;   /* what was held was not a header */
+                    have = 1u;
+                    blk[0] = b;
+                } else {
+                    stray += have + 1u;
+                    have = 0u;
+                }
+                continue;
             }
-            have--;
-            stray++;
-        }
-        if (have < BLK_TOTAL) {
-            continue;
-        }
-
-        const uint32_t seq = get32(blk + 4);
-        const uint32_t claimed = get32(blk + 8 + BLK_PAYLOAD);
-        if (payload_sum(blk + 8) == claimed) {
-            ok++;
-            if (synced && seq > next) {
-                lost += seq - next;
+            blk[have++] = b;
+            if (have < g_total) {
+                continue;
             }
-            next = seq + 1;
-            synced = true;
-        } else {
-            bad++;
-            /* Do not trust this sequence number to count losses from. */
-            synced = false;
+            have = 0;
+            const uint32_t seq = get32(blk + 4);
+            const uint32_t claimed = get32(blk + 8 + g_payload);
+            if (block_sum(blk + 4) == claimed) {
+                ok++;
+                if (synced && seq > next) {
+                    lost += seq - next;
+                }
+                next = seq + 1;
+                synced = true;
+            } else {
+                bad++;
+                /* Do not trust this sequence number to count losses from. */
+                synced = false;
+            }
         }
-        have = 0;
     }
 
     const uint64_t span = (first != 0 && last > first) ? (uint64_t)(last - first)
                                                        : 0;
-    ag_printf("got %u bytes, %u blocks ok, %u corrupt, %u lost, %u stray\n",
-              (unsigned)bytes, (unsigned)ok, (unsigned)bad, (unsigned)lost,
+    ag_printf("rx bytes=%u ok=%u\n", (unsigned)bytes, (unsigned)ok);
+    ag_printf("rx bad=%u lost=%u stray=%u\n", (unsigned)bad, (unsigned)lost,
               (unsigned)stray);
+    if (bad != 0) {
+        /* What one bad block really costs: itself, and then the hunt. */
+        ag_printf("rx resync=%u\n", (unsigned)(stray / bad));
+    }
     /*
      * The bytes of a block that never completed.  Printed rather than left to
      * be worked out from the other numbers: without it a sender that stopped
@@ -293,11 +340,19 @@ static int do_recv(uint32_t baud, uint32_t secs)
                   (unsigned)have);
     }
     if (span != 0) {
-        ag_printf("while it was flowing: %u ms = %u B/s\n",
-                  (unsigned)(span / 1000u), (unsigned)rate_bps(bytes, span));
+        /*
+         * Two rates, because they answer different questions.  bps is what
+         * came off the wire; good is what a caller could have used - the
+         * payload of the blocks that survived, with headers, checksums and
+         * everything corrupt taken out.  A faster line that loses more can
+         * still win, and only the second number says whether it did.
+         */
+        ag_printf("rx ms=%u bps=%u\n", (unsigned)(span / 1000u),
+                  (unsigned)rate_bps(bytes, span));
+        ag_printf("rx good=%u\n", (unsigned)rate_bps(ok * g_payload, span));
     }
     if (bytes == 0) {
-        ag_printf("nothing arrived - check tx/rx are crossed and grounds tied\n");
+        ag_printf("rx nothing - crossed tx/rx? common ground?\n");
     }
     return 0;
 }
@@ -318,9 +373,28 @@ static int do_info(void)
 
 static void usage(void)
 {
-    ag_printf("usage: link send <baud> [kb]\n");
-    ag_printf("       link recv <baud> [secs]\n");
+    ag_printf("usage: link send <baud> [kb] [block]\n");
+    ag_printf("       link recv <baud> [secs] [block]\n");
     ag_printf("       link info\n");
+    ag_printf("block is the whole block on the wire, %u..%u, default %u\n",
+              (unsigned)BLK_MIN, (unsigned)BLK_MAX, (unsigned)BLK_DEFAULT);
+}
+
+/* The fourth argument, spelled the same for send and recv. */
+static bool take_block(int argc, char **argv)
+{
+    if (argc < 5) {
+        return true;
+    }
+    uint32_t n = 0;
+    if (!parse_u32(argv[4], &n) || n < BLK_MIN || n > BLK_MAX) {
+        ag_printf("link: '%s' is not a block size (%u..%u)\n", argv[4],
+                  (unsigned)BLK_MIN, (unsigned)BLK_MAX);
+        return false;
+    }
+    g_total = n;
+    g_payload = n - BLK_OVERHEAD;
+    return true;
 }
 
 int ag_main(int argc, char **argv)
@@ -350,12 +424,18 @@ int ag_main(int argc, char **argv)
             ag_printf("link: '%s' is not a size in KB\n", argv[3]);
             return 1;
         }
+        if (!take_block(argc, argv)) {
+            return 1;
+        }
         return do_send(baud, kb);
     }
     if (argv[1][0] == 'r') {
         uint32_t secs = 15u;
         if (argc >= 4 && (!parse_u32(argv[3], &secs) || secs == 0)) {
             ag_printf("link: '%s' is not a number of seconds\n", argv[3]);
+            return 1;
+        }
+        if (!take_block(argc, argv)) {
             return 1;
         }
         return do_recv(baud, secs);

@@ -1,0 +1,226 @@
+diff --git a/src/cache.cc b/src/cache.cc
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -375,11 +375,28 @@ bool cacheLock(Cache* cache, int key, void** data, CacheEntry** cacheEntryPtr)
+              * appears at all is a run with something missing on the screen.
+              */
+             ag_cache_failed[slot]++;
+-            debugPrint("\nCACHE: %s (key %d) would not load - %d of %d KB in "
+-                       "the cache is in use, %d entries\n",
++            /*
++             * ARGON: and how much of it was LOCKED, which is the number that
++             * says whether the cache is too small or merely all in use.  The
++             * first version printed cache->size and called it "in use", which
++             * reads as "locked" and is not - it is how full the cache is, and
++             * I drew a wrong conclusion from my own line.  Counted only on
++             * the failure path, so the walk costs nothing.
++             */
++            int locked_kb = 0;
++            int locked_n = 0;
++
++            for (int i = 0; i < cache->entriesLength; i++) {
++                if (cache->entries[i]->referenceCount != 0) {
++                    locked_kb += cache->entries[i]->size / 1024;
++                    locked_n++;
++                }
++            }
++            debugPrint("\nCACHE: %s (key %d) would not load - %d of %d KB "
++                       "held, %d entries, of which %d KB in %d are LOCKED\n",
+                 ag_miss_name[0] != '\0' ? ag_miss_name : "?", key,
+                 cache->size / 1024, cache->maxSize / 1024,
+-                cache->entriesLength);
++                cache->entriesLength, locked_kb, locked_n);
+             return false;
+         }
+ 
+@@ -508,6 +525,24 @@ bool argonCacheLend(Cache* cache)
+     cacheFlush(cache);
+ 
+     if (cache->entriesLength != 0) {
++        /*
++         * ARGON: and say so.  A silent refusal here is what made the save
++         * panel's failure unreadable on 16 September 2026: the ladder in
++         * on_out_of_arena printed what it had tried and this rung printed
++         * nothing at all, so the log showed an attempt and no outcome.  What
++         * is left after a flush is locked art, and its count is the number
++         * that says whether waiting would help.
++         */
++        int locked = 0;
++
++        for (int i = 0; i < cache->entriesLength; i++) {
++            if (cache->entries[i]->referenceCount != 0) {
++                locked++;
++            }
++        }
++        debugPrint("\nCACHE: cannot lend the block - %d entries left "
++                   "after a flush, %d of them locked\n",
++                   cache->entriesLength, locked);
+         return false;
+     }
+ 
+@@ -573,21 +608,50 @@ bool argonCacheBorrow(Cache* cache, int size, int* handleIndexPtr,
+         return false;
+     }
+ 
++    /*
++     * ARGON: and every refusal says which step refused.
++     *
++     * This is the path Maxim's design goes through - "no room in the RAM
++     * cache, push it out to the flash one" is exactly what cacheEnsureSize
++     * does here before the block is cut - and on 16 September 2026 it refused
++     * the save panel's 300 KB without a word, so the log showed the arena
++     * being asked and nothing about the answer.  Four steps, four reasons,
++     * and they are different problems: too big is a size, ensureSize is art
++     * that will not leave, and heapBlockAllocate is a hole that will not form
++     * because the locked blocks in the way cannot be moved.
++     */
+     /* Bigger than the cache could ever hold: not worth emptying it to fail. */
+     if (size > cache->maxSize / 2) {
++        debugPrint("\nCACHE: cannot lend %d bytes - more than half of a %d "
++                   "byte cache\n", size, cache->maxSize);
+         return false;
+     }
+ 
+     if (!cacheEnsureSize(cache, size)) {
++        int locked_kb = 0;
++
++        for (int i = 0; i < cache->entriesLength; i++) {
++            if (cache->entries[i]->referenceCount != 0) {
++                locked_kb += cache->entries[i]->size / 1024;
++            }
++        }
++        debugPrint("\nCACHE: cannot lend %d bytes - the sweep could not free "
++                   "it, %d of %d KB held is locked\n", size, locked_kb,
++                   cache->size / 1024);
+         return false;
+     }
+ 
+     if (!heapBlockAllocate(&(cache->heap), handleIndexPtr, size, 0)) {
++        debugPrint("\nCACHE: cannot lend %d bytes - the sweep freed the room "
++                   "but the heap has no run that long; locked blocks do not "
++                   "move\n", size);
+         return false;
+     }
+ 
+     if (!heapLock(&(cache->heap), *handleIndexPtr, bufferPtr)) {
+         (void)heapBlockDeallocate(&(cache->heap), handleIndexPtr);
++        debugPrint("\nCACHE: cannot lend %d bytes - the block was cut but "
++                   "would not lock\n", size);
+         return false;
+     }
+ 
+@@ -778,9 +842,35 @@ static bool cacheFetchEntryForKey(Cache* cache, int key, int* indexPtr)
+             }
+         }
+ 
+-        if (!cacheEnsureSize(cache, size)) {
++        /*
++         * ARGON: a cache with no room is not a picture that cannot be drawn.
++         *
++         * This was `if (!cacheEnsureSize(...)) break;` - give up, hand a null
++         * Art back through artLock, and leave the caller to draw nothing or,
++         * as happened on 16 September 2026 in the middle of Maxim's game, to
++         * blit from address zero.  I called that null "the cache behaving as
++         * it should".  It is not, and he said so: "он так не должен".
++         *
++         * Everything below this line already knows what to do when the cache
++         * is full - ask the heap, borrow a big block from the arena, and in
++         * the last resort empty the cache and allocate anyway - and none of
++         * it was ever reached, because the first gate refused.  What
++         * cacheEnsureSize reports is whether the SWEEP could get the total
++         * down, and it cannot when the rest of the cache is locked: on the
++         * world map the interface art is on screen and held, and interface
++         * art is the one kind that cannot be used where it lies in flash,
++         * because the engine draws into it (see ag_art_store_ptr).
++         *
++         * So the sweep is still asked for - it is how the cache stays near
++         * its budget - and its answer no longer ends the attempt.  A block
++         * bigger than the whole cache is still refused here: that bound is
++         * what keeps one picture from spilling without limit into an arena
++         * that peaks at 5977 KB of 6000 during a map load.
++         */
++        if (size > cache->maxSize) {
+             break;
+         }
++        cacheEnsureSize(cache, size);
+ 
+         bool allocated = false;
+ 
+diff --git a/src/worldmap.cc b/src/worldmap.cc
+--- a/src/worldmap.cc
++++ b/src/worldmap.cc
+@@ -6608,8 +6608,28 @@ int wmSfxIdxName(int sfxIdx, char** namePtr)
+ }
+ 
+ // 0x4C50F4
++/*
++ * ARGON: the four things this does, timed apart.
++ *
++ * Maxim: "Зачем перерисовывать интерфейс целиком?"  A fair question, and the
++ * honest answer is that nobody knew what the whole cost 67 to 78 ms on - the
++ * background blit reads 307200 pixels through a transparency test, the tabs
++ * draw city names as TEXT, the dial is a rotating picture, and the window
++ * refresh composes and converts all 640x480 for a view that is 450x443.  Any
++ * of the four could be most of it, and three of the four have a cheaper
++ * shape available.  Cutting before knowing which is how the last two days
++ * went wrong.
++ */
++extern "C" {
++unsigned ag_wmo_calls;
++unsigned ag_wmo_bg_us, ag_wmo_tabs_us, ag_wmo_dial_us, ag_wmo_win_us;
++unsigned ag_wmo_bg_worst, ag_wmo_tabs_worst, ag_wmo_dial_worst, ag_wmo_win_worst;
++}
++
+ static int wmRefreshInterfaceOverlay(bool shouldRefreshWindow)
+ {
++    const uint32_t ag_o0 = ag_us();
++
+     blitBufferToBufferTrans(_backgroundFrmImage.getData(),
+         _backgroundFrmImage.getWidth(),
+         _backgroundFrmImage.getHeight(),
+@@ -6617,8 +6637,12 @@ static int wmRefreshInterfaceOverlay(bool shouldRefreshWindow)
+         wmBkWinBuf,
+         WM_WINDOW_WIDTH);
+ 
++    const uint32_t ag_o1 = ag_us();
++
+     wmRefreshTabs();
+ 
++    const uint32_t ag_o2 = ag_us();
++
+     // NOTE: Uninline.
+     wmInterfaceDialSyncTime(false);
+ 
+@@ -6656,10 +6680,32 @@ static int wmRefreshInterfaceOverlay(bool shouldRefreshWindow)
+ 
+     wmInterfaceRefreshDate(false);
+ 
++    const uint32_t ag_o3 = ag_us();
++
+     if (shouldRefreshWindow) {
+         windowRefresh(wmBkWin);
+     }
+ 
++    const uint32_t ag_o4 = ag_us();
++
++    ag_wmo_calls++;
++    ag_wmo_bg_us += ag_o1 - ag_o0;
++    ag_wmo_tabs_us += ag_o2 - ag_o1;
++    ag_wmo_dial_us += ag_o3 - ag_o2;
++    ag_wmo_win_us += ag_o4 - ag_o3;
++    if (ag_o1 - ag_o0 > ag_wmo_bg_worst) {
++        ag_wmo_bg_worst = ag_o1 - ag_o0;
++    }
++    if (ag_o2 - ag_o1 > ag_wmo_tabs_worst) {
++        ag_wmo_tabs_worst = ag_o2 - ag_o1;
++    }
++    if (ag_o3 - ag_o2 > ag_wmo_dial_worst) {
++        ag_wmo_dial_worst = ag_o3 - ag_o2;
++    }
++    if (ag_o4 - ag_o3 > ag_wmo_win_worst) {
++        ag_wmo_win_worst = ag_o4 - ag_o3;
++    }
++
+     return 0;
+ }
+ 

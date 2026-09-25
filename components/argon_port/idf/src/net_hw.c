@@ -24,8 +24,11 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "mdns.h"
 #include "lwip/netdb.h"
+#include "lwip/priv/tcp_priv.h"
 #include "lwip/sockets.h"
+#include "lwip/tcpip.h"
 #include "nvs_flash.h"
 
 #include "net_hw.h"
@@ -113,6 +116,35 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 }
 
 void ag_port_net_on_ready(ag_port_net_ready_fn fn) { s_on_ready = fn; }
+
+/*
+ * A name on the network, so a phone opens http://argon.local:8765/ rather than
+ * the address DHCP happened to hand out - which nobody can guess and which
+ * changes.  mDNS answers <hostname>.local for whatever interface is up, the
+ * station's lease or the board's own access point alike; the component watches
+ * the netifs itself, so this only has to be called once, after the stack is up.
+ *
+ * Idempotent: init once, and the name can be set again to change it.
+ */
+ag_err_t ag_port_net_mdns(const char *hostname)
+{
+    static bool inited;
+
+    if (hostname == NULL || hostname[0] == '\0') {
+        hostname = "argon";
+    }
+    if (!inited) {
+        if (mdns_init() != ESP_OK) {
+            return -AG_EIO;
+        }
+        inited = true;
+    }
+    if (mdns_hostname_set(hostname) != ESP_OK) {
+        return -AG_EIO;
+    }
+    (void)mdns_instance_name_set(hostname);
+    return AG_OK;
+}
 
 /* Everything both links need before either can be brought up. */
 static ag_err_t common_start(void)
@@ -212,7 +244,43 @@ ag_err_t ag_port_net_start(void)
 
 #endif /* AG_PORT_HAS_WIFI */
 
-bool ag_port_net_ready(void) { return s_got_ip; }
+/*
+ * The board's own access point counts as a network.
+ *
+ * s_got_ip is set by IP_EVENT_STA_GOT_IP and by nothing else - a station that
+ * has been given a lease.  An access point is never given one: it *is* the
+ * thing that gives them, and it has 192.168.4.1 from the moment it starts.  So
+ * a board that only offers a point had a radio up, an address printed on its
+ * own console, and a network layer that said "not ready" for ever - which meant
+ * nothing that waits for the network ever started on it.  Not PHONE.SYS, not
+ * HTTPD.AXE, not the virtual keyboard.
+ *
+ * Found on the CYD on 13 September 2026 with `[ap] ssid` set: `wifi` said
+ * `access point "ArgonOS", at 192.168.4.1, 0 clients` while the phone link
+ * never opened its listener.  The roadmap's "join the board's SSID from a phone
+ * and open the map in a browser" had never actually been done, which is how it
+ * survived this long.
+ *
+ * A station lease still wins when there is one: a board doing both is joined to
+ * something, and that is the address the rest of the world can reach.
+ */
+static bool ap_addr(uint32_t *out)
+{
+#if AG_PORT_HAS_WIFI
+    ag_port_wifi_ap_status_t ap;
+    if (ag_port_wifi_ap_status(&ap) == AG_OK && ap.on && ap.ip != 0u) {
+        if (out != NULL) {
+            *out = ap.ip;
+        }
+        return true;
+    }
+#else
+    (void)out;
+#endif
+    return false;
+}
+
+bool ag_port_net_ready(void) { return s_got_ip || ap_addr(NULL); }
 
 ag_err_t ag_port_net_ifaddr(uint32_t *addr)
 {
@@ -220,7 +288,7 @@ ag_err_t ag_port_net_ifaddr(uint32_t *addr)
         return -AG_EINVAL;
     }
     if (!s_got_ip) {
-        return -AG_EAGAIN;
+        return ap_addr(addr) ? AG_OK : -AG_EAGAIN;
     }
     *addr = ntohl(s_ip.addr); /* host-order IPv4 */
     return AG_OK;
@@ -375,11 +443,69 @@ int32_t ag_port_net_recv(int fd, void *buf, size_t len)
     return (n < 0) ? (int32_t)map_errno(errno) : (int32_t)n;
 }
 
+ag_err_t ag_port_net_stats(ag_port_net_stats_t *out)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    memset(out, 0, sizeof(*out));
+
+    /*
+     * Walked with the stack locked, because these lists are the TCP timer's
+     * and it runs on its own thread.  LOCK_TCPIP_CORE is what every other
+     * caller into lwIP's internals uses here.
+     */
+    LOCK_TCPIP_CORE();
+    for (const struct tcp_pcb *p = tcp_active_pcbs; p != NULL; p = p->next) {
+        out->active++;
+        /*
+         * snd_queuelen is segments, not bytes; what is wanted is how much is
+         * actually held, and that is the unsent and unacked chains.
+         */
+        for (const struct tcp_seg *g = p->unsent; g != NULL; g = g->next) {
+            out->queued += g->len;
+        }
+        for (const struct tcp_seg *g = p->unacked; g != NULL; g = g->next) {
+            out->queued += g->len;
+        }
+        if (p->snd_wnd == 0u) {
+            out->stalled++;
+        }
+    }
+    for (const struct tcp_pcb_listen *p = tcp_listen_pcbs.listen_pcbs;
+         p != NULL; p = p->next) {
+        out->listening++;
+    }
+    for (const struct tcp_pcb *p = tcp_tw_pcbs; p != NULL; p = p->next) {
+        out->time_wait++;
+    }
+    for (const struct tcp_pcb *p = tcp_bound_pcbs; p != NULL; p = p->next) {
+        out->bound++;
+    }
+    UNLOCK_TCPIP_CORE();
+    return AG_OK;
+}
+
 void ag_port_net_close(int fd)
 {
     if (fd >= 0) {
         (void)lwip_close(fd);
     }
+}
+
+void ag_port_net_close_hard(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+    /*
+     * Linger of zero is the standard spelling of "reset it": close then sends
+     * an RST instead of a FIN and frees the queue with it.  Needs
+     * CONFIG_LWIP_SO_LINGER, which sdkconfig.defaults turns on for this.
+     */
+    struct linger lg = {.l_onoff = 1, .l_linger = 0};
+    (void)lwip_setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    (void)lwip_close(fd);
 }
 
 /*

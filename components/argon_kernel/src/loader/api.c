@@ -29,6 +29,7 @@
 #include <argon/input.h>
 #include <argon/kernel.h>
 #include <argon/keys.h>
+#include <argon/cfg.h>
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/module.h>
@@ -41,6 +42,8 @@
 #include <argon/filemap.h>
 #include <argon/vfs.h>
 
+#include "core/sysconfig.h"
+
 #include <argon/port/config.h>
 
 #include <argon/port/ble.h>
@@ -50,6 +53,7 @@
 #include <argon/port/wifi.h>
 #include <argon/port/camera.h>
 #include <argon/port/usbd.h>
+#include <argon/port/flash.h>
 
 #include "console/uart_console.h"
 #include "dev/io.h"
@@ -158,6 +162,12 @@ static void api_module_on_unload(void (*fn)(void))
     ag_module_on_unload(fn);
 }
 
+static bool api_module_task(void (*fn)(void *), void *arg, const char *name,
+                            uint32_t stack, int priority, uint32_t flags)
+{
+    return ag_module_task(fn, arg, name, stack, priority, flags);
+}
+
 /* Defined below, next to the other session-facing calls. */
 static int32_t api_prompt_in_slot(int slot, const char *cwd);
 
@@ -173,6 +183,7 @@ static const ag_sys_api_t k_sys = {
     .heartbeat = api_heartbeat,
     .module_on_unload = api_module_on_unload,
     .prompt_in_slot = api_prompt_in_slot,
+    .module_task = api_module_task,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -1150,6 +1161,111 @@ static ag_err_t api_power_declare(ag_power_fitness_t fitness, const char *why)
     return err;
 }
 
+/*
+ * Raw flash stores (ABI 0.45).
+ *
+ * A thin pass-through to the port, with one rule enforced here and nowhere
+ * else: only subtype 0x41 may be opened.  ag_port_part_find already refuses
+ * anything that is not a data partition, so the firmware is safe from a typo,
+ * but C: (littlefs, subtype 0x82) and nvs are data partitions too and an
+ * application that could erase those could wipe the machine's configuration.
+ * One comparison is the entire difference between "a store of my own" and
+ * "any storage on the machine".
+ */
+#define AG_STORE_SUBTYPE 0x41u
+
+static ag_store_t api_store_open(const char *label)
+{
+    if (label == NULL || *label == '\0') {
+        return NULL;
+    }
+
+    ag_port_part_t p = ag_port_part_find(label);
+
+    if (p == NULL || ag_port_part_subtype(p) != AG_STORE_SUBTYPE) {
+        return NULL;
+    }
+    return (ag_store_t)p;
+}
+
+static uint64_t api_store_bytes(ag_store_t s)
+{
+    return ag_port_part_size((ag_port_part_t)s);
+}
+
+static uint32_t api_store_erase_size(ag_store_t s)
+{
+    return ag_port_part_erase_size((ag_port_part_t)s);
+}
+
+/* Every call re-checks the handle: it came from an application, so it is a
+ * number the application can make up, and a made-up one must not reach the
+ * flash driver. */
+static bool store_ok(ag_store_t s)
+{
+    return s != NULL && ag_port_part_subtype((ag_port_part_t)s) == AG_STORE_SUBTYPE;
+}
+
+static ag_err_t api_store_read(ag_store_t s, uint64_t off, void *buf,
+                               size_t len)
+{
+    if (!store_ok(s) || buf == NULL) {
+        return AG_EINVAL;
+    }
+    return ag_port_part_read((ag_port_part_t)s, off, buf, len);
+}
+
+static ag_err_t api_store_write(ag_store_t s, uint64_t off, const void *buf,
+                                size_t len)
+{
+    if (!store_ok(s) || buf == NULL) {
+        return AG_EINVAL;
+    }
+    return ag_port_part_write((ag_port_part_t)s, off, buf, len);
+}
+
+static ag_err_t api_store_erase(ag_store_t s, uint64_t off, size_t len)
+{
+    if (!store_ok(s)) {
+        return AG_EINVAL;
+    }
+    return ag_port_part_erase((ag_port_part_t)s, off, len);
+}
+
+static ag_err_t api_store_map(ag_store_t s, uint64_t off, size_t len,
+                              const void **addr, ag_store_map_t *out)
+{
+    if (!store_ok(s) || addr == NULL || out == NULL) {
+        return AG_EINVAL;
+    }
+
+    ag_port_map_t h = 0;
+    const ag_err_t err = ag_port_part_map_data((ag_port_part_t)s, off, len,
+                                               addr, &h);
+
+    *out = (ag_store_map_t)h;
+    return err;
+}
+
+static void api_store_unmap(ag_store_map_t h)
+{
+    if (h != 0) {
+        ag_port_part_unmap((ag_port_map_t)h);
+    }
+}
+
+static const ag_store_api_t k_store = {
+    .size = sizeof(ag_store_api_t),
+    .open = api_store_open,
+    .bytes = api_store_bytes,
+    .erase_size = api_store_erase_size,
+    .read = api_store_read,
+    .write = api_store_write,
+    .erase = api_store_erase,
+    .map = api_store_map,
+    .unmap = api_store_unmap,
+};
+
 static const ag_power_api_t k_power = {
     .size = sizeof(ag_power_api_t),
     .status = api_power_status,
@@ -1252,6 +1368,11 @@ static ag_err_t api_ble_adv_status(ag_ble_adv_status_t *out)
 {
     return ag_port_ble_adv_status(out);
 }
+
+static ag_err_t api_ble_adv_notify(const void *data, uint32_t len)
+{
+    return ag_port_ble_adv_notify(data, len);
+}
 #endif /* AG_PORT_HAS_BLE_PERIPH */
 
 #if AG_PORT_HAS_BLE_CENTRAL
@@ -1334,6 +1455,7 @@ static const ag_ble_api_t k_ble = {
 #endif
 #if AG_PORT_HAS_BLE_PERIPH
     .adv_raw = api_ble_adv_raw,
+    .adv_notify = api_ble_adv_notify,
 #endif
 };
 #endif /* AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL */
@@ -1646,46 +1768,47 @@ static const ag_usbd_api_t k_usbd = {
 };
 #endif /* AG_PORT_HAS_USBD */
 
-/*
- * Configuration, for a .SYS or an .AXE that needs to know what the board was
- * told.  The subtable was NULL until now, and that had a cost nobody could see
- * from a config file: a driver asking the ABI which UART its wire was on got the
- * compiled-in default instead, so `[link2] uart = 0` was read as "this wire was
- * never asked for" and the middle of a cluster could not have a second wire
- * however its SYSTEM.CFG was written - silently, with nothing in the journal.
- * See wire_up() in apps/nodelink.
- *
- * Read-only for now.  Nothing here writes the file back, so set_str and commit
- * say so rather than pretending; a board's configuration is edited on a PC and
- * flashed into C:, which the tools already do.
- *
- * Filling in a subtable that was NULL is not an ABI change: every caller
- * already guards with AG_HAS(api->cfg, get_int).
- */
+/* ----------------------------------------------------------------------- */
+/* cfg - read the system/board configuration (SYSTEM.CFG + BOARD.CFG).      */
+/*                                                                          */
+/* Read-only for now: a driver reads its own keys (a radio its ssid, a      */
+/* panel its rotation).  Writing back to SYSTEM.CFG is the owner's job      */
+/* through the shell, so set_str/commit answer -AG_ENOTSUP rather than      */
+/* pretend.  Without this table api->cfg was NULL and every `.SYS`/`.AXE`   */
+/* silently saw no configuration at all.                                    */
+/* ----------------------------------------------------------------------- */
 static ag_err_t api_cfg_get_str(const char *key, char *buf, size_t len)
 {
-    if (key == NULL || buf == NULL || len == 0u) {
+    if (key == NULL || buf == NULL || len == 0) {
         return -AG_EINVAL;
     }
-    const char *v = ag_cfg_get(ag_sysconfig(), key, NULL);
-    if (v == NULL) {
+    buf[0] = '\0';
+    const ag_cfg_t *cfg = ag_sysconfig();
+    if (cfg == NULL) {
         return -AG_ENOENT;
     }
-    const size_t n = strlen(v);
-    const size_t copy = (n < len - 1u) ? n : len - 1u;
-    memcpy(buf, v, copy);
-    buf[copy] = '\0';
+    const char *val = ag_cfg_get(cfg, key, NULL);
+    if (val == NULL) {
+        return -AG_ENOENT;
+    }
+    size_t i = 0;
+    for (; val[i] != '\0' && i + 1 < len; i++) {
+        buf[i] = val[i];
+    }
+    buf[i] = '\0';
     return AG_OK;
 }
 
 static int32_t api_cfg_get_int(const char *key, int32_t def)
 {
-    return ag_cfg_get_int(ag_sysconfig(), key, def);
+    const ag_cfg_t *cfg = ag_sysconfig();
+    return (cfg == NULL) ? def : ag_cfg_get_int(cfg, key, def);
 }
 
 static bool api_cfg_get_bool(const char *key, bool def)
 {
-    return ag_cfg_get_bool(ag_sysconfig(), key, def);
+    const ag_cfg_t *cfg = ag_sysconfig();
+    return (cfg == NULL) ? def : ag_cfg_get_bool(cfg, key, def);
 }
 
 static ag_err_t api_cfg_set_str(const char *key, const char *value)
@@ -1695,7 +1818,10 @@ static ag_err_t api_cfg_set_str(const char *key, const char *value)
     return -AG_ENOTSUP;
 }
 
-static ag_err_t api_cfg_commit(void) { return -AG_ENOTSUP; }
+static ag_err_t api_cfg_commit(void)
+{
+    return -AG_ENOTSUP;
+}
 
 static const ag_cfg_api_t k_cfg = {
     .size = sizeof(ag_cfg_api_t),
@@ -1734,6 +1860,7 @@ static const ag_api_t k_api = {
     .ble = NULL,
 #endif
     .power = &k_power,
+    .store = &k_store,
 #if AG_PORT_HAS_WIFIMON
     .wifimon = &k_wifimon,
 #else

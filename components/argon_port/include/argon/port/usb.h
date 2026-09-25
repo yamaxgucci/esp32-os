@@ -71,6 +71,31 @@ typedef struct {
     uint16_t       vid;
     uint16_t       pid;
     uint32_t       reports; /* how many have arrived since it attached         */
+    /* Laps of the port's own event loop.  A count that is not moving means the
+     * port has stopped handling anything at all, which is a different fault
+     * from a device that has gone quiet with a healthy endpoint - and the two
+     * were indistinguishable from outside until this existed. */
+    uint32_t       loops;
+    /* Milliseconds since the last report, and how many times a silent pipe has
+     * been prodded back to life.  "495 reports, endpoint completed" said
+     * nothing about whether that was a second ago or ten minutes. */
+    uint32_t       silent_ms;
+    uint32_t       prods;
+    /*
+     * ARGON: and what each of the device's HID interfaces is doing, because
+     * "open, 249 reports" was true of a mouse that had stopped for good and
+     * there was no way to see that from outside.  `pipes` is how many are
+     * filled in.
+     */
+    uint32_t pipes;
+    struct {
+        uint8_t        itf;
+        uint8_t        ep;
+        ag_usb_usage_t usage;
+        const char    *last;   /* the last transfer status, in words          */
+        uint32_t       errors; /* how many times it had to be cleared         */
+        bool           dead;   /* cleared and still refusing                  */
+    } pipe[4];
 } ag_port_usb_status_t;
 
 /*

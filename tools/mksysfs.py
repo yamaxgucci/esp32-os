@@ -253,6 +253,7 @@ def main():
                             "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME",
                             '"partitions_4mb.csv"').strip('"')
         args.partitions = named if os.path.isabs(named)             else os.path.join(ROOT, named)
+        print("mksysfs: layout %s (from sdkconfig)" % named)
 
     offset, size = read_partition(args.partitions, "sysfs")
     name_max = read_config(args.sdkconfig, "CONFIG_LITTLEFS_OBJ_NAME_LEN", "64")

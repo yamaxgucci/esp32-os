@@ -4,8 +4,8 @@
  * Several apps may open this device at once.  Each open gets a private ring;
  * write() pushes interleaved s16 frames into that ring.  Whenever any client
  * has a full mix period, samples are summed (int32 → saturating s16) and
- * written to a single exclusive sink: pcmvirt if present, else pcm0, else
- * pcmnull.  Missing clients contribute silence for that period.
+ * written to a single exclusive sink: pcmvirt if present, then pcmrem, then
+ * pcm0, else pcmnull.  Missing clients contribute silence for that period.
  *
  * Each of those is looked for HERE and then on the node next door, so a board
  * with no converter of its own plays through its neighbour rather than into
@@ -27,14 +27,24 @@
 #define TAG "pcmmix"
 
 #define PCMMIX_CLIENTS     4
-#define PCMMIX_RING_BYTES  (4u * 1024u)
+/*
+ * 16 KB per client, which is 186 ms of 22 kHz stereo, and not four.
+ *
+ * A client's ring is what stands between "the program produced sound" and "the
+ * sink was ready for it", and on this machine the two can be a long way apart:
+ * the kernel holds the device registry across a whole blit, so while a screen
+ * is being pushed down a serial link the task with the samples cannot get in.
+ * Four kilobytes is 46 ms and the surplus is dropped silently - which is where
+ * the game's music went while its picture was being sent.
+ */
+#define PCMMIX_RING_BYTES  (16u * 1024u)
 #define PCMMIX_PERIOD      256u /* frames per mix tick */
 
 typedef struct pcmmix_client {
     int            used;
     ag_audio_fmt_t fmt;
     int            fmt_set;
-    uint8_t       *ring; /* PCMMIX_RING_BYTES in PSRAM (or internal fallback) */
+    uint8_t       *ring; /* PCMMIX_RING_BYTES, allocated while the client is open */
     size_t         ring_r;
     size_t         ring_w;
     size_t         ring_used;
@@ -60,9 +70,10 @@ typedef struct {
     int16_t         *mix_scratch; /* PCMMIX_PERIOD * 2, heap */
 } pcmmix_state_t;
 
+static void *pcmmix_alloc(size_t n); /* PSRAM first, then internal */
+
 static pcmmix_state_t *s_st; /* heap/PSRAM — keep DRAM BSS tight */
 static ag_device_t    *s_dev;
-static uint8_t        *s_ring_pool; /* PCMMIX_CLIENTS * PCMMIX_RING_BYTES */
 
 static void default_fmt(ag_audio_fmt_t *out)
 {
@@ -168,16 +179,24 @@ static void ring_clear(pcmmix_client_t *c)
 
 /*
  * Best first, and this order is a fact about SOUND rather than about devices:
- * a helper on the development machine, then the board's own converter, then
- * the one that swallows it.  The registry cannot derive this and should not
- * try - which is why the list stays here and only the looking moved out.
+ * a helper on the development machine, the wire to a second board, then the
+ * board's own converter, then the one that swallows it.  The registry cannot
+ * derive this and should not try - which is why the list stays here and only
+ * the looking moved out.
  *
  * pcmmix itself is absent from the list deliberately.  It is of class
  * AG_DEV_AUDIO too, and a mixer that could choose itself as its own output is
  * a loop with no bottom.
+ *
+ * pcmvirt and pcmrem are both published by a loadable driver, and a driver was
+ * loaded on purpose: nobody installs one and then wants the built-in output
+ * instead.  pcmrem is the wire to a second board (apps/remdisp), which on a
+ * machine whose amplifier is unsoldered is the only output there is - so it has
+ * to come ahead of pcm0, which would otherwise win by existing and play to
+ * nothing at all, indistinguishably from working.
  */
-static const char *const k_audio_prefer[] = {"pcmvirt", "pcm0", "pcmnull",
-                                             NULL};
+static const char *const k_audio_prefer[] = {"pcmvirt", "pcmrem", "pcm0",
+                                             "pcmnull", NULL};
 
 /*
  * HERE OR ON THE NODE NEXT DOOR, and the road back to that line was the whole
@@ -408,7 +427,10 @@ static pcmmix_client_t *alloc_client(pcmmix_state_t *st)
     for (i = 0; i < PCMMIX_CLIENTS; i++) {
         if (!st->clients[i].used) {
             pcmmix_client_t *c = &st->clients[i];
-            uint8_t         *ring = c->ring;
+            uint8_t *ring = (uint8_t *)pcmmix_alloc(PCMMIX_RING_BYTES);
+            if (ring == NULL) {
+                return NULL; /* no memory for a ring is no client */
+            }
             memset(c, 0, sizeof(*c));
             c->ring = ring;
             c->used = 1;
@@ -453,6 +475,8 @@ static ag_err_t mix_close_session(ag_device_t *dev, void *session)
     }
     c->used = 0;
     ring_clear(c);
+    ag_port_free(c->ring);
+    c->ring = NULL;
     if (s_st->client_count > 0) {
         s_st->client_count--;
     }
@@ -595,8 +619,6 @@ static void *pcmmix_alloc(size_t n)
 
 ag_err_t ag_pcmmix_init(void)
 {
-    const size_t pool_bytes =
-        (size_t)PCMMIX_CLIENTS * (size_t)PCMMIX_RING_BYTES;
     const size_t scratch_bytes = PCMMIX_PERIOD * 2u * sizeof(int16_t);
     ag_dev_desc_t desc;
     ag_err_t      err;
@@ -610,21 +632,23 @@ ag_err_t ag_pcmmix_init(void)
     default_fmt(&s_st->mix_fmt);
     s_st->mix_fmt_set = 1;
 
+    /*
+     * No ring pool here any more.  Four clients' rings at sixteen kilobytes
+     * each is sixty-four, taken at boot whether anything ever opens the mixer
+     * or not - and on the CYD, which has 179 KB and plays its sound through
+     * pcm0 directly, that was the memory the picture receiver needed to load
+     * at all (`load remterm.axe failed (-12)`).  A ring is allocated when a
+     * client opens and freed when it closes; a board that never mixes never
+     * pays.
+     */
     s_st->mix_scratch = (int16_t *)pcmmix_alloc(scratch_bytes);
-    s_ring_pool = (uint8_t *)pcmmix_alloc(pool_bytes);
-    if (s_st->mix_scratch == NULL || s_ring_pool == NULL) {
-        ag_port_free(s_st->mix_scratch);
-        ag_port_free(s_ring_pool);
+    if (s_st->mix_scratch == NULL) {
         ag_port_free(s_st);
         s_st = NULL;
-        s_ring_pool = NULL;
         return -AG_ENOMEM;
     }
     memset(s_st->mix_scratch, 0, scratch_bytes);
-    memset(s_ring_pool, 0, pool_bytes);
-    for (i = 0; i < PCMMIX_CLIENTS; i++) {
-        s_st->clients[i].ring = s_ring_pool + i * PCMMIX_RING_BYTES;
-    }
+    (void)i;
 
     memset(&desc, 0, sizeof(desc));
     desc.name = "pcmmix";
@@ -636,16 +660,14 @@ ag_err_t ag_pcmmix_init(void)
     err = ag_dev_register(&desc, &s_dev);
     if (err != AG_OK) {
         ag_port_free(s_st->mix_scratch);
-        ag_port_free(s_ring_pool);
         ag_port_free(s_st);
         s_st = NULL;
-        s_ring_pool = NULL;
         return err;
     }
     (void)ag_dev_on_revoke(on_revoke);
     ag_log(AG_LOG_INFO, TAG,
-           "pcmmix ready (sum %u clients → pcmvirt|pcm0|pcmnull, here or on "
-           "the node next door)",
+           "pcmmix ready (sum %u clients → pcmvirt|pcmrem|pcm0|pcmnull, here "
+           "or on the node next door)",
            (unsigned)PCMMIX_CLIENTS);
     return AG_OK;
 }

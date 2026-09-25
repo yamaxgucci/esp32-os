@@ -25,6 +25,17 @@ tools/local-env.ps1
 # Fetched by apps/gfxbench/build.py (LVGL v9.3.0). Not vendored.
 third_party/lvgl/
 
+# Fetched by apps/fallout/build.py. The engine is under the Sustainable Use
+# License - not an open licence, and no commercial use - so it stays out of
+# this repository entirely; what lives in apps/fallout is the port, Apache-2.0
+# like the rest. adecode and fpattern are MIT and are fetched with it rather
+# than separately.
+third_party/fallout1-ce/
+third_party/fallout2-ce/
+third_party/adecode-src/
+third_party/fpattern-src/
+third_party/zlib-src/
+
 # Reference recordings, cabinet impulses and NAM captures: third party, and
 # 177 MB of them. assets/audio/guitar-di/README.md says what each one is, where
 # it came from and what its noise floor measures, which is the part worth
@@ -46,6 +57,11 @@ compile_commands.json
 Thumbs.db
 desktop.ini
 .DS_Store
+build_cyd/
+build_s3/
+
+# Local, always-loaded working notes for Claude - kept out of the public repo
+CLAUDE.md
 
 # Board WiFi password, read by the flashing tools (assets/pwd). Never committed.
 assets/pwd
