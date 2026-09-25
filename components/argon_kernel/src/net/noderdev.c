@@ -268,6 +268,8 @@ typedef struct {
      */
     uint32_t in_rate, wire_rate;
     uint8_t  in_ch, wire_ch;
+    /* when the sound written so far is due to have played (see pace_audio) */
+    int64_t  due_us;
 } rdev_t;
 
 /*
@@ -431,8 +433,41 @@ static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
  */
 static uint8_t s_fit_buf[RD_POUR_CAP];
 
+/*
+ * THE WRITE IS THE CLOCK, and a proxy had none.
+ *
+ * A mixer runs on its writer's call and mixes as many periods as are ready;
+ * what keeps it to real time is the converter, whose write waits for room.
+ * This write never waited, so the C3 sent sound exactly as fast as its program
+ * made it: slower than real time while TONE computed sinf in soft float (the
+ * CYD played holes), faster once it read a table (the CYD's ring overflowed) -
+ * the same stutter from both sides, with every counter on the wire clean
+ * (25 Sep 2026).  So the proxy keeps time as a converter would: no more than
+ * PACE_LEAD_US ahead of the clock, which is also the cushion the far board
+ * starts with.
+ */
+#define PACE_LEAD_US 80000
+
+static void pace_audio(rdev_t *p, size_t len)
+{
+    if (p->in_rate == 0u || p->in_ch == 0u) {
+        return;
+    }
+    const int64_t frames = (int64_t)(len / ((size_t)p->in_ch * 2u));
+    const int64_t now = ag_port_us();
+    if (p->due_us < now - PACE_LEAD_US) {
+        p->due_us = now; /* a new stream, or one that stopped for a while */
+    }
+    p->due_us += frames * 1000000 / (int64_t)p->in_rate;
+    const int64_t ahead = p->due_us - now - PACE_LEAD_US;
+    if (ahead > 1000) {
+        ag_port_task_delay(ag_port_ms_to_ticks((uint32_t)(ahead / 1000)));
+    }
+}
+
 static int32_t pour_audio(rdev_t *p, const void *buf, size_t len, uint64_t off)
 {
+    pace_audio(p, len);
     const uint8_t *src = (const uint8_t *)buf;
     const bool     convert = p->in_rate != 0u && p->wire_rate != 0u &&
                          (p->in_rate != p->wire_rate || p->in_ch != p->wire_ch);
@@ -951,6 +986,9 @@ static void reply(uint8_t op, uint16_t tag, int32_t status, uint8_t cls,
  */
 #define RD_MAX_SESSIONS 8
 static ag_device_t *s_session[RD_MAX_SESSIONS];
+/* A sound session's channels, from the SETFMT it was opened with: what a
+ * frame is, when frames have to be taken out (see keep_pace). */
+static uint8_t s_session_ch[RD_MAX_SESSIONS];
 
 /* The request being served, and the worker serving it. */
 static uint8_t        s_req[RD_HDR + RD_MAX_PAYLOAD];
@@ -1035,6 +1073,11 @@ static ag_port_task_t    s_pour_task;
 static uint32_t s_pour_periods;
 static uint32_t s_pour_bytes;
 static uint32_t s_pour_lost;
+/* of those: a full ring on arrival, and a converter that stayed full */
+static uint32_t s_pour_full;
+static uint32_t s_pour_short;
+/* frames taken out to keep up with this converter (keep_pace) */
+static uint32_t s_pour_paced;
 static uint32_t s_pour_said_ms;
 static uint32_t s_pour_said_periods;
 static uint32_t s_pour_said_lost;
@@ -1121,6 +1164,10 @@ static void serve_one(const uint8_t *b, uint16_t n)
         }
         memcpy(obuf, pay, k);
         const ag_err_t e = ag_dev_ioctl(dev, a, obuf, k);
+        if (e == AG_OK && a == AG_IOC_AUDIO_SETFMT && k >= sizeof(ag_audio_fmt_t) &&
+            h < (uint32_t)RD_MAX_SESSIONS) {
+            s_session_ch[h] = ((const ag_audio_fmt_t *)obuf)->channels;
+        }
         reply(op, tag, (int32_t)e, AG_LINK_CONTROL, obuf, k);
         break;
     }
@@ -1275,13 +1322,70 @@ static void pour_report(void)
         s_pour_lost == s_pour_said_lost) {
         return;
     }
-    ag_log(AG_LOG_INFO, TAG, "poured %u periods, %u bytes, %u lost",
+    ag_log(AG_LOG_INFO, TAG,
+           "poured %u periods, %u bytes, %u lost (%u to a full ring, %u to a "
+           "full converter), %u frames paced out",
            (unsigned)s_pour_periods, (unsigned)s_pour_bytes,
-           (unsigned)s_pour_lost);
+           (unsigned)s_pour_lost, (unsigned)s_pour_full,
+           (unsigned)s_pour_short, (unsigned)s_pour_paced);
     s_pour_said = true;
     s_pour_said_ms = now;
     s_pour_said_periods = s_pour_periods;
     s_pour_said_lost = s_pour_lost;
+}
+
+/*
+ * TWO CLOCKS, AND THIS BOARD'S IS THE ONE THAT PLAYS.
+ *
+ * The sender makes sound at its own clock's rate and this converter plays it
+ * at another's; they are never quite the same, and on the CYD they are not
+ * close: its DAC, asked for 22 050 Hz near the bottom of what its divider
+ * reaches, plays about 16% slow.  The ring then fills steadily and whole
+ * periods were thrown away at the full end - a regular hole a person hears as
+ * a rhythm (811 of 5 168 periods, 25 Sep 2026).
+ *
+ * So the queue sets the pace: past half full, frames are taken out evenly
+ * through the period - one in eight, one in five past three quarters - which
+ * moves the pitch by that much for as long as it lasts instead of cutting the
+ * sound.  Frames, not bytes: a stereo session loses both channels of a frame.
+ * Only for a session whose format this board was told.
+ */
+static uint32_t keep_pace(rd_period_t *pd)
+{
+    const uint8_t ch = (pd->handle < (uint32_t)RD_MAX_SESSIONS)
+                           ? s_session_ch[pd->handle]
+                           : 0u;
+    if (ch == 0u || pd->op != RD_WRITE) {
+        return pd->len;
+    }
+    /*
+     * One frame a period, and only near full: that is 0.4% of a 256-frame
+     * period, enough for two crystals that disagree and too little to hear.
+     * It took one in eight past half full at first, which on a 4 Mbaud wire -
+     * where the queue fills from the bursts, not from the clocks - was a
+     * grain on everything a person listened to.  A clock as wrong as the
+     * CYD's DAC was at 22 kHz is the converter's own to fix (audio_hw.c).
+     */
+    const uint32_t queued = (s_ring_w + RD_RING - s_ring_r) % RD_RING;
+    if (queued * 4u < RD_RING * 3u) {
+        return pd->len;
+    }
+    const uint32_t every = 0xffffffffu; /* see the loop: the last frame only */
+    const uint32_t frame = (uint32_t)ch * 2u;
+    const uint32_t frames = pd->len / frame;
+    uint32_t       out = 0;
+    (void)every;
+    for (uint32_t f = 0; f < frames; f++) {
+        if (f == frames - 1u && frames > 1u) {
+            s_pour_paced++;
+            continue;
+        }
+        if (out != f) {
+            memmove(pd->data + out * frame, pd->data + f * frame, frame);
+        }
+        out++;
+    }
+    return out * frame;
 }
 
 static void pour_task(void *arg)
@@ -1325,6 +1429,7 @@ static void pour_task(void *arg)
                 s_ring_r = (s_ring_r + 1u) % RD_RING;
                 continue;
             }
+            const uint32_t len = keep_pace(pd);
             /*
              * All of the period, waiting for room.  A converter's write does
              * not wait (audio_hw.c says why: its caller may hold the registry)
@@ -1336,9 +1441,9 @@ static void pour_task(void *arg)
              * up on rather than delaying every period behind it.
              */
             uint32_t done = 0;
-            for (int waited = 0; done < pd->len && waited < 40;) {
+            for (int waited = 0; done < len && waited < 40;) {
                 const int32_t n = ag_dev_write(dev, pd->data + done,
-                                               pd->len - done, pd->off + done);
+                                               len - done, pd->off + done);
                 if (n < 0) {
                     break;
                 }
@@ -1353,8 +1458,9 @@ static void pour_task(void *arg)
                 s_pour_periods++;
                 s_pour_bytes += done;
             }
-            if (done < pd->len) {
+            if (done < len) {
                 s_pour_lost++;
+                s_pour_short++;
             }
         } else {
             /*
@@ -1480,6 +1586,16 @@ static void take_period(const uint8_t *b, uint16_t n)
     }
 
     uint32_t next = (s_ring_w + 1u) % RD_RING;
+    /*
+     * Sound waits a little too.  A period arriving at a full ring is part of
+     * a burst - a frame of the link carries several - and the converter is
+     * draining the ring at its own rate as this runs, so a few milliseconds
+     * make room for it where dropping it made a hole in what is heard.
+     */
+    for (int k = 0; k < 20 && next == s_ring_r && b[0] == RD_WRITE; k++) {
+        ag_port_task_delay(1);
+        next = (s_ring_w + 1u) % RD_RING;
+    }
     if (next == s_ring_r && b[0] == RD_BLITZ) {
         /*
          * A screen kept by what changed cannot miss a change: this waits for
@@ -1493,6 +1609,7 @@ static void take_period(const uint8_t *b, uint16_t n)
     }
     if (next == s_ring_r) {
         s_pour_lost++; /* full: this one missed its moment */
+        s_pour_full++;
         return;
     }
     rd_period_t *pd = &s_ring[s_ring_w];

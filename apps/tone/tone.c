@@ -9,7 +9,8 @@
  *   run t:\tone.axe 1000 80 20      1 kHz, level 80, 20 s
  *   run t:\tone.axe 440 60 8 pcm0   this board's own converter, by name
  *   run t:\tone.axe 440 60 8 cyd.pcm0   a neighbour's, by the name `dev` lists
- *   run t:\tone.axe sweep 60 30     a glide, 200 -> 1600 -> 200 Hz
+ *   run t:\tone.axe sweep 30 60     a siren, 700 Hz +-25%
+ *   run t:\tone.axe beep 30         three short beeps, a marker
  *
  * The level IS the volume: this DAC has no gain of its own, so loudness is the
  * amplitude of the samples and nothing else.  A steady tone is also the
@@ -30,6 +31,16 @@ AG_APP("TONE", "1.0", "argon", 0);
 #define FRAMES    512               /* per write; 11.6 ms at 44.1 kHz */
 
 static int16_t s_buf[FRAMES * CHANNELS];
+
+/*
+ * One cycle of sine, computed once.  A sinf() per sample is 44 100 a second
+ * of soft float on a chip with no FPU, and the C3 could not keep up: thirty
+ * seconds of siren took it 31.3, and the mixer filled what was late with
+ * silence - a stutter Maxim heard and blamed, rightly at first, on the wire
+ * (25 Sep 2026).  A table read is the same sound at no cost.
+ */
+#define TABLE 1024
+static int16_t s_sine[TABLE];
 
 /* Tiny base-10 parse: no libc for one number, and a bad arg falls to the def. */
 static int parse_int(const char *s, int def)
@@ -54,13 +65,20 @@ static int parse_int(const char *s, int def)
 int ag_main(int argc, char **argv)
 {
     /*
-     * "sweep" in place of a frequency: the pitch glides 200 -> 1600 -> 200 Hz,
-     * one way in four seconds.  A dropout on a steady tone is a click; on a
-     * glide it is also a jump in the pitch, so a gap in a stream that crosses
-     * a wire is heard even when it is short.
+     * "sweep" in place of a frequency: a siren, 700 Hz swinging 25% either way
+     * and back, two seconds each way - Maxim's ask, after a 200-1600 Hz
+     * glide that was loud, high and too busy to hear a fault in.  A dropout
+     * on a slow drift is a hole in a sound that is otherwise always there.
      */
     const bool sweep = (argc > 1) && argv[1][0] == 's';
-    int freq = sweep ? 200 : parse_int((argc > 1) ? argv[1] : NULL, 440);
+    /*
+     * "beep": three short beeps and nothing else - 880 Hz, 150 ms each, 150 ms
+     * apart.  A marker, so that a listener comparing two sounds knows which one
+     * is starting.
+     */
+    const bool beep = (argc > 1) && argv[1][0] == 'b';
+    int freq = sweep ? 700 : beep ? 880
+                                  : parse_int((argc > 1) ? argv[1] : NULL, 440);
     int vol  = parse_int((argc > 2) ? argv[2] : NULL, 50);
     int secs = parse_int((argc > 3) ? argv[3] : NULL, 15);
 
@@ -86,7 +104,7 @@ int ag_main(int argc, char **argv)
 
     const int16_t amp = (int16_t)(32767 * vol / 100);
     if (sweep) {
-        ag_printf("tone: sweep 200-1600 Hz, level %d (amp %d), %d s -> %s\n",
+        ag_printf("tone: siren 525-875 Hz, level %d (amp %d), %d s -> %s\n",
                   vol, (int)amp, secs, path);
     } else {
         ag_printf("tone: %d Hz, level %d (amp %d), %d s -> %s\n", freq, vol,
@@ -101,20 +119,32 @@ int ag_main(int argc, char **argv)
     }
 
     /*
-     * The pitch is a ratio per sample: log-linear, so each octave takes the
-     * same time and the glide sounds even rather than rushing at the top.
-     * 200 -> 1600 is three octaves in four seconds.
+     * The pitch moves by the same number of hertz every sample: 525 -> 875 Hz
+     * (700 +-25%) in two seconds and back.  It was a ratio per sample from
+     * powf(hi/lo, 1/(2*rate)), and this libc's powf gives exactly 1.0 for an
+     * exponent that small - a "siren" of one steady note (25 Sep 2026).
      */
-    const float up = powf(1600.0f / 200.0f, 1.0f / (4.0f * (float)RATE_HZ));
+    const float lo = 525.0f;
+    const float hi = 875.0f;
+    const float step = (hi - lo) / (2.0f * (float)RATE_HZ);
     float       hz = (float)freq;
-    float       dir = up;
+    float       dir = step;
     float       phase = 0.0f;
-    const uint64_t want = (uint64_t)secs * RATE_HZ;
+    for (int i = 0; i < TABLE; i++) {
+        s_sine[i] = (int16_t)((float)amp * sinf(6.2831853f * (float)i / (float)TABLE));
+    }
+
+    const uint64_t want = beep ? (uint64_t)RATE_HZ * 9u / 10u
+                               : (uint64_t)secs * RATE_HZ;
     uint64_t       done = 0;
 
     while (done < want && !ag_interrupted()) {
         for (int i = 0; i < FRAMES; i++) {
-            const int16_t smp = (int16_t)((float)amp * sinf(phase));
+            /* in beep mode: on for 150 ms of every 300 */
+            const bool on = !beep || ((done + (uint64_t)i) % (RATE_HZ * 3u / 10u)) <
+                                         (RATE_HZ * 15u / 100u);
+            const int16_t smp =
+                on ? s_sine[(int)(phase * ((float)TABLE / 6.2831853f)) & (TABLE - 1)] : 0;
             s_buf[i * 2] = smp;
             s_buf[i * 2 + 1] = smp;
             phase += 6.2831853f * hz / (float)RATE_HZ;
@@ -122,11 +152,11 @@ int ag_main(int argc, char **argv)
                 phase -= 6.2831853f;
             }
             if (sweep) {
-                hz *= dir;
-                if (hz >= 1600.0f) {
-                    dir = 1.0f / up;
-                } else if (hz <= 200.0f) {
-                    dir = up;
+                hz += dir;
+                if (hz >= hi) {
+                    dir = -step;
+                } else if (hz <= lo) {
+                    dir = step;
                 }
             }
         }
