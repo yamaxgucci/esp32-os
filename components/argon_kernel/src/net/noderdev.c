@@ -39,6 +39,7 @@
 #include <argon/nodedev.h>
 #include <argon/nodename.h>
 
+#include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 
@@ -133,7 +134,6 @@ static uint16_t get16(const uint8_t *p)
  *   reply: handle field carries the status or the count.
  */
 static bool s_serving;
-static bool s_attached;
 
 static volatile bool     s_busy;
 static volatile uint16_t s_tag;
@@ -142,9 +142,26 @@ static volatile int32_t  s_status;
 static uint8_t           s_rbuf[RD_MAX_PAYLOAD];
 static volatile uint16_t s_rlen;
 
-static ag_err_t send_raw(uint8_t op, uint8_t flags, uint16_t tag, uint32_t h,
-                         uint32_t a, uint32_t b, uint8_t cls, const void *pay,
-                         uint16_t plen)
+/*
+ * EVERY MESSAGE HERE GOES TO ONE WIRE AND ONE NODE, named.  It went to "the
+ * link", which is whatever `link use` selected last - so with two neighbours
+ * the second one's devices were listed and every call to them went to the
+ * first (25 Sep 2026).  A proxy knows where its device is; a request being
+ * served knows who asked.  Wire -1 is the old meaning, kept for a caller that
+ * has neither.
+ */
+static int32_t link_send(int32_t wire, uint16_t dst, uint8_t cls,
+                         const void *buf, uint16_t len)
+{
+    if (wire < 0) {
+        return ag_linkprov_send(RD_CHAN, cls, buf, len);
+    }
+    return ag_linkprov_send_to_on(wire, dst, RD_CHAN, cls, buf, len);
+}
+
+static ag_err_t send_raw(int32_t wire, uint16_t dst, uint8_t op, uint8_t flags,
+                         uint16_t tag, uint32_t h, uint32_t a, uint32_t b,
+                         uint8_t cls, const void *pay, uint16_t plen)
 {
     uint8_t buf[RD_HDR + RD_MAX_PAYLOAD];
     if (plen > RD_MAX_PAYLOAD) {
@@ -164,7 +181,7 @@ static ag_err_t send_raw(uint8_t op, uint8_t flags, uint16_t tag, uint32_t h,
      * pause and not the machine. */
     for (int t = 0; t < 200; t++) {
         const int32_t r =
-            ag_linkprov_send(RD_CHAN, cls, buf, (uint16_t)(RD_HDR + plen));
+            link_send(wire, dst, cls, buf, (uint16_t)(RD_HDR + plen));
         if (r >= 0) {
             return AG_OK;
         }
@@ -176,12 +193,18 @@ static ag_err_t send_raw(uint8_t op, uint8_t flags, uint16_t tag, uint32_t h,
     return -AG_ETIMEDOUT;
 }
 
-static int32_t ask(uint8_t op, uint32_t h, uint32_t a, uint32_t b, uint8_t cls,
-                   const void *pay, uint16_t plen, void *out, uint16_t *outlen)
+typedef struct rdev rdev_t;
+static int32_t proxy_wire(const rdev_t *p);
+static uint16_t proxy_node(const rdev_t *p);
+
+static int32_t ask(const rdev_t *p, uint8_t op, uint32_t h, uint32_t a,
+                   uint32_t b, uint8_t cls, const void *pay, uint16_t plen,
+                   void *out, uint16_t *outlen)
 {
     static uint16_t next_tag = 1;
 
-    if (!ag_linkprov_bound()) {
+    const int32_t wire = proxy_wire(p);
+    if (wire < 0 ? !ag_linkprov_bound() : ag_linkprov_name_at(wire) == NULL) {
         return -AG_ENODEV;
     }
     if (ag_linkprov_in_reader()) {
@@ -205,7 +228,8 @@ static int32_t ask(uint8_t op, uint32_t h, uint32_t a, uint32_t b, uint8_t cls,
     s_have = false;
     s_rlen = 0;
 
-    int32_t rc = (int32_t)send_raw(op, 0, s_tag, h, a, b, cls, pay, plen);
+    int32_t rc = (int32_t)send_raw(wire, proxy_node(p), op, 0, s_tag, h, a, b,
+                                   cls, pay, plen);
     if (rc == AG_OK) {
         /*
          * SHORT, and the reason is not the wire.
@@ -255,11 +279,17 @@ static int32_t ask(uint8_t op, uint32_t h, uint32_t a, uint32_t b, uint8_t cls,
  * and closed by the layer above and the far node's handle has to live exactly
  * as long as that.
  */
-typedef struct {
+struct rdev {
     char    name[AG_DEV_NAME_MAX]; /* the device's own name, over there */
     char    qualified[AG_DEV_NAME_MAX];
     int32_t far_handle;
     bool    used;
+    /* where it is: this board's wire to it, and the node's name hash */
+    int32_t  wire;
+    uint16_t node;
+    /* a screen, and a panel rather than a buffer (see pick_display) */
+    bool     display;
+    bool     panel;
     /*
      * A sound device's two formats: what the caller writes (`in`) and what
      * goes over the wire and is set on the far device (`wire`).  They differ
@@ -270,7 +300,17 @@ typedef struct {
     uint8_t  in_ch, wire_ch;
     /* when the sound written so far is due to have played (see pace_audio) */
     int64_t  due_us;
-} rdev_t;
+};
+
+static int32_t proxy_wire(const rdev_t *p)
+{
+    return (p != NULL) ? p->wire : -1;
+}
+
+static uint16_t proxy_node(const rdev_t *p)
+{
+    return (p != NULL) ? p->node : 0u;
+}
 
 /*
  * Enough for a real second board, and TAKEN FROM THE HEAP when a link is
@@ -318,7 +358,7 @@ static ag_err_t rd_open(ag_device_t *dev, uint32_t flags)
     if (p == NULL) {
         return -AG_ENODEV;
     }
-    const int32_t r = ask(RD_OPEN, 0, flags, 0, AG_LINK_CONTROL, p->name,
+    const int32_t r = ask(p, RD_OPEN, 0, flags, 0, AG_LINK_CONTROL, p->name,
                           (uint16_t)strlen(p->name), NULL, NULL);
     if (r < 0) {
         return (ag_err_t)r;
@@ -333,7 +373,7 @@ static ag_err_t rd_close(ag_device_t *dev)
     if (p == NULL) {
         return -AG_ENODEV;
     }
-    const int32_t r = ask(RD_CLOSE, (uint32_t)p->far_handle, 0, 0,
+    const int32_t r = ask(p, RD_CLOSE, (uint32_t)p->far_handle, 0, 0,
                           AG_LINK_CONTROL, NULL, 0, NULL, NULL);
     p->far_handle = -1;
     return (r < 0) ? (ag_err_t)r : AG_OK;
@@ -349,8 +389,8 @@ static int32_t rd_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
         len = RD_MAX_PAYLOAD;
     }
     uint16_t got = (uint16_t)len;
-    return ask(RD_READ, (uint32_t)p->far_handle, (uint32_t)len, (uint32_t)off,
-               AG_LINK_CONTROL, NULL, 0, buf, &got);
+    return ask(p, RD_READ, (uint32_t)p->far_handle, (uint32_t)len,
+               (uint32_t)off, AG_LINK_CONTROL, NULL, 0, buf, &got);
 }
 
 /* What this node has poured at the neighbour, for `link` and for a person. */
@@ -407,8 +447,8 @@ static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
      * one thing it must not be.  The stream class does not queue behind the
      * reliable one either - that is what the class is for.
      */
-    const int32_t r = ag_linkprov_send(RD_CHAN, AG_LINK_STREAM, buf2,
-                                       (uint16_t)(RD_HDR + len));
+    const int32_t r = link_send(p->wire, p->node, AG_LINK_STREAM, buf2,
+                                (uint16_t)(RD_HDR + len));
     if (r < 0) {
         s_sent_dropped++;
         return (int32_t)len; /* let go of it, and say the period was taken */
@@ -521,7 +561,7 @@ static void fit_to_wire(rdev_t *p, const ag_audio_fmt_t *want, ag_audio_fmt_t *f
     *far = *want;
     ag_link_info_t li;
     uint32_t       room = 0;
-    if (ag_linkprov_info(&li) == AG_OK) {
+    if (ag_linkprov_info_on(p->wire, &li) == AG_OK) {
         room = li.bytes_per_sec / 3u * 2u;
     }
     if (room != 0u) {
@@ -580,7 +620,7 @@ static int32_t rd_write(ag_device_t *dev, const void *buf, size_t len,
      * bounded because only one request is outstanding at a time, so a device
      * cannot flood the wire however hard it is written to.
      */
-    return ask(RD_WRITE, (uint32_t)p->far_handle, 0, (uint32_t)off,
+    return ask(p, RD_WRITE, (uint32_t)p->far_handle, 0, (uint32_t)off,
                AG_LINK_CONTROL, buf, (uint16_t)len, NULL, NULL);
 }
 
@@ -606,12 +646,12 @@ static ag_err_t rd_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
         ag_audio_fmt_t far;
         fit_to_wire(p, (const ag_audio_fmt_t *)arg, &far);
         back = (uint16_t)sizeof(far);
-        const int32_t r = ask(RD_IOCTL, (uint32_t)p->far_handle, cmd, 0,
+        const int32_t r = ask(p, RD_IOCTL, (uint32_t)p->far_handle, cmd, 0,
                               AG_LINK_CONTROL, &far, (uint16_t)sizeof(far),
                               &far, &back);
         return (r < 0) ? (ag_err_t)r : AG_OK;
     }
-    const int32_t r = ask(RD_IOCTL, (uint32_t)p->far_handle, cmd, 0,
+    const int32_t r = ask(p, RD_IOCTL, (uint32_t)p->far_handle, cmd, 0,
                           AG_LINK_CONTROL, arg, (uint16_t)arglen, arg, &back);
     return (r < 0) ? (ag_err_t)r : AG_OK;
 }
@@ -624,7 +664,7 @@ static uint64_t rd_size(ag_device_t *dev)
     }
     uint8_t  o[8];
     uint16_t on = (uint16_t)sizeof(o);
-    const int32_t r = ask(RD_SIZE, (uint32_t)p->far_handle, 0, 0,
+    const int32_t r = ask(p, RD_SIZE, (uint32_t)p->far_handle, 0, 0,
                           AG_LINK_CONTROL, NULL, 0, o, &on);
     if (r < 0 || on < 8) {
         return 0;
@@ -666,7 +706,7 @@ static ag_err_t ensure_open(rdev_t *p)
     if (p->far_handle >= 0) {
         return AG_OK;
     }
-    const int32_t r = ask(RD_OPEN, 0, 0, 0, AG_LINK_CONTROL, p->name,
+    const int32_t r = ask(p, RD_OPEN, 0, 0, 0, AG_LINK_CONTROL, p->name,
                           (uint16_t)strlen(p->name), NULL, NULL);
     if (r < 0) {
         return (ag_err_t)r;
@@ -683,12 +723,12 @@ static ag_err_t ensure_open(rdev_t *p)
  * anything between messages.
  */
 #define RD_BLIT_HDR 12u
-/* What one poured message may carry on the wire that is bound now. */
-static uint16_t rd_pour_payload(void)
+/* What one poured message may carry on the wire that screen is on. */
+static uint16_t rd_pour_payload(const rdev_t *p)
 {
     ag_link_info_t li;
     uint32_t       room = RD_MAX_PAYLOAD;
-    if (ag_linkprov_info(&li) == AG_OK && li.mtu > RD_HDR) {
+    if (ag_linkprov_info_on(proxy_wire(p), &li) == AG_OK && li.mtu > RD_HDR) {
         room = li.mtu - RD_HDR;
     }
     if (room > RD_POUR_CAP) {
@@ -719,7 +759,7 @@ static ag_err_t rd_gfxinfo(ag_handle_t h, ag_gfxinfo_t *out)
     }
     uint8_t  ans[16];
     uint16_t got = 0;
-    const int32_t r = ask(RD_GFXINFO, (uint32_t)p->far_handle, 0, 0,
+    const int32_t r = ask(p, RD_GFXINFO, (uint32_t)p->far_handle, 0, 0,
                           AG_LINK_CONTROL, NULL, 0, ans, &got);
     if (r < 0 || got < 12u) {
         return (r < 0) ? (ag_err_t)r : -AG_EIO;
@@ -757,8 +797,12 @@ static ag_err_t rd_send_z(uint32_t handle, const uint8_t *pay, uint16_t len)
     put32(msg + 8, 0);
     put32(msg + 12, 0);
     memcpy(msg + RD_HDR, pay, len);
-    const int32_t r = ag_linkprov_send(RD_CHAN, AG_LINK_BULK, msg,
-                                       (uint16_t)(RD_HDR + len));
+    const rdev_t *const p = s_display_proxy;
+    if (p == NULL) {
+        return -AG_ENODEV;
+    }
+    const int32_t r = link_send(p->wire, p->node, AG_LINK_BULK, msg,
+                                (uint16_t)(RD_HDR + len));
     return (r >= 0) ? AG_OK : (ag_err_t)r;
 }
 
@@ -779,7 +823,7 @@ static void rd_blit_raw(rdev_t *p, const ag_blit_t *b)
         }
     }
     uint8_t *const msg = s_blitmsg;
-    const uint16_t pixroom = (uint16_t)((rd_pour_payload() - RD_BLIT_HDR) / 2u);
+    const uint16_t pixroom = (uint16_t)((rd_pour_payload(p) - RD_BLIT_HDR) / 2u);
 
     /*
      * WHOLE ROWS WHEN A ROW FITS, so a slice is w by k rather than a strip of
@@ -821,8 +865,8 @@ static void rd_blit_raw(rdev_t *p, const ag_blit_t *b)
                 memcpy(dst, src + x, (size_t)n * 2u);
                 dst += (size_t)n * 2u;
             }
-            (void)ag_linkprov_send(
-                RD_CHAN, AG_LINK_STREAM, msg,
+            (void)link_send(
+                p->wire, p->node, AG_LINK_STREAM, msg,
                 (uint16_t)(RD_HDR + RD_BLIT_HDR + (uint32_t)n * rh * 2u));
         }
     }
@@ -849,7 +893,7 @@ static void rd_blit(ag_handle_t h, const ag_blit_t *b)
     if (ensure_open(p) != AG_OK) {
         return;
     }
-    if (!rdp_damage(b, (uint32_t)p->far_handle, rd_pour_payload(),
+    if (!rdp_damage(b, (uint32_t)p->far_handle, rd_pour_payload(p),
                     rd_send_z)) {
         rd_blit_raw(p, b); /* no memory for the painter: every pixel, raw */
     }
@@ -866,7 +910,7 @@ static ag_err_t rd_textinfo(ag_handle_t h, uint16_t *cols, uint16_t *rows)
     }
     uint8_t  ans[8];
     uint16_t got = 0;
-    const int32_t r = ask(RD_TEXTINFO, (uint32_t)p->far_handle, 0, 0,
+    const int32_t r = ask(p, RD_TEXTINFO, (uint32_t)p->far_handle, 0, 0,
                           AG_LINK_CONTROL, NULL, 0, ans, &got);
     if (r < 0 || got < 4u) {
         return (r < 0) ? (ag_err_t)r : -AG_EIO;
@@ -904,8 +948,8 @@ static void rd_textrow(ag_handle_t h, uint16_t row, const ag_textcell_t *cells,
     put16(msg + RD_HDR, row);
     put16(msg + RD_HDR + 2, count);
     memcpy(msg + RD_HDR + 4, cells, (size_t)count * sizeof(ag_textcell_t));
-    (void)ag_linkprov_send(
-        RD_CHAN, AG_LINK_STREAM, msg,
+    (void)link_send(
+        p->wire, p->node, AG_LINK_STREAM, msg,
         (uint16_t)(RD_HDR + 4u + count * sizeof(ag_textcell_t)));
 }
 
@@ -933,8 +977,8 @@ static void rd_textcur(ag_handle_t h, uint16_t col, uint16_t row,
      * out the character it is standing on. */
     msg[RD_HDR + 5] = under.ch;
     msg[RD_HDR + 6] = under.attr;
-    (void)ag_linkprov_send(RD_CHAN, AG_LINK_STREAM, msg,
-                           (uint16_t)(RD_HDR + 7u));
+    (void)link_send(p->wire, p->node, AG_LINK_STREAM, msg,
+                    (uint16_t)(RD_HDR + 7u));
 }
 
 static const ag_display_ops_t k_proxy_display_ops = {
@@ -964,10 +1008,19 @@ static const ag_dev_ops_t k_proxy_ops = {
 
 /* ---- serving the far node ----------------------------------------------- */
 
-static void reply(uint8_t op, uint16_t tag, int32_t status, uint8_t cls,
-                  const void *pay, uint16_t plen)
+/*
+ * Who asked, and down which wire: taken on the reader when the request
+ * arrives, because the worker that answers it is not the reader and would
+ * otherwise answer down the selected wire, to the selected node.
+ */
+static int32_t  s_req_wire = -1;
+static uint16_t s_req_from;
+
+static void reply_to(int32_t wire, uint16_t dst, uint8_t op, uint16_t tag,
+                     int32_t status, uint8_t cls, const void *pay,
+                     uint16_t plen)
 {
-    const ag_err_t e = send_raw((uint8_t)(op | RD_REPLY), 0, tag,
+    const ag_err_t e = send_raw(wire, dst, (uint8_t)(op | RD_REPLY), 0, tag,
                                 (uint32_t)status, 0, 0, cls, pay, plen);
     if (e != AG_OK) {
         /*
@@ -981,6 +1034,12 @@ static void reply(uint8_t op, uint16_t tag, int32_t status, uint8_t cls,
                                  "out: %d",
                (unsigned)op, (int)status, (int)e);
     }
+}
+
+static void reply(uint8_t op, uint16_t tag, int32_t status, uint8_t cls,
+                  const void *pay, uint16_t plen)
+{
+    reply_to(s_req_wire, s_req_from, op, tag, status, cls, pay, plen);
 }
 
 /*
@@ -1669,8 +1728,11 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
      * operation is entitled to block, and blocking here would stop this node
      * hearing anything, including the acks its own traffic waits for.
      */
+    const int32_t  wire = ag_linkprov_current();
+    const uint16_t from = ag_linkprov_from();
     if (s_working) {
-        reply(b[0], get16(b + 2), -AG_EBUSY, AG_LINK_CONTROL, NULL, 0);
+        reply_to(wire, from, b[0], get16(b + 2), -AG_EBUSY, AG_LINK_CONTROL,
+                 NULL, 0);
         return;
     }
     if (n > sizeof(s_req)) {
@@ -1678,6 +1740,8 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
     }
     memcpy(s_req, b, n);
     s_req_len = n;
+    s_req_wire = wire;
+    s_req_from = from;
     s_working = true;
     /* As nodeproc's worker: internal stack, else PSRAM (see there). */
     if (!ag_proc_task_create(worker, "rdevsrv", 4096, NULL, 1,
@@ -1705,9 +1769,104 @@ ag_err_t ag_noderdev_serve(void)
 
 /* ---- attaching ---------------------------------------------------------- */
 
-int32_t ag_noderdev_attach(uint32_t timeout_ms)
+/*
+ * EVERY NEIGHBOUR'S DEVICES, AT ONCE, EACH WHERE IT IS.
+ *
+ * This was one neighbour: the one `link use` had selected, all its proxies in
+ * one owner, and a second `link devs` took the first neighbour's away.  A board
+ * in the middle of three has two, and what Maxim asked for is the system he
+ * describes - "the boards know nothing about wires; a list of devices simply
+ * appears".  So proxies are owned per wire, a wire's neighbour can come and go
+ * without touching the others', and each proxy carries its own wire and node.
+ *
+ * One owner token per wire: ag_dev_revoke_owner takes a neighbour's devices
+ * out and leaves everybody else's.
+ */
+static uint8_t s_owner_tok[AG_LINK_WIRES];
+static bool    s_attached_on[AG_LINK_WIRES];
+
+/*
+ * The screen, chosen among every neighbour's: A PANEL BEATS A BUFFER IN
+ * MEMORY, and that is a fact about screens rather than about registries - the
+ * same shape as "a real converter beats the null one", which is why the audio
+ * list lives in the mixer.  Taking whichever came first sent a megabyte of
+ * pixels to the far board's SOFT framebuffer, where nobody was looking, while
+ * its ST7789 sat beside it in the same listing.  Chosen again whenever a
+ * neighbour comes or goes, so a screen that left is not drawn on.
+ */
+static void pick_display(void)
 {
-    const char *peer = ag_node_peer_name();
+    rdev_t *best = NULL;
+    for (int i = 0; s_proxy != NULL && i < RD_MAX_PROXIES; i++) {
+        rdev_t *p = &s_proxy[i];
+        if (!p->used || !p->display) {
+            continue;
+        }
+        if (best == NULL || (p->panel && !best->panel)) {
+            best = p;
+        }
+    }
+    if (best != s_display_proxy) {
+        if (best != NULL) {
+            ag_log(AG_LOG_INFO, TAG, "%s is the neighbour's screen",
+                   best->qualified);
+        }
+        s_display_proxy = best;
+        s_display_real = (best != NULL) && best->panel;
+    }
+}
+
+static uint32_t detach_wire(int32_t wire)
+{
+    if (wire < 0 || wire >= (int32_t)AG_LINK_WIRES) {
+        return 0;
+    }
+    const uint32_t gone = ag_dev_revoke_owner((const void *)&s_owner_tok[wire]);
+    for (int i = 0; s_proxy != NULL && i < RD_MAX_PROXIES; i++) {
+        if (s_proxy[i].used && s_proxy[i].wire == wire) {
+            if (s_display_proxy == &s_proxy[i]) {
+                s_display_proxy = NULL;
+                s_display_real = false;
+            }
+            memset(&s_proxy[i], 0, sizeof(s_proxy[i]));
+        }
+    }
+    s_attached_on[wire] = false;
+    pick_display();
+    return gone;
+}
+
+static int32_t attach_locked(int32_t wire, uint32_t timeout_ms);
+
+/*
+ * One attach at a time: the shell's `link devs` and the docking task can both
+ * be here, and a device listing and the proxy table are single things.
+ */
+static ag_port_mutex_t s_att_lock;
+
+int32_t ag_noderdev_attach_on(int32_t wire, uint32_t timeout_ms)
+{
+    if (s_att_lock == NULL) {
+        s_att_lock = ag_port_mutex_new();
+        if (s_att_lock == NULL) {
+            return -AG_ENOMEM;
+        }
+    }
+    if (!ag_port_mutex_take(s_att_lock, ag_port_ms_to_ticks(20000))) {
+        return -AG_EBUSY;
+    }
+    const int32_t r = attach_locked(wire, timeout_ms);
+    (void)ag_port_mutex_give(s_att_lock);
+    return r;
+}
+
+static int32_t attach_locked(int32_t wire, uint32_t timeout_ms)
+{
+    if (wire < 0 || wire >= (int32_t)AG_LINK_WIRES ||
+        ag_linkprov_name_at(wire) == NULL) {
+        return -AG_ENODEV;
+    }
+    const char *peer = ag_node_peer_name_at(wire);
     if (peer == NULL) {
         /*
          * No name, no qualified names - and a proxy called `pcm0` beside this
@@ -1721,19 +1880,14 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
     if (se != AG_OK) {
         return (int32_t)se;
     }
-    if (s_attached) {
-        (void)ag_noderdev_detach();
-    }
-
-    ag_devinfo_t  info[RD_MAX_PROXIES];
-    const int32_t n = ag_nodedev_list(info, RD_MAX_PROXIES, timeout_ms);
-    if (n < 0) {
-        return n;
+    if (proxy_table() == NULL) {
+        ag_log(AG_LOG_ERROR, TAG, "no memory for the neighbour's devices");
+        return -AG_ENOMEM;
     }
 
     /*
-     * Into a bounded buffer first.  ag_node_peer_name returns a pointer and the
-     * compiler cannot see that what is behind it is already short, so the
+     * Into a bounded buffer first.  ag_node_peer_name_at returns a pointer and
+     * the compiler cannot see that what is behind it is already short, so the
      * qualified name below would be built from something of unknown length.
      * The copy is exact - a name is validated against this same bound when it
      * arrives - and it makes the bound visible where it is used.
@@ -1741,19 +1895,48 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
     char pn[AG_NODE_NAME_MAX];
     ag_strlcpy(pn, peer, sizeof(pn));
 
-    int32_t made = 0;
-    if (proxy_table() == NULL) {
-        ag_log(AG_LOG_ERROR, TAG, "no memory for the neighbour's devices");
-        return 0;
+    /* On the heap: 32 records are 1.8 KB, and this runs on a small task. */
+    ag_devinfo_t *info =
+        (ag_devinfo_t *)ag_port_alloc(sizeof(ag_devinfo_t) * RD_MAX_PROXIES,
+                                      AG_MEM_SLOW | AG_MEM_BYTE);
+    if (info == NULL) {
+        info = (ag_devinfo_t *)ag_port_alloc(
+            sizeof(ag_devinfo_t) * RD_MAX_PROXIES, AG_MEM_BYTE);
+    }
+    if (info == NULL) {
+        return -AG_ENOMEM;
+    }
+    const int32_t n = ag_nodedev_list_on(wire, info, RD_MAX_PROXIES, timeout_ms);
+    if (n < 0) {
+        ag_port_free(info);
+        return n;
     }
 
-    for (int32_t i = 0; i < n && made < RD_MAX_PROXIES; i++) {
+    /* What was there before goes first: a neighbour that says hello again has
+     * started over, and every handle it gave out is gone with it. */
+    (void)detach_wire(wire);
+
+    int32_t made = 0;
+    int32_t skipped = 0;
+    int     slot = 0;
+    for (int32_t i = 0; i < n && i < (int32_t)RD_MAX_PROXIES; i++) {
         /*
          * Not the link itself.  A proxy for the far node's own link device
          * would be a device reached over the very thing it describes, and
          * `link use sound.node0` would be a loop with no bottom.
          */
         if (info[i].cls == AG_DEV_LINK) {
+            continue;
+        }
+        /*
+         * Nor the far node's own proxies - its OTHER neighbours' devices.
+         * `c3.cyd.pcm0` on the Zero would be the CYD's converter reached as a
+         * device of the C3, every sample served twice on the way; and it does
+         * not fit a device name anyway.  A board two hops away is reached by
+         * the link's relay, not by stacking proxies.
+         */
+        if (ag_stricmp(info[i].driver, "node") == 0) {
+            skipped++;
             continue;
         }
         /*
@@ -1765,7 +1948,7 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
          * missing.  Refusing it by name, out loud, is the answer that can be
          * acted on - and the cure is to give the node a shorter name.
          */
-        char full[AG_NODE_NAME_MAX + 1 + AG_DEV_NAME_MAX];
+        char   full[AG_NODE_NAME_MAX + 1 + AG_DEV_NAME_MAX];
         size_t at = 0;
         while (pn[at] != '\0' && at < sizeof(pn) - 1u) {
             full[at] = pn[at];
@@ -1792,49 +1975,37 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
             continue;
         }
 
-        rdev_t *p = &s_proxy[made];
+        while (slot < RD_MAX_PROXIES && s_proxy[slot].used) {
+            slot++;
+        }
+        if (slot >= RD_MAX_PROXIES) {
+            /*
+             * And what did NOT fit, by name.  A listing that quietly stops at
+             * a limit is the worst kind of answer: everything looks healthy and
+             * the device somebody actually wanted is simply absent.
+             */
+            ag_log(AG_LOG_WARN, TAG,
+                   "%s and what follows did not fit (room for %d devices of "
+                   "every neighbour); raise RD_MAX_PROXIES",
+                   full, (int)RD_MAX_PROXIES);
+            break;
+        }
+        rdev_t *p = &s_proxy[slot];
         memset(p, 0, sizeof(*p));
         ag_strlcpy(p->name, info[i].name, sizeof(p->name));
         ag_strlcpy(p->qualified, full, sizeof(p->qualified));
         p->far_handle = -1;
         p->used = true;
-
+        p->wire = wire;
+        p->node = ag_node_hash(pn);
         /*
          * A display gets the class vtable as well as the byte one.  Without it
          * the graphics layer walks past this device and the screen on the
-         * other board is listed and unusable.
+         * other board is listed and unusable.  Which of several is THE screen
+         * is pick_display's; the far board's driver name says panel or buffer.
          */
-        const bool is_display = (info[i].cls == AG_DEV_DISPLAY);
-        if (is_display) {
-            /*
-             * A PANEL BEATS A BUFFER IN MEMORY, and that is a fact about
-             * screens rather than about registries - the same shape as "a real
-             * converter beats the null one", which is why the audio list lives
-             * in the mixer.  Taking whichever came first sent a megabyte of
-             * pixels to the far board's SOFT framebuffer, where nobody was
-             * looking, while its ST7789 sat beside it in the same listing.
-             *
-             * The far board's driver name is what says which is which; it
-             * travels in the device record already.  Same family of mistake as
-             * pcmnull always being present.
-             */
-            const bool real = (ag_stricmp(info[i].driver, "soft") != 0);
-            const bool better =
-                (s_display_proxy == NULL) ||
-                (real && !s_display_real);
-            if (better) {
-                if (s_display_proxy != NULL && s_display_proxy != p) {
-                    ag_log(AG_LOG_INFO, TAG,
-                           "%s (%s) takes the screen from %s", full,
-                           info[i].driver, s_display_proxy->qualified);
-                }
-                s_display_proxy = p;
-                s_display_real = real;
-            } else if (s_display_proxy != p) {
-                ag_log(AG_LOG_INFO, TAG, "%s: %s already has the screen", full,
-                       s_display_proxy->qualified);
-            }
-        }
+        p->display = (info[i].cls == AG_DEV_DISPLAY);
+        p->panel = p->display && (ag_stricmp(info[i].driver, "soft") != 0);
 
         const ag_dev_desc_t desc = {
             .name = p->qualified,
@@ -1842,9 +2013,9 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
             .cls = info[i].cls,
             .flags = info[i].flags,
             .ops = &k_proxy_ops,
-            .class_ops = is_display ? (const void *)&k_proxy_display_ops : NULL,
+            .class_ops = p->display ? (const void *)&k_proxy_display_ops : NULL,
             .priv = p,
-            .owner = (const void *)&s_proxy,
+            .owner = (const void *)&s_owner_tok[wire],
         };
         const ag_err_t re = ag_dev_register(&desc, NULL);
         if (re != AG_OK) {
@@ -1861,41 +2032,152 @@ int32_t ag_noderdev_attach(uint32_t timeout_ms)
              */
             ag_log(AG_LOG_WARN, TAG, "%s could not be registered here: %d",
                    full, (int)re);
-            p->used = false;
+            memset(p, 0, sizeof(*p));
             continue;
         }
         made++;
     }
-    s_attached = (made > 0);
-    ag_log(AG_LOG_INFO, TAG, "%d device(s) of %s are here now", (int)made,
-           peer);
-    /*
-     * And what did NOT fit, by name of the count.  A listing that quietly
-     * stops at a limit is the worst kind of answer: everything looks healthy
-     * and the device somebody actually wanted is simply absent.
-     */
-    if (n > (int32_t)RD_MAX_PROXIES) {
-        ag_log(AG_LOG_WARN, TAG,
-               "%d of %s's devices did not fit (room for %d); raise "
-               "RD_MAX_PROXIES",
-               (int)(n - (int32_t)RD_MAX_PROXIES), peer, (int)RD_MAX_PROXIES);
+    ag_port_free(info);
+    s_attached_on[wire] = (made > 0);
+    pick_display();
+    ag_log(AG_LOG_INFO, TAG, "%d device(s) of %s are here now (wire %s)",
+           (int)made, pn, ag_linkprov_name_at(wire));
+    if (skipped > 0) {
+        ag_log(AG_LOG_INFO, TAG,
+               "%d more are %s's own neighbours', reached through it, not "
+               "listed here",
+               (int)skipped, pn);
     }
     return made;
 }
 
+int32_t ag_noderdev_attach(uint32_t timeout_ms)
+{
+    const int32_t wire = ag_linkprov_current();
+    if (wire < 0) {
+        return -AG_ENODEV;
+    }
+    return ag_noderdev_attach_on(wire, timeout_ms);
+}
+
 uint32_t ag_noderdev_detach(void)
 {
-    const uint32_t gone = ag_dev_revoke_owner((const void *)&s_proxy);
-    /*
-     * The TABLE, not the pointer to it.  When this was an array `sizeof`
-     * meant the whole thing; the moment it became a heap pointer the same
-     * line meant four bytes, and the table would have been left full of
-     * handles to a node that is no longer there.  GCC caught it
-     * (-Wsizeof-pointer-memaccess); it is the reason that warning exists.
-     */
-    if (s_proxy != NULL) {
-        memset(s_proxy, 0, sizeof(rdev_t) * RD_MAX_PROXIES);
+    uint32_t gone = 0;
+    for (int32_t w = 0; w < (int32_t)AG_LINK_WIRES; w++) {
+        gone += detach_wire(w);
     }
-    s_attached = false;
     return gone;
+}
+
+/* ---- by itself, when the board docked ----------------------------------- */
+
+/*
+ * A BOARD THAT ASKED TO DOCK GETS ITS NEIGHBOURS' DEVICES WITHOUT ASKING AGAIN.
+ *
+ * `link devs` was the only way in, on the reasoning that pulling a far
+ * registry into this one is a thing to ask for rather than discover.  It is -
+ * and a board whose SYSTEM.CFG binds its wires at boot HAS asked, once, for
+ * all of it.  Maxim, 25 Sep 2026: all devices attach by themselves when a
+ * board has asked for cluster docking; the boards know nothing about wires, a
+ * list of devices simply appears.  So a wire bound at boot attaches its
+ * neighbour's devices the moment the neighbour says its name, and again every
+ * time it says it anew (it restarted: every handle it gave out is gone).  A
+ * wire bound by hand at the prompt still waits for `link devs`.
+ *
+ * Not on the reader, where the hello arrives: attaching asks the neighbour for
+ * its list and waits for the answer, which the reader brings.  So a small task
+ * does it, made when there is something to do and gone after.
+ */
+static volatile bool     s_auto;
+static volatile uint32_t s_want; /* wires whose neighbour has named itself */
+static volatile bool     s_att_running;
+static volatile int32_t  s_att_wire = -1; /* being attached right now */
+static ag_port_task_t    s_att_task;
+
+void ag_noderdev_auto(bool on)
+{
+    s_auto = on;
+}
+
+int32_t ag_noderdev_wire_for(uint32_t axe_flags)
+{
+    if ((axe_flags & AG_AXE_NEEDS_GFX) != 0u && s_display_proxy != NULL &&
+        s_display_proxy->used) {
+        return s_display_proxy->wire;
+    }
+    return -1;
+}
+
+static void attach_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        uint32_t bits = s_want;
+        if (bits == 0u) {
+            s_att_running = false;
+            if (s_want == 0u) {
+                break;
+            }
+            s_att_running = true;
+            continue;
+        }
+        int32_t w = 0;
+        while (((bits >> w) & 1u) == 0u) {
+            w++;
+        }
+        s_want &= ~(1u << w);
+        s_att_wire = w;
+        /*
+         * Three tries a second apart.  The neighbour that has just said hello
+         * is still starting its own services, and a listing it has no answer
+         * for yet is a timeout here, not an absence of devices.
+         */
+        int32_t r = -AG_ETIMEDOUT;
+        for (int t = 0; t < 3; t++) {
+            r = ag_noderdev_attach_on(w, 4000u);
+            if (r >= 0 || (r != -AG_ETIMEDOUT && r != -AG_EAGAIN &&
+                           r != -AG_EBUSY)) {
+                break;
+            }
+            ag_port_task_delay(ag_port_ms_to_ticks(1000));
+        }
+        if (r < 0) {
+            ag_log(AG_LOG_WARN, TAG,
+                   "%s's devices did not attach: %d (`link devs` asks again)",
+                   ag_node_peer_name_at(w) != NULL ? ag_node_peer_name_at(w)
+                                                   : "the neighbour",
+                   (int)r);
+        }
+        s_att_wire = -1;
+    }
+    ag_port_task_delete(NULL);
+}
+
+void ag_noderdev_peer_named(int32_t wire, bool again)
+{
+    if (!s_auto || wire < 0 || wire >= (int32_t)AG_LINK_WIRES) {
+        return;
+    }
+    /*
+     * An answer to this board's own hello attaches only a wire that has
+     * nothing yet.  Both halves of one exchange used to attach, so every
+     * neighbour's devices were listed, registered, revoked and registered
+     * again a few milliseconds apart at every boot.
+     */
+    if (!again && (s_attached_on[wire] || s_att_wire == wire ||
+                   (s_want & (1u << wire)) != 0u)) {
+        return;
+    }
+    s_want |= (1u << wire);
+    if (s_att_running) {
+        return;
+    }
+    s_att_running = true;
+    /* As the other cluster workers: an internal stack, else PSRAM. */
+    if (!ag_proc_task_create(attach_task, "rdevatt", 4096, NULL, 1,
+                             AG_PORT_ANY_CORE, &s_att_task)) {
+        s_att_running = false;
+        ag_log(AG_LOG_WARN, TAG, "no task to attach the neighbour's devices; "
+                                 "`link devs` does it by hand");
+    }
 }

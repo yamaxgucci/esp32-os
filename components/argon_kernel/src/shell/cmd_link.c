@@ -1124,20 +1124,37 @@ int ag_cmd_link(int argc, char **argv)
      * instant the link is bound.
      */
     if (ag_path_icmp(argv[1], "devs") == 0) {
-        const int32_t n = ag_noderdev_attach(8000u);
-        if (n == -AG_EAGAIN) {
-            ag_console_puts("the other node has not said its name yet; "
-                            "try again\n");
+        /* Every neighbour's, one wire at a time: the others' stay as they
+         * are while one is asked again. */
+        int bad = 0, asked = 0;
+        for (int32_t w = 0; w < (int32_t)AG_LINK_WIRES; w++) {
+            if (ag_linkprov_name_at(w) == NULL) {
+                continue;
+            }
+            asked++;
+            const int32_t n = ag_noderdev_attach_on(w, 8000u);
+            if (n == -AG_EAGAIN) {
+                ag_console_printf("%s: the node there has not said its name "
+                                  "yet; try again\n",
+                                  ag_linkprov_name_at(w));
+                bad++;
+                continue;
+            }
+            if (n < 0) {
+                ag_console_printf("%s: link devs: %d\n",
+                                  ag_linkprov_name_at(w), (int)n);
+                bad++;
+                continue;
+            }
+            ag_console_printf("%d device(s) of %s are in this registry now\n",
+                              (int)n, ag_node_peer_name_at(w));
+        }
+        if (asked == 0) {
+            ag_console_puts("link devs: no wire is bound\n");
             return 1;
         }
-        if (n < 0) {
-            ag_console_printf("link devs: %d\n", (int)n);
-            return 1;
-        }
-        ag_console_printf("%d device(s) of %s are in this registry now\n",
-                          (int)n, ag_node_peer_name());
         ag_console_puts("  `dev` lists them; open one by its qualified name\n");
-        return 0;
+        return (bad > 0) ? 1 : 0;
     }
 
     if (ag_path_icmp(argv[1], "nodevs") == 0) {

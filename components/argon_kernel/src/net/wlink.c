@@ -14,6 +14,17 @@ static void lock(wlink_t *s) { (void)ag_port_mutex_take(s->lock, AG_PORT_FOREVER
 
 static void unlock(wlink_t *s) { (void)ag_port_mutex_give(s->lock); }
 
+void (*volatile wl_rx_notify)(void);
+
+void wl_rx_wake(wlink_t *w)
+{
+    (void)ag_port_sem_give(w->rx_sem);
+    void (*const fn)(void) = wl_rx_notify;
+    if (fn != NULL) {
+        fn();
+    }
+}
+
 static void count(wlink_t *s, uint32_t *field, uint32_t by)
 {
     lock(s);
@@ -488,7 +499,7 @@ static void peer_restarted(wlink_t *s, uint32_t sess)
     /* a writer waiting for room and a reader waiting for bytes both look at
      * the epoch when they wake */
     (void)ag_port_sem_give(s->space_sem);
-    (void)ag_port_sem_give(s->rx_sem);
+    wl_rx_wake(s);
 }
 
 /* A segmented payload that stands for exactly `span` stream bytes. */
@@ -702,7 +713,7 @@ uint32_t wl_rx(wlink_t *s, const uint8_t *f, uint32_t got)
     unlock(s);
     if (delivered > 0u) {
         s->nak_sent = false;
-        (void)ag_port_sem_give(s->rx_sem);
+        wl_rx_wake(s);
         /*
          * A further hole behind the one just filled: one between frames
          * held, or the frame this end threw away itself.  Forgetting the
@@ -1055,6 +1066,12 @@ int32_t wl_recv2(wlink_t *s, void *head, size_t hcap, void *buf, size_t cap,
             }
         }
         unlock(s);
+        /* Zero is "only if there is one": linkprov's one reader asks every
+         * wire in turn, and a tick's wait on each empty one was a tick's delay
+         * on all the others. */
+        if (timeout_ms == 0u) {
+            return -AG_EAGAIN;
+        }
         const ag_port_ticks_t used = (ag_port_ticks_t)(ag_port_ticks() - start);
         if (used >= span) {
             return -AG_EAGAIN;

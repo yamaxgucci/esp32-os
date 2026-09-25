@@ -187,6 +187,20 @@ static void driver_present_blit(const ag_blit_t *b)
         if (!AG_HAS(o, blit_rect) || o->blit_rect == NULL) {
             continue;
         }
+        /*
+         * ONE TABLE, ONE SCREEN.  blit_rect is called with a zero handle, so
+         * a table several devices share cannot tell them apart and draws
+         * wherever it draws - the neighbours' screens do (noderdev.c
+         * pick_display).  Called once per device, a C3 with two neighbours
+         * sent every band to the CYD twice.
+         */
+        bool seen = false;
+        for (unsigned k = 0; k < n; k++) {
+            seen = seen || (ops[k] == o);
+        }
+        if (seen) {
+            continue;
+        }
         ops[n++] = o;
     }
     ag_dev_lock_release();

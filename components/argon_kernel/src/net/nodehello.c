@@ -23,6 +23,7 @@
 #include <argon/log.h>
 #include <argon/kernel.h>
 #include <argon/nodename.h>
+#include <argon/noderdev.h>
 
 #include <argon/port/task.h>
 #include <argon/port/time.h>
@@ -213,6 +214,9 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
          * rather than "whoever spoke last".
          */
         ag_node_set_peer_name(name);
+        /* A neighbour that asks has just bound its end - it booted, or it
+         * started over - so what it lent before is gone: its devices again. */
+        ag_noderdev_peer_named(ag_linkprov_current(), true);
         /*
          * Said out loud when it fails.  This was `(void)` - an answer that
          * never went out looked exactly like one that was never needed, and
@@ -228,6 +232,7 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         }
     } else if (b[0] == NH_TELL) {
         ag_node_set_peer_name(name);
+        ag_noderdev_peer_named(ag_linkprov_current(), false);
     }
 }
 

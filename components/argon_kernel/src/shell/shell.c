@@ -71,6 +71,7 @@
 #include <argon/nodedev.h>
 #include <argon/nodedrv.h>
 #include <argon/nodename.h>
+#include <argon/noderdev.h>
 #include <argon/nodeps.h>
 
 #include "shell/cmd_link.h"
@@ -1363,6 +1364,27 @@ static int cmd_run(int argc, char **argv)
                 (h.flags & AG_AXE_NEEDS_GFX) != 0 &&
                 ag_display_owner() != AG_PID_KERNEL;
             if (unmet != 0 || glass_taken) {
+                /*
+                 * WHICH NEIGHBOUR.  The one `link use` last named was the only
+                 * one asked, so on the C3 between the Zero and the CYD a
+                 * program that needs a screen went to the Zero's framebuffer in
+                 * memory - 1 490 frames a second drawn where nobody could see -
+                 * with the CYD's panel one wire away (26 Sep 2026).  Asked of
+                 * the neighbour whose device fits (noderdev knows which screen
+                 * is a panel), then the selection is given back as it was.
+                 */
+                const int32_t  was_wire = ag_linkprov_current();
+                const uint16_t was_target = ag_linkprov_target();
+                const int32_t  best = ag_noderdev_wire_for(h.flags);
+                bool           moved = false;
+                if (best >= 0 && best != was_wire &&
+                    ag_linkprov_select(best) == AG_OK) {
+                    const char *peer = ag_node_peer_name_at(best);
+                    ag_linkprov_set_target(peer != NULL ? ag_node_hash(peer)
+                                                        : 0u);
+                    moved = true;
+                }
+                int rc = -1;
                 const int32_t there = ag_nodedev_can(h.flags, 8000u);
                 if (there == 1) {
                     char line[AG_PATH_MAX + 64];
@@ -1416,14 +1438,16 @@ static int cmd_run(int argc, char **argv)
                                 ag_console_printf(
                                     "did not run there either: %d\n",
                                     (int)code);
-                                return 1;
+                                rc = 1;
+                                goto placed;
                             }
                             /* The same sentence as the other placement path
                              * above, for the same reason. */
                             ag_console_printf("returned %d from %s\n",
                                               (int)code,
                                               ag_linkprov_active());
-                            return (code == 0) ? 0 : 1;
+                            rc = (code == 0) ? 0 : 1;
+                            goto placed;
                         }
                         ag_console_printf("  (the other node: %d)\n",
                                           (int)err);
@@ -1435,6 +1459,14 @@ static int cmd_run(int argc, char **argv)
                  * Guessing on its behalf would replace one true message with a
                  * different one.
                  */
+            placed:
+                if (moved) {
+                    (void)ag_linkprov_select(was_wire);
+                    ag_linkprov_set_target(was_target);
+                }
+                if (rc >= 0) {
+                    return rc;
+                }
             }
         }
     }

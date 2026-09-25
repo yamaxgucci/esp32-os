@@ -44,9 +44,31 @@ ag_err_t ag_noderdev_serve(void);
  * answered; returns -AG_EAGAIN when it has not.  Returns how many appeared.
  */
 int32_t ag_noderdev_attach(uint32_t timeout_ms);
+/* The same for the neighbour on one wire; the others' devices stay. */
+int32_t ag_noderdev_attach_on(int32_t wire, uint32_t timeout_ms);
 
-/* Take them all out again.  Open handles are revoked, not waited for. */
+/* Take them all out again, every neighbour's.  Open handles are revoked, not
+ * waited for. */
 uint32_t ag_noderdev_detach(void);
+
+/*
+ * Docking: from ag_noderdev_auto(true) on - which the boot-time bind says -
+ * a neighbour's devices attach by themselves whenever it names itself on a
+ * wire (ag_noderdev_peer_named, from the hello, on the reader).  A wire bound
+ * by hand still waits for `link devs`.
+ */
+void ag_noderdev_auto(bool on);
+
+/*
+ * The wire to the neighbour best placed for a program with these .AXE flags,
+ * or -1 for "no preference": for one that needs a screen, the neighbour whose
+ * screen is the one this board draws on - a panel before a framebuffer in
+ * memory.
+ */
+int32_t ag_noderdev_wire_for(uint32_t axe_flags);
+/* `again`: the neighbour started over (it asked), so what it lent before is
+ * gone even if its devices are here; otherwise only a wire with none yet. */
+void ag_noderdev_peer_named(int32_t wire, bool again);
 
 #ifdef __cplusplus
 }

@@ -31,6 +31,7 @@
 
 #include <argon/cfg.h>
 #include <argon/device.h>
+#include <argon/linkprov.h>
 #include <argon/log.h>
 #include <argon/nodename.h>
 
@@ -143,16 +144,24 @@ ag_device_t *ag_dev_find_anywhere(const char *name)
     if (d != NULL) {
         return d;
     }
-    const char *peer = ag_node_peer_name();
-    if (peer == NULL) {
-        return NULL;
+    /* Every neighbour's, in wire order: a board knows nothing about wires,
+     * only that the device is on a board next to it. */
+    for (int32_t w = 0; w < (int32_t)AG_LINK_WIRES; w++) {
+        const char *peer = ag_node_peer_name_at(w);
+        if (peer == NULL) {
+            continue;
+        }
+        char      qualified[AG_DEV_NAME_MAX];
+        const int n = snprintf(qualified, sizeof(qualified), "%s.%s", peer, name);
+        if (n < 0 || (size_t)n >= sizeof(qualified)) {
+            continue; /* it could not have been registered under that name */
+        }
+        d = ag_dev_find(qualified);
+        if (d != NULL) {
+            return d;
+        }
     }
-    char qualified[AG_DEV_NAME_MAX];
-    const int n = snprintf(qualified, sizeof(qualified), "%s.%s", peer, name);
-    if (n < 0 || (size_t)n >= sizeof(qualified)) {
-        return NULL; /* it could not have been registered under that name */
-    }
-    return ag_dev_find(qualified);
+    return NULL;
 }
 
 ag_device_t *ag_dev_default(ag_dev_class_t cls, const char *const *prefer)

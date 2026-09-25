@@ -13,7 +13,11 @@
 #include <argon/log.h>
 #include <argon/nodename.h>
 
+#include <argon/port/sync.h>
 #include <argon/port/task.h>
+
+#include "net/wlink.h"
+#include "proc/proc_internal.h"
 
 /*
  * SEVERAL WIRES, AND THE ONE THIS CALL MEANS.
@@ -24,11 +28,11 @@
  * takes a node index - so what was missing was only down here.
  *
  * Which wire a call means is NOT a new argument on nine files' worth of call
- * sites.  It is derived: each wire has its own reader task, a handler runs on
- * the task of the wire its message arrived on, so a reply goes back out THAT
- * wire without anybody saying so.  Everything else - a shell command, a
- * migration, a program starting a job - means the selected wire, the one
- * `link use` last named.
+ * sites.  It is derived: one reader task takes every wire's messages, and while
+ * it is handling one it knows which wire that one came in on (s_reading), so a
+ * reply goes back out THAT wire without anybody saying so.  Everything else - a
+ * shell command, a migration, a program starting a job - means the selected
+ * wire, the one `link use` last named.
  *
  * That rule is worth stating the other way round, because it is the whole
  * design: an answer travels home the way its question came, and only a new
@@ -40,12 +44,32 @@ typedef struct {
     const ag_link_ops_t *ops;
     ag_device_t         *dev;
     char                 name[AG_DEV_NAME_MAX];
-    ag_port_task_t       reader;
-    volatile bool        reader_stop;
 } wire_t;
 
 static wire_t s_wire[LINK_WIRES];
 static int    s_sel = -1; /* what `link use` last bound; -1 is none */
+
+/*
+ * ONE READER FOR EVERY WIRE, and the wire it is handling right now.
+ *
+ * It used to be a task a wire, eight kilobytes of stack each (see
+ * reader_start for why eight), and on the C3 in the middle of three boards
+ * that was sixteen of its 189.  One task can read them all because nothing it
+ * waits on is the wire itself: it asks each wire without waiting, and when none
+ * had anything it sleeps on s_wake, which every kernel link gives when its
+ * reader has something (wl_rx_notify) - so a message is picked up at once,
+ * whichever wire it came on.  A driver that is not on a kernel link is still
+ * read, twenty milliseconds late at worst.
+ *
+ * The price is that the wires now take turns inside a handler: a far node's
+ * file read that goes down FAT holds up the other wire's messages for its
+ * length, where it used to hold up only its own.  They were already queued
+ * behind each other at the far end's reader; what is new is only the middle
+ * board's wait.
+ */
+static ag_port_task_t   s_reader;
+static wire_t *volatile s_reading;
+static ag_port_sem_t    s_wake;
 
 static const char s_none[] = "none";
 
@@ -82,11 +106,10 @@ static void let_go(held_t *h) { ag_dev_call_end(h->dev); }
  * selected one.  Both can be absent, and then there is no wire at all. */
 static wire_t *current(void)
 {
-    const ag_port_task_t self = ag_port_task_self();
-    for (unsigned i = 0; i < LINK_WIRES; i++) {
-        if (s_wire[i].ops != NULL && s_wire[i].reader != NULL &&
-            s_wire[i].reader == self) {
-            return &s_wire[i];
+    if (s_reader != NULL && ag_port_task_self() == s_reader) {
+        wire_t *const w = s_reading;
+        if (w != NULL && w->ops != NULL) {
+            return w;
         }
     }
     if (s_sel >= 0 && s_wire[s_sel].ops != NULL) {
@@ -103,9 +126,8 @@ static wire_t *current(void)
  * the same reason: they are properties of the WIRE, and something that serves
  * three neighbours at once has one answer per wire, not one answer.
  *
- * `s_from` is the source of the frame being handled, kept per wire because two
- * reader tasks can be inside a handler at the same time and a single variable
- * would attribute one neighbour's message to the other.  It is written
+ * `s_from` is the source of the frame being handled, kept per wire so that the
+ * answer to one neighbour's message is never addressed from another's.  It is written
  * immediately before the handler is called and read by ag_linkprov_from(),
  * which is the only caller that means anything by it.
  *
@@ -299,12 +321,7 @@ void ag_linkprov_unlisten(uint8_t chan)
 
 bool ag_linkprov_reading(void)
 {
-    for (unsigned i = 0; i < LINK_WIRES; i++) {
-        if (s_wire[i].reader != NULL) {
-            return true;
-        }
-    }
-    return false;
+    return s_reader != NULL;
 }
 
 /*
@@ -316,13 +333,7 @@ bool ag_linkprov_reading(void)
  */
 bool ag_linkprov_in_reader(void)
 {
-    const ag_port_task_t self = ag_port_task_self();
-    for (unsigned i = 0; i < LINK_WIRES; i++) {
-        if (s_wire[i].reader != NULL && s_wire[i].reader == self) {
-            return true;
-        }
-    }
-    return false;
+    return s_reader != NULL && ag_port_task_self() == s_reader;
 }
 
 /*
@@ -346,17 +357,18 @@ static void route(wire_t *w, uint8_t chan, const ag_link_addr_t *from,
      * For this board.  Whoever is about to be handed it may answer, and the
      * answer has to be addressed to the node that WROTE the message - which,
      * for a frame that crossed a middle board, is not the wire's neighbour.
-     * Recorded before the handler runs and per wire, because two neighbours can
-     * be inside a handler at the same moment.
+     * Recorded before the handler runs, per wire.
      */
     s_from[wire_slot(w)] = from->src;
     /*
-     * The handler runs HERE, on this wire's own task, and that is what makes a
-     * reply go back the way the question came: current() finds this wire by
-     * asking which task is running.
+     * The handler runs HERE, on the reader, with s_reading naming this wire,
+     * and that is what makes a reply go back the way the question came:
+     * current() asks the reader which wire it is handling.
      */
     if (chan < LINK_CHANS && s_rx_fn[chan] != NULL) {
+        s_reading = w;
         s_rx_fn[chan](chan, buf, len, s_rx_ctx[chan]);
+        s_reading = NULL;
     }
 }
 
@@ -410,70 +422,117 @@ static uint32_t reader_cap(const wire_t *w)
 }
 
 /*
- * SIZED AGAIN WHEN THE WIRE'S DRIVER CHANGES.  The reader outlives the device
- * it was started for: `drv unload NODELINK`, `drv load linkspi.sys` and
- * `link use node1` rebind the wire under a reader that is still running, and
- * a buffer sized once, for NODELINK's 248 bytes, cut every 1 948-byte
- * rectangle LINKSPI carried to 312 - and the screen service threw each one
- * away as short.  The whole picture crossed the wire and none of it arrived.
+ * SIZED AGAIN WHEN A WIRE'S DRIVER CHANGES.  The reader outlives the devices
+ * it reads: `drv unload NODELINK`, `drv load linkspi.sys` and `link use node1`
+ * rebind a wire under a reader that is still running, and a buffer sized once,
+ * for NODELINK's 248 bytes, cut every 1 948-byte rectangle LINKSPI carried to
+ * 312 - and the screen service threw each one away as short.  The whole picture
+ * crossed the wire and none of it arrived.  One buffer, the size of the largest
+ * wire bound.
  */
-static void reader_task(void *arg)
-{
-    wire_t            *w = (wire_t *)arg;
-    const ag_device_t *sized = NULL;
-    uint32_t           cap = 0;
-    uint8_t           *buf = NULL;
+static const ag_device_t *s_sized[LINK_WIRES];
+static uint32_t           s_cap_of[LINK_WIRES];
 
-    while (!w->reader_stop) {
-        if (w->ops == NULL) {
-            ag_port_task_delay(ag_port_ms_to_ticks(20));
-            continue;
-        }
-        if (buf == NULL || w->dev != sized) {
-            const uint32_t want = reader_cap(w);
-            sized = w->dev;
-            if (buf == NULL || want != cap) {
-                ag_port_free(buf);
-                cap = want;
-                buf = (uint8_t *)ag_port_alloc(cap, AG_MEM_BYTE);
-                if (buf == NULL) {
-                    ag_log(AG_LOG_ERROR, "link",
-                           "%s: no %u bytes for the reader; falling back to "
-                           "288",
-                           w->name, (unsigned)cap);
-                    cap = READER_BUF_MIN;
-                    buf = (uint8_t *)ag_port_alloc(cap, AG_MEM_BYTE);
-                }
-                if (buf == NULL) {
-                    break;
-                }
-            }
-        }
-        uint8_t        chan = 0;
-        ag_link_addr_t from;
-        memset(&from, 0, sizeof(from));
-        held_t h;
-        if (!hold(w, &h)) {
-            continue; /* gone meanwhile: the next lap waits for a new one */
-        }
-        const int32_t n = h.ops->recv_a(h.dev, &chan, buf, cap, 50, &from);
-        let_go(&h);
-        if (n <= 0) {
-            continue;
-        }
-        route(w, chan, &from, buf, (uint16_t)n);
+/* The kernel links' "your reader has something": wakes this one reader. */
+static void reader_wake(void)
+{
+    const ag_port_sem_t sem = s_wake;
+    if (sem != NULL) {
+        (void)ag_port_sem_give(sem);
     }
-    ag_port_free(buf);
-    w->reader = NULL;
-    ag_port_task_delete(NULL);
 }
 
-static void reader_start(wire_t *w)
+/* How long the reader sleeps with nothing on any wire, for a driver whose link
+ * does not wake it; a kernel link wakes it at once. */
+#define READER_IDLE_MS 20u
+
+static void reader_task(void *arg)
 {
-    if (w->reader != NULL) {
+    (void)arg;
+    uint32_t cap = 0;
+    uint8_t *buf = NULL;
+
+    for (;;) {
+        /* the buffer: the largest any bound wire's driver asks for */
+        uint32_t want = READER_BUF_MIN;
+        for (unsigned i = 0; i < LINK_WIRES; i++) {
+            wire_t *const w = &s_wire[i];
+            if (w->ops == NULL) {
+                s_sized[i] = NULL;
+                continue;
+            }
+            if (s_sized[i] != w->dev) {
+                s_cap_of[i] = reader_cap(w);
+                s_sized[i] = w->dev;
+            }
+            if (s_cap_of[i] > want) {
+                want = s_cap_of[i];
+            }
+        }
+        if (buf == NULL || want > cap) {
+            ag_port_free(buf);
+            cap = want;
+            buf = (uint8_t *)ag_port_alloc(cap, AG_MEM_BYTE);
+            if (buf == NULL) {
+                ag_log(AG_LOG_ERROR, "link",
+                       "no %u bytes for the reader; falling back to 288",
+                       (unsigned)cap);
+                cap = READER_BUF_MIN;
+                buf = (uint8_t *)ag_port_alloc(cap, AG_MEM_BYTE);
+            }
+            if (buf == NULL) {
+                ag_port_task_delay(ag_port_ms_to_ticks(1000));
+                continue;
+            }
+        }
+
+        /* one message from each wire that has one, none waited for */
+        bool got = false;
+        for (unsigned i = 0; i < LINK_WIRES; i++) {
+            wire_t *const w = &s_wire[i];
+            if (w->ops == NULL) {
+                continue;
+            }
+            uint8_t        chan = 0;
+            ag_link_addr_t from;
+            memset(&from, 0, sizeof(from));
+            held_t h;
+            if (!hold(w, &h)) {
+                continue; /* gone meanwhile */
+            }
+            const int32_t n = h.ops->recv_a(h.dev, &chan, buf, cap, 0, &from);
+            let_go(&h);
+            if (n > 0) {
+                got = true;
+                route(w, chan, &from, buf, (uint16_t)n);
+            }
+        }
+        if (!got) {
+            (void)ag_port_sem_take(s_wake, ag_port_ms_to_ticks(READER_IDLE_MS));
+        }
+    }
+}
+
+/*
+ * Started by the first `link use` and kept: a board that has bound a wire once
+ * is a board in a cluster, and the next wire - or the same one after a driver
+ * is swapped - is read by the same task.
+ */
+static void reader_start(void)
+{
+    if (s_reader != NULL) {
         return;
     }
-    w->reader_stop = false;
+    if (s_wake == NULL) {
+        /* binary: however many wires spoke, one lap reads them all */
+        s_wake = ag_port_sem_new_binary();
+        if (s_wake == NULL) {
+            ag_log(AG_LOG_ERROR, "link", "no wake for the reader: nothing will "
+                                         "be heard");
+            return;
+        }
+    }
+    wl_rx_notify = reader_wake;
     /* Priority 1: below every application, for the reason this tree keeps
      * repeating - a link's task above them took a game from 40 fps to
      * unplayable. */
@@ -497,8 +556,15 @@ static void reader_start(wire_t *w)
      * `link` prints what is left of this, so the next change that eats into
      * it is visible before it is fatal rather than after.
      */
-    if (!ag_port_task_create(reader_task, "ag_link", 8192, w, 1, 0, 0,
-                             &w->reader)) {
+    /*
+     * Internal SRAM if there is room, PSRAM if not, as the cluster's workers
+     * do: an emulated S3 after the merge of 25 Sep 2026 had not 8 KB left in
+     * one piece by the time `link use` ran, the reader was never made, and
+     * both nodes sent into a wire nobody read ("no reader task" in the
+     * journal, 0 of 24 pings back).
+     */
+    if (!ag_proc_task_create(reader_task, "ag_link", 8192, NULL, 1, 0,
+                             &s_reader)) {
         ag_log(AG_LOG_ERROR, "link", "no reader task: nothing will be heard");
     }
 }
@@ -557,13 +623,7 @@ ag_err_t ag_linkprov_drop(const char *name)
     if (i < 0) {
         return -AG_ENODEV;
     }
-    /*
-     * The reader is told to stop and the wire is let go now rather than
-     * waited for: the task is inside a recv() with its own timeout, and
-     * holding the shell until that returns would look like a hang.  It reads
-     * ops == NULL on its next lap and ends itself.
-     */
-    s_wire[i].reader_stop = true;
+    /* The reader reads ops == NULL on its next lap and passes the wire by. */
     s_wire[i].ops = NULL;
     s_wire[i].dev = NULL;
     strcpy(s_wire[i].name, s_none);
@@ -582,10 +642,10 @@ ag_err_t ag_linkprov_drop(const char *name)
 uint32_t ag_linkprov_reader_stack_left(int32_t wire)
 {
     if (wire < 0 || (unsigned)wire >= LINK_WIRES ||
-        s_wire[wire].reader == NULL) {
+        s_wire[wire].ops == NULL || s_reader == NULL) {
         return 0;
     }
-    return ag_port_task_stack_unused(s_wire[wire].reader);
+    return ag_port_task_stack_unused(s_reader);
 }
 
 int32_t ag_linkprov_current(void)
@@ -725,7 +785,6 @@ ag_err_t ag_linkprov_use(const char *name)
      */
     if (strcmp(name, s_none) == 0) {
         if (s_sel >= 0) {
-            s_wire[s_sel].reader_stop = true;
             s_wire[s_sel].ops = NULL;
             s_wire[s_sel].dev = NULL;
             strcpy(s_wire[s_sel].name, s_none);
@@ -759,8 +818,9 @@ ag_err_t ag_linkprov_use(const char *name)
     /*
      * Already bound is a SELECTION, not a second binding.  Typing `link use
      * node0` twice - which a script does every time it is re-run - must not
-     * start a second reader on the same device, and both readers would then
-     * take turns eating each other's messages.
+     * take a second slot for the same device, or the reader would ask it
+     * twice a lap and the two slots would take turns eating each other's
+     * messages.
      */
     int slot = ag_linkprov_index_of(dev->name);
     if (slot < 0) {
@@ -783,7 +843,7 @@ ag_err_t ag_linkprov_use(const char *name)
     ag_strlcpy(w->name, dev->name, sizeof(w->name));
     s_sel = slot;
 
-    reader_start(w);
+    reader_start();
 
     held_t   h;
     ag_err_t e = -AG_ENODEV;
@@ -793,7 +853,6 @@ ag_err_t ag_linkprov_use(const char *name)
     }
     if (e != AG_OK) {
         ag_log(AG_LOG_ERROR, "link", "%s did not start: %d", w->name, (int)e);
-        w->reader_stop = true;
         w->ops = NULL;
         w->dev = NULL;
         strcpy(w->name, s_none);
@@ -817,6 +876,15 @@ ag_err_t ag_linkprov_use(const char *name)
                    w->name, (unsigned)info.mtu, (unsigned)AG_LINK_MIN_MTU);
         }
     }
+    return AG_OK;
+}
+
+ag_err_t ag_linkprov_select(int32_t wire)
+{
+    if (wire < 0 || (unsigned)wire >= LINK_WIRES || s_wire[wire].ops == NULL) {
+        return -AG_ENODEV;
+    }
+    s_sel = (int)wire;
     return AG_OK;
 }
 
@@ -845,8 +913,21 @@ bool ag_linkprov_up(void)
 int32_t ag_linkprov_send(uint8_t chan, uint8_t cls, const void *buf, size_t len)
 {
     const wire_t *w = current();
-    return send_addressed((w != NULL) ? wire_slot(w) : -1, ag_linkprov_target(),
-                          chan, cls, buf, len);
+    /*
+     * AN ANSWER GOES TO WHOEVER ASKED, not to the node `link use` last named.
+     * Sent from the reader while it handles a message, this is an answer to
+     * that message - a device listing, a hello, a file - and it used to be
+     * addressed to the target: on the C3 between two boards, with `link use
+     * cyd` in force, the answer to the Zero's question went out on the Zero's
+     * wire addressed to the CYD, and the Zero passed it on or dropped it.
+     */
+    uint16_t dst = ag_linkprov_target();
+    if (w != NULL && ag_linkprov_in_reader() && s_reading == w &&
+        s_from[wire_slot(w)] != 0u) {
+        dst = s_from[wire_slot(w)];
+    }
+    return send_addressed((w != NULL) ? wire_slot(w) : -1, dst, chan, cls, buf,
+                          len);
 }
 
 void ag_linkprov_poll(uint32_t ms)
@@ -902,12 +983,26 @@ ag_err_t ag_linkprov_stats(ag_link_stats_t *out)
  * when they were missing would be a second set of constants in a second place,
  * which is exactly the thing this exists to remove.
  */
+static ag_err_t info_of(wire_t *w, ag_link_info_t *out);
+
 ag_err_t ag_linkprov_info(ag_link_info_t *out)
+{
+    return info_of(current(), out);
+}
+
+ag_err_t ag_linkprov_info_on(int32_t wire, ag_link_info_t *out)
+{
+    if (wire < 0 || (unsigned)wire >= LINK_WIRES || s_wire[wire].ops == NULL) {
+        return -AG_ENODEV;
+    }
+    return info_of(&s_wire[wire], out);
+}
+
+static ag_err_t info_of(wire_t *w, ag_link_info_t *out)
 {
     if (out == NULL) {
         return -AG_EINVAL;
     }
-    wire_t *w = current();
     if (w == NULL) {
         return -AG_ENODEV;
     }

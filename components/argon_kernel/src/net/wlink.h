@@ -356,4 +356,13 @@ int32_t wl_read(wlink_t *w, void *buf, size_t len, uint32_t timeout_ms);
 /* The protocol's counters into a stats struct. */
 void wl_stats(const wlink_t *w, ag_spilink_stats_t *out);
 
+/*
+ * The link's reader has something to look at: bytes, a block, a close or a
+ * restart.  Gives the link's own wake and then tells wl_rx_notify, which is
+ * how ONE task can wait on every wire at once (linkprov's reader) instead of
+ * a task a wire.  Called from task context, never from an interrupt.
+ */
+void wl_rx_wake(wlink_t *w);
+extern void (*volatile wl_rx_notify)(void);
+
 #endif /* ARGON_NET_WLINK_H */

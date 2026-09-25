@@ -142,6 +142,9 @@ void ag_node_autobind(void)
                want);
         return;
     }
+    /* Docking was asked for: every neighbour's devices, as each names itself
+     * (see ag_noderdev_auto). */
+    ag_noderdev_auto(true);
 
     /*
      * `auto` is EVERY link device this board has, not the first one.

@@ -99,6 +99,10 @@ uint32_t ag_linkprov_reader_stack_left(int32_t wire);
  * this drops the one asked for, whichever is selected. */
 ag_err_t ag_linkprov_drop(const char *name);
 
+/* Make a bound wire the selected one, as `link use` does for a wire already
+ * bound - without starting its driver again. */
+ag_err_t ag_linkprov_select(int32_t wire);
+
 /* Send on a named wire rather than on the one this call would mean. */
 int32_t ag_linkprov_send_on(int32_t wire, uint8_t chan, uint8_t cls,
                             const void *buf, size_t len);
@@ -226,5 +230,7 @@ ag_err_t ag_linkprov_stats(ag_link_stats_t *out);
 
 /* The bound wire's shape.  Never answers "unknown" - see the note above. */
 ag_err_t ag_linkprov_info(ag_link_info_t *out);
+/* The same for one wire by index, whichever this call would otherwise mean. */
+ag_err_t ag_linkprov_info_on(int32_t wire, ag_link_info_t *out);
 
 #endif /* ARGON_LINKPROV_H */

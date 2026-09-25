@@ -8,6 +8,10 @@
 # same program (cluster.md 3b).  For that to work, each side needs both.
 #
 # Xtensa, for this board itself:
+# GFXNOISE: the screen test.  A neighbour without a screen (the C3) that is
+# asked to run it sends it HERE, to the panel - and this board runs its own
+# build of it, which it has to have (26 Sep 2026: -45, "no build of GFXNOISE").
+GFXNOISE.AXE
 GRIND32.AXE
 LINK32.AXE
 MIGRAN32.AXE

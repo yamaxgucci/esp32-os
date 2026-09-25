@@ -674,7 +674,7 @@ static void deliver(spilink_t *s, unsigned slot, uint32_t got)
     if (put > 0u) {
         /* A count and not a flag: two blocks can arrive before the reader
          * wakes, and one give per block is what lets it see both. */
-        (void)ag_port_sem_give(s->w.rx_sem);
+        wl_rx_wake(&s->w);
     }
 }
 
@@ -1093,7 +1093,7 @@ static ag_err_t link_teardown(spilink_t *s, ag_spilink_stats_t *out)
 
     /* A reader blocked in read() has to see the link close under it, and so
      * does a writer waiting for room. */
-    (void)ag_port_sem_give(s->w.rx_sem);
+    wl_rx_wake(&s->w);
     (void)ag_port_sem_give(s->w.space_sem);
 
     bool gone = true;

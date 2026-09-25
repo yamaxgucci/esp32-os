@@ -67,6 +67,14 @@
 /* two: one on the wire while the next is built - queued behind it, so the
  * line does not go quiet between them */
 #define UL_TXBUF     2u
+/*
+ * The send ring, in frames: what may be on the wire unacknowledged.  FOUR,
+ * and three was measured, not guessed (Zero-C3, 16 Mbaud, 2 KB frames, 26 Sep
+ * 2026): Z->C3 98.6% either way, but C3->Z fell from 98.7% to 92-96% - the
+ * C3 waits for the Zero's acknowledgement with only three frames out.  One
+ * frame is 2 KB a wire; six points of the wire are worth more.
+ */
+#define UL_TX_FRAMES 4u
 /* what one DMA read takes at most; the frame finder holds a frame and this */
 #define UL_READ      1024u
 #define UL_READ_MS   20u
@@ -530,7 +538,8 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
         return -AG_EBUSY;
     }
     const uint32_t pay = frame - WL_HDR;
-    w->txcap = (4u * pay + 3u) & ~3u;
+    /* UL_TX_FRAMES frames of what is sent and not yet acknowledged */
+    w->txcap = (UL_TX_FRAMES * pay + 3u) & ~3u;
     w->rxcap = (3u * pay + 3u) & ~3u;
     u->pcap = frame + UL_READ;
     const size_t dbytes = (size_t)(dma ? UL_TXBUF : 1u) * frame;
@@ -662,7 +671,7 @@ ag_err_t ag_uartlink_close(int port, ag_spilink_stats_t *out)
     u->w.open = false;
     unlock(u);
     /* a reader or a writer waiting sees the link closed when it wakes */
-    (void)ag_port_sem_give(u->w.rx_sem);
+    wl_rx_wake(&u->w);
     (void)ag_port_sem_give(u->w.space_sem);
     if (!rx_gone || !tx_gone) {
         /* a task still inside the port: its buffers are not ours to free */

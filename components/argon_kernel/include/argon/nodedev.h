@@ -41,6 +41,9 @@ ag_err_t ag_nodedev_start(void);
  * no neighbour look the same in a listing and mean opposite things.
  */
 int32_t ag_nodedev_list(ag_devinfo_t *out, uint32_t max, uint32_t timeout_ms);
+/* The same, of the neighbour on one wire (-1: the wire this call means). */
+int32_t ag_nodedev_list_on(int32_t wire, ag_devinfo_t *out, uint32_t max,
+                           uint32_t timeout_ms);
 
 /*
  * "Could you run a program that needs this?"  `axe_flags` is a .AXE flags word;

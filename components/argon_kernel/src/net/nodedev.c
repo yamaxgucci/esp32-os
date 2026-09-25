@@ -11,6 +11,7 @@
 #include <argon/linkprov.h>
 #include <argon/log.h>
 #include <argon/display.h>
+#include <argon/nodename.h>
 #include <argon/proc.h>
 
 #include <argon/port/task.h>
@@ -64,6 +65,8 @@ static uint32_t      s_out_max;
 static volatile uint32_t s_out_n;
 static volatile bool     s_done;
 static volatile bool     s_wanted;
+/* the wire a listing was asked on: an answer off another one is not it */
+static volatile int32_t  s_list_wire = -1;
 
 /* The capability question in flight.  One at a time; it is a single yes or no. */
 static volatile bool s_can_wanted;
@@ -88,7 +91,18 @@ static void get_rec(ag_devinfo_t *info, const uint8_t *p)
     info->flags = p[ND_NAME * 2u + 1u];
 }
 
+/* Out of one wire to one node; wire -1 is "the wire this call means" - the
+ * reader answering, or the selected one. */
+static ag_err_t send_msg_on(int32_t wire, uint16_t dst, uint8_t op,
+                            const void *payload, uint16_t len);
+
 static ag_err_t send_msg(uint8_t op, const void *payload, uint16_t len)
+{
+    return send_msg_on(-1, 0u, op, payload, len);
+}
+
+static ag_err_t send_msg_on(int32_t wire, uint16_t dst, uint8_t op,
+                            const void *payload, uint16_t len)
 {
     uint8_t buf[ND_HDR + ND_MAX_MSG];
     if (len > ND_MAX_MSG) {
@@ -103,7 +117,10 @@ static ag_err_t send_msg(uint8_t op, const void *payload, uint16_t len)
     }
     for (int t = 0; t < 200; t++) {
         const int32_t r =
-            ag_linkprov_send(ND_CHAN, AG_LINK_CONTROL, buf, ND_HDR + len);
+            (wire < 0)
+                ? ag_linkprov_send(ND_CHAN, AG_LINK_CONTROL, buf, ND_HDR + len)
+                : ag_linkprov_send_to_on(wire, dst, ND_CHAN, AG_LINK_CONTROL,
+                                         buf, ND_HDR + len);
         if (r >= 0) {
             return AG_OK;
         }
@@ -194,6 +211,9 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         if (!s_wanted) {
             break; /* nobody asked: an answer to a question already given up on */
         }
+        if (s_list_wire >= 0 && ag_linkprov_current() != s_list_wire) {
+            break; /* another neighbour's answer to another question */
+        }
         for (uint16_t at = 0; at + ND_REC <= len; at = (uint16_t)(at + ND_REC)) {
             if (s_out_n >= s_out_max) {
                 break;
@@ -203,6 +223,9 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         }
         break;
     case ND_OP_END:
+        if (s_list_wire >= 0 && ag_linkprov_current() != s_list_wire) {
+            break;
+        }
         s_done = true;
         break;
     case ND_OP_CAN:
@@ -237,11 +260,28 @@ ag_err_t ag_nodedev_start(void)
 
 int32_t ag_nodedev_list(ag_devinfo_t *out, uint32_t max, uint32_t timeout_ms)
 {
+    return ag_nodedev_list_on(-1, out, max, timeout_ms);
+}
+
+int32_t ag_nodedev_list_on(int32_t wire, ag_devinfo_t *out, uint32_t max,
+                           uint32_t timeout_ms)
+{
     if (out == NULL || max == 0u) {
         return -AG_EINVAL;
     }
-    if (!ag_linkprov_bound()) {
+    if (wire < 0 ? !ag_linkprov_bound() : ag_linkprov_name_at(wire) == NULL) {
         return -AG_ENODEV;
+    }
+    /* The answer arrives on the reader; asking from it waits for itself. */
+    if (ag_linkprov_in_reader()) {
+        return -AG_EBUSY;
+    }
+    /* Addressed to the neighbour on that wire by its name, when it has said
+     * one: 0 is "whoever reads it", which the neighbour is too. */
+    uint16_t dst = 0;
+    if (wire >= 0) {
+        const char *peer = ag_node_peer_name_at(wire);
+        dst = (peer != NULL) ? ag_node_hash(peer) : 0u;
     }
     if (!s_listening) {
         const ag_err_t e = ag_nodedev_start();
@@ -254,11 +294,13 @@ int32_t ag_nodedev_list(ag_devinfo_t *out, uint32_t max, uint32_t timeout_ms)
     s_out_max = max;
     s_out_n = 0;
     s_done = false;
+    s_list_wire = wire;
     s_wanted = true;
 
-    const ag_err_t err = send_msg(ND_OP_LIST, NULL, 0);
+    const ag_err_t err = send_msg_on(wire, dst, ND_OP_LIST, NULL, 0);
     if (err != AG_OK) {
         s_wanted = false;
+        s_list_wire = -1;
         return (int32_t)err;
     }
 
@@ -268,11 +310,13 @@ int32_t ag_nodedev_list(ag_devinfo_t *out, uint32_t max, uint32_t timeout_ms)
     while (!s_done) {
         if (ag_port_us() >= deadline) {
             s_wanted = false;
+            s_list_wire = -1;
             return -AG_ETIMEDOUT;
         }
         ag_port_task_delay(ag_port_ms_to_ticks(5));
     }
     s_wanted = false;
+    s_list_wire = -1;
     return (int32_t)s_out_n;
 }
 
