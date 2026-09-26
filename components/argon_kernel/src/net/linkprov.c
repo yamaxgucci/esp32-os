@@ -823,6 +823,18 @@ ag_err_t ag_linkprov_use(const char *name)
      * messages.
      */
     int slot = ag_linkprov_index_of(dev->name);
+    /*
+     * AND NOTHING ELSE.  It went on to call the driver's start again, which
+     * began the wire over: the far end saw a peer restart, every block in
+     * flight was thrown away, and - with devices attaching by themselves - the
+     * neighbour took all of this board's devices out and put them back.  A
+     * script that says `link use zero` every thirty seconds did that every
+     * thirty seconds (26 Sep 2026).
+     */
+    if (slot >= 0 && s_wire[slot].dev == dev && s_wire[slot].ops == ops) {
+        s_sel = slot;
+        return AG_OK;
+    }
     if (slot < 0) {
         for (unsigned i = 0; i < LINK_WIRES && slot < 0; i++) {
             if (s_wire[i].ops == NULL) {

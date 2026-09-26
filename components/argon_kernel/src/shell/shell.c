@@ -1869,6 +1869,11 @@ static int cmd_dev_default(int argc, char **argv)
         }
         if (automatic) {
             ag_console_printf("%s: back to the best there is\n", argv[2]);
+        } else if (strchr(argv[3], '+') != NULL) {
+            ag_device_t *g[8];
+            const int    n = ag_dev_default_group(cls, g, 8);
+            ag_console_printf("%s: all of %s - %d of them here now\n", argv[2],
+                              argv[3], n);
         } else if (ag_dev_find(argv[3]) == NULL) {
             ag_console_printf("%s: %s is not in the list (yet); nothing until it "
                               "is\n", argv[2], argv[3]);

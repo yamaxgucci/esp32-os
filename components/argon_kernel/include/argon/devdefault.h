@@ -49,6 +49,12 @@ ag_err_t ag_dev_default_choose(ag_dev_class_t cls, const char *name);
 /* What was chosen for the class, or NULL. */
 const char *ag_dev_default_chosen(ag_dev_class_t cls);
 
+/*
+ * The chosen GROUP, `a+b+c`: its members present now, into `out`, in the
+ * order they were named; 0 when the choice is not a group.  See devdefault.c.
+ */
+int ag_dev_default_group(ag_dev_class_t cls, ag_device_t **out, int max);
+
 #ifdef __cplusplus
 }
 #endif

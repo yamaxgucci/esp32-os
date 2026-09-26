@@ -228,6 +228,23 @@ static dma_port_t *dma_for(int port)
     if (d->tried) {
         return NULL; /* asked once, refused once; do not ask every frame */
     }
+    /*
+     * NOT A SECOND CONTROLLER WHERE THERE IS ONE.  The C3 and the S3 have a
+     * single UHCI; IDF refuses a second ("no free controller") - after
+     * touching the one that is working.  Asking was enough to do it: `link`
+     * on the C3's driver-path wire to the CYD asked whether uart1 could DMA,
+     * and from that moment the C3 heard nothing more on uart0 from the Zero
+     * (26 Sep 2026: 0 retransmissions before, 351 twenty seconds after).
+     */
+#if defined(SOC_UHCI_NUM)
+    uint32_t in_use = 0;
+    for (int i = 0; i < AG_PORT_UART_MAX; i++) {
+        in_use += (s_dma[i].ctrl != NULL) ? 1u : 0u;
+    }
+    if (in_use >= (uint32_t)SOC_UHCI_NUM) {
+        return NULL; /* not "tried": this port may have it once that one is let go */
+    }
+#endif
     d->tried = true;
 
     d->done = xSemaphoreCreateCounting(AG_DMA_QUEUE, 0);
@@ -403,6 +420,7 @@ static void rx_task(void *arg)
 {
     dma_port_t *d = (dma_port_t *)arg;
     uint8_t     r = 0;
+    uint32_t    refused = 0; /* mounts refused in a row */
     for (;;) {
         /*
          * WHAT COUNTS AS IDLE, set every time because a reconfiguration of
@@ -439,9 +457,35 @@ static void rx_task(void *arg)
 #endif
         if (uhci_receive(d->ctrl, d->rx_ring[r], AG_DMA_RX_RING) != ESP_OK) {
             d->rx_active = false;
+            /*
+             * A CONTROLLER THAT NEVER COMES BACK.  Once on the Zero, after
+             * resets on both ends of a 16 Mbaud line, the receive state stayed
+             * off "enable" for good: this loop asked a thousand times a second,
+             * IDF said so in the log each time, and the console drowned in it -
+             * a board that answered nothing, with nothing wrong but the one
+             * receive (26 Sep 2026).  So: the complaint once, not per tick, and
+             * after a fifth of a second of refusals the state is put back,
+             * which is all that stands between the channel and the next mount.
+             */
+            refused++;
+            if (refused == 10u) {
+                esp_log_level_set("uhci", ESP_LOG_NONE);
+            }
+#if AG_UHCI_PRIVATE
+            if (refused % 200u == 0u) {
+                atomic_store(&d->ctrl->rx_dir.rx_fsm, UHCI_RX_FSM_ENABLE);
+                ESP_EARLY_LOGW("uartdma", "uart%d: receive stuck for %u tries; "
+                                          "state put back to enable",
+                               d->port, (unsigned)refused);
+            }
+#endif
             vTaskDelay(1);
             continue;
         }
+        if (refused >= 10u) {
+            esp_log_level_set("uhci", ESP_LOG_WARN);
+        }
+        refused = 0;
         (void)xSemaphoreTake(d->rx_rearm, portMAX_DELAY);
         r ^= 1u;
     }

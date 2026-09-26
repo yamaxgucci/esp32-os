@@ -27,6 +27,8 @@
 #define TAG "pcmmix"
 
 #define PCMMIX_CLIENTS     4
+/* members of a room group played into beside the sink (multiroom) */
+#define PCMMIX_ALSO        3
 /*
  * 16 KB per client, which is 186 ms of 22 kHz stereo, and not four.
  *
@@ -62,6 +64,9 @@ typedef struct {
     ag_device_t     *sink;
     int              sink_held;
     char             sink_name[AG_DEV_NAME_MAX];
+    /* the other members of a chosen group (multiroom), open beside `sink` */
+    ag_device_t     *also[PCMMIX_ALSO];
+    int              also_n;
 
     uint64_t         bytes_out;
     uint64_t         bytes_drop_nosink;
@@ -250,10 +255,64 @@ static void on_revoke(ag_device_t *dev)
         s_st->sink_held = 0;
         s_st->sink_name[0] = '\0';
     }
+    /* a room of a group left: the others play on */
+    for (int i = 0; s_st != NULL && i < s_st->also_n; i++) {
+        if (s_st->also[i] == dev) {
+            s_st->also[i] = s_st->also[--s_st->also_n];
+            i--;
+        }
+    }
+}
+
+static void release_also(pcmmix_state_t *st)
+{
+    for (int i = 0; i < st->also_n; i++) {
+        (void)ag_dev_close(st->also[i]);
+    }
+    st->also_n = 0;
+}
+
+/*
+ * THE REST OF A GROUP, beside the sink.  Opened, set to the mixer's format
+ * and written every period after the sink - so each member is paced by its
+ * own write, as the one sink is (a neighbour's converter by its proxy's
+ * clock, noderdev.c pace_audio).  Asked every period like the sink, so a
+ * member that appears joins and one that goes is let go.
+ */
+static void ensure_also(pcmmix_state_t *st)
+{
+    ag_device_t *g[1 + PCMMIX_ALSO];
+    const int    n = ag_dev_default_group(AG_DEV_AUDIO, g, 1 + PCMMIX_ALSO);
+    int          want_n = 0;
+    ag_device_t *want[PCMMIX_ALSO];
+    for (int i = 0; i < n; i++) {
+        if (g[i] != st->sink && want_n < PCMMIX_ALSO) {
+            want[want_n++] = g[i];
+        }
+    }
+    bool same = (want_n == st->also_n);
+    for (int i = 0; same && i < want_n; i++) {
+        same = (want[i] == st->also[i]);
+    }
+    if (same) {
+        return;
+    }
+    release_also(st);
+    for (int i = 0; i < want_n; i++) {
+        if (ag_dev_open(want[i], AG_O_WRONLY) != AG_OK) {
+            continue;
+        }
+        ag_audio_fmt_t fmt = st->mix_fmt;
+        (void)ag_dev_ioctl(want[i], AG_IOC_AUDIO_SETFMT, &fmt, sizeof(fmt));
+        st->also[st->also_n++] = want[i];
+        ag_log(AG_LOG_INFO, TAG, "and /dev/%s, as the same room group",
+               want[i]->name);
+    }
 }
 
 static void release_sink(pcmmix_state_t *st)
 {
+    release_also(st);
     if (st->sink_held && st->sink != NULL) {
         (void)ag_dev_close(st->sink);
     }
@@ -394,6 +453,10 @@ static void mix_one_period(pcmmix_state_t *st)
         st->bytes_out += (uint64_t)n;
     } else {
         st->bytes_drop_nosink += (uint64_t)period_bytes;
+    }
+    ensure_also(st);
+    for (i = 0; i < (size_t)st->also_n; i++) {
+        (void)ag_dev_write(st->also[i], st->mix_scratch, period_bytes, 0);
     }
 }
 
@@ -537,6 +600,10 @@ static ag_err_t mix_ioctl_session(ag_device_t *dev, void *session, uint32_t cmd,
         if (s_st->sink_held && s_st->sink != NULL) {
             ag_audio_fmt_t f = s_st->mix_fmt;
             (void)ag_dev_ioctl(s_st->sink, AG_IOC_AUDIO_SETFMT, &f, sizeof(f));
+        }
+        for (int k = 0; k < s_st->also_n; k++) {
+            ag_audio_fmt_t f = s_st->mix_fmt;
+            (void)ag_dev_ioctl(s_st->also[k], AG_IOC_AUDIO_SETFMT, &f, sizeof(f));
         }
         return AG_OK;
     }

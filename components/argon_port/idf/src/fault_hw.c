@@ -51,6 +51,8 @@
 
 #include <xtensa/corebits.h>
 
+#include "esp_private/cache_utils.h"
+#include "esp_private/panic_internal.h"
 #include "esp_rom_sys.h"
 #include "xtensa_api.h"
 
@@ -150,7 +152,19 @@ static void fault_handler(XtExcFrame *frame)
      * calls ra - and it is read here for the same reason: the record should say
      * not only where the program died but where it came from.
      */
-    if (s_note(cause, (uint32_t)frame->pc, (uint32_t)frame->excvaddr,
+    /*
+     * A DELIBERATE ABORT IS NOT AN APPLICATION FAULT, on this architecture
+     * too.  ESP-IDF's panic_abort() is an illegal instruction here as on
+     * RISC-V, and the RISC-V half has always let it through; this half took
+     * it for the application's.  So an assertion that failed inside the
+     * kernel while a program was loading "recovered" the program and left the
+     * kernel in whatever state the assertion was about: the Zero answered
+     * nothing at all afterwards, and IDF's message saying which assertion was
+     * never printed (26 Sep 2026).  Let IDF have it - with its report.
+     */
+    const bool claimable = !g_panic_abort && spi_flash_cache_enabled();
+    if (claimable &&
+        s_note(cause, (uint32_t)frame->pc, (uint32_t)frame->excvaddr,
                (uint32_t)frame->a1, (uint32_t)frame->a0)) {
         /*
          * Say it here, from the exception itself, with esp_rom_printf - the one

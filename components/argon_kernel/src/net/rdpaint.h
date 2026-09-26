@@ -49,4 +49,17 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
 /* One payload onto a local screen; the pixels drawn, 0 if it was not one. */
 uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len);
 
+/*
+ * THE FAR SCREEN'S PACE.  Called by the painter after every pass it sent,
+ * and returns when the far end has what the pass carried (or has given up
+ * waiting).  Without it the painter kept the pace of the FIRST wire: a
+ * neighbour's screen two hops away, behind a 4 Mbaud wire, was fed at
+ * 16 Mbaud, and the board in the middle stood in its relay with a queue it
+ * could not empty - hearing nothing else, its own answers included (26 Sep
+ * 2026).  Waiting a pass costs frames, not the picture: what changes
+ * meanwhile goes in the next pass, which is what the painter is for.
+ */
+typedef void (*rdp_sync_fn)(uint32_t handle);
+void rdp_set_sync(rdp_sync_fn sync);
+
 #endif /* ARGON_NET_RDPAINT_H */

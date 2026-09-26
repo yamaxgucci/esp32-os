@@ -226,10 +226,70 @@ void ag_dev_note_done(void)
  */
 #define AG_LOCKWATCH_AFTER_US 2000000ll
 
+/*
+ * AND EVERY DEVICE'S OWN LOCK.  A read or a write holds that one and lets the
+ * registry go, so a driver that stops inside a write was invisible to the
+ * watch above: a Zero that answered nothing at all, and not a word from here
+ * (26 Sep 2026).  Seen held by the same task three watches running - three
+ * seconds - it is said, once per spell.
+ */
+const void *ag_log_lock_holder(void); /* core/log.c */
+
+static const void *console_holder(void)
+{
+    return ag_console_lock_holder(); /* argon/console.h */
+}
+
+static void io_lockwatch(void)
+{
+    static ag_port_task_t last[AG_DEV_MAX];
+    static uint8_t        runs[AG_DEV_MAX];
+    for (int i = 0; i < AG_DEV_MAX; i++) {
+        const ag_port_task_t who =
+            (s_io[i] != NULL) ? ag_port_mutex_holder(s_io[i]) : NULL;
+        if (who == NULL || who != last[i]) {
+            last[i] = who;
+            runs[i] = 0;
+            continue;
+        }
+        if (runs[i] < 255u) {
+            runs[i]++;
+        }
+        if (runs[i] == 3u || runs[i] == 30u) {
+            ag_port_raw_print("\n[lockwatch] a device's own lock (slot %d) held "
+                              "%u s by '%s'\n",
+                              i, (unsigned)runs[i], ag_port_task_name(who));
+        }
+    }
+    /* and the two every task ends up waiting on when one of them stops */
+    const void *(*const other[2])(void) = {console_holder,
+                                           ag_log_lock_holder};
+    static const char *const other_name[2] = {"console", "journal"};
+    static const void       *other_last[2];
+    static uint8_t           other_runs[2];
+    for (int k = 0; k < 2; k++) {
+        const void *who = other[k]();
+        if (who == NULL || who != other_last[k]) {
+            other_last[k] = who;
+            other_runs[k] = 0;
+            continue;
+        }
+        if (other_runs[k] < 255u) {
+            other_runs[k]++;
+        }
+        if (other_runs[k] == 3u || other_runs[k] == 30u) {
+            ag_port_raw_print("\n[lockwatch] the %s lock held %u s by '%s'\n",
+                              other_name[k], (unsigned)other_runs[k],
+                              ag_port_task_name((ag_port_task_t)(uintptr_t)who));
+        }
+    }
+}
+
 void ag_dev_lockwatch(void)
 {
     static int64_t said_at;
 
+    io_lockwatch();
     const ag_port_task_t who = s_hold_task;
     const int64_t        since = s_hold_since;
     if (who == NULL || since == 0) {

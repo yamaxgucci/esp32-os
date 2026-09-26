@@ -87,6 +87,17 @@ if(NOT CMAKE_SCRIPT_MODE_FILE AND NOT CONFIG_IDF_TARGET_ARCH_XTENSA)
     idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=xt_unhandled_exception" APPEND)
 endif()
 
+# FLASH FROM A TASK WHOSE STACK IS IN PSRAM: the partition calls every IDF
+# component makes are routed through idf/src/flashop_hw.c, which hands them to
+# a task with an internal stack when the caller's is not.  On every target:
+# where there is no PSRAM the test passes and the call goes straight through.
+if(NOT CMAKE_SCRIPT_MODE_FILE AND ARGON_PORT STREQUAL "idf")
+    foreach(fn esp_partition_read esp_partition_write esp_partition_read_raw
+               esp_partition_write_raw esp_partition_erase_range esp_partition_mmap)
+        idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=${fn}" APPEND)
+    endforeach()
+endif()
+
 idf_component_register(
     SRCS ${ARGON_PORT_SRCS}
     INCLUDE_DIRS "include" "${ARGON_PORT}"

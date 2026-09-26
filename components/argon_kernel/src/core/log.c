@@ -47,6 +47,13 @@ static bool         s_ready;
  */
 static ag_port_mutex_t s_lock;
 
+
+/* Who holds this lock now, for the lock watch (dev/devices.c). */
+const void *ag_log_lock_holder(void)
+{
+    return (s_lock != NULL) ? (const void *)ag_port_mutex_holder(s_lock) : NULL;
+}
+
 static void log_lock(void)
 {
     if (s_lock != NULL) {

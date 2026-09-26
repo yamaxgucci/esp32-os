@@ -69,6 +69,9 @@ static struct {
     uint32_t passes, px_in, bytes_out;
     int64_t  said_us;
     uint32_t said_passes, said_px, said_bytes;
+    /* the far end's pace: time waited in sync, this second - the total and
+     * the longest; and the longest time from one pass's start to the next */
+    int64_t  sync_us, sync_max_us, gap_max_us, last_pass_us;
 } s_p;
 
 static uint16_t get16(const uint8_t *p)
@@ -81,6 +84,10 @@ static void put16(uint8_t *p, uint16_t v)
     p[0] = (uint8_t)v;
     p[1] = (uint8_t)(v >> 8);
 }
+
+static rdp_sync_fn s_sync;
+
+void rdp_set_sync(rdp_sync_fn sync) { s_sync = sync; }
 
 static void lock(void) { (void)ag_port_mutex_take(s_p.lock, AG_PORT_FOREVER); }
 
@@ -146,10 +153,17 @@ static void report(void)
                                     1000000u / 1024u / us);
     const uint32_t kout = (uint32_t)((uint64_t)(s_p.bytes_out - s_p.said_bytes) *
                                      1000000u / 1024u / us);
+    const uint32_t passes = s_p.passes - s_p.said_passes;
     ag_log(AG_LOG_INFO, TAG,
-           "%u.%u passes/s, %u KB/s of changed pixels sent as %u KB/s",
+           "%u.%u passes/s, %u KB/s of changed pixels sent as %u KB/s; far end "
+           "waited for %u ms a pass (at most %u), longest between passes %u ms",
            (unsigned)(p10 / 10u), (unsigned)(p10 % 10u), (unsigned)kin,
-           (unsigned)kout);
+           (unsigned)kout,
+           (unsigned)(passes ? s_p.sync_us / 1000 / passes : 0),
+           (unsigned)(s_p.sync_max_us / 1000), (unsigned)(s_p.gap_max_us / 1000));
+    s_p.sync_us = 0;
+    s_p.sync_max_us = 0;
+    s_p.gap_max_us = 0;
     s_p.said_us = now;
     s_p.said_passes = s_p.passes;
     s_p.said_px = s_p.px_in;
@@ -206,6 +220,21 @@ static void painter(void *arg)
         } else if (any) {
             s_p.passes++;
             s_p.px_in += changed;
+            const rdp_sync_fn sync = s_sync;
+            if (sync != NULL) {
+                const int64_t t0 = ag_port_us();
+                sync(handle);
+                const int64_t w = ag_port_us() - t0;
+                s_p.sync_us += w;
+                if (w > s_p.sync_max_us) {
+                    s_p.sync_max_us = w;
+                }
+            }
+            const int64_t now = ag_port_us();
+            if (s_p.last_pass_us != 0 && now - s_p.last_pass_us > s_p.gap_max_us) {
+                s_p.gap_max_us = now - s_p.last_pass_us;
+            }
+            s_p.last_pass_us = now;
         }
         report();
     }
@@ -334,16 +363,59 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
 /* The receiving board                                                     */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * RECTANGLES, NOT ROWS.  Each run was drawn as a blit of its own one row
+ * high, and a panel pays for a blit before it draws a pixel: the ILI9341
+ * sets a window with three commands and their arguments, each a transfer of
+ * its own.  A 48x48 square moving over a still picture was 96 blits a frame;
+ * the CYD spent 250-380 ms of every second drawing 30-60 thousand pixels -
+ * ten microseconds a pixel on a bus that moves one in a fifth of one - and
+ * showed about seven frames a second of a program making 65 (26 Sep 2026).
+ *
+ * So runs that continue each other - the same columns, the next row - are
+ * gathered into one rectangle and drawn as one blit.  Anything else, and a
+ * full buffer, draws what is gathered first.  The buffer is taken the first
+ * time a board draws a neighbour's picture, not by every board.
+ */
+#define RDP_RECT_PX 4096u
+static uint16_t *s_rect;
+static uint16_t  s_rx, s_ry, s_rw, s_rh, s_sw, s_sh;
+
+static void rect_flush(const ag_display_ops_t *d)
+{
+    if (s_rh == 0u) {
+        return;
+    }
+    const ag_blit_t bl = {
+        .px = s_rect,
+        .stride = (uint32_t)s_rw * 2u,
+        .surf_w = s_sw,
+        .surf_h = s_sh,
+        .x = s_rx,
+        .y = s_ry,
+        .w = s_rw,
+        .h = s_rh,
+    };
+    d->blit_rect(0, &bl);
+    s_rh = 0;
+}
+
 uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
 {
     static uint16_t line[RDP_CHUNK];
     if (d == NULL || d->blit_rect == NULL || len < RDP_HDR) {
         return 0u;
     }
+    if (s_rect == NULL) {
+        s_rect = ag_port_alloc(RDP_RECT_PX * 2u, AG_MEM_BYTE);
+    }
     const uint16_t w = get16(pay);
     const uint16_t h = get16(pay + 2);
     uint32_t       at = RDP_HDR;
     uint32_t       drawn = 0;
+    s_rh = 0;
+    s_sw = w;
+    s_sh = h;
     while (at + RDP_RUN_HDR <= len) {
         const uint16_t y = get16(pay + at);
         const uint16_t x = get16(pay + at + 2);
@@ -351,23 +423,39 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
         const uint16_t plen = get16(pay + at + 6);
         at += RDP_RUN_HDR;
         if (n == 0u || n > RDP_CHUNK || at + plen > len || y >= h ||
-            (uint32_t)x + n > w ||
-            rdc_unpack(pay + at, plen, line, n) != plen) {
-            return drawn; /* not a run: the rest cannot be trusted either */
+            (uint32_t)x + n > w) {
+            break; /* not a run: the rest cannot be trusted either */
+        }
+        const bool joins = s_rect != NULL && s_rh != 0u && x == s_rx &&
+                           n == s_rw && y == (uint16_t)(s_ry + s_rh) &&
+                           (uint32_t)(s_rh + 1u) * n <= RDP_RECT_PX;
+        if (!joins) {
+            rect_flush(d);
+        }
+        uint16_t *const into = (s_rect != NULL && (uint32_t)n <= RDP_RECT_PX)
+                                   ? s_rect + (size_t)s_rh * n
+                                   : line;
+        if (rdc_unpack(pay + at, plen, into, n) != plen) {
+            break;
         }
         at += plen;
-        const ag_blit_t bl = {
-            .px = line,
-            .stride = (uint32_t)n * 2u,
-            .surf_w = w,
-            .surf_h = h,
-            .x = x,
-            .y = y,
-            .w = n,
-            .h = 1,
-        };
-        d->blit_rect(0, &bl);
         drawn += n;
+        if (into == line) {
+            /* no buffer: one row at a time, as before */
+            const ag_blit_t bl = {
+                .px = line, .stride = (uint32_t)n * 2u, .surf_w = w,
+                .surf_h = h, .x = x, .y = y, .w = n, .h = 1,
+            };
+            d->blit_rect(0, &bl);
+            continue;
+        }
+        if (s_rh == 0u) {
+            s_rx = x;
+            s_ry = y;
+            s_rw = n;
+        }
+        s_rh++;
     }
+    rect_flush(d);
     return drawn;
 }

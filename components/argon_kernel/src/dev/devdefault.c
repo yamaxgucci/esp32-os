@@ -66,7 +66,46 @@ static const char *cfg_key(ag_dev_class_t cls)
  * nobody has said otherwise".
  */
 #define DEFAULT_CLASSES 4
-static char s_chosen[DEFAULT_CLASSES][AG_DEV_NAME_MAX];
+/* room for a group: `zero.pcm0+cyd.pcm0+c6.pcm0` */
+#define DEFAULT_CHOICE_MAX 64
+static char s_chosen[DEFAULT_CLASSES][DEFAULT_CHOICE_MAX];
+
+/*
+ * A GROUP: several devices of one class chosen at once, joined by '+'.  For
+ * sound it is multiroom - the same stream out of the converter on this board
+ * and the one on the next, or two neighbours' - and it is the mixer that plays
+ * into every member (pcmmix.c).  Everything that wants ONE device gets the
+ * first member that is present.  Members are looked up by name each time, so
+ * a board that comes back is played to again without anybody choosing again.
+ */
+int ag_dev_default_group(ag_dev_class_t cls, ag_device_t **out, int max)
+{
+    const char *c = ag_dev_default_chosen(cls);
+    if (c == NULL || strchr(c, '+') == NULL || out == NULL || max <= 0) {
+        return 0;
+    }
+    int n = 0;
+    const char *p = c;
+    while (*p != '\0' && n < max) {
+        char   one[AG_DEV_NAME_MAX];
+        size_t k = 0;
+        while (*p != '\0' && *p != '+' && k + 1u < sizeof(one)) {
+            one[k++] = *p++;
+        }
+        one[k] = '\0';
+        while (*p != '\0' && *p != '+') {
+            p++; /* a member too long to be a device name is none */
+        }
+        if (*p == '+') {
+            p++;
+        }
+        ag_device_t *d = (k > 0u) ? ag_dev_find(one) : NULL;
+        if (d != NULL) {
+            out[n++] = d;
+        }
+    }
+    return n;
+}
 
 static int chosen_slot(ag_dev_class_t cls)
 {
@@ -174,6 +213,10 @@ ag_device_t *ag_dev_default(ag_dev_class_t cls, const char *const *prefer)
      */
     const char *chosen = ag_dev_default_chosen(cls);
     if (chosen != NULL) {
+        if (strchr(chosen, '+') != NULL) {
+            ag_device_t *first = NULL;
+            return (ag_dev_default_group(cls, &first, 1) > 0) ? first : NULL;
+        }
         return ag_dev_find(chosen);
     }
     ag_device_t *d = named_in_config(cls);

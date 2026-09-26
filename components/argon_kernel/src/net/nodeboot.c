@@ -109,6 +109,13 @@ ag_err_t ag_node_bind(const char *dev, bool say)
     if (!ag_cluster_allowed()) {
         return -AG_EPERM;
     }
+    /* A wire already bound is selected, and nothing is started again: not
+     * the link, and not the services - whose hello would tell the neighbour
+     * this board had started over (see ag_linkprov_use). */
+    const int32_t was = ag_linkprov_index_of(dev);
+    if (was >= 0) {
+        return ag_linkprov_select(was);
+    }
     const ag_err_t e = ag_linkprov_use(dev);
     if (e != AG_OK) {
         return e;

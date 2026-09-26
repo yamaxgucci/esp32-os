@@ -38,6 +38,7 @@
 #include <argon/log.h>
 #include <argon/nodedev.h>
 #include <argon/nodename.h>
+#include <argon/textpanel.h>
 
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
@@ -98,6 +99,14 @@ enum {
      * screen is a copy kept by what arrives, so a lost one would stay lost.
      */
     RD_BLITZ,
+    /*
+     * "that pass is over": poured behind the pass's last RD_BLITZ on the same
+     * class, so it arrives after all of them, and answered at once with the
+     * same tag - which is how the painter learns the far end has the pass
+     * (see rdp_set_sync).  An image from before this answers nothing, and the
+     * painter stops asking after a few passes of silence.
+     */
+    RD_PAINTED,
 };
 
 static void put32(uint8_t *p, uint32_t v)
@@ -247,7 +256,18 @@ static int32_t ask(const rdev_t *p, uint8_t op, uint32_t h, uint32_t a,
          * on.  The alternative - waiting patiently - takes the whole machine
          * down with it.
          */
-        const int64_t deadline = ag_port_us() + 1500000;
+        /*
+         * LONGER FOR WHAT HAPPENS ONCE.  The registry lets its lock go for a
+         * driver's call now and this waits under the one device's own lock,
+         * so what a longer wait costs is that device, not the machine.  An
+         * open is rare and on a busy neighbour it is slow - behind a whole
+         * frame of a picture being relayed to a 4 Mbaud wire it did not come
+         * back in a second and a half, the asker gave up, asked again, and
+         * the neighbour closed the session it had just opened, over and over
+         * (26 Sep 2026).  Reads and writes, which are many, keep the short one.
+         */
+        const bool    once = (op != RD_READ && op != RD_WRITE);
+        const int64_t deadline = ag_port_us() + (once ? 4000000 : 1500000);
         rc = -AG_ETIMEDOUT;
         while (ag_port_us() < deadline) {
             if (s_have) {
@@ -808,6 +828,70 @@ static ag_err_t rd_send_z(uint32_t handle, const uint8_t *pay, uint16_t len)
     return (r >= 0) ? AG_OK : (ag_err_t)r;
 }
 
+/* The far screen's pace (rdp_set_sync): one pass in flight end to end. */
+static volatile uint16_t s_paint_seq;
+static volatile uint16_t s_paint_acked;
+static volatile bool     s_paint_heard;  /* the far end has answered once */
+static uint8_t           s_paint_silent; /* passes unanswered in a row */
+static uint32_t          s_paint_waits;  /* passes that waited, for `link` */
+
+#define RD_PAINT_WAIT_MS 1000u
+#define RD_PAINT_LEGACY  3u
+
+static void rd_sync_z(uint32_t handle)
+{
+    const rdev_t *const p = s_display_proxy;
+    if (p == NULL) {
+        return;
+    }
+    /*
+     * NOT WAITING IS NOT GIVING UP.  A screen that has not answered yet is
+     * still told every pass is over, and the first answer that comes back
+     * turns the waiting on.  Giving up for good after three silent passes
+     * sounded safe and was the whole failure: the first pass is the entire
+     * picture, 150 KB through a 4 Mbaud wire and a relay, its answer came
+     * after the second - and the painter went on at the wire's pace for ever,
+     * gaps of 170-950 ms between passes, a moving square Maxim called torn
+     * (26 Sep 2026).
+     */
+    const bool wait = s_paint_heard || s_paint_silent < RD_PAINT_LEGACY;
+    uint16_t seq = (uint16_t)(s_paint_seq + 1u);
+    if (seq == 0u) {
+        seq = 1u;
+    }
+    s_paint_seq = seq;
+    uint8_t msg[RD_HDR];
+    msg[0] = RD_PAINTED;
+    msg[1] = RD_F_NOREPLY;
+    put16(msg + 2, seq);
+    put32(msg + 4, handle);
+    put32(msg + 8, 0);
+    put32(msg + 12, 0);
+    if (link_send(p->wire, p->node, AG_LINK_BULK, msg, RD_HDR) < 0) {
+        return;
+    }
+    if (!wait) {
+        return; /* told; an answer to this one still turns the waiting on */
+    }
+    s_paint_waits++;
+    const int64_t until = ag_port_us() + (int64_t)RD_PAINT_WAIT_MS * 1000;
+    while (s_paint_acked != seq && ag_port_us() < until) {
+        ag_port_task_delay(ag_port_ms_to_ticks(2));
+    }
+    if (s_paint_acked == seq) {
+        s_paint_heard = true;
+        s_paint_silent = 0;
+    } else if (s_paint_silent < 255u) {
+        s_paint_silent++;
+        if (!s_paint_heard && s_paint_silent == RD_PAINT_LEGACY) {
+            ag_log(AG_LOG_INFO, TAG,
+                   "%s does not say when a pass has arrived (an older "
+                   "image?): painting at the pace of the wire until it does",
+                   p->qualified);
+        }
+    }
+}
+
 /*
  * THE FALLBACK, for a board with no memory for the painter's two pictures: a
  * blit cut into pieces that fit.  Not reassembled at the far end: every piece
@@ -895,6 +979,7 @@ static void rd_blit(ag_handle_t h, const ag_blit_t *b)
     if (ensure_open(p) != AG_OK) {
         return;
     }
+    rdp_set_sync(rd_sync_z);
     if (!rdp_damage(b, (uint32_t)p->far_handle, rd_pour_payload(p),
                     rd_send_z)) {
         rd_blit_raw(p, b); /* no memory for the painter: every pixel, raw */
@@ -1050,6 +1135,8 @@ static void reply(uint8_t op, uint16_t tag, int32_t status, uint8_t cls,
  */
 #define RD_MAX_SESSIONS 8
 static ag_device_t *s_session[RD_MAX_SESSIONS];
+/* who opened each: the asking node's name hash (see RD_OPEN) */
+static uint16_t s_session_from[RD_MAX_SESSIONS];
 /* A sound session's channels, from the SETFMT it was opened with: what a
  * frame is, when frames have to be taken out (see keep_pace). */
 static uint8_t s_session_ch[RD_MAX_SESSIONS];
@@ -1118,6 +1205,8 @@ static bool              s_no_sink_said;
 
 static uint32_t serve_poured_class(ag_device_t *dev,
                                    const rd_period_t *pd);
+static void     glass_back_if_quiet(void);
+static void     screen_report(void);
 
 static rd_period_t       s_ring[RD_RING];
 static uint8_t          *s_ring_mem;
@@ -1173,6 +1262,27 @@ static void serve_one(const uint8_t *b, uint16_t n)
             reply(op, tag, -AG_ENODEV, AG_LINK_CONTROL, NULL, 0);
             return;
         }
+        /*
+         * A SESSION ITS ASKER HAS LOST.  An exclusive device opened again by
+         * the node that already holds it here: that node's own registry lets
+         * one holder of the proxy at a time, so the first session is one it no
+         * longer knows about - its open timed out while the answer was on the
+         * way (a busy middle board, 26 Sep 2026), or it restarted.  Held on to,
+         * it made the Zero's converter "busy" (-16) for every open after, for
+         * good.  Closed here, and the new open goes ahead.
+         */
+        if ((dev->flags & AG_DEVF_EXCLUSIVE) != 0u) {
+            for (int i = 0; i < RD_MAX_SESSIONS; i++) {
+                if (s_session[i] == dev && s_session_from[i] == s_req_from) {
+                    ag_log(AG_LOG_INFO, TAG,
+                           "%s: its asker opens it again - closing the session "
+                           "it lost",
+                           dev->name);
+                    s_session[i] = NULL;
+                    (void)ag_dev_close(dev);
+                }
+            }
+        }
         int slot = -1;
         for (int i = 0; i < RD_MAX_SESSIONS; i++) {
             if (s_session[i] == NULL) {
@@ -1190,6 +1300,7 @@ static void serve_one(const uint8_t *b, uint16_t n)
             return;
         }
         s_session[slot] = dev;
+        s_session_from[slot] = s_req_from;
         reply(op, tag, slot, AG_LINK_CONTROL, NULL, 0);
         return;
     }
@@ -1461,6 +1572,8 @@ static void pour_task(void *arg)
              * a burst gets its line without anything having to notice. */
             ag_port_notify_take(true, ag_port_ms_to_ticks(100));
             pour_report();
+            glass_back_if_quiet();
+            screen_report();
             continue;
         }
 
@@ -1544,6 +1657,16 @@ static void pour_task(void *arg)
         s_pour_last_ms = (uint32_t)(ag_port_us() / 1000);
         s_pour_said = false;
         s_ring_r = (s_ring_r + 1u) % RD_RING;
+        /*
+         * A TICK BETWEEN PERIODS, for everybody else who wants the device.
+         * Writing without a pause, this task let the device's lock go and took
+         * it again before a waiter below it could run - and the waiter was the
+         * worker opening the same converter for the node that asked: it
+         * waited out the asker's patience every time (lockwatch: "held 30 s
+         * by 'rdevpour'").  A period is six milliseconds of sound; the ring
+         * holds ten of them.
+         */
+        ag_port_task_delay(1);
     }
 }
 
@@ -1556,6 +1679,72 @@ static void pour_task(void *arg)
  * accounted for, or 0 when the device cannot do it - which is what the lost
  * counter is for.
  */
+/*
+ * THE GLASS, LENT AND GIVEN BACK.  A neighbour's picture is drawn straight
+ * onto this board's panel, and this board's console did not know: it went on
+ * painting the rows that changed over the picture, and when the neighbour's
+ * program ended the glass kept whatever was last on it - Maxim found the CYD
+ * showing a white screen with nothing wrong with it (26 Sep 2026).  So while
+ * pictures arrive the console keeps off the panel, and after RD_GLASS_QUIET_US
+ * without one it has the glass back and repaints all of it.
+ */
+#define RD_GLASS_QUIET_US 1500000
+static bool    s_glass_lent;
+static int64_t s_glass_last_us;
+
+/*
+ * What this screen does with a neighbour's picture, a second at a time: the
+ * passes it was told of (the frames per second a person sees), the messages
+ * and pixels drawn, the time spent drawing them, and how full the ring got.
+ * The painter's own report says what was SENT; this is what arrived.
+ */
+static uint32_t s_scr_passes, s_scr_msgs, s_scr_px, s_scr_ring_max;
+static int64_t  s_scr_us, s_scr_said_us;
+
+static void screen_report(void)
+{
+    const int64_t now = ag_port_us();
+    if (s_scr_said_us == 0) {
+        s_scr_said_us = now;
+        return;
+    }
+    if (now - s_scr_said_us < 1000000) {
+        return;
+    }
+    if (s_scr_msgs != 0u || s_scr_passes != 0u) {
+        const uint32_t ms = (uint32_t)((now - s_scr_said_us) / 1000);
+        ag_log(AG_LOG_INFO, TAG,
+               "screen: %u passes in %u ms, %u messages, %u px, %u ms of it "
+               "drawing, ring up to %u of %u",
+               (unsigned)s_scr_passes, (unsigned)ms, (unsigned)s_scr_msgs,
+               (unsigned)s_scr_px, (unsigned)(s_scr_us / 1000),
+               (unsigned)s_scr_ring_max, (unsigned)RD_RING);
+    }
+    s_scr_said_us = now;
+    s_scr_passes = s_scr_msgs = s_scr_px = s_scr_ring_max = 0u;
+    s_scr_us = 0;
+}
+
+static void glass_lend(void)
+{
+    s_glass_last_us = ag_port_us();
+    if (!s_glass_lent) {
+        s_glass_lent = true;
+        ag_textpanel_enable(false);
+        ag_log(AG_LOG_INFO, TAG, "a neighbour is drawing on this screen");
+    }
+}
+
+static void glass_back_if_quiet(void)
+{
+    if (s_glass_lent && ag_port_us() - s_glass_last_us > RD_GLASS_QUIET_US) {
+        s_glass_lent = false;
+        ag_textpanel_enable(true);
+        ag_log(AG_LOG_INFO, TAG, "the neighbour stopped drawing; the screen "
+                                 "is this board's again");
+    }
+}
+
 static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
 {
     const ag_display_ops_t *d = (const ag_display_ops_t *)dev->class_ops;
@@ -1581,11 +1770,19 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
         if (want == 0u || want > (uint32_t)(plen - RD_BLIT_HDR)) {
             return 0;
         }
+        glass_lend();
         d->blit_rect(0, &bl);
         return want;
     }
-    case RD_BLITZ:
-        return rdp_draw(d, pay, plen);
+    case RD_BLITZ: {
+        glass_lend();
+        const int64_t  t0 = ag_port_us();
+        const uint32_t px = rdp_draw(d, pay, plen);
+        s_scr_us += ag_port_us() - t0;
+        s_scr_msgs++;
+        s_scr_px += px;
+        return px;
+    }
     case RD_TEXTROW: {
         if (d == NULL || d->text_row == NULL || plen < 4u) {
             return 0;
@@ -1687,6 +1884,12 @@ static void take_period(const uint8_t *b, uint16_t n)
     pd->off = get32(b + 12);
     pd->op = b[0];
     s_ring_w = next;
+    {
+        const uint32_t q = (s_ring_w + RD_RING - s_ring_r) % RD_RING;
+        if (q > s_scr_ring_max) {
+            s_scr_ring_max = q;
+        }
+    }
     ag_port_notify_give(s_pour_task);
 }
 
@@ -1698,6 +1901,25 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         return;
     }
     const uint8_t *b = (const uint8_t *)data;
+
+    /*
+     * The painter's "that pass is over", and its answer - neither goes near
+     * the request machinery: no worker, no single outstanding question.
+     * Answered here, on the reader, because arriving here is the whole of
+     * what it asks: everything poured before it has arrived too (same class,
+     * in order), and the RD_BLITZ ahead of it were taken into the ring.
+     */
+    if (b[0] == RD_PAINTED) {
+        s_scr_passes++;
+        reply_to(ag_linkprov_current(), ag_linkprov_from(), RD_PAINTED,
+                 get16(b + 2), 0, AG_LINK_CONTROL, NULL, 0);
+        return;
+    }
+    if (b[0] == (uint8_t)(RD_PAINTED | RD_REPLY)) {
+        s_paint_acked = get16(b + 2);
+        s_paint_heard = true; /* this screen answers: wait for it from now */
+        return;
+    }
 
     if ((b[0] & RD_REPLY) != 0) {
         const uint16_t tag = get16(b + 2);
