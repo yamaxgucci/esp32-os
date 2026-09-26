@@ -118,6 +118,15 @@ static ag_wav_pcm_t s_di;      /* what is being played through it */
 static uint32_t     s_di_at;
 static int          s_di_loop = 1; /* a file sink plays the take once */
 static int          s_take_done;
+/*
+ * What comes in, when something does.  Stereo-sized because the converter is
+ * opened in stereo: one jack is the guitar and the other is whatever else the
+ * board wired, and de-interleaving here is cheaper than a second open.
+ */
+static int16_t      s_in[CHUNK * 2];
+static int          s_in_ch = 2;
+static int          s_live;        /* the input is a converter, not a file */
+static uint32_t     s_in_starved;  /* blocks the converter had nothing for */
 static int16_t      s_mono[CHUNK];
 static int16_t      s_stereo[CHUNK * 2];
 static float        s_peak;     /* of the last block at the converter */
@@ -1379,10 +1388,36 @@ static void audio_block(void)
     uint32_t        i;
     float           peak = 0.0f;
 
+    /*
+     * A guitar if the board has one, the take otherwise.
+     *
+     * The live block is read before the valves run rather than a sample at a
+     * time: the converter delivers in blocks and asking it for one frame is
+     * asking it to wait for the other 255.  A short answer is padded with
+     * silence rather than held for, because a pedal that stalls waiting for
+     * input has stopped being a pedal.
+     */
+    if (s_live) {
+        const int32_t got = ag_pcm_read(&s_out, s_in, (int32_t)CHUNK);
+        uint32_t      have = (got > 0) ? (uint32_t)got : 0u;
+        if (have < CHUNK) {
+            memset(s_in + have * s_in_ch, 0,
+                   (CHUNK - have) * s_in_ch * sizeof(int16_t));
+            if (got < 0) {
+                s_in_starved++;
+            }
+        }
+    }
+
     for (i = 0; i < CHUNK; i++) {
         float x = 0.0f, y;
         int   v;
-        if (s_di.data != NULL && s_di.frames > 0u && !s_take_done) {
+        if (s_live) {
+            /* Left channel: a guitar is one string of wire, and a codec that
+             * was opened in stereo sends the same thing twice or sends the
+             * other jack - neither is worth summing in. */
+            x = (float)s_in[i * s_in_ch] * (1.0f / 32768.0f);
+        } else if (s_di.data != NULL && s_di.frames > 0u && !s_take_done) {
             x = (float)s_di.data[s_di_at] * (1.0f / 32768.0f);
             if (++s_di_at >= s_di.frames) {
                 s_di_at = 0;
@@ -1827,6 +1862,7 @@ int ag_main(int argc, char **argv)
     const char *di_path = NULL;
     const char *preset = NULL;
     int         want_os = 0;
+    int         want_live = 0;
     const char *set[AG_AMP_POT_N];
     int         n_set = 0;
 
@@ -1849,6 +1885,10 @@ int ag_main(int argc, char **argv)
                                              96, 144, 168, 208, 255 };
             int v = atoi_small(argv[++i]);
             s_vol_num = k_vol[v < 0 ? 0 : (v > 10 ? 10 : v)];
+        } else if (strcmp(argv[i], "in") == 0) {
+            /* Take the guitar rather than a file.  It is the same device the
+             * sound goes out of, so there is nothing to name. */
+            want_live = 1;
         } else if (strcmp(argv[i], "os") == 0 && i + 1 < argc) {
             /* The oversampling the chain runs at, over whatever the preset was
              * baked with.  It is the largest single lever on what this costs -
@@ -1938,6 +1978,21 @@ int ag_main(int argc, char **argv)
         }
         ag_printf("stomp: sound = %s @ %u Hz, %u frames a block\n", s_out.path,
                   (unsigned)RATE, (unsigned)CHUNK);
+        if (want_live) {
+            /* Ask for one block before promising anything.  A device with no
+             * line in answers -AG_ENOSYS, and finding that out now is better
+             * than a silence nobody can explain later. */
+            const int32_t probe = ag_pcm_read(&s_out, s_in, (int32_t)CHUNK);
+            if (probe < 0) {
+                ag_printf("stomp: %s has no input (%d) - playing the take\n",
+                          s_out.path, (int)probe);
+            } else {
+                s_live = 1;
+                s_in_ch = (s_out.channels > 0) ? s_out.channels : 2;
+                ag_printf("stomp: in from %s, %d channels\n", s_out.path,
+                          s_in_ch);
+            }
+        }
     } else if (preset != NULL) {
         (void)amp_from_preset(preset);
         (void)snprintf(s_preset, sizeof(s_preset), "%s", preset);

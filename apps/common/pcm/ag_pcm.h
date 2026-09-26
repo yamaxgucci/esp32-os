@@ -44,6 +44,16 @@ void    ag_pcm_close(ag_pcm_t *o);
 void    ag_pcm_set_chunk(ag_pcm_t *o, uint32_t frames);
 
 int32_t ag_pcm_write(ag_pcm_t *o, const int16_t *pcm, int32_t frames);
+
+/*
+ * Frames from the same device, for a machine whose converter records as well
+ * as plays.  The same handle as the write, on purpose: one open, one clock,
+ * both directions - a second open would be a second stream that drifts.
+ *
+ * Returns frames, 0 when there are none yet, or a negative -AG_Exxx; -AG_ENOSYS
+ * on a sink that has no input at all, which a file sink never does.
+ */
+int32_t ag_pcm_read(ag_pcm_t *o, int16_t *pcm, int32_t frames);
 void    ag_pcm_mark_render(ag_pcm_t *o, uint32_t us);
 
 void    ag_pcm_pace_start(ag_pcm_t *o);

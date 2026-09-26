@@ -303,6 +303,15 @@ int32_t ag_port_audio_space(void)
     return s_dac != NULL ? (int32_t)(ACC_BYTES - s_acc_used) : 0;
 }
 
+/* The chip's own converters are digital-to-analogue and nothing else. */
+bool    ag_port_audio_capture(void) { return false; }
+int32_t ag_port_audio_read(int16_t *pcm, int32_t frames)
+{
+    (void)pcm;
+    (void)frames;
+    return -AG_ENOSYS;
+}
+
 #elif SOC_I2S_SUPPORTED
 
 #include "driver/i2s_std.h"
@@ -324,6 +333,12 @@ int32_t ag_port_audio_space(void)
 #define I2S_WAIT_MS 120
 
 static i2s_chan_handle_t s_tx;
+/*
+ * The same peripheral the other way.  It is opened with the transmitter and
+ * never on its own: one channel pair, one clock, both directions - see
+ * ag_port_audio_capture in the contract for why a second clock is a crackle.
+ */
+static i2s_chan_handle_t s_rx;
 static uint8_t           s_channels = 2;
 
 const char *ag_port_audio_name(void) { return "i2s"; }
@@ -357,10 +372,13 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
     chan.dma_frame_num = I2S_FRAMES;
     chan.auto_clear = true;
 
-    esp_err_t err = i2s_new_channel(&chan, &s_tx, NULL);
+    /* Both handles from one call: that is what makes them share a clock. */
+    const bool want_in = s_pins.din >= 0;
+    esp_err_t  err = i2s_new_channel(&chan, &s_tx, want_in ? &s_rx : NULL);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "i2s channel: %s", esp_err_to_name(err));
         s_tx = NULL;
+        s_rx = NULL;
         return false;
     }
 
@@ -375,7 +393,7 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
             .bclk = (gpio_num_t)s_pins.bclk,
             .ws = (gpio_num_t)s_pins.ws,
             .dout = (gpio_num_t)s_pins.dout,
-            .din = I2S_GPIO_UNUSED,
+            .din = want_in ? (gpio_num_t)s_pins.din : I2S_GPIO_UNUSED,
             .invert_flags = { .mclk_inv = false,
                               .bclk_inv = false,
                               .ws_inv = false },
@@ -398,20 +416,33 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
 #endif
 
     err = i2s_channel_init_std_mode(s_tx, &std);
+    if (err == ESP_OK && s_rx != NULL) {
+        /* The same configuration, so the two directions cannot be given
+         * different rates or slot widths by an edit to one of them. */
+        err = i2s_channel_init_std_mode(s_rx, &std);
+    }
     if (err == ESP_OK) {
         err = i2s_channel_enable(s_tx);
     }
+    if (err == ESP_OK && s_rx != NULL) {
+        err = i2s_channel_enable(s_rx);
+    }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "i2s start: %s", esp_err_to_name(err));
+        if (s_rx != NULL) {
+            (void)i2s_del_channel(s_rx);
+            s_rx = NULL;
+        }
         (void)i2s_del_channel(s_tx);
         s_tx = NULL;
         return false;
     }
 
     s_channels = channels;
-    ESP_LOGI(TAG, "i2s out on bclk=%d ws=%d dout=%d mclk=%d, %u Hz, %u ch",
+    ESP_LOGI(TAG, "i2s on bclk=%d ws=%d dout=%d din=%d mclk=%d, %u Hz, %u ch",
              (int)s_pins.bclk, (int)s_pins.ws, (int)s_pins.dout,
-             (int)s_pins.mclk, (unsigned)rate, (unsigned)channels);
+             (int)s_pins.din, (int)s_pins.mclk, (unsigned)rate,
+             (unsigned)channels);
     return true;
 }
 
@@ -427,9 +458,37 @@ void ag_port_audio_close(void)
      * takes twenty milliseconds to avoid belongs to a pin that idles at half
      * the supply, and this one does not.
      */
+    if (s_rx != NULL) {
+        (void)i2s_channel_disable(s_rx);
+        (void)i2s_del_channel(s_rx);
+        s_rx = NULL;
+    }
     (void)i2s_channel_disable(s_tx);
     (void)i2s_del_channel(s_tx);
     s_tx = NULL;
+}
+
+bool ag_port_audio_capture(void) { return s_rx != NULL; }
+
+int32_t ag_port_audio_read(int16_t *pcm, int32_t frames)
+{
+    if (pcm == NULL || frames <= 0) {
+        return 0;
+    }
+    if (s_rx == NULL) {
+        /* No line in, which is not the same as a quiet one. */
+        return -AG_ENOSYS;
+    }
+
+    const size_t    frame_bytes = (size_t)s_channels * sizeof(int16_t);
+    size_t          got = 0;
+    const esp_err_t err = i2s_channel_read(
+        s_rx, pcm, (size_t)frames * frame_bytes, &got, I2S_WAIT_MS);
+
+    if (err != ESP_OK && got == 0) {
+        return 0;
+    }
+    return (int32_t)(got / frame_bytes);
 }
 
 int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
@@ -484,6 +543,14 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
 
 int32_t ag_port_audio_space(void) { return 0; }
 
+bool    ag_port_audio_capture(void) { return false; }
+int32_t ag_port_audio_read(int16_t *pcm, int32_t frames)
+{
+    (void)pcm;
+    (void)frames;
+    return -AG_ENOSYS;
+}
+
 #endif /* SOC_DAC_SUPPORTED / SOC_I2S_SUPPORTED */
 
 #else /* !CONFIG_ARGON_ENABLE_AUDIO */
@@ -516,6 +583,15 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
 int32_t ag_port_audio_space(void)
 {
     return 0;
+}
+
+bool ag_port_audio_capture(void) { return false; }
+
+int32_t ag_port_audio_read(int16_t *pcm, int32_t frames)
+{
+    (void)pcm;
+    (void)frames;
+    return -AG_ENOSYS;
 }
 
 #endif /* CONFIG_ARGON_ENABLE_AUDIO */

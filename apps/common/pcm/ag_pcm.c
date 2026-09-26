@@ -188,6 +188,25 @@ void ag_pcm_set_chunk(ag_pcm_t *o, uint32_t frames)
     set_chunk_us(o);
 }
 
+int32_t ag_pcm_read(ag_pcm_t *o, int16_t *pcm, int32_t frames)
+{
+    if (o == 0 || pcm == 0 || frames <= 0 || o->fd < 0) {
+        return -AG_EINVAL;
+    }
+    if (o->sink == AG_PCM_SINK_WAV) {
+        /* A file is not a microphone. */
+        return -AG_ENOSYS;
+    }
+    {
+        const size_t  bytes = (size_t)frames * (size_t)o->channels * 2u;
+        const int32_t got = ag_read(o->fd, pcm, bytes);
+        if (got < 0) {
+            return got;
+        }
+        return (int32_t)((size_t)got / ((size_t)o->channels * 2u));
+    }
+}
+
 int32_t ag_pcm_write(ag_pcm_t *o, const int16_t *pcm, int32_t frames)
 {
     size_t    bytes;

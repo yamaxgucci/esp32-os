@@ -122,6 +122,7 @@ static void apply_generic_defaults(void)
     s_board.audio.bclk = AG_PIN_NONE;
     s_board.audio.ws = AG_PIN_NONE;
     s_board.audio.dout = AG_PIN_NONE;
+    s_board.audio.din = AG_PIN_NONE;
     s_board.audio.mclk = AG_PIN_NONE;
     s_board.audio.rate = 22050;
 
@@ -329,6 +330,7 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
         s_board.audio.bclk = cfg_pin(cfg, "audio.bclk", s_board.audio.bclk);
         s_board.audio.ws = cfg_pin(cfg, "audio.ws", s_board.audio.ws);
         s_board.audio.dout = cfg_pin(cfg, "audio.dout", s_board.audio.dout);
+        s_board.audio.din = cfg_pin(cfg, "audio.din", s_board.audio.din);
         s_board.audio.mclk = cfg_pin(cfg, "audio.mclk", s_board.audio.mclk);
         const int32_t ar = ag_cfg_get_int(cfg, "audio.rate",
                                           (int32_t)s_board.audio.rate);

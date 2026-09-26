@@ -44,6 +44,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* For the -AG_Exxx a read answers with; the same header the other port
+ * contracts take their error codes from. */
+#include <argon/abi.h>
+
 /*
  * Where the sound comes out, when that is the board's decision and not the
  * chip's.
@@ -64,6 +68,13 @@ typedef struct {
     int16_t  ws;
     int16_t  dout;
     int16_t  mclk; /* -1 when the codec makes its own clock, as most do */
+    /*
+     * The line the codec sends on, and -1 on a board that only plays.  It
+     * shares bclk and ws with dout because it is the same peripheral in the
+     * other direction; see ag_port_audio_capture below for why that is not an
+     * economy but a requirement.
+     */
+    int16_t  din;
     uint32_t rate; /* the board's default; open() may still ask for another */
 } ag_port_audio_pins_t;
 
@@ -82,5 +93,33 @@ bool    ag_port_audio_open(uint32_t rate, uint8_t channels);
 void    ag_port_audio_close(void);
 int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames);
 int32_t ag_port_audio_space(void);
+
+/*
+ * SOUND COMING IN
+ *
+ * capture() answers whether this machine can record at all, which is a
+ * question about the board rather than about the chip: a codec wired for both
+ * directions has a data line going the other way and a board with an amplifier
+ * on a pin does not.  It answers what the board said, exactly as present()
+ * does, and it may only be true once open() has succeeded.
+ *
+ * **There is no separate open for it, and that is the point.**  Recording and
+ * playing share one peripheral and one clock, because a converter fed by one
+ * clock and read by another drifts, and the drift is heard as a crackle every
+ * few seconds as the two buffers slide past each other.  The pedal this is for
+ * lives or dies on that - see the Blackstomp notes in docs/10-watch-board.md,
+ * where one I2S port in both directions is the first thing their design does.
+ * So open() brings up whatever the board has, both directions together, and a
+ * port that cannot do that must bring up neither.
+ *
+ * read() returns frames delivered, which may be fewer than asked for, or a
+ * negative -AG_Exxx.  It may block for as long as the frames it is waiting for
+ * take to arrive; like write() it must not block forever.  On a machine with
+ * no input it answers -AG_ENOSYS rather than silence, because silence is a
+ * thing a microphone can legitimately produce and "there is no microphone" is
+ * not.
+ */
+bool    ag_port_audio_capture(void);
+int32_t ag_port_audio_read(int16_t *pcm, int32_t frames);
 
 #endif /* ARGON_PORT_AUDIO_H */

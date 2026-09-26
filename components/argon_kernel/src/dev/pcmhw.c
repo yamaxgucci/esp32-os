@@ -185,9 +185,50 @@ static int32_t pcm_write(ag_device_t *dev, const void *buf, size_t len,
     return (int32_t)((size_t)done * frame_bytes);
 }
 
+/*
+ * The same device, the other way.
+ *
+ * Reading opens the hardware exactly as writing does, and for the same reason:
+ * a program that only listens - a tuner, a recorder, a pedal waiting for a
+ * string to be struck - never writes a frame, and opening on write alone would
+ * leave it reading from a peripheral that was never started.
+ *
+ * There is no separate device for it.  The converter is one piece of hardware
+ * on one clock, and a second node would invite two programs to open the two
+ * directions and expect them to stay together, which is the one thing they
+ * cannot do.
+ */
+static int32_t pcm_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
+{
+    (void)dev;
+    (void)off;
+
+    if (buf == NULL) {
+        return -AG_EINVAL;
+    }
+
+    const size_t frame_bytes = (size_t)s_fmt.channels * sizeof(int16_t);
+    const size_t frames = len / frame_bytes;
+    if (frames == 0u) {
+        return -AG_EINVAL;
+    }
+
+    const ag_err_t err = hw_open();
+    if (err != AG_OK) {
+        return err;
+    }
+
+    const int32_t done = ag_port_audio_read((int16_t *)buf, (int32_t)frames);
+    if (done < 0) {
+        return done;
+    }
+    return (int32_t)((size_t)done * frame_bytes);
+}
+
 static const ag_dev_ops_t k_pcm_ops = {
     .open = pcm_open,
     .close = pcm_close,
+    .read = pcm_read,
     .write = pcm_write,
     .ioctl = pcm_ioctl,
 };
@@ -207,6 +248,7 @@ ag_err_t ag_pcmhw_init(void)
         .bclk = a->bclk,
         .ws = a->ws,
         .dout = a->dout,
+        .din = a->din,
         .mclk = a->mclk,
         .rate = a->rate,
     };
@@ -244,8 +286,9 @@ ag_err_t ag_pcmhw_init(void)
     if (err != AG_OK) {
         return err;
     }
-    ag_log(AG_LOG_INFO, TAG, "pcm0 ready (%s, %u Hz, opens on first write)",
-           ag_port_audio_name(), (unsigned)s_fmt.rate);
+    ag_log(AG_LOG_INFO, TAG, "pcm0 ready (%s, %u Hz, %s, opens on first use)",
+           ag_port_audio_name(), (unsigned)s_fmt.rate,
+           (a->din >= 0) ? "in and out" : "out only");
     return AG_OK;
 }
 #else /* !CONFIG_ARGON_ENABLE_AUDIO */
