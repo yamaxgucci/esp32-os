@@ -31,6 +31,17 @@
 /* how long a pass waits for the wire before it gives the screen up as
  * unknown and sends the whole of it next time */
 #define RDP_SEND_PATIENCE_MS 2000u
+/*
+ * AT MOST A PASS PER FRAME.  Woken by every band an application presents, the
+ * painter made a pass per band - 389 a second of eight-row slivers for a
+ * program showing 65 frames - and at an application's priority that kept a
+ * core busy enough to starve the link's reader: a file copied to the Zero
+ * while it drew on the CYD took two copies of five in four minutes, where
+ * alone it took a second (26 Sep 2026).  A pass now starts no sooner than
+ * RDP_MIN_PASS_US after the last: what changes meanwhile is gathered into
+ * the next one, which is bigger, and there are fewer of them.
+ */
+#define RDP_MIN_PASS_US 16000
 
 typedef struct {
     uint16_t x0, x1; /* x1 <= x0: nothing */
@@ -173,8 +184,15 @@ static void report(void)
 static void painter(void *arg)
 {
     (void)arg;
+    int64_t began = 0;
     for (;;) {
         (void)ag_port_sem_take(s_p.wake, ag_port_ms_to_ticks(1000));
+        const int64_t since = ag_port_us() - began;
+        if (began != 0 && since < RDP_MIN_PASS_US) {
+            ag_port_task_delay(ag_port_ms_to_ticks(
+                (uint32_t)((RDP_MIN_PASS_US - since) / 1000) + 1u));
+        }
+        began = ag_port_us();
         lock();
         const uint16_t w = s_p.w;
         const uint16_t h = s_p.h;

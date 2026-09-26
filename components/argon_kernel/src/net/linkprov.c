@@ -245,6 +245,169 @@ static void relay_drop(unsigned why, uint16_t dst, const char *what)
     }
 }
 
+/*
+ * A QUEUE PER WIRE OUT, drained by a task of its own.
+ *
+ * The one reader relayed by sending, and a send into a slow wire waits for
+ * room - so while the C3 moved the Zero's picture onto the CYD's 4 Mbaud
+ * wire it read nothing at all: the Zero's own 16 Mbaud wire, with 97% of it
+ * free, was refused frame after frame (38% of the Zero's frames sent twice in
+ * the ten-minute stress), and a request of the C3's own waited behind the
+ * relay until its asker gave up (26 Sep 2026).  Now a frame to relay is copied
+ * into the outgoing wire's queue and the reader reads on; the relay task
+ * waits for room instead.  The reader waits only when a queue is full - the
+ * old back-pressure, for traffic faster than the wire out for longer than the
+ * queue absorbs.  Order is kept: once anything is queued for a wire,
+ * everything after it for that wire is queued too.
+ */
+#define RELAY_Q_BYTES (8u * 1024u)
+#define RELAY_FRAME   4096u
+#define RELAY_REC     (2u + 1u + sizeof(ag_link_addr_t))
+
+typedef struct {
+    uint8_t *mem;
+    uint32_t r, w, used;
+} relay_q_t;
+
+static relay_q_t        s_rq[LINK_WIRES];
+static ag_port_mutex_t  s_rq_lock;
+static ag_port_sem_t    s_rq_wake;
+static ag_port_task_t   s_rq_task;
+static volatile bool    s_rq_failed;
+static uint8_t         *s_rq_frame; /* one frame out of a queue, RELAY_FRAME */
+
+static void rq_put(relay_q_t *q, const void *src, uint32_t n)
+{
+    const uint8_t *p = (const uint8_t *)src;
+    for (uint32_t i = 0; i < n; i++) {
+        q->mem[q->w] = p[i];
+        q->w = (q->w + 1u) % RELAY_Q_BYTES;
+    }
+    q->used += n;
+}
+
+static void rq_get(relay_q_t *q, void *dst, uint32_t n)
+{
+    uint8_t *p = (uint8_t *)dst;
+    for (uint32_t i = 0; i < n; i++) {
+        p[i] = q->mem[q->r];
+        q->r = (q->r + 1u) % RELAY_Q_BYTES;
+    }
+    q->used -= n;
+}
+
+/* One queued frame of wire `i` into the wire, waiting for room.  True if
+ * there was one. */
+static bool rq_send_one(int i)
+{
+    uint8_t *const   frame = s_rq_frame;
+    relay_q_t *const q = &s_rq[i];
+    (void)ag_port_mutex_take(s_rq_lock, AG_PORT_FOREVER);
+    if (q->used < RELAY_REC) {
+        (void)ag_port_mutex_give(s_rq_lock);
+        return false;
+    }
+    uint8_t        hdr[RELAY_REC];
+    ag_link_addr_t a;
+    rq_get(q, hdr, RELAY_REC);
+    const uint16_t len = (uint16_t)(hdr[0] | (hdr[1] << 8));
+    const uint8_t  chan = hdr[2];
+    memcpy(&a, hdr + 3, sizeof(a));
+    const uint16_t take = (len <= RELAY_FRAME) ? len : (uint16_t)RELAY_FRAME;
+    rq_get(q, frame, take);
+    if (take < len) {
+        uint8_t skip;
+        for (uint16_t k = take; k < len; k++) {
+            rq_get(q, &skip, 1u);
+        }
+    }
+    (void)ag_port_mutex_give(s_rq_lock);
+    for (;;) {
+        held_t h;
+        if (!hold(&s_wire[i], &h)) {
+            relay_drop(2, a.dst, "the wire out of here has gone");
+            return true;
+        }
+        const int32_t r = h.ops->send_a(h.dev, chan, frame, take, &a);
+        let_go(&h);
+        if (r >= 0) {
+            s_relayed++;
+            return true;
+        }
+        if (r != -AG_EAGAIN) {
+            relay_drop(2, a.dst, "the wire out of here refused it");
+            return true;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(1));
+    }
+}
+
+static void relay_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        bool any = false;
+        for (int i = 0; i < (int)LINK_WIRES; i++) {
+            any = rq_send_one(i) || any;
+        }
+        if (!any) {
+            (void)ag_port_sem_take(s_rq_wake, ag_port_ms_to_ticks(20));
+        }
+    }
+}
+
+/* Queue a frame for wire `to`; false when there is no queue to put it in, or
+ * no room in it after waiting a little - the caller then does as before. */
+static bool relay_queue(int32_t to, uint8_t chan, const ag_link_addr_t *a,
+                        const uint8_t *buf, uint16_t len)
+{
+    if (s_rq_failed) {
+        return false;
+    }
+    if (s_rq_task == NULL) {
+        s_rq_lock = ag_port_mutex_new();
+        s_rq_wake = ag_port_sem_new_binary();
+        s_rq_frame = (uint8_t *)ag_port_alloc(RELAY_FRAME, AG_MEM_BYTE);
+        if (s_rq_lock == NULL || s_rq_wake == NULL || s_rq_frame == NULL ||
+            !ag_proc_task_create(relay_task, "ag_relay", 3072, NULL, 1, 0,
+                                 &s_rq_task)) {
+            s_rq_failed = true;
+            return false;
+        }
+    }
+    relay_q_t *const q = &s_rq[to];
+    if (q->mem == NULL) {
+        q->mem = (uint8_t *)ag_port_alloc(RELAY_Q_BYTES, AG_MEM_BYTE);
+        if (q->mem == NULL) {
+            return false;
+        }
+    }
+    const uint32_t need = RELAY_REC + len;
+    for (unsigned tries = 0;; tries++) {
+        (void)ag_port_mutex_take(s_rq_lock, AG_PORT_FOREVER);
+        if (RELAY_Q_BYTES - q->used >= need) {
+            uint8_t hdr[RELAY_REC];
+            hdr[0] = (uint8_t)len;
+            hdr[1] = (uint8_t)(len >> 8);
+            hdr[2] = chan;
+            memcpy(hdr + 3, a, sizeof(*a));
+            rq_put(q, hdr, RELAY_REC);
+            rq_put(q, buf, len);
+            (void)ag_port_mutex_give(s_rq_lock);
+            (void)ag_port_sem_give(s_rq_wake);
+            return true;
+        }
+        (void)ag_port_mutex_give(s_rq_lock);
+        if (tries >= LINK_RELAY_TRIES * 4u) {
+            relay_drop(2, a->dst, "the queue for the wire out of here stayed "
+                                  "full");
+            return true; /* dropped, and said: not for the caller to retry */
+        }
+        (void)ag_port_sem_give(s_rq_wake);
+        ag_port_task_delay(ag_port_ms_to_ticks(1));
+    }
+}
+
 static void relay(wire_t *arrived, uint8_t chan, const ag_link_addr_t *a,
                   const uint8_t *buf, uint16_t len)
 {
@@ -266,6 +429,9 @@ static void relay(wire_t *arrived, uint8_t chan, const ag_link_addr_t *a,
      * to, and if this board put its own name there the answer would come back
      * here instead of going home.
      */
+    if (relay_queue(to, chan, a, buf, len)) {
+        return;
+    }
     for (unsigned tries = 0;; tries++) {
         held_t h;
         if (!hold(&s_wire[to], &h)) {
