@@ -123,6 +123,9 @@ ag_err_t ag_port_ble_write(uint16_t handle, const void *data, uint32_t len,
  *   ag_err_t ag_port_ble_adv_status(ag_port_ble_adv_status_t *out)
  *   void     ag_port_ble_adv_set_read(const void *data, uint32_t len)
  *   int32_t  ag_port_ble_adv_last_write(uint8_t *out, uint32_t max)
+ *   ag_err_t ag_port_ble_adv_notify(const void *data, uint32_t len)
+ *   int32_t  ag_port_ble_adv_recv(uint8_t *out, uint32_t max)
+ *   uint32_t ag_port_ble_adv_mtu(void)
  *
  * Contract, not advice:
  *
@@ -155,8 +158,32 @@ ag_err_t ag_port_ble_adv_raw(const uint8_t addr[6], const uint8_t *data,
 ag_err_t ag_port_ble_adv_status(ag_port_ble_adv_status_t *out);
 void     ag_port_ble_adv_set_read(const void *data, uint32_t len);
 int32_t  ag_port_ble_adv_last_write(uint8_t *out, uint32_t max);
-/* Push bytes to the connected client as a GATT notification (board->phone). */
+/*
+ * Push bytes to the connected client as a GATT notification (board->phone).
+ * -AG_ENODEV with nobody connected and subscribed, -AG_EAGAIN when the stack
+ * has no buffer for it right now (the radio has not caught up - try again),
+ * -AG_ERANGE past what one notification carries (see adv_mtu).
+ */
 ag_err_t ag_port_ble_adv_notify(const void *data, uint32_t len);
+
+/*
+ * Every write, in order - not just the newest.
+ *
+ * adv_last_write keeps one value, which is right for a setting and wrong for a
+ * keyboard: a key's down and its up arrive a few milliseconds apart, and a
+ * reader that polls any slower than that sees only the up.  So each write is
+ * also queued, and adv_recv takes the oldest one out: its length, 0 when the
+ * queue is empty.  A write longer than `max` is cut, not split.  A queue that
+ * fills drops the newest writes, and says so in its count (see bt_hw.c).
+ */
+int32_t  ag_port_ble_adv_recv(uint8_t *out, uint32_t max);
+
+/*
+ * How many bytes one notification can carry to the client connected now: the
+ * negotiated ATT MTU less its three-byte header.  0 with nobody connected and
+ * subscribed - which is also the answer to "is anybody listening".
+ */
+uint32_t ag_port_ble_adv_mtu(void);
 
 /*
  * BLE-MIDI: the board as a MIDI controller a phone or PC plays.  Same GATT

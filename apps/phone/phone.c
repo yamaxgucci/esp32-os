@@ -75,7 +75,7 @@
 #include "ag_pixband.h"
 #include "ag_ws.h"
 
-AG_DRV("PHONE", "1.0", "argon");
+AG_DRV("PHONE", "1.1", "argon");
 
 /* ------------------------------------------------------------------------ */
 /* Sizes, and why each one is what it is                                     */
@@ -176,12 +176,30 @@ AG_DRV("PHONE", "1.0", "argon");
  *
  * 'B' / 'P' / 'I' are ag_pixband's own op bytes, so the encoder's choice is
  * the wire's op with nothing in between.
+ *
+ * The same messages cross Bluetooth, for a phone with no network in common
+ * with the board (ArgonOS's Android app; see tools/phoneapp).  The board is a
+ * GATT peripheral - service 0xfff0 - and:
+ *
+ *   phone to board: one write to 0xfff2 is one message, exactly as above.
+ *   board to phone: notifications on 0xfff1, each a flag byte and a piece of
+ *                   one message.  0x40 = the first piece, 0x80 = the last; a
+ *                   short message is one piece with both.  A piece that says
+ *                   "first" throws away whatever half message came before, so
+ *                   a message the board gave up on part way cannot corrupt the
+ *                   next one.
+ *   'Q'  board to phone, BLE only: "you no longer have the screen", then the
+ *        reason as text - what a WebSocket says with its close frame.
+ *
+ * No pictures over Bluetooth: text and keys only.  A band is kilobytes, BLE
+ * carries tens of them a second at best, and the console has to share it.
  */
 #define OP_INFO 'M'
 #define OP_ROW 'R'
 #define OP_CURSOR 'C'
 #define OP_SCROLL 'S'
 #define OP_AUTH 'A'
+#define OP_QUIT 'Q'
 
 #define IN_HELLO 'H'
 #define IN_KEY 'K'
@@ -341,6 +359,14 @@ static struct {
     /* The wire. */
     ag_handle_t listen;
     ag_handle_t conn;    /* an upgraded WebSocket, or -1                    */
+    /*
+     * Or the client is on Bluetooth instead - never both, there is one screen.
+     * See pump_ble: a phone that connects over BLE is only a client once it has
+     * said hello, and whichever of the two arrived last has the screen.
+     */
+    bool        ble_client;
+    bool        ble_adv;       /* this driver has the board advertising        */
+    uint64_t    ble_retry_at;  /* when to try advertising again after a refusal */
     ag_handle_t closing; /* answered, waiting to be hung up - see defer_close */
     uint64_t    closing_until;
     /*
@@ -710,10 +736,71 @@ static wire_t send_all(ag_handle_t h, const void *buf, uint32_t len,
  */
 #define WS_SLACK 11u
 
+/* ---- the same message, over Bluetooth ----------------------------------- */
+
+#define BLE_FIRST 0x40u
+#define BLE_LAST  0x80u
+
+/*
+ * One message as notifications: a flag byte and as much of the message as the
+ * link's MTU leaves room for, piece after piece.
+ *
+ * The deadlines mean what send_all's do.  Before the first piece nothing is
+ * owed, so a radio with no buffer is a stall after SEND_START_MS and the loop
+ * goes back to reading keys.  After it, the rest is worth waiting for up to
+ * `idle_ms` - and unlike a WebSocket, giving up half way is not fatal: the
+ * next message starts with a "first" piece and the phone drops the half it
+ * had.  So a message abandoned part way is a stall, not a lost client.
+ */
+static wire_t ble_send(const uint8_t *msg, uint32_t len, uint32_t idle_ms)
+{
+    uint8_t        pkt[256];
+    uint32_t       at = 0;
+    uint64_t       until = (uint64_t)ag_micros() + (uint64_t)idle_ms * 1000ull;
+    const uint64_t start_by =
+        (uint64_t)ag_micros() + (uint64_t)SEND_START_MS * 1000ull;
+
+    while (at < len) {
+        uint32_t room = ag_ble_adv_mtu();
+        if (room < 2u) {
+            return WIRE_GONE; /* nobody connected and listening */
+        }
+        if (room > sizeof(pkt)) {
+            room = sizeof(pkt);
+        }
+        uint32_t take = len - at;
+        if (take > room - 1u) {
+            take = room - 1u;
+        }
+        pkt[0] = (uint8_t)(((at == 0u) ? BLE_FIRST : 0u) |
+                           ((at + take == len) ? BLE_LAST : 0u));
+        memcpy(pkt + 1, msg + at, take);
+
+        const ag_err_t e = ag_ble_adv_notify(pkt, take + 1u);
+        if (e == AG_OK) {
+            at += take;
+            until = (uint64_t)ag_micros() + (uint64_t)idle_ms * 1000ull;
+            continue;
+        }
+        if (e == -AG_ERANGE) {
+            continue; /* the MTU changed between asking and sending */
+        }
+        if (e != -AG_EAGAIN) {
+            return WIRE_GONE;
+        }
+        const uint64_t now = (uint64_t)ag_micros();
+        if ((at == 0u && now > start_by) || now > until) {
+            return WIRE_STALL;
+        }
+        TASK->sleep_ms(2u);
+    }
+    return WIRE_OK;
+}
+
 static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
                       uint32_t idle_ms, uint32_t lock_ms)
 {
-    if (s.conn < 0) {
+    if (s.conn < 0 && !s.ble_client) {
         return WIRE_GONE;
     }
     uint8_t *p = (uint8_t *)payload;
@@ -736,7 +823,10 @@ static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
      * this frame's to send.
      */
     const bool is_band = (op != OP_ROW && op != OP_CURSOR && op != OP_INFO &&
-                          op != OP_SCROLL && op != OP_AUTH);
+                          op != OP_SCROLL && op != OP_AUTH && op != OP_QUIT);
+    if (is_band && s.ble_client) {
+        return WIRE_STALL; /* no pictures over Bluetooth: see the protocol */
+    }
     /*
      * The hush covers the picture too, and that was tried both ways.
      *
@@ -760,7 +850,11 @@ static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
         }
         return WIRE_STALL;
     }
-    const wire_t r = send_all(s.conn, p - (n + 1u), n + 1u + len, idle_ms);
+    /* Over Bluetooth the op and the payload go as they are: the pieces carry
+     * their own framing, and the WebSocket header in the slack is unused. */
+    const wire_t r = s.ble_client
+                         ? ble_send(p - 1, 1u + len, idle_ms)
+                         : send_all(s.conn, p - (n + 1u), n + 1u + len, idle_ms);
     if (s.wire != NULL) {
         TASK->mutex_unlock(s.wire);
     }
@@ -802,11 +896,24 @@ static wire_t ws_send(uint8_t op, void *payload, uint32_t len,
  */
 static void ws_close(const char *reason)
 {
-    if (s.conn < 0 || reason == NULL) {
+    if (reason == NULL) {
         return;
     }
     const uint32_t n = (uint32_t)strlen(reason);
     if (n > 100u) {
+        return;
+    }
+    if (s.ble_client) {
+        /* Bluetooth has no close frame to carry a reason, so it is a message:
+         * 'Q' and the text.  The link itself stays up - the phone may want the
+         * screen back, and that is one hello away. */
+        uint8_t m[1u + 100u];
+        m[0] = (uint8_t)OP_QUIT;
+        memcpy(m + 1, reason, n);
+        (void)ble_send(m, 1u + n, 200u);
+        return;
+    }
+    if (s.conn < 0) {
         return;
     }
     uint8_t buf[128];
@@ -862,6 +969,11 @@ static void drop_conn_reason(const char *why, bool gone)
      * life of the driver rather than freed across a task boundary.
      */
     s.last_life_us = 0u;
+    if (s.ble_client) {
+        s.ble_client = false;
+        ag_log(AG_LOG_INFO, "phone", "bluetooth client gone (%s)",
+               why ? why : "?");
+    }
     if (s.conn >= 0) {
         if (!gone || ag_net_reset(s.conn) != AG_OK) {
             (void)ag_net_close(s.conn);
@@ -1419,7 +1531,10 @@ static bool service_client(void)
     s.dy1 = 0;
     unlock();
 
-    if (x0 >= x1 || y0 >= y1) {
+    /* Taken and dropped over Bluetooth, which carries no pictures: the damage
+     * is still collected, so a WebSocket client that takes over later gets the
+     * whole screen from owe_everything and nothing is lost by this. */
+    if (s.ble_client || x0 >= x1 || y0 >= y1) {
         return true;
     }
     for (uint32_t y = y0; y < y1; y += BAND_ROWS) {
@@ -1849,6 +1964,134 @@ static bool pump_client(void)
     return true;
 }
 
+/* ---- Bluetooth: the same client, another way in ------------------------ */
+
+/*
+ * The name the board advertises: `[phone] name`, else `[net] hostname`, else
+ * "argon" - the name a person already calls the board by on the network.
+ * Twenty characters at most, because the advertisement is 31 bytes and the
+ * service UUID and the flags take nine of them.
+ */
+static void ble_name(char *out, size_t cap)
+{
+    const ag_cfg_api_t *cfg = ag_api()->cfg;
+    out[0] = '\0';
+    if (cfg != NULL && AG_HAS(cfg, get_str)) {
+        if (cfg->get_str("phone.name", out, cap) != AG_OK || out[0] == '\0') {
+            if (cfg->get_str("net.hostname", out, cap) != AG_OK) {
+                out[0] = '\0';
+            }
+        }
+    }
+    if (out[0] == '\0') {
+        ag_strlcpy(out, "argon", cap);
+    }
+    if (strlen(out) > 20u) {
+        out[20] = '\0';
+    }
+}
+
+/*
+ * Everything Bluetooth, once a lap: advertise while the system has the radio
+ * up, notice a phone leaving, and read what the phone wrote.
+ *
+ * The radio is never raised here.  `bt on` or `[bt] on = yes` is the system's
+ * decision, exactly as joining a Wi-Fi network is, and this only uses a radio
+ * that is already there - the same standing the WebSocket side has with
+ * ensure_listen, which waits for the network rather than bringing it up.
+ *
+ * A phone becomes the client on its hello, not on connecting.  Connecting is
+ * the radio's business and happens before the phone has even subscribed to
+ * anything it could be told; the hello is the page saying it is ready to be
+ * shown a screen - which is also exactly when the WebSocket side sends
+ * everything.  Only a hello (or the answer to a challenge) takes the screen,
+ * so a key still in flight from a phone that was just told "replaced" cannot
+ * take it back behind the other client's back.
+ */
+static void pump_ble(void)
+{
+    const ag_ble_api_t *ble = ag_api()->ble;
+    if (!AG_HAS(ble, adv_recv) || !AG_HAS(ble, radio_on)) {
+        return; /* an older kernel, or a build with no BLE peripheral */
+    }
+
+    if (!ble->radio_on()) {
+        if (s.ble_adv) {
+            s.ble_adv = false;
+            ag_log(AG_LOG_INFO, "phone", "bluetooth is off; not advertising");
+        }
+        if (s.ble_client) {
+            drop_conn("bluetooth off");
+        }
+        return;
+    }
+
+    ag_ble_adv_status_t st;
+    memset(&st, 0, sizeof(st));
+    if (ag_ble_adv_status(&st) != AG_OK) {
+        return;
+    }
+    if (!st.advertising) {
+        s.ble_adv = false;
+        const uint64_t now = (uint64_t)ag_micros();
+        if (now >= s.ble_retry_at) {
+            char name[24];
+            ble_name(name, sizeof(name));
+            const ag_err_t e = ag_ble_adv_start(name);
+            if (e == AG_OK) {
+                s.ble_adv = true;
+                ag_log(AG_LOG_INFO, "phone", "bluetooth: advertising as \"%s\"",
+                       name);
+            } else {
+                /* Once every few seconds, not every lap: a refusal now is a
+                 * refusal a millisecond from now. */
+                s.ble_retry_at = now + 5000000ull;
+                ag_log(AG_LOG_WARN, "phone", "bluetooth: cannot advertise (%d)",
+                       (int)e);
+            }
+        }
+        return;
+    }
+    s.ble_adv = true;
+
+    if (s.ble_client && (!st.connected || ag_ble_adv_mtu() == 0u)) {
+        drop_conn("bluetooth link gone");
+    }
+
+    uint8_t msg[256];
+    for (;;) {
+        const int32_t n = ag_ble_adv_recv(msg, sizeof(msg));
+        if (n <= 0) {
+            break;
+        }
+        if (!s.ble_client) {
+            if (msg[0] != IN_HELLO) {
+                continue; /* not a client yet, and this is not the knock */
+            }
+            /* Whoever arrived last has the screen - the WebSocket side's rule,
+             * and the one who had it is told why rather than just going dark. */
+            if (s.conn >= 0) {
+                ws_close("replaced");
+                drop_conn("replaced");
+            }
+            s.ble_client = true;
+            s.scroll_owed = 0u;
+            s.hush_until = 0u;
+            s.authed = false;
+            s.challenged = false;
+            s.owe_everything = true;
+            make_nonce();
+            ag_log(AG_LOG_INFO, "phone", "client connected over bluetooth "
+                                         "(%u bytes a piece)",
+                   (unsigned)ag_ble_adv_mtu());
+        }
+        handle_message(msg, (uint32_t)n);
+        if (!s.ble_client) {
+            break; /* turned away (wrong password): the rest is not ours */
+        }
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* HTTP: the page, and the upgrade                                           */
 /* ------------------------------------------------------------------------ */
@@ -2130,6 +2373,10 @@ static bool serve_request(ag_handle_t h)
         s.authed = false;
         s.challenged = false;
         s.owe_everything = true;
+        /* A fresh challenge per client.  Nothing called this before, so every
+         * connection was asked the same all-zero nonce and a digest seen once
+         * on the wire opened the board for ever after. */
+        make_nonce();
         ag_log(AG_LOG_INFO, "phone", "client connected");
         return true;
     }
@@ -2402,7 +2649,7 @@ static bool ensure_memory(void)
  * ten-millisecond ones add up alike, and it is the single long call that is
  * the fault being looked for.
  */
-#define STAGE_COUNT 9u
+#define STAGE_COUNT 10u
 static uint32_t stage_max_us[STAGE_COUNT];
 static uint8_t  stage_at;
 static uint64_t stage_since;
@@ -2455,9 +2702,11 @@ static void phone_task(void *arg)
             }
             ag_log(AG_LOG_INFO, "phone",
                    "alive: %u laps, in stage %u, worst stage %u took %u us, "
-                   "listen=%d conn=%d closing=%d",
+                   "listen=%d conn=%d closing=%d ble=%s",
                    (unsigned)laps, (unsigned)s.stage, worst, worst_us,
-                   (int)s.listen, (int)s.conn, (int)s.closing);
+                   (int)s.listen, (int)s.conn, (int)s.closing,
+                   s.ble_client ? "client"
+                                : s.ble_adv ? "advertising" : "off");
             /*
              * And the picture, on its own line so a search for it finds one
              * thing.  Silent when nothing has ever drawn, which is the common
@@ -2494,11 +2743,24 @@ static void phone_task(void *arg)
             }
         }
 
-        pump_deferred();
+        /*
+         * Either way in, or both.  The network is waited for rather than
+         * required: a board with Bluetooth and no Wi-Fi is still a board a
+         * phone can reach, and one with neither yet is one that may get
+         * either later - `wifi connect`, `bt on` - without this driver being
+         * reloaded.
+         */
+        const bool have_net = ag_api()->net != NULL;
+        if (have_net) {
+            pump_deferred();
+        }
 
         stage_enter(2);
-        if (!ensure_listen()) {
-            TASK->sleep_ms(200u);
+        const bool listening = have_net && ensure_listen();
+        stage_enter(9);
+        pump_ble();
+        if (!listening && !s.ble_client) {
+            TASK->sleep_ms(have_net ? 200u : 50u);
             continue;
         }
         stage_enter(3);
@@ -2532,7 +2794,8 @@ static void phone_task(void *arg)
          * opens a second socket, and the old one sits there being written to
          * for as long as TCP takes to notice.  So the newest upgrade wins.
          */
-        const ag_handle_t fresh = ag_tcp_accept(s.listen, 0u);
+        const ag_handle_t fresh =
+            listening ? ag_tcp_accept(s.listen, 0u) : -AG_EAGAIN;
         /*
          * A listener can die, and when it does nothing says so: accept goes on
          * answering the same error for ever and the board simply stops letting
@@ -2580,22 +2843,24 @@ static void phone_task(void *arg)
             }
         }
 
-        if (s.conn < 0) {
+        if (s.conn < 0 && !s.ble_client) {
             TASK->sleep_ms(50u);
             continue;
         }
         /*
          * A client that has proved nothing for half a minute.  Not an
          * error anywhere - every call returned what it should - which
-         * is why nothing else in this loop can see it.
+         * is why nothing else in this loop can see it.  WebSocket only:
+         * a Bluetooth link that has gone is said so by the radio itself
+         * (pump_ble), and a phone showing a quiet shell writes nothing.
          */
-        if (s.last_life_us != 0u &&
+        if (s.conn >= 0 && s.last_life_us != 0u &&
             (uint64_t)ag_micros() - s.last_life_us > LINK_SILENT_US) {
             drop_conn_reason("silent for 30 s", true);
             continue;
         }
         stage_enter(5);
-        if (!pump_client()) {
+        if (s.conn >= 0 && !pump_client()) {
             drop_conn("closed by peer");
             continue;
         }
@@ -2626,6 +2891,12 @@ static void phone_task(void *arg)
     if (s.listen >= 0) {
         (void)ag_net_close(s.listen);
         s.listen = -1;
+    }
+    /* The advertising this driver started goes with it: a board that says
+     * "connect to me" with nothing left to answer is a trap for the phone. */
+    if (s.ble_adv && AG_HAS(ag_api()->ble, adv_stop)) {
+        (void)ag_api()->ble->adv_stop();
+        s.ble_adv = false;
     }
 
     /*
@@ -3075,8 +3346,9 @@ ag_err_t ag_driver_init(void)
 {
     const ag_api_t *api = ag_api();
 
-    if (api->net == NULL) {
-        ag_printf("PHONE: this build has no network\n");
+    if (api->net == NULL && !AG_HAS(api->ble, adv_recv)) {
+        ag_printf("PHONE: this build has neither a network nor a BLE "
+                  "peripheral\n");
         return -AG_ENOTSUP;
     }
     if (!AG_HAS(api->sys, module_task)) {
@@ -3213,7 +3485,7 @@ ag_err_t ag_driver_init(void)
                             ? (uint32_t)lst.size
                             : 0u;
         char b[64];
-        (void)snprintf(b, sizeof(b), "==== boot %s ====\n", "PHONE " "1.0");
+        (void)snprintf(b, sizeof(b), "==== boot %s ====\n", "PHONE " "1.1");
         input_log(b);
     }
 
@@ -3261,8 +3533,10 @@ ag_err_t ag_driver_init(void)
     }
     s.up = true;
 
-    ag_printf("PHONE: open http://<board>:%u/ - %ux%u cells%s, %s\n",
-              (unsigned)s.port, (unsigned)s.cols, (unsigned)s.rows,
+    ag_printf("PHONE: open http://<board>:%u/%s - %ux%u cells%s, %s\n",
+              (unsigned)s.port,
+              AG_HAS(api->ble, adv_recv) ? " or the app over bluetooth" : "",
+              (unsigned)s.cols, (unsigned)s.rows,
               s.publish_text ? "" : " (pixels only)",
               needs_password() ? "password set"
                                : "NO PASSWORD ([phone] password to set one)");

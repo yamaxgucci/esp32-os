@@ -920,6 +920,36 @@ static inline ag_err_t ag_ble_adv_notify(const void *data, uint32_t len)
     return g_ag_api->ble->adv_notify(data, len);
 }
 
+/* The oldest write a client made, in order (ABI 0.64): its length, 0 when none
+ * is waiting.  -AG_ENOSYS on an older kernel or without the peripheral. */
+static inline int32_t ag_ble_adv_recv(uint8_t *out, uint32_t max)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_recv)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_recv(out, max);
+}
+
+/* Bytes one ag_ble_adv_notify carries to the client there now (ABI 0.64); 0
+ * with nobody connected and subscribed, or on a kernel that cannot say. */
+static inline uint32_t ag_ble_adv_mtu(void)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_mtu)) {
+        return 0u;
+    }
+    return g_ag_api->ble->adv_mtu();
+}
+
+/* Whether the system has the Bluetooth radio up (ABI 0.64).  False on a kernel
+ * that cannot say - a driver then leaves the radio alone, which is right. */
+static inline bool ag_ble_radio_on(void)
+{
+    if (!AG_HAS(g_ag_api->ble, radio_on)) {
+        return false;
+    }
+    return g_ag_api->ble->radio_on();
+}
+
 /* ---- BLE general: observer + GATT client (ABI 0.38) --------------------- */
 
 /*
