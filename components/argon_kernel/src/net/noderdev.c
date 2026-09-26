@@ -38,6 +38,7 @@
 #include <argon/log.h>
 #include <argon/nodedev.h>
 #include <argon/nodename.h>
+#include <argon/proc.h>
 #include <argon/textpanel.h>
 
 #include <argon/port/sync.h>
@@ -61,6 +62,14 @@
  * use is whatever the bound link says it will carry.
  */
 #define RD_POUR_CAP 2024u
+/*
+ * A piece of SOUND is at most this (27 Sep 2026): a mixer period of 256
+ * frames of stereo is 1 024 bytes, and a sound slot sized for a 2 KB picture
+ * message was half empty - nine of them, 9 KB of the CYD's memory holding
+ * nothing.  The sender cuts sound to this, whole frames; the room it gives
+ * back is what lets the picture queue hold six messages.
+ */
+#define RD_SND_CAP 1024u
 #define RD_REPLY 0x80u
 
 /*
@@ -418,6 +427,9 @@ static int32_t rd_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
 /* What this node has poured at the neighbour, for `link` and for a person. */
 static uint32_t s_sent_periods;
 static uint32_t s_sent_dropped;
+/* the longest send of a period this second, and when that was said */
+static int64_t  s_sent_max_us, s_sent_said_us;
+static uint32_t s_sent_said_n, s_sent_said_drop;
 
 /*
  * POURING: bytes with a deadline, sent and not asked about.
@@ -469,8 +481,27 @@ static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
      * one thing it must not be.  The stream class does not queue behind the
      * reliable one either - that is what the class is for.
      */
+    const int64_t t0 = ag_port_us();
     const int32_t r = link_send(p->wire, p->node, AG_LINK_STREAM, buf2,
                                 (uint16_t)(RD_HDR + len));
+    const int64_t took = ag_port_us() - t0;
+    if (took > s_sent_max_us) {
+        s_sent_max_us = took;
+    }
+    if (t0 - s_sent_said_us >= 1000000) {
+        if (s_sent_said_us != 0) {
+            ag_log(AG_LOG_INFO, TAG,
+                   "sound out: %u periods sent, %u dropped, the longest send "
+                   "%u us",
+                   (unsigned)(s_sent_periods - s_sent_said_n),
+                   (unsigned)(s_sent_dropped - s_sent_said_drop),
+                   (unsigned)s_sent_max_us);
+        }
+        s_sent_said_us = t0;
+        s_sent_said_n = s_sent_periods;
+        s_sent_said_drop = s_sent_dropped;
+        s_sent_max_us = 0;
+    }
     if (r < 0) {
         s_sent_dropped++;
         return (int32_t)len; /* let go of it, and say the period was taken */
@@ -493,7 +524,7 @@ static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
  * caller writes what it always wrote; on a wire that can carry it, nothing is
  * changed at all.
  */
-static uint8_t s_fit_buf[RD_POUR_CAP];
+static uint8_t s_fit_buf[RD_SND_CAP];
 
 /*
  * THE WRITE IS THE CLOCK, and a proxy had none.
@@ -511,7 +542,11 @@ static uint8_t s_fit_buf[RD_POUR_CAP];
 /* Half the far ring (10 periods of 5.8 ms): 80 ms was more than the ring held,
  * so it sat full, the receiver paced frames out (508 in 15 s) and a person
  * heard each one as a click. */
-#define PACE_LEAD_US 30000
+/* 20 ms, not 30 (26 Sep 2026): 30 was half the far queue, so the queue sat
+ * half full and a burst of periods behind the picture on the same wire
+ * overflowed it - 465 periods of 17 018 thrown away on the CYD, a click
+ * each.  20 leaves 60 ms of room for a burst. */
+#define PACE_LEAD_US 20000
 
 static void pace_audio(rdev_t *p, size_t len)
 {
@@ -525,7 +560,9 @@ static void pace_audio(rdev_t *p, size_t len)
     }
     p->due_us += frames * 1000000 / (int64_t)p->in_rate;
     const int64_t ahead = p->due_us - now - PACE_LEAD_US;
-    if (ahead > 1000) {
+    /* not for a program being stopped: asleep in here it is inside the
+     * driver, where a kill has to wait for it */
+    if (ahead > 1000 && !ag_proc_stopping()) {
         ag_port_task_delay(ag_port_ms_to_ticks((uint32_t)(ahead / 1000)));
     }
 }
@@ -538,7 +575,7 @@ static int32_t pour_audio(rdev_t *p, const void *buf, size_t len, uint64_t off)
                          (p->in_rate != p->wire_rate || p->in_ch != p->wire_ch);
     if (!convert) {
         for (size_t at = 0; at < len;) {
-            const size_t n = (len - at > RD_POUR_CAP) ? RD_POUR_CAP : len - at;
+            const size_t n = (len - at > RD_SND_CAP) ? RD_SND_CAP : len - at;
             (void)pour(p, src + at, n, off + at);
             at += n;
         }
@@ -838,6 +875,8 @@ static uint32_t          s_paint_waits;  /* passes that waited, for `link` */
 #define RD_PAINT_WAIT_MS 1000u
 #define RD_PAINT_LEGACY  3u
 
+#define RD_PAINT_AHEAD 1u
+
 static void rd_sync_z(uint32_t handle)
 {
     const rdev_t *const p = s_display_proxy;
@@ -873,12 +912,23 @@ static void rd_sync_z(uint32_t handle)
     if (!wait) {
         return; /* told; an answer to this one still turns the waiting on */
     }
+    /*
+     * ONE PASS IN FLIGHT.  Waiting for this pass's own answer put a whole
+     * round trip - here, the middle board, the screen and back - between
+     * every two passes, and with sound on the same wires that trip took up
+     * to 275 ms: the square stalled whenever it did (26 Sep 2026).  The
+     * painter now goes on once the pass BEFORE this one is answered, so the
+     * trip is hidden behind a pass of drawing and the screen is still never
+     * more than two passes behind.
+     */
     s_paint_waits++;
     const int64_t until = ag_port_us() + (int64_t)RD_PAINT_WAIT_MS * 1000;
-    while (s_paint_acked != seq && ag_port_us() < until) {
+    while ((uint16_t)(seq - s_paint_acked) > RD_PAINT_AHEAD &&
+           ag_port_us() < until) {
         ag_port_task_delay(ag_port_ms_to_ticks(2));
     }
-    if (s_paint_acked == seq) {
+    if (s_paint_acked != 0u &&
+        (uint16_t)(seq - s_paint_acked) <= RD_PAINT_AHEAD) {
         s_paint_heard = true;
         s_paint_silent = 0;
     } else if (s_paint_silent < 255u) {
@@ -1173,7 +1223,21 @@ static ag_port_task_t s_worker;
  * that cannot be taken now has missed its moment, which is the same rule the
  * sending side follows.
  */
-#define RD_RING 10
+/*
+ * TWO QUEUES, ONE FOR SOUND AND ONE FOR THE PICTURE (26 Sep 2026).
+ *
+ * They were one ring of ten, taken strictly in order by one task, and a sound
+ * period waits for the converter to have room - so the picture waited behind
+ * the sound: the sender keeps 30 ms of sound ahead, five periods, and every
+ * rectangle arriving behind them waited for all five to play.  The ring sat
+ * at 9 of 10, the reader waited for it, the wire behind the reader, and the
+ * square on the CYD ran at 30 passes a second where it runs 62 without
+ * sound.  Now each has its own queue out of the same slots, and the task
+ * draws whatever picture there is whenever the converter has no room.
+ */
+#define RD_SND  9
+#define RD_SCR  6
+#define RD_RING (RD_SND + RD_SCR)
 
 typedef struct {
     /*
@@ -1198,21 +1262,45 @@ typedef struct {
      * same way: the message was never dispatched by what it says it is.
      */
     uint8_t  op;
+    /* where it came from: a pass's marker is answered from the queue */
+    int32_t  wire;
+    uint16_t from;
+    uint16_t tag;
 } rd_period_t;
 
 /* Said once: a flood of identical warnings is a flood, not a diagnosis. */
 static bool              s_no_sink_said;
 
+/*
+ * What was drawn on this glass this second besides the painter's picture:
+ * raw rectangles and text, poured and asked for.  A neighbour's console on
+ * the glass beside its painter draws over the picture, and the painter does
+ * not know (26 Sep 2026).
+ */
+static uint32_t s_scr_raw, s_scr_text, s_scr_asked;
+
 static uint32_t serve_poured_class(ag_device_t *dev,
                                    const rd_period_t *pd);
 static void     glass_back_if_quiet(void);
 static void     screen_report(void);
+static void     screen_lost(void);
 
-static rd_period_t       s_ring[RD_RING];
-static uint8_t          *s_ring_mem;
-static volatile uint32_t s_ring_w;
-static volatile uint32_t s_ring_r;
-static ag_port_task_t    s_pour_task;
+typedef struct {
+    rd_period_t      *e;
+    uint32_t          n;    /* slots; it holds n - 1                       */
+    volatile uint32_t w, r;
+} rd_q_t;
+
+static rd_period_t    s_ring[RD_RING];
+static rd_q_t         s_snd = {s_ring, RD_SND, 0, 0};
+static rd_q_t         s_scr = {s_ring + RD_SND, RD_SCR, 0, 0};
+static uint8_t       *s_ring_mem;
+static ag_port_task_t s_pour_task;
+
+static uint32_t q_used(const rd_q_t *q)
+{
+    return (q->w + q->n - q->r) % q->n;
+}
 
 /*
  * THE COUNT THAT MEANS SOMETHING.
@@ -1392,6 +1480,7 @@ static void serve_one(const uint8_t *b, uint16_t n)
         };
         if ((uint32_t)bl.w * bl.h * 2u <= (uint32_t)(plen - RD_BLIT_HDR)) {
             d->blit_rect(0, &bl);
+            s_scr_asked++;
         }
         break;
     }
@@ -1421,6 +1510,7 @@ static void serve_one(const uint8_t *b, uint16_t n)
             n = room;
         }
         d->text_row(0, row, (const ag_textcell_t *)(const void *)(pay + 4), n);
+        s_scr_asked++;
         break;
     }
     case RD_TEXTCUR: {
@@ -1434,6 +1524,7 @@ static void serve_one(const uint8_t *b, uint16_t n)
             under.attr = pay[6];
         }
         d->text_cursor(0, get16(pay), get16(pay + 2), under, pay[4] != 0u);
+        s_scr_asked++;
         break;
     }
     default:
@@ -1458,6 +1549,15 @@ static void worker(void *arg)
  * one line, it is the count kept on the side that received the bytes, and it is
  * the only number in this path that is evidence of anything.
  */
+void ag_noderdev_pour_counts(uint32_t *periods, uint32_t *lost,
+                             uint32_t *full, uint32_t *paced)
+{
+    *periods = s_pour_periods;
+    *lost = s_pour_lost;
+    *full = s_pour_full;
+    *paced = s_pour_paced;
+}
+
 static void pour_report(void)
 {
     /*
@@ -1534,139 +1634,238 @@ static uint32_t keep_pace(rd_period_t *pd)
         return pd->len;
     }
     /*
-     * One frame a period, and only near full: that is 0.4% of a 256-frame
-     * period, enough for two crystals that disagree and too little to hear.
-     * It took one in eight past half full at first, which on a 4 Mbaud wire -
-     * where the queue fills from the bursts, not from the clocks - was a
-     * grain on everything a person listened to.  A clock as wrong as the
-     * CYD's DAC was at 22 kHz is the converter's own to fix (audio_hw.c).
+     * SQUEEZED IN PROPORTION, NOT A FRAME AT A TIME (26 Sep 2026).
+     *
+     * The sender's clock and this converter's are two crystals, and the
+     * CYD's plays slow: one frame taken out of a period near full was 0.4%
+     * and not enough - the queue filled anyway and whole periods were thrown
+     * away at the door, 238 of 12 583, a click each.  Now nothing is taken
+     * while the queue is at most half full, and above that the period is
+     * resampled - read out at a slightly faster step, between neighbouring
+     * frames - by up to 5% when the queue is full.  A few percent of pitch
+     * for a moment is not heard; a hole is.
      */
-    const uint32_t queued = (s_ring_w + RD_RING - s_ring_r) % RD_RING;
-    if (queued * 4u < RD_RING * 3u) {
+    const uint32_t cap = s_snd.n - 1u;
+    const uint32_t queued = q_used(&s_snd);
+    /* the sender's lead (PACE_LEAD_US, 20 ms) fills a little under half of
+     * it: above half it is the converter's clock that is slow */
+    if (queued * 2u <= cap) {
         return pd->len;
     }
-    const uint32_t every = 0xffffffffu; /* see the loop: the last frame only */
     const uint32_t frame = (uint32_t)ch * 2u;
     const uint32_t frames = pd->len / frame;
-    uint32_t       out = 0;
-    (void)every;
-    for (uint32_t f = 0; f < frames; f++) {
-        if (f == frames - 1u && frames > 1u) {
-            s_pour_paced++;
-            continue;
-        }
-        if (out != f) {
-            memmove(pd->data + out * frame, pd->data + f * frame, frame);
-        }
-        out++;
+    if (frames < 16u) {
+        return pd->len;
     }
+    /* per mille taken out: 0 at half, 50 at full */
+    const uint32_t half = cap / 2u;
+    const uint32_t over = (queued > half) ? queued - half : 0u;
+    const uint32_t pm = 50u * over / ((cap - half) ? (cap - half) : 1u);
+    uint32_t       take = frames * pm / 1000u;
+    if (take == 0u) {
+        take = 1u;
+    }
+    const uint32_t out = frames - take;
+    int16_t *const px = (int16_t *)(void *)pd->data;
+    /*
+     * In place, front to back: frame i is read from at or after i, so what
+     * is written never lands on anything still to be read.  Q16 steps.
+     */
+    const uint32_t step = (uint32_t)(((uint64_t)(frames - 1u) << 16) /
+                                     (out - 1u));
+    uint32_t       at = 0;
+    for (uint32_t k = 0; k < out; k++, at += step) {
+        const uint32_t a = at >> 16;
+        const uint32_t b = (a + 1u < frames) ? a + 1u : a;
+        const int32_t  f = (int32_t)(at & 0xffffu);
+        for (uint32_t c = 0; c < ch; c++) {
+            const int32_t va = px[a * ch + c];
+            const int32_t vb = px[b * ch + c];
+            px[k * ch + c] = (int16_t)(va + (((vb - va) * f) >> 16));
+        }
+    }
+    s_pour_paced += take;
     return out * frame;
+}
+
+/* The period being written, and how far: kept between laps, since the task
+ * draws the picture while the converter is full instead of waiting. */
+static uint32_t s_snd_len;
+static uint32_t s_snd_done;
+static uint32_t s_snd_waited;
+static bool     s_snd_begun;
+
+static void pour_pass_drawn(const rd_period_t *pd);
+/*
+ * 1: a pass is answered once drawn; 0: on arrival.  Measured both ways on 27
+ * Sep 2026, a minute of sound and picture on the CYD: 1.7% of its sound
+ * periods lost when answered once drawn, 0.5% on arrival - the painter paced
+ * by the glass sent its passes in bursts the sound then waited behind.
+ * Answering once drawn only while the glass was behind was worse again:
+ * 79 lost against 26.  On
+ * arrival, with a pass in flight and passes of at most RDP_PASS_MAX_PX, the
+ * picture queue does not stay full anyway.
+ */
+#define RD_ACK_WHEN_DRAWN 0
+
+/* One entry of the picture's queue, drawn. */
+static void pour_screen_one(void)
+{
+    rd_period_t *pd = &s_scr.e[s_scr.r];
+    if (pd->op == RD_PAINTED) {
+        pour_pass_drawn(pd);
+        s_scr.r = (s_scr.r + 1u) % s_scr.n;
+        return;
+    }
+    ag_device_t *dev = (pd->handle < (uint32_t)RD_MAX_SESSIONS)
+                           ? s_session[pd->handle]
+                           : NULL;
+    /*
+     * A class call rather than bytes: the pixels of a rectangle, a row of
+     * characters, the caret.  It goes to the device's class vtable, and it is
+     * here rather than on the reader task for the same reason a write is -
+     * putting a band on a panel takes as long as the panel takes.
+     */
+    const uint32_t faults = rdp_draw_faults();
+    const uint32_t did = (dev != NULL) ? serve_poured_class(dev, pd) : 0u;
+    if (did > 0u) {
+        s_pour_periods++;
+        s_pour_bytes += did;
+    } else {
+        s_pour_lost++;
+    }
+    if (did == 0u || rdp_draw_faults() != faults) {
+        screen_lost();
+    }
+    s_scr.r = (s_scr.r + 1u) % s_scr.n;
+}
+
+/*
+ * As much of the head sound period as the converter takes now.  True when the
+ * period is finished with - written, given up on, or had nowhere to go - and
+ * the next can start; false when the converter is full and it is to be tried
+ * again after whatever picture has arrived meanwhile.
+ */
+static bool pour_sound_some(void)
+{
+    rd_period_t *pd = &s_snd.e[s_snd.r];
+    ag_device_t *dev = (pd->handle < (uint32_t)RD_MAX_SESSIONS)
+                           ? s_session[pd->handle]
+                           : NULL;
+    if (dev == NULL) {
+        /*
+         * Nothing to write it to.  Said once, by name of the handle: a period
+         * with no session is not a wire fault and not a converter fault, it
+         * is an open that did not happen or did not survive, and the three
+         * are indistinguishable from a count of losses alone.
+         */
+        if (!s_no_sink_said) {
+            ag_log(AG_LOG_WARN, TAG,
+                   "poured sound has nowhere to go: no open device for "
+                   "handle %u", (unsigned)pd->handle);
+            s_no_sink_said = true;
+        }
+        s_pour_lost++;
+        return true;
+    }
+    if (!s_snd_begun) {
+        s_snd_len = keep_pace(pd);
+        s_snd_done = 0;
+        s_snd_waited = 0;
+        s_snd_begun = true;
+    }
+    /*
+     * All of the period, as room is made.  A converter's write does not wait
+     * (audio_hw.c says why: its caller may hold the registry) and takes what
+     * fits - so a period that arrived in a burst of frames found the
+     * converter full and was counted lost whole: a third of the C3's sound on
+     * the CYD, with the wire perfect.  After 40 ms without room the rest is
+     * given up on rather than delaying every period behind it.
+     */
+    for (;;) {
+        if (s_snd_done >= s_snd_len) {
+            break;
+        }
+        const int32_t n = ag_dev_write(dev, pd->data + s_snd_done,
+                                       s_snd_len - s_snd_done,
+                                       pd->off + s_snd_done);
+        if (n < 0) {
+            break;
+        }
+        if (n == 0) {
+            if (++s_snd_waited >= 40u) {
+                break;
+            }
+            return false; /* full: the picture meanwhile */
+        }
+        s_snd_done += (uint32_t)n;
+    }
+    if (s_snd_done > 0) {
+        s_pour_periods++;
+        s_pour_bytes += s_snd_done;
+    }
+    if (s_snd_done < s_snd_len) {
+        s_pour_lost++;
+        s_pour_short++;
+    }
+    return true;
 }
 
 static void pour_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        if (s_ring_r == s_ring_w) {
-            /* Woken by the next period, and on the clock anyway so the end of
-             * a burst gets its line without anything having to notice. */
-            ag_port_notify_take(true, ag_port_ms_to_ticks(100));
-            pour_report();
-            glass_back_if_quiet();
-            screen_report();
-            continue;
+        /*
+         * A message of the picture, then the sound, in turn.  All of the
+         * picture first was up to fifteen milliseconds of drawing with six
+         * messages waiting, and the sound that arrived meanwhile - three
+         * periods on top of the sender's lead - overflowed its queue a
+         * few times a minute (27 Sep 2026).
+         */
+        bool busy = false;
+        if (s_scr.r != s_scr.w) {
+            pour_screen_one();
+            busy = true;
         }
-
-        rd_period_t *pd = &s_ring[s_ring_r];
-        ag_device_t *dev = (pd->handle < (uint32_t)RD_MAX_SESSIONS)
-                               ? s_session[pd->handle]
-                               : NULL;
-        if (dev != NULL) {
-            /*
-             * An ordinary device write, which is exactly the point: it takes
-             * that device's own lock and no longer the registry's, so a
-             * converter that makes this wait stops nothing else on this board.
-             * Before that was true, this path froze the machine.
-             */
-            if (pd->op != RD_WRITE) {
+        bool full = false;
+        if (s_snd.r != s_snd.w) {
+            if (pour_sound_some()) {
+                s_snd_begun = false;
+                s_pour_last_ms = (uint32_t)(ag_port_us() / 1000);
+                s_pour_said = false;
+                s_snd.r = (s_snd.r + 1u) % s_snd.n;
                 /*
-                 * A class call rather than bytes: the pixels of a rectangle,
-                 * a row of characters, the caret.  It goes to the device's
-                 * class vtable, and it is here rather than on the reader task
-                 * for the same reason a write is - putting a band on a panel
-                 * takes as long as the panel takes.
+                 * A TICK BETWEEN PERIODS, for everybody else who wants the
+                 * device.  Writing without a pause, this task let the
+                 * device's lock go and took it again before a waiter below it
+                 * could run - and the waiter was the worker opening the same
+                 * converter for the node that asked: it waited out the
+                 * asker's patience every time (lockwatch: "held 30 s by
+                 * 'rdevpour'").  Woken early by a rectangle arriving; and
+                 * none at all while one is waiting to be drawn - drawing it
+                 * lets the converter's lock go just the same.
                  */
-                const uint32_t did = serve_poured_class(dev, pd);
-                if (did > 0u) {
-                    s_pour_periods++;
-                    s_pour_bytes += did;
-                } else {
-                    s_pour_lost++;
+                if (s_scr.r == s_scr.w) {
+                    (void)ag_port_notify_take(true, 1);
                 }
-                s_ring_r = (s_ring_r + 1u) % RD_RING;
                 continue;
             }
-            const uint32_t len = keep_pace(pd);
-            /*
-             * All of the period, waiting for room.  A converter's write does
-             * not wait (audio_hw.c says why: its caller may hold the registry)
-             * and takes what fits - so a period that arrived in a burst of
-             * frames found the converter full and was counted lost whole: a
-             * third of the C3's sound on the CYD, with the wire perfect.  This
-             * task holds nothing, so it is the one place that CAN wait; a
-             * period is 10-12 ms, and after 40 without room the rest is given
-             * up on rather than delaying every period behind it.
-             */
-            uint32_t done = 0;
-            for (int waited = 0; done < len && waited < 40;) {
-                const int32_t n = ag_dev_write(dev, pd->data + done,
-                                               len - done, pd->off + done);
-                if (n < 0) {
-                    break;
-                }
-                if (n == 0) {
-                    ag_port_task_delay(ag_port_ms_to_ticks(1));
-                    waited++;
-                    continue;
-                }
-                done += (uint32_t)n;
-            }
-            if (done > 0) {
-                s_pour_periods++;
-                s_pour_bytes += done;
-            }
-            if (done < len) {
-                s_pour_lost++;
-                s_pour_short++;
-            }
-        } else {
-            /*
-             * Nothing to write it to.  Said once, by name of the handle: a
-             * period with no session is not a wire fault and not a converter
-             * fault, it is an open that did not happen or did not survive, and
-             * the three are indistinguishable from a count of losses alone.
-             */
-            if (!s_no_sink_said) {
-                ag_log(AG_LOG_WARN, TAG,
-                       "poured sound has nowhere to go: no open device for "
-                       "handle %u", (unsigned)pd->handle);
-                s_no_sink_said = true;
-            }
-            s_pour_lost++;
+            full = true;
         }
-        s_pour_last_ms = (uint32_t)(ag_port_us() / 1000);
-        s_pour_said = false;
-        s_ring_r = (s_ring_r + 1u) % RD_RING;
-        /*
-         * A TICK BETWEEN PERIODS, for everybody else who wants the device.
-         * Writing without a pause, this task let the device's lock go and took
-         * it again before a waiter below it could run - and the waiter was the
-         * worker opening the same converter for the node that asked: it
-         * waited out the asker's patience every time (lockwatch: "held 30 s
-         * by 'rdevpour'").  A period is six milliseconds of sound; the ring
-         * holds ten of them.
-         */
-        ag_port_task_delay(1);
+        if (busy) {
+            continue;
+        }
+        if (full) {
+            /* the converter plays a millisecond; a rectangle wakes us sooner */
+            (void)ag_port_notify_take(true, 1);
+            continue;
+        }
+        /* Woken by the next period, and on the clock anyway so the end of a
+         * burst gets its line without anything having to notice. */
+        ag_port_notify_take(true, ag_port_ms_to_ticks(100));
+        pour_report();
+        glass_back_if_quiet();
+        screen_report();
     }
 }
 
@@ -1691,6 +1890,33 @@ static void pour_task(void *arg)
 #define RD_GLASS_QUIET_US 1500000
 static bool    s_glass_lent;
 static int64_t s_glass_last_us;
+/*
+ * THE CONSOLE DREW OVER THE NEIGHBOUR'S PICTURE, and the neighbour has to be
+ * told.  Its painter sends only what changed against what it believes this
+ * screen shows; after the glass went back to the console for a pause longer
+ * than RD_GLASS_QUIET_US it believed wrong, and every pass after drew a
+ * moving square's new edges on a screen of text: white, with pieces of noise
+ * and a square the wrong colour (26 Sep 2026, Maxim watching).  The next
+ * "pass painted" answer carries RD_PAINTED_LOST, and the painter sends every
+ * row again.
+ */
+#define RD_PAINTED_LOST 1
+static volatile bool s_glass_owed;
+/*
+ * AND ANY PIECE OF THE PICTURE NOT DRAWN owes the same: a message dropped
+ * from a full queue, one the panel refused, one that could not be read to
+ * its end.  The painter believes it arrived, so without this the part of the
+ * screen it covered stays wrong until those pixels happen to change - and a
+ * still background never does.  Counted (s_scr_lost), so the screen report
+ * says so.
+ */
+static uint32_t s_scr_lost;
+
+static void screen_lost(void)
+{
+    s_scr_lost++;
+    s_glass_owed = true;
+}
 
 /*
  * What this screen does with a neighbour's picture, a second at a time: the
@@ -1699,7 +1925,105 @@ static int64_t s_glass_last_us;
  * The painter's own report says what was SENT; this is what arrived.
  */
 static uint32_t s_scr_passes, s_scr_msgs, s_scr_px, s_scr_ring_max;
+/* this second: the longest wait between two passes, and between two periods
+ * of sound, and the fullest the sound queue got */
+static int64_t  s_scr_pass_at, s_scr_gap_max, s_snd_at, s_snd_gap_max;
+static uint32_t s_snd_q_max;
+/* the same since the board started, for `link` */
+static int64_t  s_all_gap_max, s_all_snd_gap_max;
+static uint32_t s_all_passes, s_all_snd_q_max;
+/*
+ * THE SECOND-BY-SECOND REPORT IS ASKED FOR, NOT GIVEN (27 Sep 2026).  A
+ * journal line waits for the console, and the CYD's console is a UART at
+ * 115 200: while it printed, the task that feeds the converter waited with
+ * it, and the sound queue overflowed once in every sixteen seconds - exactly
+ * as often as the measuring script asked for the journal.  `link report on`
+ * turns it on; `link` shows the totals without it.
+ */
+static volatile bool s_report;
+
+void ag_noderdev_report(bool on)
+{
+    s_report = on;
+}
+
+void ag_noderdev_screen_counts(uint32_t *passes, uint32_t *lost,
+                               uint32_t *gap_ms, uint32_t *snd_gap_ms,
+                               uint32_t *snd_q_max, uint32_t *snd_q_cap)
+{
+    *passes = s_all_passes;
+    *lost = s_scr_lost;
+    *gap_ms = (uint32_t)(s_all_gap_max / 1000);
+    *snd_gap_ms = (uint32_t)(s_all_snd_gap_max / 1000);
+    *snd_q_max = s_all_snd_q_max;
+    *snd_q_cap = RD_SND - 1u;
+}
 static int64_t  s_scr_us, s_scr_said_us;
+
+/*
+ * THE ANSWER GOES OUT FROM A TASK OF ITS OWN.  Sent from the pour task, it
+ * waited up to 20 ms for room on the wire back, and the pour task is the one
+ * that feeds the converter: with every pass answered that way the CYD threw
+ * away 285 periods of sound in a minute, where it had thrown away 30.  The
+ * pour task only posts it here and goes on.
+ */
+#define RD_ACKS 4u
+
+typedef struct {
+    int32_t  wire;
+    uint16_t from;
+    uint16_t tag;
+    bool     lost;
+} rd_ack_t;
+
+static rd_ack_t          s_ack[RD_ACKS];
+static volatile uint32_t s_ack_w, s_ack_r;
+static ag_port_task_t    s_acker;
+
+static void acker_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        while (s_ack_r != s_ack_w) {
+            const rd_ack_t a = s_ack[s_ack_r % RD_ACKS];
+            s_ack_r++;
+            reply_to(a.wire, a.from, RD_PAINTED, a.tag,
+                     a.lost ? RD_PAINTED_LOST : 0, AG_LINK_CONTROL, NULL, 0);
+        }
+        ag_port_notify_take(true, ag_port_ms_to_ticks(100));
+    }
+}
+
+/* A pass's marker, reached: every message of the pass is on the glass. */
+static void pour_pass_drawn(const rd_period_t *pd)
+{
+    s_scr_passes++;
+    const int64_t now = ag_port_us();
+    s_all_passes++;
+    if (s_scr_pass_at != 0 && now - s_scr_pass_at > s_all_gap_max) {
+        s_all_gap_max = now - s_scr_pass_at;
+    }
+    if (s_scr_pass_at != 0 && now - s_scr_pass_at > s_scr_gap_max) {
+        s_scr_gap_max = now - s_scr_pass_at;
+    }
+    s_scr_pass_at = now;
+    const bool lost = s_glass_owed;
+    s_glass_owed = false;
+    if (s_acker == NULL &&
+        !ag_proc_task_create(acker_task, "rdevack", 2048, NULL, 6,
+                             AG_PORT_ANY_CORE, &s_acker)) {
+        /* no task: answered here, as it was, rather than not at all */
+        reply_to(pd->wire, pd->from, RD_PAINTED, pd->tag,
+                 lost ? RD_PAINTED_LOST : 0, AG_LINK_CONTROL, NULL, 0);
+        return;
+    }
+    if (s_ack_w - s_ack_r >= RD_ACKS) {
+        return; /* four behind: the painter's wait will cover this one */
+    }
+    s_ack[s_ack_w % RD_ACKS] = (rd_ack_t){pd->wire, pd->from, pd->tag, lost};
+    s_ack_w++;
+    ag_port_notify_give(s_acker);
+}
 
 static void screen_report(void)
 {
@@ -1711,17 +2035,37 @@ static void screen_report(void)
     if (now - s_scr_said_us < 1000000) {
         return;
     }
-    if (s_scr_msgs != 0u || s_scr_passes != 0u) {
+    const bool screen = s_report &&
+                        (s_scr_msgs != 0u || s_scr_passes != 0u ||
+                         s_scr_raw != 0u || s_scr_text != 0u ||
+                         s_scr_asked != 0u);
+    if (screen) {
         const uint32_t ms = (uint32_t)((now - s_scr_said_us) / 1000);
         ag_log(AG_LOG_INFO, TAG,
                "screen: %u passes in %u ms, %u messages, %u px, %u ms of it "
-               "drawing, ring up to %u of %u",
+               "drawing, queue up to %u of %u, %u not drawn so far",
                (unsigned)s_scr_passes, (unsigned)ms, (unsigned)s_scr_msgs,
                (unsigned)s_scr_px, (unsigned)(s_scr_us / 1000),
-               (unsigned)s_scr_ring_max, (unsigned)RD_RING);
+               (unsigned)s_scr_ring_max, (unsigned)(RD_SCR - 1u),
+               (unsigned)s_scr_lost);
+    }
+    /* apart, because a journal line has a length and the first one had
+     * grown past it; and for sound alone too */
+    if (s_report && (screen || s_snd_gap_max != 0 || s_snd_q_max != 0u)) {
+        ag_log(AG_LOG_INFO, TAG,
+               "timing: passes up to %u ms apart, sound up to %u ms apart, "
+               "its queue up to %u of %u; besides the picture %u raw, %u "
+               "text, %u asked",
+               (unsigned)(s_scr_gap_max / 1000), (unsigned)(s_snd_gap_max / 1000),
+               (unsigned)s_snd_q_max, (unsigned)(RD_SND - 1u),
+               (unsigned)s_scr_raw, (unsigned)s_scr_text,
+               (unsigned)s_scr_asked);
     }
     s_scr_said_us = now;
     s_scr_passes = s_scr_msgs = s_scr_px = s_scr_ring_max = 0u;
+    s_scr_raw = s_scr_text = s_scr_asked = 0u;
+    s_scr_gap_max = s_snd_gap_max = 0;
+    s_snd_q_max = 0u;
     s_scr_us = 0;
 }
 
@@ -1740,6 +2084,7 @@ static void glass_back_if_quiet(void)
     if (s_glass_lent && ag_port_us() - s_glass_last_us > RD_GLASS_QUIET_US) {
         s_glass_lent = false;
         ag_textpanel_enable(true);
+        s_glass_owed = true;
         ag_log(AG_LOG_INFO, TAG, "the neighbour stopped drawing; the screen "
                                  "is this board's again");
     }
@@ -1753,6 +2098,7 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
 
     switch (pd->op) {
     case RD_BLIT: {
+        s_scr_raw++;
         if (d == NULL || d->blit_rect == NULL || plen < RD_BLIT_HDR) {
             return 0;
         }
@@ -1784,6 +2130,7 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
         return px;
     }
     case RD_TEXTROW: {
+        s_scr_text++;
         if (d == NULL || d->text_row == NULL || plen < 4u) {
             return 0;
         }
@@ -1801,6 +2148,7 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
         return (uint32_t)cnt * sizeof(ag_textcell_t);
     }
     case RD_TEXTCUR: {
+        s_scr_text++;
         if (d == NULL || d->text_cursor == NULL || plen < 5u) {
             return 0;
         }
@@ -1820,14 +2168,29 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
 static void take_period(const uint8_t *b, uint16_t n)
 {
     if (s_ring_mem == NULL) {
-        s_ring_mem = (uint8_t *)ag_port_alloc((size_t)RD_RING * RD_POUR_CAP,
-                                              AG_MEM_BYTE);
+        /*
+         * Twenty kilobytes, out of PSRAM where there is any.  Taken from
+         * internal memory on the Zero it was the last of it, and the
+         * converter these periods are for could then not have the 4 KB its
+         * DMA descriptors need: sound arrived and nothing played (26 Sep
+         * 2026).  A period is copied out of here once; PSRAM is fast enough.
+         */
+        const size_t bytes = (size_t)RD_SND * RD_SND_CAP +
+                             (size_t)RD_SCR * RD_POUR_CAP;
+        s_ring_mem = (uint8_t *)ag_port_alloc(bytes,
+                                              AG_MEM_SLOW | AG_MEM_BYTE);
+        if (s_ring_mem == NULL) {
+            s_ring_mem = (uint8_t *)ag_port_alloc(bytes, AG_MEM_BYTE);
+        }
         if (s_ring_mem == NULL) {
             s_pour_lost++;
             return;
         }
         for (uint32_t i = 0; i < RD_RING; i++) {
-            s_ring[i].data = s_ring_mem + (size_t)i * RD_POUR_CAP;
+            s_ring[i].data =
+                (i < RD_SND) ? s_ring_mem + (size_t)i * RD_SND_CAP
+                             : s_ring_mem + (size_t)RD_SND * RD_SND_CAP +
+                                   (size_t)(i - RD_SND) * RD_POUR_CAP;
         }
     }
     if (s_pour_task == NULL) {
@@ -1837,8 +2200,12 @@ static void take_period(const uint8_t *b, uint16_t n)
          * possibility.  Below applications, like every other task this file's
          * neighbours make.
          */
-        if (!ag_port_task_create(pour_task, "rdevpour", 3072, NULL, 1,
-                                 AG_PORT_ANY_CORE, 0, &s_pour_task)) {
+        /* 4 KB: at 3 it had 260 bytes left on the Zero (`mem /t`). */
+        /* internal memory, else PSRAM, as the server's workers: on an
+         * emulated S3 there were not 4 KB inside, the task was never made,
+         * and every period poured at it was lost (nodetest, 27 Sep 2026) */
+        if (!ag_proc_task_create(pour_task, "rdevpour", 4096, NULL, 1,
+                                 AG_PORT_ANY_CORE, &s_pour_task)) {
             s_pour_lost++;
             return;
         }
@@ -1846,49 +2213,73 @@ static void take_period(const uint8_t *b, uint16_t n)
                ag_node_peer_name() != NULL ? ag_node_peer_name() : "the wire");
     }
 
-    uint32_t next = (s_ring_w + 1u) % RD_RING;
-    /*
-     * Sound waits a little too.  A period arriving at a full ring is part of
-     * a burst - a frame of the link carries several - and the converter is
-     * draining the ring at its own rate as this runs, so a few milliseconds
-     * make room for it where dropping it made a hole in what is heard.
-     */
-    for (int k = 0; k < 20 && next == s_ring_r && b[0] == RD_WRITE; k++) {
-        ag_port_task_delay(1);
-        next = (s_ring_w + 1u) % RD_RING;
+    rd_q_t *const q = (b[0] == RD_WRITE) ? &s_snd : &s_scr;
+    if (q == &s_snd) {
+        const int64_t now = ag_port_us();
+        if (s_snd_at != 0 && now - s_snd_at > s_all_snd_gap_max) {
+            s_all_snd_gap_max = now - s_snd_at;
+        }
+        if (q_used(q) > s_all_snd_q_max) {
+            s_all_snd_q_max = q_used(q);
+        }
+        if (s_snd_at != 0 && now - s_snd_at > s_snd_gap_max) {
+            s_snd_gap_max = now - s_snd_at;
+        }
+        s_snd_at = now;
+        if (q_used(q) > s_snd_q_max) {
+            s_snd_q_max = q_used(q);
+        }
     }
-    if (next == s_ring_r && b[0] == RD_BLITZ) {
+    uint32_t      next = (q->w + 1u) % q->n;
+    /*
+     * SOUND DOES NOT WAIT HERE, and it used to - up to 20 ms for room, on the
+     * reader, which is the one task that reads the wire.  The sender keeps
+     * 30 ms of sound ahead and the queue holds about 36, so it was nearly
+     * always full: the reader spent its time asleep in here, and everything
+     * else on the wire waited with it - the painter's "pass painted" answers
+     * most of all, which the painter waits for before its next pass.  With
+     * sound going, a square drawn 63 times a second alone was drawn 3 times
+     * (26 Sep 2026).  A period that finds the queue full is dropped and
+     * counted, which is what the stream class is for.
+     */
+    if (next == q->r && (b[0] == RD_BLITZ || b[0] == RD_PAINTED)) {
         /*
          * A screen kept by what changed cannot miss a change: this waits for
          * the pour task, and the wire waits behind it - which is the screen
          * being slower than the wire, said as back-pressure.
          */
-        for (int k = 0; k < 1000 && next == s_ring_r; k++) {
+        for (int k = 0; k < 1000 && next == q->r; k++) {
             ag_port_task_delay(1);
-            next = (s_ring_w + 1u) % RD_RING;
+            next = (q->w + 1u) % q->n;
         }
     }
-    if (next == s_ring_r) {
+    if (next == q->r) {
         s_pour_lost++; /* full: this one missed its moment */
         s_pour_full++;
+        if (q == &s_scr) {
+            screen_lost();
+        }
         return;
     }
-    rd_period_t *pd = &s_ring[s_ring_w];
+    rd_period_t *pd = &q->e[q->w];
     uint16_t     plen = (uint16_t)(n - RD_HDR);
-    if (plen > RD_POUR_CAP) {
-        plen = (uint16_t)RD_POUR_CAP;
+    const uint16_t cap = (q == &s_snd) ? (uint16_t)RD_SND_CAP
+                                       : (uint16_t)RD_POUR_CAP;
+    if (plen > cap) {
+        plen = cap; /* an older sender's longer piece: its tail is gone */
+        s_pour_short++;
     }
     memcpy(pd->data, b + RD_HDR, plen);
     pd->len = plen;
     pd->handle = get32(b + 4);
     pd->off = get32(b + 12);
     pd->op = b[0];
-    s_ring_w = next;
-    {
-        const uint32_t q = (s_ring_w + RD_RING - s_ring_r) % RD_RING;
-        if (q > s_scr_ring_max) {
-            s_scr_ring_max = q;
-        }
+    pd->wire = ag_linkprov_current();
+    pd->from = ag_linkprov_from();
+    pd->tag = get16(b + 2);
+    q->w = next;
+    if (q == &s_scr && q_used(q) > s_scr_ring_max) {
+        s_scr_ring_max = q_used(q);
     }
     ag_port_notify_give(s_pour_task);
 }
@@ -1910,14 +2301,37 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
      * in order), and the RD_BLITZ ahead of it were taken into the ring.
      */
     if (b[0] == RD_PAINTED) {
-        s_scr_passes++;
-        reply_to(ag_linkprov_current(), ag_linkprov_from(), RD_PAINTED,
-                 get16(b + 2), 0, AG_LINK_CONTROL, NULL, 0);
+        /*
+         * INTO THE QUEUE BEHIND THE PASS, AND ANSWERED WHEN IT IS DRAWN
+         * (26 Sep 2026).  Answered here, on arrival, it told the painter a
+         * pass was over while it was still waiting to be drawn, so the
+         * painter went on at the pace of the wire and not of this screen:
+         * the CYD draws about 157 000 pixels a second, and 62 passes of a
+         * moving square are 155 000 - the picture queue stayed full, this
+         * reader waited for room in it, and the sound behind the picture on
+         * the same wire was turned away until the CYD fell silent.  Answered
+         * from the queue, the painter runs at the speed the glass is drawn.
+         */
+#if RD_ACK_WHEN_DRAWN
+        take_period(b, n);
+#else
+        {
+            rd_period_t now_pd;
+            memset(&now_pd, 0, sizeof(now_pd));
+            now_pd.wire = ag_linkprov_current();
+            now_pd.from = ag_linkprov_from();
+            now_pd.tag = get16(b + 2);
+            pour_pass_drawn(&now_pd); /* on arrival, as before */
+        }
+#endif
         return;
     }
     if (b[0] == (uint8_t)(RD_PAINTED | RD_REPLY)) {
         s_paint_acked = get16(b + 2);
         s_paint_heard = true; /* this screen answers: wait for it from now */
+        if ((int32_t)get32(b + 4) == RD_PAINTED_LOST) {
+            rdp_forget(); /* its console drew over it: all of it again */
+        }
         return;
     }
 
@@ -2019,6 +2433,7 @@ static uint8_t s_owner_tok[RD_SRCS];
 static bool    s_attached_on[RD_SRCS];
 static int32_t s_far_wire[RD_FAR];
 static char    s_far_name[RD_FAR][AG_NODE_NAME_MAX];
+static uint8_t s_far_starts[RD_FAR]; /* as told when last attached */
 /*
  * When a far node's devices last failed to attach, and so when to ask again.
  * The cluster's list of far nodes comes every two seconds and each one is a
@@ -2457,7 +2872,7 @@ static void want_src(int32_t src)
     }
 }
 
-void ag_noderdev_far_named(int32_t via, const char *name)
+void ag_noderdev_far_named(int32_t via, const char *name, uint8_t starts)
 {
     if (!s_auto || via < 0 || via >= (int32_t)AG_LINK_WIRES || name == NULL ||
         name[0] == '\0' || strlen(name) >= AG_NODE_NAME_MAX) {
@@ -2466,6 +2881,17 @@ void ag_noderdev_far_named(int32_t via, const char *name)
     int free_slot = -1;
     for (int k = 0; k < RD_FAR; k++) {
         if (strcmp(s_far_name[k], name) == 0) {
+            if (s_far_wire[k] == via && s_far_starts[k] != starts &&
+                s_attached_on[(int32_t)AG_LINK_WIRES + k]) {
+                /* it started over: what it lent is gone, attach it again */
+                ag_log(AG_LOG_INFO, TAG,
+                       "%s started over; its devices again", name);
+                s_far_starts[k] = starts;
+                s_attached_on[(int32_t)AG_LINK_WIRES + k] = false;
+                s_far_failed[k] = false;
+                want_src((int32_t)AG_LINK_WIRES + k);
+                return;
+            }
             if (s_far_wire[k] == via &&
                 (s_attached_on[(int32_t)AG_LINK_WIRES + k] ||
                  s_att_wire == (int32_t)AG_LINK_WIRES + k ||
@@ -2494,5 +2920,6 @@ void ag_noderdev_far_named(int32_t via, const char *name)
     }
     ag_strlcpy(s_far_name[free_slot], name, sizeof(s_far_name[free_slot]));
     s_far_wire[free_slot] = via;
+    s_far_starts[free_slot] = starts;
     want_src((int32_t)AG_LINK_WIRES + free_slot);
 }

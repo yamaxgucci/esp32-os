@@ -153,10 +153,31 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
     head[1] = chan;
     put16(head + 2, dst);
     put16(head + 4, src);
+    /*
+     * WHOLE, AND WAITED FOR WITHOUT THE LOCK.  The lock is held only while a
+     * message is copied in, never while room is awaited, so a sender of
+     * sound is not stood behind a picture that is waiting for the wire to
+     * drain (see AG_SPILINK_WHOLE).  Bulk yields: it goes only when room for
+     * somebody else's message is left behind it.  Stream is one attempt, as
+     * it always was: late sound is worse than none.
+     */
+    const uint32_t how = stream ? AG_SPILINK_WHOLE
+                         : (cls == AG_LINK_BULK)
+                             ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE |
+                                AG_SPILINK_YIELD)
+                             : (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE);
+    const uint32_t until = now_ms() + (stream ? 0u : ND_SEND_MS);
+    int32_t        w;
+    for (;;) {
+        TASK->mutex_lock(nd->txlock, UINT32_MAX);
+        w = IO->uart_link_send2(nd->uart, head, ND_HEAD, buf, len, how, 0u);
+        TASK->mutex_unlock(nd->txlock);
+        if (w != -AG_EAGAIN || stream || (int32_t)(now_ms() - until) >= 0) {
+            break;
+        }
+        TASK->sleep_ms(1);
+    }
     TASK->mutex_lock(nd->txlock, UINT32_MAX);
-    const int32_t w = IO->uart_link_send2(
-        nd->uart, head, ND_HEAD, buf, len,
-        stream ? 0u : AG_SPILINK_RELIABLE, stream ? 1u : ND_SEND_MS);
     int32_t r;
     if (w > 0) {
         nd->sent++;

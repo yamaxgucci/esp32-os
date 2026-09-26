@@ -886,6 +886,8 @@ int32_t wl_send(wlink_t *s, const void *buf, size_t len, uint32_t flags,
  * the driver needs no buffer of its own to join them: NODELINK and LINKSPI
  * each kept 4 KB a wire for nothing else (25 Sep 2026).
  */
+#define WL_YIELD_ROOM 1280u
+
 int32_t wl_send2(wlink_t *s, const void *head, size_t hlen, const void *body,
                  size_t blen, uint32_t flags, uint32_t timeout_ms)
 {
@@ -907,6 +909,30 @@ int32_t wl_send2(wlink_t *s, const void *head, size_t hlen, const void *body,
         if (!s->open) {
             unlock(s);
             return -AG_ENODEV;
+        }
+        if ((flags & AG_SPILINK_WHOLE) != 0u) {
+            /*
+             * WHOLE OR NOT AT ALL, and a bulk writer leaves room behind it.
+             * A block begun is a block its writer has to finish, however
+             * long the room takes, and on a wire with two writers - the C3
+             * relaying a picture to the CYD while it sends the CYD its sound -
+             * each waited for the other inside a half-written block: sends of
+             * 91 ms and 53 ms in the same second, the sound arriving in
+             * bursts that overflowed the far queue, a click each (26 Sep
+             * 2026).  Asked this way, nothing is begun that cannot be ended.
+             */
+            uint32_t want = need;
+            if ((flags & AG_SPILINK_YIELD) != 0u) {
+                /* room for one message of sound (a 1 KB period and its
+                 * heads, 1 054 bytes): a third of the ring left the wire to
+                 * the CYD at 447 KB/s of its 748 */
+                want += (s->txcap / 3u < WL_YIELD_ROOM) ? s->txcap / 3u
+                                                        : WL_YIELD_ROOM;
+            }
+            if (ring_space(&s->tx) < want) {
+                unlock(s);
+                return -AG_EAGAIN;
+            }
         }
         if (ring_space(&s->tx) >= WL_REC) {
             /*

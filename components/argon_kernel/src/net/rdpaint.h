@@ -48,6 +48,9 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
 
 /* One payload onto a local screen; the pixels drawn, 0 if it was not one. */
 uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len);
+/* Payloads rdp_draw could not draw to the end: a run it could not read.  The
+ * rest of such a payload is lost, and the screen with it until repainted. */
+uint32_t rdp_draw_faults(void);
 
 /*
  * THE FAR SCREEN'S PACE.  Called by the painter after every pass it sent,
@@ -61,5 +64,11 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len);
  */
 typedef void (*rdp_sync_fn)(uint32_t handle);
 void rdp_set_sync(rdp_sync_fn sync);
+
+/*
+ * The far screen no longer shows what the painter sent: it gave its glass
+ * back to its own console meanwhile.  Every row goes again on the next pass.
+ */
+void rdp_forget(void);
 
 #endif /* ARGON_NET_RDPAINT_H */

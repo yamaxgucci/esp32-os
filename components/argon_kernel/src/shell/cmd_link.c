@@ -341,6 +341,38 @@ static void print_stats(void)
         ag_console_printf("timer   %u ms, round trip not measured yet\n",
                           (unsigned)st.rto_ms);
     }
+    uint32_t relayed = 0, dropped = 0, held = 0;
+    ag_linkprov_relay_counts(&relayed, &dropped, &held);
+    if (relayed != 0u || dropped != 0u) {
+        ag_console_printf("relay   %u moved between neighbours, %u dropped, "
+                          "%u times a wire waited for room\n",
+                          (unsigned)relayed, (unsigned)dropped,
+                          (unsigned)held);
+    }
+    uint32_t sp = 0, sl = 0, sg = 0, ss = 0, sq = 0, sc = 0;
+    ag_noderdev_screen_counts(&sp, &sl, &sg, &ss, &sq, &sc);
+    if (sp != 0u || sl != 0u) {
+        ag_console_printf("screen  %u passes drawn here, %u pieces not drawn, "
+                          "the longest wait between two %u ms\n",
+                          (unsigned)sp, (unsigned)sl, (unsigned)sg);
+    }
+    if (ss != 0u || sq != 0u) {
+        ag_console_printf("sound   the longest wait between two periods %u ms,"
+                          " its queue up to %u of %u\n",
+                          (unsigned)ss, (unsigned)sq, (unsigned)sc);
+    }
+    uint32_t pp = 0, pl = 0, pf = 0, pq = 0;
+    ag_noderdev_pour_counts(&pp, &pl, &pf, &pq);
+    if (pp != 0u || pl != 0u) {
+        ag_console_printf("poured  %u periods here, %u lost (%u to a full queue),"
+                          " %u frames squeezed out\n",
+                          (unsigned)pp, (unsigned)pl, (unsigned)pf,
+                          (unsigned)pq);
+    }
+    ag_console_printf("reader  above applications for 2 ms in 10; ran over "
+                      "%u times, the relay %u\n",
+                      (unsigned)ag_linkprov_reader_overruns(),
+                      (unsigned)ag_linkprov_relay_overruns());
     print_spilink();
 }
 
@@ -637,6 +669,54 @@ static int link_ping(uint32_t count, uint8_t cls)
         return (got * 2u >= count) ? 0 : 1;
     }
     return (got == count) ? 0 : 1;
+}
+
+/*
+ * `link flood <secs> [size] [prio]`: the wire filled with bytes that mean
+ * nothing, to measure it beside whatever else is running.  See the sink in
+ * linkprov.c.  Priority 2 by default: an application's LOW class, so a real
+ * program on this board comes first for the processor.
+ */
+static int link_flood(int argc, char **argv)
+{
+    const uint32_t secs = (argc > 2) ? (uint32_t)atoi(argv[2]) : 10u;
+    const uint32_t size = (argc > 3) ? (uint32_t)atoi(argv[3]) : 0u;
+    const unsigned prio = (argc > 4) ? (unsigned)atoi(argv[4]) : 2u;
+    ag_console_printf("flood: %u s at priority %u to %s\n", (unsigned)secs,
+                      prio, ag_linkprov_active());
+    ag_linkprov_flood_t f;
+    const ag_err_t e = ag_linkprov_flood(((secs == 0u) ? 1u : secs) * 1000u,
+                                         size, prio, &f);
+    if (e != AG_OK) {
+        ag_console_printf("flood: %d\n", (int)e);
+        return 1;
+    }
+    const uint32_t ms = (f.sent_ms == 0u) ? 1u : f.sent_ms;
+    ag_console_printf("sent     %u B in %u frames of %u in %u ms = %u KB/s; "
+                      "the wire was full %u times\n",
+                      (unsigned)f.sent_bytes, (unsigned)f.sent_frames,
+                      (unsigned)f.size, (unsigned)f.sent_ms,
+                      (unsigned)((uint64_t)f.sent_bytes * 1000u / ms / 1024u),
+                      (unsigned)f.full);
+    if (!f.answered) {
+        ag_console_puts("arrived  the far end did not say\n");
+    } else {
+        const uint32_t gms = (f.got_ms == 0u) ? 1u : f.got_ms;
+        ag_console_printf("arrived  %u B in %u frames over %u ms = %u KB/s, "
+                          "by the far end's count\n",
+                          (unsigned)f.got_bytes, (unsigned)f.got_frames,
+                          (unsigned)f.got_ms,
+                          (unsigned)((uint64_t)f.got_bytes * 1000u / gms /
+                                     1024u));
+        ag_console_printf("checked  %u frames out of turn, %u with a wrong "
+                          "byte\n",
+                          (unsigned)f.got_order, (unsigned)f.got_wrong);
+    }
+    print_stats();
+    return (f.answered && f.got_bytes == f.sent_bytes && f.got_order == 0u &&
+            f.got_wrong == 0u)
+               ? 0
+               : 1;
 }
 
 int ag_cmd_link(int argc, char **argv)
@@ -1042,6 +1122,16 @@ int ag_cmd_link(int argc, char **argv)
     if (ag_path_icmp(argv[1], "echo") == 0) {
         const uint32_t s = (argc > 2) ? (uint32_t)atoi(argv[2]) : 20u;
         return link_echo((s == 0) ? 1u : s);
+    }
+    if (ag_path_icmp(argv[1], "report") == 0) {
+        const bool on = argc > 2 && ag_path_icmp(argv[2], "on") == 0;
+        ag_noderdev_report(on);
+        ag_console_printf("the screen's report each second: %s\n",
+                          on ? "on" : "off");
+        return 0;
+    }
+    if (ag_path_icmp(argv[1], "flood") == 0) {
+        return link_flood(argc, argv);
     }
     if (ag_path_icmp(argv[1], "run") == 0) {
         if (argc < 3) {

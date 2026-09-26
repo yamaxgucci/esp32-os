@@ -66,6 +66,13 @@ uint32_t ag_node_peer_cpu_hz(void);
  */
 const char *ag_node_peer_name_at(int32_t wire);
 uint8_t     ag_node_peer_cores_at(int32_t wire);
+/*
+ * The neighbour of the wire in hand has just started (its hello was a
+ * question); and how many times each wire's neighbour has, so a board beyond
+ * it can tell that the handles it holds there are gone (26 Sep 2026).
+ */
+void        ag_node_peer_started(void);
+uint8_t     ag_node_peer_starts_at(int32_t wire);
 uint32_t    ag_node_peer_cpu_hz_at(int32_t wire);
 
 /*

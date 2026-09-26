@@ -10,6 +10,7 @@
 
 #include <argon/clu.h>
 #include <argon/console.h>
+#include <argon/device.h>
 #include <argon/hostfs.h>
 #include <argon/session.h>
 #include <argon/audio.h>
@@ -88,7 +89,7 @@ uint32_t ag_proc_unmet_needs(uint32_t axe_flags)
 #define AG_PROC_HEAP_MIN (16u * 1024u)
 
 /* How long a process is given to leave the kernel before it is killed anyway. */
-#define AG_PROC_KILL_GRACE_MS 500
+#define AG_PROC_KILL_GRACE_MS 2000
 
 /*
  * The table, on the heap from ag_proc_init, and walked only up to s_proc_n -
@@ -567,9 +568,17 @@ static bool holds_kernel_lock(ag_port_task_t task)
     if (task == NULL) {
         return false;
     }
+    /*
+     * AND INSIDE A DRIVER.  A task deleted in a device write leaves that
+     * device's lock held, and whatever the driver held below it: TONE killed
+     * on the C3 in the middle of pouring sound took the lock of the wire to
+     * the CYD with it, and the shell that had asked for the kill never came
+     * back (26 Sep 2026).
+     */
     return ag_console_lock_holder() == (void *)task ||
            ag_storage_vfs_lock_holder() == (void *)task ||
-           ag_hostfs_rpc_holder() == (void *)task;
+           ag_hostfs_rpc_holder() == (void *)task ||
+           ag_dev_task_in_driver((const void *)task);
 }
 
 bool ag_proc_task_in_kernel(ag_port_task_t task)
@@ -1713,11 +1722,13 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
      * kernel lock leaves that lock held forever, and the two locks that matter -
      * the console and the filesystem - are how anything else gets done.
      */
-    for (uint32_t waited = 0; waited < AG_PROC_KILL_GRACE_MS; waited += 10) {
+    /* a millisecond at a time: a program that writes sound is outside the
+     * driver for moments, not for tens of milliseconds */
+    for (uint32_t waited = 0; waited < AG_PROC_KILL_GRACE_MS; waited++) {
         if (!holds_kernel_lock(task)) {
             break;
         }
-        ag_port_task_delay(ag_port_ms_to_ticks(10));
+        ag_port_task_delay(1);
     }
 
     lock();

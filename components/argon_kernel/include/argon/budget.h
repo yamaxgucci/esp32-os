@@ -87,6 +87,18 @@ bool ag_budget_service(void);
 bool ag_budget_report(uint32_t index, const char **name, uint32_t *used_ms,
                       uint32_t *budget_ms, bool *demoted);
 
+/*
+ * `cpu`: count, on every tick of every core, the task that was running.
+ * ag_cpu_sample(true) clears and starts, (false) stops; then the counts are
+ * read per core, a slot at a time, and the handles matched to names by the
+ * caller.  A tick is a millisecond, so a few seconds give a percentage good
+ * to a few tenths.
+ */
+void     ag_cpu_sample(bool on);
+bool     ag_cpu_sampled(int core, uint32_t index, ag_port_task_t *task,
+                        uint32_t *ticks);
+uint32_t ag_cpu_sampled_total(int core, uint32_t *lost);
+
 #ifdef __cplusplus
 }
 #endif

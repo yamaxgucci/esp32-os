@@ -233,4 +233,42 @@ ag_err_t ag_linkprov_info(ag_link_info_t *out);
 /* The same for one wire by index, whichever this call would otherwise mean. */
 ag_err_t ag_linkprov_info_on(int32_t wire, ag_link_info_t *out);
 
+/*
+ * Frames this board moved between two neighbours, frames it had to drop, and
+ * how many times the reader left a wire unread because the queue out had no
+ * room - the back-pressure, counted.
+ */
+/* Windows in which the reader spent its 2 ms and was dropped below
+ * applications for the rest (see READER_PRIO_HIGH in linkprov.c). */
+uint32_t ag_linkprov_reader_overruns(void);
+/* The same for the relay's task, which is on the same terms. */
+uint32_t ag_linkprov_relay_overruns(void);
+
+void ag_linkprov_relay_counts(uint32_t *relayed, uint32_t *dropped,
+                              uint32_t *held);
+
+/*
+ * `link flood`: meaningless bytes into the selected wire for `ms`, as fast as
+ * it takes them, from a task at priority `prio`, in frames of `size` (0 or
+ * too big: the wire's largest).  The far board's sink counts what arrives and
+ * is asked at the end.  A tool for measuring the wire beside real traffic.
+ */
+typedef struct {
+    uint32_t size;        /* bytes a frame                                 */
+    uint32_t sent_bytes;
+    uint32_t sent_frames;
+    uint32_t sent_ms;
+    uint32_t full;        /* times the wire had no room and the flood waited */
+    int32_t  error;
+    bool     answered;    /* the far end said what it got                  */
+    uint32_t got_bytes;
+    uint32_t got_frames;
+    uint32_t got_ms;      /* first frame to last, by the far end's clock   */
+    uint32_t got_order;   /* frames that arrived out of their turn         */
+    uint32_t got_wrong;   /* frames with a byte other than the one sent    */
+} ag_linkprov_flood_t;
+
+ag_err_t ag_linkprov_flood(uint32_t ms, uint32_t size, unsigned prio,
+                           ag_linkprov_flood_t *out);
+
 #endif /* ARGON_LINKPROV_H */

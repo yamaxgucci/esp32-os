@@ -116,7 +116,7 @@ static volatile int32_t  s_job_wire = -1;
 #define NC_PEERS_MS 2000u      /* how often the list is sent */
 #define NC_PEERS_TTL_MS 10000u /* silence for this long forgets one */
 #define NC_PEERS_MAX_HOPS 2u   /* told about, then told on - and no further */
-#define NC_PEER_REC_MAX 16u    /* name_len + name + cores + hops + hz  */
+#define NC_PEER_REC_MAX 17u    /* name_len + name + cores + hops + hz + starts */
 /*
  * Room for one list: this board, its other neighbours, and what it was told.
  * Sized from the worst case rather than the bench, or the last records would
@@ -130,6 +130,7 @@ typedef struct {
     uint8_t  cores;
     uint8_t  hops;
     uint32_t cpu_hz;
+    uint8_t  starts;  /* how many times it has started over, as told */
     int32_t  via;     /* MY wire index this was heard through */
     uint32_t seen_ms; /* when a neighbour last said it, for ageing */
 } nc_peer_t;
@@ -556,13 +557,13 @@ static int32_t wire_of_name(const char *name)
 /* One record into `buf`.  False when it does not fit or the name is unusable. */
 static bool put_peer_rec(uint8_t *buf, uint32_t cap, uint32_t *at,
                          const char *name, uint8_t cores, uint8_t hops,
-                         uint32_t cpu_hz)
+                         uint32_t cpu_hz, uint8_t starts)
 {
     const size_t n = strlen(name);
     if (n == 0 || n >= AG_NODE_NAME_MAX) {
         return false;
     }
-    if (*at + 1u + n + 1u + 1u + 4u > cap) {
+    if (*at + 1u + n + 1u + 1u + 4u + 1u > cap) {
         return false;
     }
     buf[(*at)++] = (uint8_t)n;
@@ -574,6 +575,15 @@ static bool put_peer_rec(uint8_t *buf, uint32_t cap, uint32_t *at,
     buf[(*at)++] = (uint8_t)((cpu_hz >> 8) & 0xffu);
     buf[(*at)++] = (uint8_t)((cpu_hz >> 16) & 0xffu);
     buf[(*at)++] = (uint8_t)((cpu_hz >> 24) & 0xffu);
+    /*
+     * HOW MANY TIMES IT HAS STARTED OVER, and a board two hops away had no
+     * other way to know.  Its neighbour sees the question of a board that
+     * restarts; the board beyond saw the same name in the next list and went
+     * on writing into sessions that no longer existed - the CYD reset alone
+     * and the Zero's picture went nowhere, 0 of 5 000 messages drawn
+     * (26 Sep 2026).
+     */
+    buf[(*at)++] = starts;
     return true;
 }
 
@@ -600,7 +610,7 @@ static void send_peers(int32_t wire, uint32_t now, const nc_peer_t *learned,
     if (me == NULL || me[0] == '\0') {
         return;
     }
-    (void)put_peer_rec(buf + AG_CLUF_HDR, cap, &at, me, 0u, 0u, 0u);
+    (void)put_peer_rec(buf + AG_CLUF_HDR, cap, &at, me, 0u, 0u, 0u, 0u);
 
     /* My other neighbours: one hop from whoever is reading this. */
     for (int32_t i = 0; i < (int32_t)AG_LINK_WIRES; i++) {
@@ -613,7 +623,8 @@ static void send_peers(int32_t wire, uint32_t now, const nc_peer_t *learned,
         }
         (void)put_peer_rec(buf + AG_CLUF_HDR, cap, &at, n,
                            ag_node_peer_cores_at(i), 1u,
-                           ag_node_peer_cpu_hz_at(i));
+                           ag_node_peer_cpu_hz_at(i),
+                           ag_node_peer_starts_at(i));
     }
 
     /* And what I was told, one hop further out. */
@@ -632,7 +643,7 @@ static void send_peers(int32_t wire, uint32_t now, const nc_peer_t *learned,
             continue; /* a wire of ours appeared; it is told as a neighbour */
         }
         (void)put_peer_rec(buf + AG_CLUF_HDR, cap, &at, p->name, p->cores,
-                           (uint8_t)(p->hops + 1u), p->cpu_hz);
+                           (uint8_t)(p->hops + 1u), p->cpu_hz, p->starts);
     }
 
     const ag_cluf_hdr_t h = { .op = AG_CLUF_PEERS, .flags = 0,
@@ -680,7 +691,7 @@ static void peers_learn(const uint8_t *body, uint32_t len)
 
     while (at + 2u <= len) {
         const uint32_t n = body[at++];
-        if (n == 0 || n >= AG_NODE_NAME_MAX || at + n + 6u > len) {
+        if (n == 0 || n >= AG_NODE_NAME_MAX || at + n + 7u > len) {
             return; /* a record that does not fit: whole ones before it stand */
         }
         char name[AG_NODE_NAME_MAX];
@@ -694,6 +705,7 @@ static void peers_learn(const uint8_t *body, uint32_t len)
                             ((uint32_t)body[at + 2] << 16) |
                             ((uint32_t)body[at + 3] << 24);
         at += 4u;
+        const uint8_t starts = body[at++];
 
         if (!have_via) {
             /*
@@ -757,6 +769,7 @@ static void peers_learn(const uint8_t *body, uint32_t len)
         p->cores = cores;
         p->hops = hops;
         p->cpu_hz = hz;
+        p->starts = starts;
         p->via = via;
         p->seen_ms = now;
         ag_port_mutex_give(s_peerlock);
@@ -766,7 +779,7 @@ static void peers_learn(const uint8_t *body, uint32_t len)
          * heard of while it was restarting would otherwise never be asked.
          */
         (void)fresh;
-        ag_noderdev_far_named(via, name);
+        ag_noderdev_far_named(via, name, starts);
     }
 }
 

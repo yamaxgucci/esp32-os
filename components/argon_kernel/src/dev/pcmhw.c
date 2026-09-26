@@ -26,6 +26,7 @@
 #include "argon/log.h"
 
 #include <argon/port/audio.h>
+#include <argon/port/time.h>
 
 /*
  * Nothing at all where the build has no output.
@@ -68,14 +69,39 @@ static void hw_close(void)
     }
 }
 
+/*
+ * A FAILED START IS NOT TRIED AGAIN ON THE NEXT WRITE.  A write comes every
+ * period, and a converter that cannot start - no DMA memory for its
+ * descriptors - was tried again every six milliseconds, each failure four
+ * lines from the driver below: the Zero spent 64% of a core printing them,
+ * its picture stopped going out, and its console could not be heard over them
+ * (26 Sep 2026).  After a failure the next try waits a second, then two, then
+ * four, up to eight; the writes in between are refused at once.
+ */
+static int64_t  s_retry_us;
+static uint32_t s_backoff_ms;
+
 static ag_err_t hw_open(void)
 {
     if (s_hw_open) {
         return AG_OK;
     }
-    if (!ag_port_audio_open(s_fmt.rate, s_fmt.channels)) {
+    const int64_t now = ag_port_us();
+    if (s_retry_us != 0 && now < s_retry_us) {
         return -AG_EIO;
     }
+    if (!ag_port_audio_open(s_fmt.rate, s_fmt.channels)) {
+        s_backoff_ms = (s_backoff_ms == 0u) ? 1000u
+                       : (s_backoff_ms < 8000u) ? s_backoff_ms * 2u
+                                                : 8000u;
+        s_retry_us = now + (int64_t)s_backoff_ms * 1000;
+        ag_log(AG_LOG_WARN, TAG,
+               "the converter would not start (no DMA memory?); trying again "
+               "in %u ms", (unsigned)s_backoff_ms);
+        return -AG_EIO;
+    }
+    s_retry_us = 0;
+    s_backoff_ms = 0;
     s_hw_open = true;
     return AG_OK;
 }

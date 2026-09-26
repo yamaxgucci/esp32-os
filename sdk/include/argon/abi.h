@@ -1860,6 +1860,15 @@ typedef struct {
 #define AG_SPILINK_BLOCKS 4u
 /* spi_link_send: send this block again if it is lost or damaged */
 #define AG_SPILINK_RELIABLE 1u
+/*
+ * ... and (26 Sep 2026, kernels before ignore them) take it only if all of it
+ * fits now, answering -AG_EAGAIN at once otherwise - so a writer waiting for
+ * room holds nothing while it waits; and YIELD: only if room is left after it
+ * for another writer's message, a third of the transmit ring.  Bulk yields,
+ * so sound and control never wait behind a picture or a file.
+ */
+#define AG_SPILINK_WHOLE    2u
+#define AG_SPILINK_YIELD    4u
 /* ag_spilink_block_t.flags: blocks no..last were lost and not sent again */
 #define AG_SPILINK_LOST 0x80u
 

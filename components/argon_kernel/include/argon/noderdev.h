@@ -72,7 +72,22 @@ void ag_noderdev_peer_named(int32_t wire, bool again);
 /* A node beyond a neighbour, heard of through wire `via` (the cluster's list
  * of far nodes): its devices too, addressed to it, the neighbour passing them
  * on. */
-void ag_noderdev_far_named(int32_t via, const char *name);
+void ag_noderdev_far_named(int32_t via, const char *name, uint8_t starts);
+
+/* What was poured at this board and what came of it, since it started: the
+ * pour task's own report is said only when a pour pauses, and sound that
+ * never pauses never says it (`link` prints these). */
+void ag_noderdev_pour_counts(uint32_t *periods, uint32_t *lost,
+                             uint32_t *full, uint32_t *paced);
+
+/* `link report on|off`: the screen's second-by-second journal lines. */
+void ag_noderdev_report(bool on);
+/* A neighbour's picture here since the board started: passes drawn, pieces
+ * not drawn, the longest wait between two passes and between two periods of
+ * sound, and the fullest the sound queue got, of how many. */
+void ag_noderdev_screen_counts(uint32_t *passes, uint32_t *lost,
+                               uint32_t *gap_ms, uint32_t *snd_gap_ms,
+                               uint32_t *snd_q_max, uint32_t *snd_q_cap);
 
 #ifdef __cplusplus
 }

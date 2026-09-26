@@ -15,6 +15,7 @@
 
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
+#include <argon/port/time.h>
 
 #include "net/wlink.h"
 #include "proc/proc_internal.h"
@@ -255,10 +256,21 @@ static void relay_drop(unsigned why, uint16_t dst, const char *what)
  * the ten-minute stress), and a request of the C3's own waited behind the
  * relay until its asker gave up (26 Sep 2026).  Now a frame to relay is copied
  * into the outgoing wire's queue and the reader reads on; the relay task
- * waits for room instead.  The reader waits only when a queue is full - the
- * old back-pressure, for traffic faster than the wire out for longer than the
- * queue absorbs.  Order is kept: once anything is queued for a wire,
+ * waits for room instead.  Order is kept: once anything is queued for a wire,
  * everything after it for that wire is queued too.
+ *
+ * A FULL QUEUE STOPS THE READING, IT NEVER DROPS.  The first version waited
+ * 32 ms for room and then threw the frame away, and the frame was already
+ * acknowledged on the wire it came in on - so the Zero believed its picture
+ * delivered and the CYD never saw that piece of it.  A picture is sent as
+ * changes, so one lost piece is wrong pixels for as long as that part of the
+ * screen stays still: a second of the square, then rubbish, then a screen
+ * that looked frozen, as soon as sound shared the CYD's wire (26 Sep 2026).
+ * Now the reader does not take the next frame off a wire at all while a queue
+ * it could be relayed into has no room for one; the frame stays in that
+ * wire's receive ring, the ring fills, and the sender is told "not taken" and
+ * sends it again later - the back-pressure the wire already has, reaching the
+ * origin.  The relay task wakes the reader each time it makes room.
  */
 #define RELAY_Q_BYTES (8u * 1024u)
 #define RELAY_FRAME   4096u
@@ -269,11 +281,29 @@ typedef struct {
     uint32_t r, w, used;
 } relay_q_t;
 
+static void reader_wake(void);
+
 static relay_q_t        s_rq[LINK_WIRES];
 static ag_port_mutex_t  s_rq_lock;
 static ag_port_sem_t    s_rq_wake;
 static ag_port_task_t   s_rq_task;
 static volatile bool    s_rq_failed;
+/* The link's own tasks above applications, on a budget: see the reader's
+ * note, ABOVE APPLICATIONS, ON A BUDGET OF 2 MS IN EVERY 10. */
+#define READER_PRIO_HIGH  6u
+#define READER_PRIO_LOW   1u
+#define READER_WINDOW_US  10000
+#define READER_BUDGET_US  2000
+/* the relay's budget, as the reader's (READER_PRIO_HIGH): its window, what it
+ * spent in it, whether it has been dropped for the rest */
+static volatile int64_t s_rl_window;
+static volatile int64_t s_rl_used;
+static volatile bool    s_rl_low;
+static uint32_t         s_rl_drops;
+static void relay_charge(int64_t began);
+static void relay_lift(void);
+static volatile bool    s_rq_stalled; /* the reader stopped a wire for room  */
+static uint32_t         s_rq_stops;   /* how many times it did               */
 static uint8_t         *s_rq_frame; /* one frame out of a queue, RELAY_FRAME */
 
 static void rq_put(relay_q_t *q, const void *src, uint32_t n)
@@ -296,10 +326,37 @@ static void rq_get(relay_q_t *q, void *dst, uint32_t n)
     q->used -= n;
 }
 
+/*
+ * THE LONGEST SEND OF A RELAYED FRAME, a second at a time: a wire whose
+ * writers wait for each other shows here first (26 Sep 2026).
+ */
+static int64_t  s_rl_max_us, s_rl_said_us;
+static uint32_t s_rl_sends;
+
+static void relay_meter(int64_t took)
+{
+    s_rl_sends++;
+    if (took > s_rl_max_us) {
+        s_rl_max_us = took;
+    }
+    const int64_t now = ag_port_us();
+    if (now - s_rl_said_us >= 1000000) {
+        if (s_rl_said_us != 0) {
+            ag_log(AG_LOG_INFO, "link",
+                   "relay: %u frames sent on, the longest send %u us",
+                   (unsigned)s_rl_sends, (unsigned)s_rl_max_us);
+        }
+        s_rl_said_us = now;
+        s_rl_sends = 0;
+        s_rl_max_us = 0;
+    }
+}
+
 /* One queued frame of wire `i` into the wire, waiting for room.  True if
  * there was one. */
 static bool rq_send_one(int i)
 {
+    const int64_t    began = ag_port_us();
     uint8_t *const   frame = s_rq_frame;
     relay_q_t *const q = &s_rq[i];
     (void)ag_port_mutex_take(s_rq_lock, AG_PORT_FOREVER);
@@ -322,16 +379,22 @@ static bool rq_send_one(int i)
         }
     }
     (void)ag_port_mutex_give(s_rq_lock);
+    relay_charge(began);
     for (;;) {
         held_t h;
         if (!hold(&s_wire[i], &h)) {
             relay_drop(2, a.dst, "the wire out of here has gone");
             return true;
         }
+        const int64_t t0 = ag_port_us();
         const int32_t r = h.ops->send_a(h.dev, chan, frame, take, &a);
         let_go(&h);
+        relay_meter(ag_port_us() - t0);
         if (r >= 0) {
             s_relayed++;
+            if (s_rq_stalled) {
+                reader_wake(); /* room now: a stopped wire can be read */
+            }
             return true;
         }
         if (r != -AG_EAGAIN) {
@@ -356,8 +419,39 @@ static void relay_task(void *arg)
     }
 }
 
-/* Queue a frame for wire `to`; false when there is no queue to put it in, or
- * no room in it after waiting a little - the caller then does as before. */
+/*
+ * May the reader take the next frame off wire `in`?  Not while any queue it
+ * could be relayed into lacks room for the largest frame that wire carries -
+ * which is what makes the wait in relay_queue below one that does not happen.
+ * Asked before the frame is read, so it cannot know where the frame is going
+ * and answers for every other wire: with the one middle board of two wires
+ * that is exact, and with more it stops a wire a little sooner than it had to.
+ */
+static bool relay_room_for(unsigned in, uint32_t frame)
+{
+    if (s_rq_task == NULL) {
+        return true;
+    }
+    const uint32_t need = RELAY_REC + ((frame < RELAY_FRAME) ? frame
+                                                             : RELAY_FRAME);
+    bool room = true;
+    (void)ag_port_mutex_take(s_rq_lock, AG_PORT_FOREVER);
+    for (unsigned j = 0; j < LINK_WIRES; j++) {
+        if (j != in && s_rq[j].mem != NULL &&
+            RELAY_Q_BYTES - s_rq[j].used < need) {
+            room = false;
+        }
+    }
+    (void)ag_port_mutex_give(s_rq_lock);
+    if (!room) {
+        s_rq_stalled = true;
+        s_rq_stops++;
+    }
+    return room;
+}
+
+/* Queue a frame for wire `to`; false when there is no queue to put it in - the
+ * caller then does as before. */
 static bool relay_queue(int32_t to, uint8_t chan, const ag_link_addr_t *a,
                         const uint8_t *buf, uint16_t len)
 {
@@ -369,8 +463,8 @@ static bool relay_queue(int32_t to, uint8_t chan, const ag_link_addr_t *a,
         s_rq_wake = ag_port_sem_new_binary();
         s_rq_frame = (uint8_t *)ag_port_alloc(RELAY_FRAME, AG_MEM_BYTE);
         if (s_rq_lock == NULL || s_rq_wake == NULL || s_rq_frame == NULL ||
-            !ag_proc_task_create(relay_task, "ag_relay", 3072, NULL, 1, 0,
-                                 &s_rq_task)) {
+            !ag_proc_task_create(relay_task, "ag_relay", 3072, NULL,
+                                 READER_PRIO_HIGH, 0, &s_rq_task)) {
             s_rq_failed = true;
             return false;
         }
@@ -394,18 +488,29 @@ static bool relay_queue(int32_t to, uint8_t chan, const ag_link_addr_t *a,
             rq_put(q, hdr, RELAY_REC);
             rq_put(q, buf, len);
             (void)ag_port_mutex_give(s_rq_lock);
+            relay_lift();
             (void)ag_port_sem_give(s_rq_wake);
             return true;
         }
         (void)ag_port_mutex_give(s_rq_lock);
-        if (tries >= LINK_RELAY_TRIES * 4u) {
+        /* Only when relay_room_for was wrong about it, or the wire out has
+         * stopped taking anything at all for two seconds. */
+        if (tries >= 2000u) {
             relay_drop(2, a->dst, "the queue for the wire out of here stayed "
-                                  "full");
+                                  "full for two seconds");
             return true; /* dropped, and said: not for the caller to retry */
         }
         (void)ag_port_sem_give(s_rq_wake);
         ag_port_task_delay(ag_port_ms_to_ticks(1));
     }
+}
+
+void ag_linkprov_relay_counts(uint32_t *relayed, uint32_t *dropped,
+                              uint32_t *held)
+{
+    *relayed = s_relayed;
+    *dropped = s_relay_dropped;
+    *held = s_rq_stops;
 }
 
 static void relay(wire_t *arrived, uint8_t chan, const ag_link_addr_t *a,
@@ -599,9 +704,103 @@ static uint32_t reader_cap(const wire_t *w)
 static const ag_device_t *s_sized[LINK_WIRES];
 static uint32_t           s_cap_of[LINK_WIRES];
 
-/* The kernel links' "your reader has something": wakes this one reader. */
+/*
+ * ABOVE APPLICATIONS, ON A BUDGET OF 2 MS IN EVERY 10 (26 Sep 2026).
+ *
+ * At priority 1 the reader waited for every application to pause, and a
+ * wire's receive ring is three frames: on the CYD, whose cores were 85% and
+ * 67% idle, it still turned the C3 away 709 times in eight seconds, because
+ * a frame arrives every 1.25 ms at 8 Mbaud and the reader shared its core
+ * with the sound task and waited its turn.  On the Zero drawing a game, a
+ * 22 KB file took forty seconds instead of one.
+ *
+ * So it runs above applications, and counts its own time by the clock -
+ * around each message, two readings - rather than on the tick, which cannot
+ * tell 2 ms from 3.  Once it has spent READER_BUDGET_US in a window it drops
+ * itself to READER_PRIO_LOW, where it was before, and is lifted again by the
+ * first frame that arrives after the window has turned: reader_wake runs on
+ * the wire's own task, which is above applications, so a reader starved at
+ * the bottom is not left to lift itself.  A game loses at most 2 ms in any
+ * ten to the wire, never a whole frame at once; Maxim's figure (the default
+ * budgets elsewhere are 20 of 100).
+ */
+/* READER_PRIO_HIGH and the rest: defined with the relay, which is first */
+
+static volatile int64_t s_rd_window;  /* when the current window began   */
+static volatile int64_t s_rd_used;    /* spent in it                     */
+static volatile bool    s_rd_low;     /* dropped for the rest of it      */
+static uint32_t         s_rd_drops;   /* how many windows it overran     */
+
+static void reader_charge(int64_t began)
+{
+    const int64_t now = ag_port_us();
+    if (now - s_rd_window >= READER_WINDOW_US) {
+        s_rd_window = now;
+        s_rd_used = 0;
+    }
+    s_rd_used += now - began;
+    if (!s_rd_low && s_rd_used > READER_BUDGET_US) {
+        s_rd_low = true;
+        s_rd_drops++;
+        ag_port_task_prio_set(s_reader, READER_PRIO_LOW);
+    }
+}
+
+uint32_t ag_linkprov_reader_overruns(void)
+{
+    return s_rd_drops;
+}
+
+/*
+ * THE RELAY, ON THE SAME TERMS (26 Sep 2026).  At priority 1 on the C3 it
+ * waited for TONE's synthesis at 5 on the same core, and every frame of the
+ * Zero's picture it moved to the CYD waited with it: with one pass in flight,
+ * that wait was the picture's frame rate.  It is charged what it does - the
+ * copy out of its queue - and a fixed cost a frame for the send, because a
+ * send that waits for the wire to take it is asleep, not busy.
+ */
+#define RELAY_SEND_COST_US 50
+
+static void relay_charge(int64_t began)
+{
+    const int64_t now = ag_port_us();
+    if (now - s_rl_window >= READER_WINDOW_US) {
+        s_rl_window = now;
+        s_rl_used = 0;
+    }
+    s_rl_used += (now - began) + RELAY_SEND_COST_US;
+    if (!s_rl_low && s_rl_used > READER_BUDGET_US) {
+        s_rl_low = true;
+        s_rl_drops++;
+        ag_port_task_prio_set(s_rq_task, READER_PRIO_LOW);
+    }
+}
+
+/* From the reader, which queues for it: its priority back once its window
+ * has turned. */
+static void relay_lift(void)
+{
+    if (s_rl_low && s_rq_task != NULL &&
+        ag_port_us() - s_rl_window >= READER_WINDOW_US) {
+        s_rl_low = false;
+        ag_port_task_prio_set(s_rq_task, READER_PRIO_HIGH);
+    }
+}
+
+uint32_t ag_linkprov_relay_overruns(void)
+{
+    return s_rl_drops;
+}
+
+/* The kernel links' "your reader has something": wakes this one reader, and
+ * gives it its priority back if its window has turned. */
 static void reader_wake(void)
 {
+    if (s_rd_low && s_reader != NULL &&
+        ag_port_us() - s_rd_window >= READER_WINDOW_US) {
+        s_rd_low = false;
+        ag_port_task_prio_set(s_reader, READER_PRIO_HIGH);
+    }
     const ag_port_sem_t sem = s_wake;
     if (sem != NULL) {
         (void)ag_port_sem_give(sem);
@@ -654,6 +853,7 @@ static void reader_task(void *arg)
 
         /* one message from each wire that has one, none waited for */
         bool got = false;
+        s_rq_stalled = false;
         for (unsigned i = 0; i < LINK_WIRES; i++) {
             wire_t *const w = &s_wire[i];
             if (w->ops == NULL) {
@@ -662,6 +862,9 @@ static void reader_task(void *arg)
             uint8_t        chan = 0;
             ag_link_addr_t from;
             memset(&from, 0, sizeof(from));
+            if (!relay_room_for(i, s_cap_of[i])) {
+                continue; /* left in its ring: see A FULL QUEUE, above */
+            }
             held_t h;
             if (!hold(w, &h)) {
                 continue; /* gone meanwhile */
@@ -670,13 +873,256 @@ static void reader_task(void *arg)
             let_go(&h);
             if (n > 0) {
                 got = true;
+                const int64_t began = ag_port_us();
                 route(w, chan, &from, buf, (uint16_t)n);
+                reader_charge(began);
             }
         }
         if (!got) {
             (void)ag_port_sem_take(s_wake, ag_port_ms_to_ticks(READER_IDLE_MS));
         }
     }
+}
+
+/*
+ * THE SINK, and the flood that fills it (26 Sep 2026).
+ *
+ * A question the cluster could not answer: when a file copy under load took
+ * forty times as long as alone, was it the wire, or the boards at its ends?
+ * Every real service puts its own work between the wire and the number - a
+ * file is read off a card, a picture is decoded and painted - so none of them
+ * measures the wire.  The flood sends bytes that mean nothing as fast as the
+ * wire takes them, from a task at a priority it is given; the sink on the far
+ * board counts them in the reader and does nothing else with them.  What
+ * arrives is then the wire plus the two readers and nothing more, and run
+ * beside a real service it says how much of the wire that service left.
+ *
+ * Always listening, because the board being measured is the busy one, and a
+ * busy board's console is the first thing to stop answering.  The counts
+ * cost two words a frame.
+ */
+#define LINK_CHAN_SINK 9u
+#define SINK_DATA      'D' /* bytes to count                               */
+#define SINK_RESET     '0' /* start counting again                         */
+#define SINK_ASK       '?' /* what has arrived since the reset             */
+#define SINK_ANSWER    'R' /* 'R', bytes, frames, ms first to last, frames
+                            * out of order, frames with a wrong byte       */
+#define SINK_ANSWER_LEN 21u
+
+/*
+ * EVERY FRAME NUMBERED AND EVERY BYTE KNOWN.  A count says the wire carried
+ * as much as was sent; it does not say it carried THAT.  A picture sent as
+ * changes is ruined by one block delivered twice, late or altered while
+ * every counter reads clean, so the sink checks each frame's number against
+ * the last and each byte against the pattern its number makes.
+ */
+static uint8_t sink_byte(uint32_t seq, uint32_t k)
+{
+    return (uint8_t)(seq * 31u + k * 7u + (k >> 8));
+}
+
+static volatile uint32_t s_sink_bytes;
+static volatile uint32_t s_sink_frames;
+static volatile int64_t  s_sink_first_us;
+static volatile int64_t  s_sink_last_us;
+static volatile bool     s_sink_heard; /* an answer came back to a flood   */
+static uint32_t          s_sink_answer[5];
+static uint32_t          s_sink_next;    /* the number the next frame should have */
+static uint32_t          s_sink_order;   /* frames that did not have it           */
+static uint32_t          s_sink_wrong;   /* frames with a byte not the pattern's  */
+
+static void put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void sink_rx(uint8_t chan, const void *buf, uint16_t len, void *ctx)
+{
+    (void)chan;
+    (void)ctx;
+    const uint8_t *p = (const uint8_t *)buf;
+    if (len == 0u) {
+        return;
+    }
+    if (p[0] == (uint8_t)SINK_DATA) {
+        const int64_t now = ag_port_us();
+        if (s_sink_frames == 0u) {
+            s_sink_first_us = now;
+        }
+        s_sink_last_us = now;
+        s_sink_bytes += len;
+        s_sink_frames++;
+        if (len >= 5u) {
+            const uint32_t seq = get32(p + 1);
+            if (seq != s_sink_next) {
+                s_sink_order++;
+            }
+            s_sink_next = seq + 1u;
+            for (uint32_t k = 5; k < len; k++) {
+                if (p[k] != sink_byte(seq, k)) {
+                    s_sink_wrong++;
+                    break;
+                }
+            }
+        }
+    } else if (p[0] == (uint8_t)SINK_RESET) {
+        s_sink_frames = 0u;
+        s_sink_bytes = 0u;
+        s_sink_next = 0u;
+        s_sink_order = 0u;
+        s_sink_wrong = 0u;
+    } else if (p[0] == (uint8_t)SINK_ASK) {
+        uint8_t a[SINK_ANSWER_LEN];
+        a[0] = (uint8_t)SINK_ANSWER;
+        put32(a + 1, s_sink_bytes);
+        put32(a + 5, s_sink_frames);
+        put32(a + 9, (uint32_t)((s_sink_last_us - s_sink_first_us) / 1000));
+        put32(a + 13, s_sink_order);
+        put32(a + 17, s_sink_wrong);
+        /* On the reader, so it goes back to the asker, out the wire the
+         * question came in on; a full window is waited out briefly. */
+        for (int t = 0; t < 50; t++) {
+            if (ag_linkprov_send(LINK_CHAN_SINK, AG_LINK_CONTROL, a,
+                                 sizeof(a)) != -AG_EAGAIN) {
+                break;
+            }
+            ag_port_task_delay(1);
+        }
+    } else if (p[0] == (uint8_t)SINK_ANSWER && len >= SINK_ANSWER_LEN) {
+        s_sink_answer[0] = get32(p + 1);
+        s_sink_answer[1] = get32(p + 5);
+        s_sink_answer[2] = get32(p + 9);
+        s_sink_answer[3] = get32(p + 13);
+        s_sink_answer[4] = get32(p + 17);
+        s_sink_heard = true;
+    }
+}
+
+typedef struct {
+    uint32_t              ms;
+    uint32_t              size;
+    uint8_t              *frame;
+    ag_linkprov_flood_t  *out;
+    ag_port_sem_t         done;
+} flood_job_t;
+
+/* A control message into the selected wire, waiting out a full window. */
+static int32_t flood_say(const void *buf, size_t len)
+{
+    int32_t r = -AG_EAGAIN;
+    for (int t = 0; t < 500 && r == -AG_EAGAIN; t++) {
+        r = ag_linkprov_send(LINK_CHAN_SINK, AG_LINK_CONTROL, buf, len);
+        if (r == -AG_EAGAIN) {
+            ag_port_task_delay(1);
+        }
+    }
+    return r;
+}
+
+static void flood_task(void *arg)
+{
+    flood_job_t *const         j = (flood_job_t *)arg;
+    ag_linkprov_flood_t *const o = j->out;
+    const uint8_t              reset = (uint8_t)SINK_RESET;
+    if (flood_say(&reset, 1u) < 0) {
+        o->error = -AG_EIO;
+    }
+    const int64_t start = ag_port_us();
+    const int64_t until = start + (int64_t)j->ms * 1000;
+    while (o->error == 0 && ag_port_us() < until) {
+        const uint32_t seq = o->sent_frames;
+        put32(j->frame + 1, seq);
+        for (uint32_t k = 5; k < j->size; k++) {
+            j->frame[k] = sink_byte(seq, k);
+        }
+        const int32_t r = ag_linkprov_send(LINK_CHAN_SINK, AG_LINK_BULK,
+                                           j->frame, j->size);
+        if (r >= 0) {
+            o->sent_bytes += j->size;
+            o->sent_frames++;
+        } else if (r == -AG_EAGAIN) {
+            /* The wire is full: the one thing a flood is meant to find. */
+            o->full++;
+            ag_port_task_delay(1);
+        } else {
+            o->error = r;
+        }
+    }
+    o->sent_ms = (uint32_t)((ag_port_us() - start) / 1000);
+    (void)ag_port_sem_give(j->done);
+    ag_port_task_delete(NULL);
+}
+
+ag_err_t ag_linkprov_flood(uint32_t ms, uint32_t size, unsigned prio,
+                           ag_linkprov_flood_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!ag_linkprov_bound()) {
+        return -AG_ENODEV;
+    }
+    ag_link_info_t info;
+    if (ag_linkprov_info_on(ag_linkprov_current(), &info) != AG_OK ||
+        info.mtu < 16u) {
+        return -AG_ENODEV;
+    }
+    if (size == 0u || size > info.mtu) {
+        size = info.mtu;
+    }
+    flood_job_t j = {ms, size, NULL, out, NULL};
+    j.frame = (uint8_t *)ag_port_alloc(size, AG_MEM_BYTE);
+    j.done = ag_port_sem_new_binary();
+    ag_port_task_t t = NULL;
+    if (j.frame == NULL || j.done == NULL) {
+        out->error = -AG_ENOMEM;
+    } else {
+        for (uint32_t i = 0; i < size; i++) {
+            j.frame[i] = (uint8_t)(i * 7u + 1u);
+        }
+        j.frame[0] = (uint8_t)SINK_DATA;
+        out->size = size;
+        if (!ag_port_task_create(flood_task, "ag_flood", 3072, &j, prio,
+                                 AG_PORT_ANY_CORE, 0, &t)) {
+            out->error = -AG_ENOMEM;
+        } else {
+            (void)ag_port_sem_take(j.done, AG_PORT_FOREVER);
+        }
+    }
+    if (j.done != NULL) {
+        ag_port_sem_free(j.done);
+    }
+    if (j.frame != NULL) {
+        ag_port_free(j.frame);
+    }
+    if (out->error != 0) {
+        return (ag_err_t)out->error;
+    }
+    /* What arrived, by the far end's count.  Asked after the last frame, on
+     * the same wire, so the answer is behind every one of them. */
+    s_sink_heard = false;
+    const uint8_t ask = (uint8_t)SINK_ASK;
+    if (flood_say(&ask, 1u) >= 0) {
+        for (int w = 0; w < 300 && !s_sink_heard; w++) {
+            ag_port_task_delay(ag_port_ms_to_ticks(10));
+        }
+    }
+    if (s_sink_heard) {
+        out->answered = true;
+        out->got_bytes = s_sink_answer[0];
+        out->got_frames = s_sink_answer[1];
+        out->got_ms = s_sink_answer[2];
+        out->got_order = s_sink_answer[3];
+        out->got_wrong = s_sink_answer[4];
+    }
+    return AG_OK;
 }
 
 /*
@@ -689,6 +1135,7 @@ static void reader_start(void)
     if (s_reader != NULL) {
         return;
     }
+    (void)ag_linkprov_listen(LINK_CHAN_SINK, sink_rx, NULL);
     if (s_wake == NULL) {
         /* binary: however many wires spoke, one lap reads them all */
         s_wake = ag_port_sem_new_binary();
@@ -699,8 +1146,8 @@ static void reader_start(void)
         }
     }
     wl_rx_notify = reader_wake;
-    /* Priority 1: below every application, for the reason this tree keeps
-     * repeating - a link's task above them took a game from 40 fps to
+    /* Above applications, but only for 2 ms in every 10: see READER_PRIO_HIGH.
+     * A link's task above them WITHOUT a limit took a game from 40 fps to
      * unplayable. */
     /*
      * EIGHT KILOBYTES, AND IT IS NOT A ROUND NUMBER PICKED FOR COMFORT.
@@ -729,8 +1176,8 @@ static void reader_start(void)
      * both nodes sent into a wire nobody read ("no reader task" in the
      * journal, 0 of 24 pings back).
      */
-    if (!ag_proc_task_create(reader_task, "ag_link", 8192, NULL, 1, 0,
-                             &s_reader)) {
+    if (!ag_proc_task_create(reader_task, "ag_link", 8192, NULL,
+                             READER_PRIO_HIGH, 0, &s_reader)) {
         ag_log(AG_LOG_ERROR, "link", "no reader task: nothing will be heard");
     }
 }

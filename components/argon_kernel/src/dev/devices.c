@@ -331,7 +331,12 @@ void ag_dev_lockwatch(void)
  */
 bool ag_dev_in_driver(void)
 {
-    const void *self = ag_port_task_self();
+    return ag_dev_task_in_driver(ag_port_task_self());
+}
+
+/* The same question about another task: may it be deleted where it stands? */
+bool ag_dev_task_in_driver(const void *self)
+{
     if (s_dev_mutex != NULL && ag_port_mutex_holder(s_dev_mutex) == self) {
         return true;
     }

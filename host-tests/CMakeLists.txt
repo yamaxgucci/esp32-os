@@ -421,3 +421,22 @@ else()
     target_compile_options(wlink_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 add_test(NAME wlink_tests COMMAND wlink_tests)
+
+# A neighbour's screen end to end: the painter's passes drawn into a
+# framebuffer that must equal the frame after each (test_rdpaint.c).  Its
+# own executable for the same reason as the one above: the painter's port
+# is stubbed (rdpaint_stub/).
+add_executable(rdpaint_tests
+    test_rdpaint.c
+    "${ARGON_ROOT}/components/argon_kernel/src/net/rdcodec.c")
+target_include_directories(rdpaint_tests BEFORE PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/rdpaint_stub")
+target_include_directories(rdpaint_tests PRIVATE
+    "${ARGON_ROOT}/components/argon_kernel/src"
+    ${ARGON_INCLUDES})
+if(MSVC)
+    target_compile_definitions(rdpaint_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(rdpaint_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME rdpaint_tests COMMAND rdpaint_tests)

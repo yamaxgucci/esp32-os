@@ -42,6 +42,19 @@
  * the next one, which is bigger, and there are fewer of them.
  */
 #define RDP_MIN_PASS_US 16000
+/*
+ * AND AT MOST THIS MUCH IN A PASS (26 Sep 2026).  The first pass is the whole
+ * screen, 76 800 pixels, and the far screen draws them at about the pace of
+ * the wire: for two hundred milliseconds its reader waited on a full picture
+ * queue and read nothing else off the wire - the sound behind it included,
+ * which arrived 60 ms late and overflowed its queue in one burst.  A big
+ * change now goes out over several passes, each short enough to draw in
+ * about 12 ms (4 096 pixels; 8 192 was still 25 ms, and the
+ * sound behind it overflowed); an ordinary pass - a moving square is 2 500 pixels - is never
+ * cut.  The next pass starts where this one stopped, so a picture that
+ * changes everywhere every frame is still sent round, not only at the top.
+ */
+#define RDP_PASS_MAX_PX 4096u
 
 typedef struct {
     uint16_t x0, x1; /* x1 <= x0: nothing */
@@ -78,6 +91,7 @@ static struct {
     uint32_t  len;
 
     uint32_t passes, px_in, bytes_out;
+    uint16_t next_y; /* where a pass cut short goes on from */
     int64_t  said_us;
     uint32_t said_passes, said_px, said_bytes;
     /* the far end's pace: time waited in sync, this second - the total and
@@ -181,18 +195,11 @@ static void report(void)
     s_p.said_bytes = s_p.bytes_out;
 }
 
-static void painter(void *arg)
+/* One pass: every row marked since the last, out of the picture and into
+ * the wire.  Apart from the loop so the host test can make passes itself. */
+static void pass(void)
 {
-    (void)arg;
-    int64_t began = 0;
-    for (;;) {
-        (void)ag_port_sem_take(s_p.wake, ag_port_ms_to_ticks(1000));
-        const int64_t since = ag_port_us() - began;
-        if (began != 0 && since < RDP_MIN_PASS_US) {
-            ag_port_task_delay(ag_port_ms_to_ticks(
-                (uint32_t)((RDP_MIN_PASS_US - since) / 1000) + 1u));
-        }
-        began = ag_port_us();
+    {
         lock();
         const uint16_t w = s_p.w;
         const uint16_t h = s_p.h;
@@ -209,11 +216,37 @@ static void painter(void *arg)
         put16(s_p.msg, w);
         put16(s_p.msg + 2, h);
         s_p.len = RDP_HDR;
-        for (uint32_t y = 0; y < h && ok; y++) {
+        const uint32_t first = (s_p.next_y < h) ? s_p.next_y : 0u;
+        s_p.next_y = 0;
+        for (uint32_t k = 0; k < h && ok; k++) {
+            const uint32_t y = (first + k) % h;
             const uint32_t x0 = s_p.work[y].x0;
             const uint32_t x1 = s_p.work[y].x1;
             if (x1 <= x0) {
                 continue;
+            }
+            if (changed >= RDP_PASS_MAX_PX) {
+                /* the rest of the rows for the next pass, back where the
+                 * presents meanwhile have been marking */
+                lock();
+                for (uint32_t j = k; j < h; j++) {
+                    const uint32_t yy = (first + j) % h;
+                    const span_t   ws = s_p.work[yy];
+                    if (ws.x1 <= ws.x0) {
+                        continue;
+                    }
+                    span_t *const dp = &s_p.dirty[yy];
+                    if (dp->x1 <= dp->x0) {
+                        *dp = ws;
+                    } else {
+                        dp->x0 = (ws.x0 < dp->x0) ? ws.x0 : dp->x0;
+                        dp->x1 = (ws.x1 > dp->x1) ? ws.x1 : dp->x1;
+                    }
+                }
+                unlock();
+                s_p.next_y = (uint16_t)y;
+                (void)ag_port_sem_give(s_p.wake);
+                break;
             }
             any = true;
             const uint16_t *row = s_p.pic + (size_t)y * w;
@@ -256,6 +289,36 @@ static void painter(void *arg)
         }
         report();
     }
+}
+
+static void painter(void *arg)
+{
+    (void)arg;
+    int64_t began = 0;
+    for (;;) {
+        (void)ag_port_sem_take(s_p.wake, ag_port_ms_to_ticks(1000));
+        const int64_t since = ag_port_us() - began;
+        if (began != 0 && since < RDP_MIN_PASS_US) {
+            ag_port_task_delay(ag_port_ms_to_ticks(
+                (uint32_t)((RDP_MIN_PASS_US - since) / 1000) + 1u));
+        }
+        began = ag_port_us();
+        pass();
+    }
+}
+
+void rdp_forget(void)
+{
+    if (s_p.task == NULL || s_p.pic == NULL) {
+        return;
+    }
+    lock();
+    for (uint32_t y = 0; y < s_p.h; y++) {
+        s_p.dirty[y].x0 = 0;
+        s_p.dirty[y].x1 = s_p.w;
+    }
+    unlock();
+    (void)ag_port_sem_give(s_p.wake);
 }
 
 /* The buffers, once, for the first surface's size; false if there is no
@@ -398,6 +461,9 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
 #define RDP_RECT_PX 4096u
 static uint16_t *s_rect;
 static uint16_t  s_rx, s_ry, s_rw, s_rh, s_sw, s_sh;
+static uint32_t  s_draw_faults;
+
+uint32_t rdp_draw_faults(void) { return s_draw_faults; }
 
 static void rect_flush(const ag_display_ops_t *d)
 {
@@ -442,6 +508,7 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
         at += RDP_RUN_HDR;
         if (n == 0u || n > RDP_CHUNK || at + plen > len || y >= h ||
             (uint32_t)x + n > w) {
+            s_draw_faults++;
             break; /* not a run: the rest cannot be trusted either */
         }
         const bool joins = s_rect != NULL && s_rh != 0u && x == s_rx &&
@@ -454,6 +521,7 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
                                    ? s_rect + (size_t)s_rh * n
                                    : line;
         if (rdc_unpack(pay + at, plen, into, n) != plen) {
+            s_draw_faults++;
             break;
         }
         at += plen;

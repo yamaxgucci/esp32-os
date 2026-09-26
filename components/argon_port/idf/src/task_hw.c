@@ -43,6 +43,7 @@ uint32_t ag_port_task_list(ag_port_task_info_t *out, uint32_t max)
             }
             o->stack_unused = (uint32_t)uxTaskGetStackHighWaterMark(t);
             o->prio = (unsigned)uxTaskPriorityGet(t);
+            o->task = t;
         }
         n++;
     }

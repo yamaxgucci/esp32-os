@@ -46,6 +46,9 @@ static char s_name[AG_NODE_NAME_MAX] = "node";
 static char     s_peer[AG_LINK_WIRES][AG_NODE_NAME_MAX];
 static uint8_t  s_peer_cores_at[AG_LINK_WIRES];
 static uint32_t s_peer_cpu_hz_at[AG_LINK_WIRES];
+/* how many times each wire's neighbour has started over, as its questions
+ * say - told on to the boards beyond, which cannot hear them (nodeclu.c) */
+static uint8_t  s_peer_starts_at[AG_LINK_WIRES];
 
 /* The slot this call means: the wire in hand, and 0 when there is no wire at
  * all - so a board that never binds one still has somewhere to put what it
@@ -146,6 +149,19 @@ uint8_t ag_node_peer_cores_at(int32_t wire)
         return 0;
     }
     return s_peer_cores_at[wire];
+}
+
+void ag_node_peer_started(void)
+{
+    s_peer_starts_at[peer_slot()]++;
+}
+
+uint8_t ag_node_peer_starts_at(int32_t wire)
+{
+    if (wire < 0 || (uint32_t)wire >= AG_LINK_WIRES) {
+        return 0;
+    }
+    return s_peer_starts_at[wire];
 }
 
 uint32_t ag_node_peer_cpu_hz_at(int32_t wire)

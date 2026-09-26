@@ -28,6 +28,7 @@
 
 #include <argon/log.h>
 
+#include <argon/port/mem.h>
 #include <argon/port/time.h>
 
 
@@ -56,6 +57,27 @@ typedef struct {
 } slot_t;
 
 static slot_t   s_slots[AG_BUDGET_SLOTS];
+
+/*
+ * `cpu`: every task that was running when a tick landed, counted, per core.
+ * A table per core so that each is written by one core only and a slot is
+ * never claimed by both at once; a task that runs on both cores has a line in
+ * each.  Handles only - a name cannot be read here (see budget_tick) - and
+ * matched to names afterwards, in task context.
+ */
+#define AG_CPU_SLOTS 40u
+
+typedef struct {
+    ag_port_task_t volatile task[AG_CPU_SLOTS];
+    uint32_t volatile       ticks[AG_CPU_SLOTS];
+    uint32_t volatile       total;
+    uint32_t volatile       lost; /* a tick the table had no room for */
+} cpu_table_t;
+
+/* On the heap, the first time `cpu` is asked: 650 bytes of static memory
+ * were more than the S3's window had left (27 Sep 2026). */
+static cpu_table_t *volatile s_cpu;
+static volatile bool         s_cpu_on;
 static uint32_t s_window_tick; /* ticks into the current window            */
 static bool     s_hooked;
 
@@ -89,6 +111,22 @@ static void AG_PORT_IRAM budget_tick(int core, ag_port_task_t running)
                     s_slots[i].fresh = true;
                 }
             }
+        }
+    }
+
+    if (s_cpu_on && s_cpu != NULL && core >= 0 && core < 2) {
+        cpu_table_t *const c = &s_cpu[core];
+        c->total++;
+        uint32_t i = 0;
+        while (i < AG_CPU_SLOTS && c->task[i] != running &&
+               c->task[i] != NULL) {
+            i++;
+        }
+        if (i == AG_CPU_SLOTS) {
+            c->lost++;
+        } else {
+            c->task[i] = running;
+            c->ticks[i]++;
         }
     }
 
@@ -230,6 +268,45 @@ bool ag_budget_service(void)
     }
 
     return changed;
+}
+
+void ag_cpu_sample(bool on)
+{
+    if (on) {
+        s_cpu_on = false;
+        if (s_cpu == NULL) {
+            s_cpu = (cpu_table_t *)ag_port_alloc(2u * sizeof(cpu_table_t),
+                                                 AG_MEM_FAST);
+            if (s_cpu == NULL) {
+                return;
+            }
+        }
+        memset((void *)s_cpu, 0, 2u * sizeof(cpu_table_t));
+    }
+    s_cpu_on = on && s_cpu != NULL;
+}
+
+bool ag_cpu_sampled(int core, uint32_t index, ag_port_task_t *task,
+                    uint32_t *ticks)
+{
+    if (s_cpu == NULL || core < 0 || core >= 2 || index >= AG_CPU_SLOTS ||
+        s_cpu[core].task[index] == NULL) {
+        return false;
+    }
+    *task = s_cpu[core].task[index];
+    *ticks = s_cpu[core].ticks[index];
+    return true;
+}
+
+uint32_t ag_cpu_sampled_total(int core, uint32_t *lost)
+{
+    if (s_cpu == NULL || core < 0 || core >= 2) {
+        return 0;
+    }
+    if (lost != NULL) {
+        *lost = s_cpu[core].lost;
+    }
+    return s_cpu[core].total;
 }
 
 bool ag_budget_report(uint32_t index, const char **name, uint32_t *used_ms,

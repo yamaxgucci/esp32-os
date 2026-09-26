@@ -75,6 +75,14 @@
  * frame is 2 KB a wire; six points of the wire are worth more.
  */
 #define UL_TX_FRAMES 4u
+/*
+ * ...and never less than this many bytes (26 Sep 2026).  A message is now
+ * taken whole or not at all, and bulk leaves room for a message of sound
+ * behind it (AG_SPILINK_WHOLE, _YIELD): in the 4 KB ring of a 1 KB-frame
+ * wire that left room for one 2 KB picture message at a time, and the wire
+ * to the CYD fell from 748 KB/s to 422.  6 KB holds two and the sound.
+ */
+#define UL_TX_MIN_BYTES 6144u
 /* what one DMA read takes at most; the frame finder holds a frame and this */
 #define UL_READ      1024u
 #define UL_READ_MS   20u
@@ -539,7 +547,9 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
     }
     const uint32_t pay = frame - WL_HDR;
     /* UL_TX_FRAMES frames of what is sent and not yet acknowledged */
-    w->txcap = (UL_TX_FRAMES * pay + 3u) & ~3u;
+    w->txcap = (UL_TX_FRAMES * pay < UL_TX_MIN_BYTES)
+                   ? UL_TX_MIN_BYTES
+                   : ((UL_TX_FRAMES * pay + 3u) & ~3u);
     w->rxcap = (3u * pay + 3u) & ~3u;
     u->pcap = frame + UL_READ;
     const size_t dbytes = (size_t)(dma ? UL_TXBUF : 1u) * frame;

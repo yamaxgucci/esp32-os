@@ -83,6 +83,7 @@ typedef struct {
     uint32_t stack_bytes;  /* the whole stack */
     uint32_t stack_unused; /* never touched yet */
     unsigned prio;
+    ag_port_task_t task;   /* the handle, to match against a tick sample */
 } ag_port_task_info_t;
 
 uint32_t ag_port_task_list(ag_port_task_info_t *out, uint32_t max);

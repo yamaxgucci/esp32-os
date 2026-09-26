@@ -214,6 +214,7 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
          * rather than "whoever spoke last".
          */
         ag_node_set_peer_name(name);
+        ag_node_peer_started();
         /* A neighbour that asks has just bound its end - it booted, or it
          * started over - so what it lent before is gone: its devices again. */
         ag_noderdev_peer_named(ag_linkprov_current(), true);

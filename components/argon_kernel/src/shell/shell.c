@@ -450,6 +450,78 @@ static int mem_tasks(void)
     return 0;
 }
 
+/*
+ * `cpu [secs]`: who spends the processor, per core, sampled on the tick.
+ * The question "is it the wire or the board" needs this answer first: a
+ * board whose link tasks never get to run looks exactly like a slow wire.
+ */
+static int cmd_cpu(int argc, char **argv)
+{
+    enum { MAX_TASKS = 48 };
+    const uint32_t secs = (argc > 1) ? (uint32_t)atoi(argv[1]) : 3u;
+    ag_port_task_info_t *t =
+        ag_port_alloc(sizeof(*t) * MAX_TASKS, AG_MEM_BYTE);
+    if (t == NULL) {
+        ag_console_puts("cpu: no memory for the list\n");
+        return 1;
+    }
+    ag_cpu_sample(true);
+    ag_port_task_delay(ag_port_ms_to_ticks(((secs == 0u) ? 1u : secs) * 1000u));
+    ag_cpu_sample(false);
+    uint32_t n = ag_port_task_list(t, MAX_TASKS);
+    if (n > MAX_TASKS) {
+        n = MAX_TASKS;
+    }
+    for (int core = 0; core < 2; core++) {
+        uint32_t       lost = 0;
+        const uint32_t total = ag_cpu_sampled_total(core, &lost);
+        if (total == 0u) {
+            continue;
+        }
+        ag_console_printf("core %d: %u ticks%s\n", core, (unsigned)total,
+                          (lost != 0u) ? " (some not placed)" : "");
+        /* largest first, a few dozen at most: pick the next largest each time */
+        uint32_t done_mask[2] = {0u, 0u};
+        for (;;) {
+            uint32_t best = 0, best_i = 0;
+            bool     any = false;
+            ag_port_task_t task = NULL, best_task = NULL;
+            uint32_t ticks = 0;
+            for (uint32_t i = 0; i < 64u && ag_cpu_sampled(core, i, &task, &ticks);
+                 i++) {
+                if ((done_mask[i / 32u] & (1u << (i % 32u))) == 0u &&
+                    (!any || ticks > best)) {
+                    best = ticks;
+                    best_i = i;
+                    best_task = task;
+                    any = true;
+                }
+            }
+            if (!any) {
+                break;
+            }
+            done_mask[best_i / 32u] |= 1u << (best_i % 32u);
+            const char *name = "(ended)";
+            unsigned    prio = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                if (t[k].task == best_task) {
+                    name = t[k].name;
+                    prio = t[k].prio;
+                }
+            }
+            const uint32_t tenths = (uint32_t)((uint64_t)best * 1000u / total);
+            if (tenths == 0u) {
+                continue;
+            }
+            ag_console_printf("  %3u.%u%%  %-16s prio %u\n",
+                              (unsigned)(tenths / 10u),
+                              (unsigned)(tenths % 10u), name, prio);
+        }
+    }
+    ag_port_free(t);
+    return 0;
+}
+
 static int cmd_mem(int argc, char **argv)
 {
     if (argc > 1 && (strcmp(argv[1], "/t") == 0 ||
@@ -5804,6 +5876,7 @@ static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
     {"mem", "[/t]", "memory usage; /t: every task and its stack", cmd_mem},
+    {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
     {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
      cmd_boot},

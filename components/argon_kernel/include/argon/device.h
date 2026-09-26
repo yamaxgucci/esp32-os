@@ -174,6 +174,8 @@ ag_err_t ag_dev_init(const ag_dev_lock_t *lock);
  * write should be checked against; see caller() in src/dev/io.c.
  */
 bool ag_dev_in_driver(void);
+/* The same for any task: inside a driver, holding what the driver holds. */
+bool ag_dev_task_in_driver(const void *task);
 
 /*
  * Hold the registry across a call into a driver.
