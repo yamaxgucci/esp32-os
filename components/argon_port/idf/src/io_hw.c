@@ -160,8 +160,27 @@ ag_err_t ag_port_gpio_config(int pin, int mode)
     return from_esp(gpio_config(&cfg));
 }
 
+static void spi_drain_all(void);
+
+/*
+ * NOT WHILE A QUEUED WRITE IS STILL GOING OUT.
+ *
+ * A long SPI write returns with its bytes still on the wire (spi_xfer_locked,
+ * 23 Sep), and a panel driver's next move is to drop its data/command pin and
+ * send a command.  Dropped under the tail of a rectangle, it turned pixels
+ * into commands - inversion on and off, a new MADCTL, display off - and the
+ * CYD showed a square that ran across the screen instead of along it, black
+ * one moment and white the next, on white glass (26 Sep 2026).  It hid for
+ * three days because a panel's own full-width bands end on a piece of exactly
+ * 1024 bytes, which goes out polled; a rectangle 56 pixels wide does not.
+ *
+ * So a pin waits for the bus, which is what a driver that saw spi_xfer return
+ * had every right to assume: from its side, the write was over.  Nothing is
+ * queued almost always, and then this is one test per bus.
+ */
 void ag_port_gpio_write(int pin, int level)
 {
+    spi_drain_all();
     (void)gpio_set_level((gpio_num_t)pin, (level != 0) ? 1 : 0);
 }
 
@@ -544,9 +563,10 @@ typedef struct {
      *
      * Anything else that touches the bus reaps this first - see spi_drain.
      */
-    spi_transaction_t tx_trans[2];
-    int               tx_which;
-    bool              tx_busy;
+    spi_transaction_t   tx_trans[2];
+    int                 tx_which;
+    bool                tx_busy;
+    spi_device_handle_t tx_dev; /* the device the queued write is on */
     /* ag_port_spi_xfer_start/finish: the transfers queued, oldest first */
     spi_transaction_t q_trans[2];
     uint8_t           q_head;
@@ -925,11 +945,27 @@ static ag_err_t spi_drain(int bus, spi_device_handle_t dev)
     if (!s_spi[bus].tx_busy) {
         return AG_OK;
     }
+    if (s_spi[bus].tx_dev != NULL) {
+        dev = s_spi[bus].tx_dev; /* its result is queued on its own device */
+    }
     spi_transaction_t *done = NULL;
     const esp_err_t    ae =
         spi_device_get_trans_result(dev, &done, portMAX_DELAY);
     s_spi[bus].tx_busy = false;
     return from_esp(ae);
+}
+
+/* Every bus's queued write out, before a pin changes (ag_port_gpio_write). */
+static void spi_drain_all(void)
+{
+    for (int bus = 1; bus < AG_PORT_SPI_SLOTS; bus++) {
+        if (!s_spi[bus].tx_busy || s_spi[bus].lock == NULL) {
+            continue;
+        }
+        xSemaphoreTakeRecursive(s_spi[bus].lock, portMAX_DELAY);
+        (void)spi_drain(bus, s_spi[bus].tx_dev);
+        xSemaphoreGiveRecursive(s_spi[bus].lock);
+    }
 }
 
 ag_err_t ag_port_spi_xfer_start(int bus, int cs, const void *tx, void *rx,
@@ -1144,6 +1180,7 @@ static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
                 return from_esp(ae);
             }
             s_spi[bus].tx_busy = true;
+            s_spi[bus].tx_dev = dev;
             s_spi[bus].tx_which = w ^ 1;
             return AG_OK;
         }

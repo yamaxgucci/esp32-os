@@ -267,7 +267,24 @@ ag_err_t ag_port_uart_config(int port, const ag_port_uart_cfg_t *cfg)
 
     uart_config_t hw = {0};
     fill(&hw, cfg);
-    return from_esp(uart_param_config(port, &hw));
+    const esp_err_t rc = uart_param_config(port, &hw);
+    if (rc != ESP_OK) {
+        return from_esp(rc);
+    }
+    /*
+     * THE RECEIVE FIFO IS 128 BYTES, and the driver is woken when 120 of them
+     * are full.  The last eight take 10 us at 8 Mbaud and 5 at 16: an interrupt
+     * any later than that and bytes are lost in the FIFO, whole frames with
+     * them - the CYD took 67 KB/s of the C3's 8 Mbaud with 0 bad frames and
+     * hundreds missing, where the same wires carried 786 KB/s raw in the
+     * test of 4 Sep (26 Sep 2026).  Woken at a quarter full on a fast line,
+     * the interrupt has three quarters of the FIFO to be late by.
+     */
+    if (cfg->baud >= 1000000u && uart_is_driver_installed(port)) {
+        (void)uart_set_rx_full_threshold(port, 32);
+        (void)uart_set_rx_timeout(port, 4);
+    }
+    return AG_OK;
 }
 
 ag_err_t ag_port_uart_pins(int port, int tx, int rx)
