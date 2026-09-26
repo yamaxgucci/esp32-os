@@ -75,6 +75,16 @@ typedef struct {
      * economy but a requirement.
      */
     int16_t  din;
+    /*
+     * The I2C bus the codec is programmed over, or -1 on a board whose output
+     * needs no programming.  A converter wired straight to pins is ready the
+     * moment it is clocked; a codec is a small computer that wakes up muted,
+     * with its converters unpowered, and will sit through a whole song saying
+     * nothing.  The bus is opened by the kernel before open() is called - the
+     * port is told the number, not the wires, because the wires are already in
+     * BOARD.CFG under [i2c0] and one place is enough.
+     */
+    int16_t  i2c;
     uint32_t rate; /* the board's default; open() may still ask for another */
 } ag_port_audio_pins_t;
 

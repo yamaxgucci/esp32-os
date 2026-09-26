@@ -457,6 +457,26 @@ static ag_err_t i2c_bring_up(int bus)
     return AG_OK;
 }
 
+/*
+ * Open a bus for something that is not going to talk on it through this
+ * device.  The audio codec is the case: it is programmed over I2C, but the
+ * thing that programs it lives in the port layer and is handed a bus number,
+ * not wires - and it runs at the moment sound is first played, which may be
+ * long before anything else has touched the bus.  Without this the first
+ * write would fail with -AG_ENODEV on a board that is wired perfectly.
+ *
+ * It is idempotent, it takes the same lock every other caller here takes, and
+ * it reserves the pins exactly as a scan would, so a bus brought up this way
+ * is indistinguishable afterwards from one brought up by use.
+ */
+ag_err_t ag_io_i2c_up(int bus)
+{
+    lock();
+    ag_err_t err = i2c_bring_up(bus);
+    unlock();
+    return err;
+}
+
 static ag_err_t io_i2c_write(int bus, uint8_t addr, const void *buf, size_t len,
                              uint32_t timeout_ms)
 {

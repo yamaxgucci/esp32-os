@@ -119,6 +119,7 @@ static void apply_generic_defaults(void)
     s_board.uart[2].rx = 20;
 
     strcpy(s_board.audio.driver, "auto");
+    s_board.audio.i2c = AG_PIN_NONE;
     s_board.audio.bclk = AG_PIN_NONE;
     s_board.audio.ws = AG_PIN_NONE;
     s_board.audio.dout = AG_PIN_NONE;
@@ -332,6 +333,16 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
         s_board.audio.dout = cfg_pin(cfg, "audio.dout", s_board.audio.dout);
         s_board.audio.din = cfg_pin(cfg, "audio.din", s_board.audio.din);
         s_board.audio.mclk = cfg_pin(cfg, "audio.mclk", s_board.audio.mclk);
+        /*
+         * Not a pin, which is why it does not go through cfg_pin: `audio.i2c`
+         * is a bus number, and 0 is a perfectly good one.  A board with a
+         * codec says which bus programs it; a board with a bare converter
+         * leaves it out and nothing is opened on its behalf.
+         */
+        const int32_t ai2c = ag_cfg_get_int(cfg, "audio.i2c", -1);
+        if (ai2c >= 0 && ai2c < AG_I2C_BUSES) {
+            s_board.audio.i2c = (int16_t)ai2c;
+        }
         const int32_t ar = ag_cfg_get_int(cfg, "audio.rate",
                                           (int32_t)s_board.audio.rate);
         if (ar >= 8000 && ar <= 48000) {

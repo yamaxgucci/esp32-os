@@ -31,4 +31,9 @@ extern const ag_io_api_t ag_io_api_table;
  */
 void ag_io_register_devices(void);
 
+/* Brings an I2C bus up on behalf of a caller that will talk on it elsewhere -
+ * see the comment on the definition.  Idempotent; -AG_ENODEV if BOARD.CFG
+ * never said where the bus is. */
+ag_err_t ag_io_i2c_up(int bus);
+
 #endif /* ARGON_DEV_IO_H */

@@ -132,6 +132,7 @@ typedef struct {
      * that only plays - which is every board here until the Audio Kit. */
     int16_t  din;
     int16_t  mclk; /* optional; AG_PIN_NONE if unused */
+    int16_t  i2c;  /* bus the codec is programmed over; AG_PIN_NONE if none */
     uint32_t rate; /* default sample rate hint for pcmnull / drivers */
 } ag_board_audio_t;
 

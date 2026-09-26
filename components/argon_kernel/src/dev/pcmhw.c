@@ -27,6 +27,8 @@
 
 #include <argon/port/audio.h>
 
+#include "io.h" /* ag_io_i2c_up, for a board whose output is a codec */
+
 /*
  * Nothing at all where the build has no output.
  *
@@ -72,6 +74,24 @@ static ag_err_t hw_open(void)
 {
     if (s_hw_open) {
         return AG_OK;
+    }
+    /*
+     * A codec has to be woken before it is clocked, and waking it is I2C.
+     * The bus is brought up here rather than at boot for the same reason the
+     * converter is opened here rather than at boot: a machine sitting at a
+     * prompt should pay for neither.  A failure is logged and not fatal -
+     * every board that has ever worked has no codec at all, and refusing to
+     * play because a bus nobody needs would not open would be a regression
+     * for all of them.
+     */
+    const int16_t codec_bus = ag_board()->audio.i2c;
+    if (codec_bus >= 0) {
+        const ag_err_t err = ag_io_i2c_up((int)codec_bus);
+        if (err != AG_OK) {
+            ag_log(AG_LOG_WARN, "pcm0",
+                   "codec bus i2c%d would not open (%d); the output may be "
+                   "clocked but silent", (int)codec_bus, (int)err);
+        }
     }
     if (!ag_port_audio_open(s_fmt.rate, s_fmt.channels)) {
         return -AG_EIO;
@@ -250,6 +270,7 @@ ag_err_t ag_pcmhw_init(void)
         .dout = a->dout,
         .din = a->din,
         .mclk = a->mclk,
+        .i2c = a->i2c,
         .rate = a->rate,
     };
     ag_port_audio_pins(&pins);
