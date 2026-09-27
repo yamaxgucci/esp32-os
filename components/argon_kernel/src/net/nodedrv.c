@@ -317,9 +317,15 @@ static void nd_unlock(void)
  * wire that the asking side's link cannot hold.  Zero is "did not say", which
  * is what everything but ND_FETCH says.
  */
-static ag_err_t send_frame(uint16_t dst, uint8_t op, uint8_t note, uint16_t tag,
-                           uint32_t h, uint32_t arg, uint8_t cls,
-                           const void *pay, uint16_t plen)
+/* background: a frame may wait this long for its window (see fetch_task) */
+#define ND_BG_WAIT_MS   60000u
+#define ND_FETCH_STACK  8192u
+#define ND_FETCH_PRIO   2u
+
+static ag_err_t send_frame_on(int32_t wire, uint16_t dst, uint8_t op,
+                              uint8_t note, uint16_t tag, uint32_t h,
+                              uint32_t arg, uint8_t cls, const void *pay,
+                              uint16_t plen)
 {
     uint8_t buf[ND_HDR + ND_CHUNK_MAX];
     if (plen > ND_CHUNK_MAX) {
@@ -337,20 +343,37 @@ static ag_err_t send_frame(uint16_t dst, uint8_t op, uint8_t note, uint16_t tag,
      * node cannot block us for ever.  Pumping while we wait is also what lets
      * the acknowledgements that open the window come in - on a wire with one
      * clock master, nothing moves unless somebody is inside the driver. */
-    for (int t = 0; t < 2000; t++) {
+    const bool    bg = (cls == AG_LINK_BACKGROUND);
+    const int64_t until =
+        ag_port_us() + (int64_t)(bg ? ND_BG_WAIT_MS : 4000u) * 1000;
+    for (;;) {
         const size_t  n = (size_t)(ND_HDR + plen);
-        const int32_t r = (dst == 0) ? ag_linkprov_send(ND_CHAN, cls, buf, n)
-                                     : ag_linkprov_send_to(dst, ND_CHAN, cls,
-                                                           buf, n);
+        const int32_t r =
+            (wire >= 0) ? ag_linkprov_send_to_on(wire, dst, ND_CHAN, cls, buf, n)
+            : (dst == 0) ? ag_linkprov_send(ND_CHAN, cls, buf, n)
+                         : ag_linkprov_send_to(dst, ND_CHAN, cls, buf, n);
         if (r >= 0) {
             return AG_OK;
         }
         if (r != -AG_EAGAIN) {
             return (ag_err_t)r;
         }
-        ag_linkprov_poll(2);
+        if (ag_port_us() >= until) {
+            return -AG_ETIMEDOUT;
+        }
+        if (bg) {
+            ag_port_task_delay(1); /* its own task: the reader reads on */
+        } else {
+            ag_linkprov_poll(2);
+        }
     }
-    return -AG_ETIMEDOUT;
+}
+
+static ag_err_t send_frame(uint16_t dst, uint8_t op, uint8_t note, uint16_t tag,
+                           uint32_t h, uint32_t arg, uint8_t cls,
+                           const void *pay, uint16_t plen)
+{
+    return send_frame_on(-1, dst, op, note, tag, h, arg, cls, pay, plen);
 }
 
 static int32_t ask(uint8_t op, uint32_t h, uint32_t arg, uint8_t cls,
@@ -404,6 +427,70 @@ static void reply(uint8_t op, uint16_t tag, int32_t status, uint8_t cls,
      */
     (void)send_frame(ag_linkprov_from(), (uint8_t)(op | ND_REPLY), 0, tag,
                      (uint32_t)status, 0, cls, pay, plen);
+}
+
+/*
+ * A STREAMED READ, served: the file goes back as a run of frames without
+ * being asked again, and the count with the verdict (see ND_FETCH in
+ * serve()).  `cls` is BACKGROUND from the fetch task and BULK on the
+ * reader; `wire` the one the request came in on, or -1 on the reader, where
+ * the wire is the one being read.
+ */
+static void fetch_serve(int32_t wire, uint16_t peer, uint16_t tag, uint32_t h,
+                        uint32_t want, uint32_t chunk, uint8_t cls,
+                        uint8_t *obuf)
+{
+    uint32_t sent = 0;
+    int32_t  err = 0;
+    while (sent < want) {
+        uint32_t take = chunk;
+        if (take > want - sent) {
+            take = want - sent;
+        }
+        const int32_t r = ag_vfs_read((ag_handle_t)h, obuf, take);
+        if (r < 0) {
+            err = r;
+            break;
+        }
+        if (r == 0) {
+            break; /* end of file: a short answer, not a failure */
+        }
+        const ag_err_t e = send_frame_on(wire, peer, ND_DATA, 0, tag, 0, 0,
+                                         cls, obuf, (uint16_t)r);
+        if (e != AG_OK) {
+            err = (int32_t)e;
+            break;
+        }
+        sent += (uint32_t)r;
+    }
+    (void)send_frame_on(wire, peer, ND_END, 0, tag, (uint32_t)err, sent, cls,
+                        NULL, 0);
+}
+
+/*
+ * THE REMOTE DRIVE'S FILE ON WHAT IS LEFT OVER (27 Sep 2026), as `link get`
+ * (net/nodefs.c): a fetch is handed to a task of its own and streamed on
+ * BACKGROUND, behind the picture and the sound on every board.  It cannot be
+ * on the reader - the window's answers come in on the reader.  One fetch at
+ * a time; another, or no memory for the task, is served on the reader, on
+ * BULK, as before.
+ */
+
+static struct {
+    volatile bool busy;
+    int32_t       wire;
+    uint16_t      peer, tag;
+    uint32_t      h, want, chunk;
+} s_fsrv;
+
+static void fetch_task(void *arg)
+{
+    (void)arg;
+    uint8_t obuf[ND_CHUNK_MAX]; /* on this task's stack, not in static RAM */
+    fetch_serve(s_fsrv.wire, s_fsrv.peer, s_fsrv.tag, s_fsrv.h,
+                s_fsrv.want, s_fsrv.chunk, AG_LINK_BACKGROUND, obuf);
+    s_fsrv.busy = false;
+    ag_port_task_delete(NULL);
 }
 
 static uint16_t enc_stat(uint8_t *p, const ag_stat_t *st)
@@ -520,29 +607,22 @@ static void serve(const uint8_t *b, uint16_t n)
             chunk = b[1];
         }
 
-        uint32_t sent = 0;
-        int32_t  err = 0;
-        while (sent < want) {
-            uint32_t take = chunk;
-            if (take > want - sent) {
-                take = want - sent;
+        if (!s_fsrv.busy) {
+            s_fsrv.busy = true;
+            s_fsrv.wire = ag_linkprov_current();
+            s_fsrv.peer = peer;
+            s_fsrv.tag = tag;
+            s_fsrv.h = h;
+            s_fsrv.want = want;
+            s_fsrv.chunk = chunk;
+            ag_port_task_t t = NULL;
+            if (ag_port_task_create(fetch_task, "nodedrv", ND_FETCH_STACK, NULL,
+                                    ND_FETCH_PRIO, AG_PORT_ANY_CORE, 0u, &t)) {
+                break; /* the task answers it all, END included */
             }
-            const int32_t r = ag_vfs_read((ag_handle_t)h, obuf, take);
-            if (r < 0) {
-                err = r;
-                break;
-            }
-            if (r == 0) {
-                break; /* end of file: a short answer, not a failure */
-            }
-            const ag_err_t e = send_frame(peer, ND_DATA, 0, tag, 0, 0,
-                                          AG_LINK_BULK, obuf, (uint16_t)r);
-            if (e != AG_OK) {
-                err = (int32_t)e;
-                break;
-            }
-            sent += (uint32_t)r;
+            s_fsrv.busy = false;
         }
+        fetch_serve(-1, peer, tag, h, want, chunk, AG_LINK_BULK, obuf);
 
         /*
          * THE COUNT GOES WITH THE VERDICT, on BULK, in the same sequence space
@@ -555,8 +635,6 @@ static void serve(const uint8_t *b, uint16_t n)
          * that makes silent truncation impossible, and the one this floor has
          * already paid for once (net/nodefs.c).
          */
-        (void)send_frame(peer, ND_END, 0, tag, (uint32_t)err, sent,
-                         AG_LINK_BULK, NULL, 0);
         break;
     }
     case ND_WRITE:

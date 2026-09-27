@@ -2098,7 +2098,18 @@ static void glass_lend(void)
     s_glass_last_us = ag_port_us();
     if (!s_glass_lent) {
         s_glass_lent = true;
+        /*
+         * UNDER THE LOCK THE CONSOLE PAINTS UNDER (27 Sep 2026).  The panel's
+         * driver has no lock of its own, and the console's render reads "am I
+         * enabled" once and then paints its rows: switched off from here in
+         * the middle of that, the glass had two painters at once - this task
+         * and the console's - in one SPI device, and the console's task waited
+         * for ever for a transfer the other had taken (a CYD whose console
+         * died, drawing on).  Taking the registry lock waits a render out.
+         */
+        ag_dev_lock_hold();
         ag_textpanel_enable(false);
+        ag_dev_lock_release();
         ag_log(AG_LOG_INFO, TAG, "a neighbour is drawing on this screen");
     }
 }
