@@ -239,6 +239,7 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32s3-touch-lcd-2  Waveshare ESP32-S3-Touch-LCD-2: 2in 240x320 ST7789 + CST816 touch, 16 MB, USB-JTAG console'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
+            Write-Host '                esp32-a1s   ESP32-A1S Audio Kit: ES8388 codec on I2S, external RAM'
             Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
             exit 0
         }
@@ -256,6 +257,10 @@ switch ($Command.ToLowerInvariant()) {
             'esp32-probe' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.probe'
                             $chip = 'esp32' }
             'esp32-cyd' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.cyd'
+                          $chip = 'esp32' }
+            # The Audio Kit: the same chip, an ES8388 on I2S, and the external
+            # RAM the module has - see sdkconfig.esp32.a1s.
+            'esp32-a1s' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.a1s'
                           $chip = 'esp32' }
             'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
             'esp32s3-board' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board'

@@ -1,0 +1,115 @@
+# AI-Thinker ESP32-A1S Audio Kit: the esp32 target plus the memory the module
+# has and the CYD does not.
+#
+# This is a separate file rather than a switch in sdkconfig.defaults.esp32
+# because the two boards share a chip and disagree about the one thing that
+# matters most on it.  The CYD has 320 KB of SRAM and nothing else; the A1S
+# module carries external RAM on the same package.  Turning that on for both
+# would cost the CYD an initialisation that fails and a chunk of instruction
+# RAM for the driver, to gain nothing.
+#
+# The amplifier emulator is why it is worth a target of its own.  On the S3 it
+# lives in internal SRAM because that is where its curves have to be, but the
+# things around it - a captured impulse, a take being played, the partitions of
+# the convolution - are large, cold and perfectly happy in slower memory.  With
+# 169 KB to hand there is no room to even try.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_40M=y
+
+# The module is an ESP32-A1S and it either has the memory or it does not.
+# `ignore not found` keeps a board without it booting into a system that says
+# 0 KB extended, which is a diagnosis; without this the same board stops in the
+# bootloader, which is not.
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# Available to malloc, not only to the drivers that ask for it by name.  An
+# allocation big enough to matter goes here first and the ABI's AG_MEM_FAST
+# still reaches internal SRAM for the things that must be fast.
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+# The cache workaround is 14 KB of instruction RAM that the image has not got
+# and this chip has not needed since revision 3.  The board says what it is at
+# every boot - "Chip rev: v3.1" - so the image says so too.  It is stated here,
+# on the board that was measured, rather than in the shared esp32 defaults: a
+# rev-1 ESP32 refuses an image built this way, and refusing to boot is the
+# right answer for a wrong board and the wrong one for the CYD.
+CONFIG_ESP32_REV_MIN_3=y
+
+# 256 bytes short after that, and the radio is the right place to find them:
+# the PHY keeps a copy of its hot code in instruction RAM to transmit a little
+# faster, which matters to a board moving data and not at all to one whose job
+# is to be a pedal.  Turning it off costs radio throughput this board will
+# never ask for.
+CONFIG_ESP_PHY_IRAM_OPT=n
+
+# No Bluetooth on this board, and it is not a saving of last resort.
+#
+# The 256 bytes had to come from somewhere, and the honest place is a radio
+# this board has no use for: the Audio Kit is a pedal: a guitar goes in a
+# jack and a speaker comes out, and nothing in that wants a BLE keyboard.
+# Dropping it returns instruction RAM and about 25 KB of static RAM that the
+# emulator can spend on sound.  Wi-Fi stays - it is how files get onto the
+# board without going through the console a hex byte at a time.
+CONFIG_ARGON_ENABLE_BLE=n
+CONFIG_BT_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=n
+
+# The code arena, which is what the Bluetooth was really holding.
+#
+# 8 KB is the esp32 default and it dates from the day both radios were linked
+# in: the arena was what gave, down from 48, because nothing else in that
+# instruction RAM was optional.  Here BLE is gone, and the room it held is
+# worth more to this board than to any other - the emulator is 57 KB of code
+# that runs on every one of 22050 samples a second, and at 8 KB it does not
+# fit, so it relocates into flash and runs through the cache instead.  A miss
+# there is 302 cycles.
+CONFIG_ARGON_APP_ARENA_KB=60
+
+# And the other radio, for the same reason and with the same precedent.
+#
+# sdkconfig.esp32.dsp already made this trade once, to time a circuit solver
+# that was really timing the flash cache.  This board is that argument with a
+# speaker on the end: it is a pedal, a guitar goes in and a sound comes out,
+# and nothing in the signal path wants an access point.  Files still reach it
+# over the console at a kilobyte a second, which is slow and sufficient.
+#
+# Give it back if the phone screen is ever wanted here: it costs the arena.
+CONFIG_ARGON_ENABLE_NET=n
+CONFIG_ARGON_NET_WIFI=n
+CONFIG_ARGON_NET_WIFI_MON=n
+
+# TRIED AND REVERTED: FreeRTOS in flash.
+#
+# CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH buys ten kilobytes and this board
+# panics on it - `Core 1 panic'ed (Cache error)` in a reboot loop, right at the
+# media stage.  The reasoning was that this machine runs one long-lived audio
+# task rather than a storm of context switches, and the reasoning was beside
+# the point: the scheduler is in instruction RAM so that it can run while the
+# flash cache is off, which is exactly what happens around a flash write, and
+# "rarely switches" does not mean "never switches there".  Left written down
+# because the option looks free and is not.
+#
+# Power management goes instead, and it is worth stating what it did and did
+# not buy.  Measured by the difference between links, it is 1168 bytes - not
+# the ten; those came from the SPI driver below.  It is here on its own merits:
+# ARGON_ENABLE_PM is what calls esp_pm_configure, and without it the clock is
+# pinned at 240 MHz.  Frequency scaling under a converter counting on that
+# clock is a fault nobody can reproduce - the board sounds wrong between notes
+# and perfect whenever it is being watched.
+CONFIG_ARGON_ENABLE_PM=n
+
+# The last kilobyte, from the SPI driver.
+#
+# Its interrupt handlers sit in instruction RAM so that a transfer can run
+# while the flash cache is off.  Nothing on this board does that - the card
+# slot is empty and the codec is on I2C - and unlike the FreeRTOS option above
+# this one is a supported configuration rather than a trap: the driver simply
+# refuses the cache-disabled case instead of crashing in it.
+CONFIG_SPI_MASTER_ISR_IN_IRAM=n
+CONFIG_SPI_MASTER_IN_IRAM=n
+CONFIG_SPI_SLAVE_ISR_IN_IRAM=n
+CONFIG_SPI_SLAVE_IN_IRAM=n
