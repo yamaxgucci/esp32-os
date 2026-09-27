@@ -321,6 +321,8 @@ static int32_t dac_be_read(int16_t *pcm, int32_t frames)
 /* A codec on the far end of those wires has to be woken; see the header. */
 #include "codec_es8388.h"
 
+#include <argon/port/time.h> /* ag_port_us, to measure the rate rather than trust it */
+
 /*
  * Four descriptors of 240 frames is about forty milliseconds at 22 kHz: long
  * enough that a task which stops to read a file does not empty the chain,
@@ -345,6 +347,13 @@ static i2s_chan_handle_t s_tx;
  */
 static i2s_chan_handle_t s_rx;
 static uint8_t           s_i2s_channels = 2;
+/* Kept so that close() can say what the whole session amounted to: a board
+ * that made no sound and a board that was never asked to are different
+ * faults and the journal should not need a person to tell them apart. */
+static uint32_t          s_i2s_ok;
+static uint32_t          s_i2s_bad;
+static uint32_t          s_i2s_frames;
+static int64_t           s_i2s_mark;
 
 static const char *i2s_be_name(void) { return "i2s"; }
 
@@ -484,6 +493,12 @@ static void i2s_be_close(void)
         (void)i2s_del_channel(s_rx);
         s_rx = NULL;
     }
+    ESP_LOGI(TAG, "i2s closing: %u writes accepted whole, %u short or refused",
+             (unsigned)s_i2s_ok, (unsigned)s_i2s_bad);
+    s_i2s_ok = 0;
+    s_i2s_bad = 0;
+    s_i2s_frames = 0;
+    s_i2s_mark = 0;
     (void)i2s_channel_disable(s_tx);
     (void)i2s_del_channel(s_tx);
     s_tx = NULL;
@@ -522,6 +537,58 @@ static int32_t i2s_be_write(const int16_t *pcm, int32_t frames)
     size_t          wrote = 0;
     const esp_err_t err = i2s_channel_write(
         s_tx, pcm, (size_t)frames * frame_bytes, &wrote, I2S_WAIT_MS);
+
+    /*
+     * A refusal used to return zero and say nothing, which is the worst
+     * possible behaviour for this particular failure: the caller reads it as
+     * back-pressure, tries again, and the board spends the afternoon looking
+     * busy and sounding like nothing.  Say it once - repeating it every 11 ms
+     * would bury everything else in the journal - and then say how it ended.
+     */
+    if (err != ESP_OK || wrote != (size_t)frames * frame_bytes) {
+        if (s_i2s_bad == 0u) {
+            ESP_LOGW(TAG, "i2s write: %s, %u of %u bytes",
+                     esp_err_to_name(err), (unsigned)wrote,
+                     (unsigned)((size_t)frames * frame_bytes));
+        }
+        s_i2s_bad++;
+    } else {
+        s_i2s_ok++;
+        if (s_i2s_ok == 1u) {
+            ESP_LOGI(TAG, "i2s write: first %u bytes accepted",
+                     (unsigned)wrote);
+        }
+    }
+
+    /*
+     * HOW FAST THE HARDWARE IS EATING, measured rather than assumed.
+     *
+     * i2s_channel_write blocks until the chain has room, so the rate at which
+     * it accepts frames IS the rate the converter is clocking them out.  If
+     * that number holds at the rate that was asked for, the peripheral is
+     * running and the samples are leaving on DOUT; if it halves, or drifts, or
+     * stops, the clock is what broke - and none of that can be heard from
+     * another room, which is the whole reason it is counted here.
+     *
+     * The codec is asked at the same moment whether it is still configured, so
+     * that one line in the journal covers both halves of "is it still
+     * playing": the machine's side and the chip's.
+     */
+    s_i2s_frames += (uint32_t)(wrote / frame_bytes);
+    const int64_t now = ag_port_us();
+    if (s_i2s_mark == 0) {
+        s_i2s_mark = now;
+    } else if (now - s_i2s_mark >= 5000000) {
+        const int64_t  span = now - s_i2s_mark;
+        const uint32_t hz =
+            (uint32_t)(((int64_t)s_i2s_frames * 1000000) / span);
+        ESP_LOGI(TAG, "i2s: %u frames in %u ms = %u Hz out (%u refused)",
+                 (unsigned)s_i2s_frames, (unsigned)(span / 1000),
+                 (unsigned)hz, (unsigned)s_i2s_bad);
+        ag_codec_es8388_poll((int)s_pins.i2c);
+        s_i2s_frames = 0;
+        s_i2s_mark = now;
+    }
 
     if (err != ESP_OK && wrote == 0) {
         return 0;

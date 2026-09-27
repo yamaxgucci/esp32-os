@@ -36,4 +36,9 @@ bool ag_codec_es8388_begin(int bus, bool capture);
  * input.  Safe on a board where begin() answered false. */
 void ag_codec_es8388_end(int bus);
 
+/* Re-reads the registers that decide whether a sound comes out, while it is
+ * supposed to be coming out, and logs only a disagreement.  Cheap enough for
+ * once every few seconds and useless more often than that. */
+void ag_codec_es8388_poll(int bus);
+
 #endif /* ARGON_CODEC_ES8388_H */

@@ -145,6 +145,14 @@
       "src": ["apps/tone/tone.c", "apps/common/libc/libc_shim.c"]
     },
     {
+      "out": "LOOPBACK.AXE", "group": "core",
+      "_note": "Plays a tone and reads the same device back, with a cable from the output jack to the input jack, and prints the level that came round. The instrument that ends an argument about whether a board is making a sound: registers, byte counts and clock rates all say what SHOULD be happening, and only this says what IS. Needs [audio] pins with din in BOARD.CFG.",
+      "include": ["apps/common", "apps/common/pcm", "apps/common/libc"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/loopback/loopback.c", "apps/common/pcm/ag_pcm.c",
+              "apps/common/libc/libc_shim.c"]
+    },
+    {
       "out": "HTTPD.AXE", "group": "core",
       "_note": "The file server, now a loadable .AXE instead of a built-in command - httpd is out of the firmware. Run it by name: `run httpd.axe [port] [dir] [/w]` (Maxim does not want it re-mapped to a bare `httpd` command). Full serve path (GET 32K byte-exact, listing, HEAD, 404, path-traversal 403, multipart upload + delete) verified in QEMU against tools/netfixture.py, and it drives tools/nettest.ps1's pass-2. Build gotcha it cost: mkaxe used to compile the shim without -fno-builtin, so GCC rewrote libc_shim's own strlen loop into a call to strlen and recursed the stack away deep in netmsg's header parse; mkaxe now passes -fno-builtin for every .AXE.",
       "include": ["apps/common/libc", "components/argon_kernel/include"],

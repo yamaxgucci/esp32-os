@@ -59,6 +59,54 @@ static ag_err_t wr(int bus, uint8_t reg, uint8_t val)
     return ag_port_i2c_write(bus, ES8388_ADDR, buf, sizeof(buf), ES_TIMEOUT_MS);
 }
 
+static ag_err_t rd(int bus, uint8_t reg, uint8_t *val)
+{
+    return ag_port_i2c_wrrd(bus, ES8388_ADDR, &reg, 1, val, 1, ES_TIMEOUT_MS);
+}
+
+/*
+ * Read back the handful of registers that decide whether a sound comes out,
+ * and say what they hold.
+ *
+ * A write that returns AG_OK means the bus acknowledged a byte, not that the
+ * chip kept it.  A codec whose reference never came up, or that reset itself
+ * under a clock it did not like, acknowledges everything and holds nothing -
+ * and the setup above would report twenty-one successes into a silence.  This
+ * is the difference between "we told it to unmute" and "it is unmuted", and
+ * the two are worth an afternoon apart.
+ */
+static void verify(int bus)
+{
+    static const struct {
+        uint8_t     reg;
+        uint8_t     want;
+        const char *what;
+    } k_check[] = {
+        {ES_CHIPPOWER, 0x00, "chip power"},
+        {ES_DACPOWER, 0x3c, "outputs open"},
+        {ES_DACCONTROL3, 0x00, "unmuted"},
+        {ES_DACCONTROL1, 0x18, "I2S 16 bit"},
+        {ES_DACCONTROL2, 0x02, "256x"},
+        {ES_MASTERMODE, 0x00, "slave"},
+        {ES_LOUT1VOL, 0x1e, "headphone volume"},
+        {ES_MIX_L, 0x90, "left to mixer"},
+    };
+    for (size_t i = 0; i < sizeof(k_check) / sizeof(k_check[0]); i++) {
+        uint8_t        got = 0xff;
+        const ag_err_t err = rd(bus, k_check[i].reg, &got);
+        if (err != AG_OK) {
+            ESP_LOGW(TAG, "readback 0x%02x (%s): bus said %d",
+                     k_check[i].reg, k_check[i].what, (int)err);
+        } else if (got != k_check[i].want) {
+            ESP_LOGW(TAG, "readback 0x%02x (%s): 0x%02x, wrote 0x%02x",
+                     k_check[i].reg, k_check[i].what, got, k_check[i].want);
+        } else {
+            ESP_LOGI(TAG, "readback 0x%02x (%s): 0x%02x as written",
+                     k_check[i].reg, k_check[i].what, got);
+        }
+    }
+}
+
 /*
  * A step in the sequence.  It is a table and not a run of calls so that the
  * order is readable as an order: every line of it matters, and three of them
@@ -145,6 +193,45 @@ static bool run(int bus, const es_step_t *steps, size_t n, const char *what)
     return true;
 }
 
+/*
+ * Ask the codec, while it is playing, whether it is still the codec we set up.
+ *
+ * A part that browns out, or that loses the clock it divides, comes back with
+ * its power-on defaults: muted, outputs shut.  Every register write we made
+ * would still have returned success, hours ago, and nothing since would say
+ * otherwise.  This is the only way the board can notice that from the inside,
+ * and it exists because the alternative was a person standing next to it.
+ *
+ * Silent when all is well: a line every few seconds saying "still fine" is a
+ * line nobody reads by the time it matters.
+ */
+void ag_codec_es8388_poll(int bus)
+{
+    static const struct {
+        uint8_t     reg;
+        uint8_t     want;
+        const char *what;
+    } k_watch[] = {
+        {ES_DACPOWER, 0x3c, "outputs"},
+        {ES_DACCONTROL3, 0x00, "mute"},
+        {ES_CHIPPOWER, 0x00, "chip power"},
+    };
+    if (bus < 0) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof(k_watch) / sizeof(k_watch[0]); i++) {
+        uint8_t        got = 0xff;
+        const ag_err_t err = rd(bus, k_watch[i].reg, &got);
+        if (err != AG_OK) {
+            ESP_LOGW(TAG, "codec stopped answering on %s: %d",
+                     k_watch[i].what, (int)err);
+        } else if (got != k_watch[i].want) {
+            ESP_LOGW(TAG, "codec changed under us: %s is 0x%02x, was 0x%02x",
+                     k_watch[i].what, got, k_watch[i].want);
+        }
+    }
+}
+
 bool ag_codec_es8388_begin(int bus, bool capture)
 {
     if (bus < 0) {
@@ -187,6 +274,7 @@ bool ag_codec_es8388_begin(int bus, bool capture)
         ESP_LOGW(TAG, "playing, but nothing will be recorded");
     }
 
+    verify(bus);
     ESP_LOGI(TAG, "ES8388 up on i2c%d: out unmuted at 0 dB, in %s", bus,
              capture ? "on line input at 0 dB" : "off");
     return true;
