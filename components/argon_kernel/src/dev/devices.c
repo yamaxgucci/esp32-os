@@ -760,6 +760,21 @@ ag_err_t ag_devices_init(void)
                        kbd);
             }
         }
+    } else if (ag_cfg_get_bool(ag_sysconfig(), "bt.on", false)) {
+        /*
+         * The radio with nothing named to attach: `[bt] on = yes` is `bt on`
+         * at boot.  For a board that is reached over BLE rather than one that
+         * reaches out - PHONE.SYS serves a phone on it, and a driver does not
+         * raise the radio itself any more than it joins a Wi-Fi network.
+         */
+        ag_powerctl_bus_needed();
+        const ag_err_t bterr = ag_port_bt_start();
+        if (bterr != AG_OK) {
+            ag_log(AG_LOG_WARN, "bt", "radio did not start (%d)", (int)bterr);
+        } else {
+            (void)ag_btinput_init();
+            ag_log(AG_LOG_INFO, "bt", "radio on ([bt] on)");
+        }
     } else if (ag_cfg_get_bool(ag_sysconfig(), "bt.release", false)) {
         /*
          * A board that will not use Bluetooth can have the controller's memory

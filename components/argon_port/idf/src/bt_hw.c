@@ -295,6 +295,7 @@ static void hidh_event(void *handler_args, esp_event_base_t base, int32_t id,
 
 #if AG_PORT_HAS_BLE_PERIPH
 static void ble_periph_register(void);
+static void ble_periph_reset(void);
 #endif
 
 /*
@@ -457,6 +458,9 @@ ag_err_t ag_port_bt_stop(void)
     s_seen_n = 0;
     s_reports = 0;
     s_dev_name[0] = '\0';
+#if AG_PORT_HAS_BLE_PERIPH
+    ble_periph_reset();
+#endif
     return AG_OK;
 }
 
@@ -1139,6 +1143,54 @@ static uint8_t           s_adv_last[BLE_PERIPH_VAL_MAX];
 static volatile uint32_t s_adv_last_len;
 static char              s_adv_name[32];
 static uint8_t           s_adv_own_addr_type;
+/* The client has turned notifications on for the read characteristic - until
+ * then a notification goes nowhere, and a page's first screen with it. */
+static volatile bool     s_periph_subscribed;
+
+/*
+ * Every write, queued in arrival order: see ag_port_ble_adv_recv.  Records are
+ * a length byte and that many bytes, in a ring.  A kilobyte is a hundred key
+ * events, which is a second of a person typing as fast as a person can against
+ * a reader that polls a hundred times a second.  Guarded by a spinlock rather
+ * than the mutex, because the writer is NimBLE's host task and this is taken
+ * for a copy and nothing else.
+ */
+#define RXQ_BYTES 1024u
+static uint8_t           s_rxq[RXQ_BYTES];
+static uint32_t          s_rxq_head; /* where the next record is written       */
+static uint32_t          s_rxq_tail; /* where the oldest record starts         */
+static uint32_t          s_rxq_used;
+static volatile uint32_t s_rxq_dropped;
+static portMUX_TYPE      s_rxq_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void rxq_put(const uint8_t *p, uint32_t n)
+{
+    if (n == 0u || n > 255u) {
+        return;
+    }
+    portENTER_CRITICAL(&s_rxq_mux);
+    if (s_rxq_used + 1u + n > RXQ_BYTES) {
+        s_rxq_dropped++;
+    } else {
+        s_rxq[s_rxq_head] = (uint8_t)n;
+        s_rxq_head = (s_rxq_head + 1u) % RXQ_BYTES;
+        for (uint32_t i = 0; i < n; i++) {
+            s_rxq[s_rxq_head] = p[i];
+            s_rxq_head = (s_rxq_head + 1u) % RXQ_BYTES;
+        }
+        s_rxq_used += 1u + n;
+    }
+    portEXIT_CRITICAL(&s_rxq_mux);
+}
+
+static void rxq_clear(void)
+{
+    portENTER_CRITICAL(&s_rxq_mux);
+    s_rxq_head = 0u;
+    s_rxq_tail = 0u;
+    s_rxq_used = 0u;
+    portEXIT_CRITICAL(&s_rxq_mux);
+}
 
 /*
  * The one place a client's read and write are served.  Read hands back whatever
@@ -1158,12 +1210,19 @@ static int periph_access(uint16_t conn_handle, uint16_t attr_handle,
                    ? 0
                    : BLE_ATT_ERR_INSUFFICIENT_RES;
     case BLE_GATT_ACCESS_OP_WRITE_CHR: {
+        /* Flattened once, for both readers: the queue, which keeps every
+         * write, and the last value, which keeps the newest. */
+        uint8_t  flat[255];
         uint16_t got = 0;
-        if (ble_hs_mbuf_to_flat(ctxt->om, s_adv_last, sizeof(s_adv_last),
-                                &got) == 0) {
-            s_adv_last_len = got;
-            s_adv_writes++;
+        if (ble_hs_mbuf_to_flat(ctxt->om, flat, sizeof(flat), &got) != 0) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
+        rxq_put(flat, got);
+        const uint32_t keep = (got < sizeof(s_adv_last)) ? got
+                                                         : sizeof(s_adv_last);
+        memcpy(s_adv_last, flat, keep);
+        s_adv_last_len = keep;
+        s_adv_writes++;
         return 0;
     }
     default:
@@ -1239,6 +1298,21 @@ static void ble_periph_register(void)
     (void)ble_gatts_add_svcs(s_periph_svcs);
 }
 
+/*
+ * The radio went off with a client on it.  No disconnect event is coming - the
+ * host that would send it has just been stopped - so without this the board
+ * believes it is still advertising and still has a listener, and the next
+ * `bt on` would never advertise again.
+ */
+static void ble_periph_reset(void)
+{
+    s_adv_on = false;
+    s_adv_client = false;
+    s_periph_subscribed = false;
+    s_periph_conn = 0xffff;
+    rxq_clear();
+}
+
 static int gap_event_periph(struct ble_gap_event *event, void *arg);
 
 static int periph_adv_begin(void)
@@ -1279,8 +1353,14 @@ static int gap_event_periph(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         s_adv_client = (event->connect.status == 0);
+        s_periph_subscribed = false;
+        rxq_clear(); /* what the last client said is not this one's */
         if (event->connect.status == 0) {
             s_periph_conn = event->connect.conn_handle;
+        } else if (s_adv_on) {
+            /* A connection that failed to form leaves the advertiser
+             * stopped; nobody could find the board again. */
+            (void)periph_adv_begin();
         }
         break;
     case BLE_GAP_EVENT_DISCONNECT:
@@ -1288,9 +1368,15 @@ static int gap_event_periph(struct ble_gap_event *event, void *arg)
          * be reached exactly once.  Advertise again so the next one can find
          * it. */
         s_adv_client = false;
+        s_periph_subscribed = false;
         s_periph_conn = 0xffff;
         if (s_adv_on) {
             (void)periph_adv_begin();
+        }
+        break;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.attr_handle == s_periph_val_handle) {
+            s_periph_subscribed = event->subscribe.cur_notify != 0;
         }
         break;
     default:
@@ -1418,19 +1504,73 @@ void ag_port_ble_adv_set_read(const void *data, uint32_t len)
  */
 ag_err_t ag_port_ble_adv_notify(const void *data, uint32_t len)
 {
-    if (s_periph_conn == 0xffff) {
+    const uint16_t conn = s_periph_conn;
+    if (conn == 0xffff || !s_periph_subscribed) {
         return -AG_ENODEV;
     }
     if (data == NULL || len == 0u) {
         return -AG_EINVAL;
     }
+    if (len > ag_port_ble_adv_mtu()) {
+        return -AG_ERANGE;
+    }
+    /*
+     * Out of buffers is "not now", not "broken".  The stack holds a notification
+     * until the radio's next connection event takes it, and a sender that fills
+     * the pool faster than that - a screenful of rows, say - gets NULL here or
+     * ENOMEM below until the radio catches up.  That is the BLE spelling of a
+     * full TCP window, and the caller treats it the same way.
+     */
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
     if (om == NULL) {
-        return -AG_ENOMEM;
+        return -AG_EAGAIN;
     }
-    return (ble_gatts_notify_custom(s_periph_conn, s_periph_val_handle, om) == 0)
-               ? AG_OK
-               : -AG_EIO;
+    /* notify_custom owns om from here, sent or not. */
+    const int rc = ble_gatts_notify_custom(conn, s_periph_val_handle, om);
+    if (rc == 0) {
+        return AG_OK;
+    }
+    if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
+        return -AG_EAGAIN;
+    }
+    if (rc == BLE_HS_ENOTCONN) {
+        return -AG_ENODEV;
+    }
+    return -AG_EIO;
+}
+
+int32_t ag_port_ble_adv_recv(uint8_t *out, uint32_t max)
+{
+    if (out == NULL) {
+        return -AG_EINVAL;
+    }
+    int32_t got = 0;
+    portENTER_CRITICAL(&s_rxq_mux);
+    if (s_rxq_used != 0u) {
+        const uint32_t n = s_rxq[s_rxq_tail];
+        uint32_t at = (s_rxq_tail + 1u) % RXQ_BYTES;
+        for (uint32_t i = 0; i < n; i++) {
+            if (i < max) {
+                out[i] = s_rxq[at];
+            }
+            at = (at + 1u) % RXQ_BYTES;
+        }
+        s_rxq_tail = at;
+        s_rxq_used -= 1u + n;
+        got = (int32_t)((n < max) ? n : max);
+    }
+    portEXIT_CRITICAL(&s_rxq_mux);
+    return got;
+}
+
+uint32_t ag_port_ble_adv_mtu(void)
+{
+    const uint16_t conn = s_periph_conn;
+    if (conn == 0xffff || !s_periph_subscribed) {
+        return 0u;
+    }
+    const uint16_t mtu = ble_att_mtu(conn);
+    return (mtu > 3u) ? (uint32_t)mtu - 3u : 0u;
 }
 
 int32_t ag_port_ble_adv_last_write(uint8_t *out, uint32_t max)

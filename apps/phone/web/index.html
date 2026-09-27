@@ -581,7 +581,11 @@ function band(op, v, at, end) {
  * browser's own storage: it never leaves this device, and what crosses the wire
  * is a digest of it and a nonce, never the password.
  */
-const PW_KEY = "argon.pw." + location.host;
+/* Which board this is.  In a browser, the address it was opened at; in the
+ * Android app, which serves this page itself and reaches the board over
+ * Bluetooth, the board's name (the app's shim.js sets ARGON_BOARD). */
+const BOARD = window.ARGON_BOARD || location.host;
+const PW_KEY = "argon.pw." + BOARD;
 
 function storedPassword() {
   try { return localStorage.getItem(PW_KEY) || ""; } catch (e) { return ""; }
@@ -647,7 +651,7 @@ function connect() {
   ws.onopen = () => {
     if (ws !== st.ws) { ws.close(); return; }
     ui.dot.classList.add("on");
-    ui.note.textContent = location.host;
+    ui.note.textContent = BOARD;
     setBar("");
     ws.send(new Uint8Array([IN_HELLO]));
   };

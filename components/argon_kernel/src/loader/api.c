@@ -1377,7 +1377,26 @@ static ag_err_t api_ble_adv_notify(const void *data, uint32_t len)
 {
     return ag_port_ble_adv_notify(data, len);
 }
+
+static int32_t api_ble_adv_recv(uint8_t *out, uint32_t max)
+{
+    return ag_port_ble_adv_recv(out, max);
+}
+
+static uint32_t api_ble_adv_mtu(void) { return ag_port_ble_adv_mtu(); }
 #endif /* AG_PORT_HAS_BLE_PERIPH */
+
+/*
+ * Whether the system has the radio up.  Asked by a driver that serves over BLE
+ * and must not raise the radio itself: `bt on` and `[bt] on` are the system's
+ * decision, as `wifi on` is, and a driver that turned it on would be taking
+ * about a hundred kilobytes nobody gave it.
+ */
+static bool api_ble_radio_on(void)
+{
+    ag_port_bt_status_t st;
+    return ag_port_bt_status(&st) == AG_OK && st.state != AG_BT_OFF;
+}
 
 #if AG_PORT_HAS_BLE_CENTRAL
 static ag_err_t api_ble_scan(ag_ble_dev_t *out, uint32_t max, uint32_t *found,
@@ -1460,7 +1479,10 @@ static const ag_ble_api_t k_ble = {
 #if AG_PORT_HAS_BLE_PERIPH
     .adv_raw = api_ble_adv_raw,
     .adv_notify = api_ble_adv_notify,
+    .adv_recv = api_ble_adv_recv,
+    .adv_mtu = api_ble_adv_mtu,
 #endif
+    .radio_on = api_ble_radio_on,
 };
 #endif /* AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL */
 

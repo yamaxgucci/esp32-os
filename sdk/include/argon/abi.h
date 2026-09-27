@@ -432,9 +432,23 @@ extern "C" {
  *      uart_link), task (stack_left then svc_start/svc_stopping) and the
  *      api root (store then clu, usbd).  Every in-tree image is rebuilt;
  *      one built on the cluster line before this reads the wrong members.
+ *
+ * 0.64 appended ble->adv_recv, adv_mtu and radio_on: every write a client made,
+ *      in order (adv_last_write keeps one, and a key's down and up arrive
+ *      milliseconds apart), how much one notification carries, and whether
+ *      the system has the radio up - so PHONE.SYS can serve over BLE without
+ *      raising the radio itself.  Numbered past worktree-cluster's 0.63, which
+ *      already spent 0.52-0.63 on its own line; 0.53-0.63 are not in main.
+ *
+ * 0.65 AG_LINK_BACKGROUND, and AG_LINK_CLASSES is 4 (27 Sep 2026): reliable,
+ *      and only on what the other classes leave - a file beside a picture and
+ *      sound.  Behind every other class on every board it crosses, and
+ *      windowed from end to end.  A link driver built before this refuses
+ *      class 3 as one it does not know, so NODELINK and LINKSPI are rebuilt
+ *      with it.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 63u
+#define AG_ABI_MINOR 65u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -2789,6 +2803,27 @@ typedef struct ag_ble_api {
      * -AG_ENODEV until a client is connected.
      */
     ag_err_t (*adv_notify)(const void *data, uint32_t len);
+
+    /*
+     * ABI 0.64 - what a link over BLE needs besides the push.
+     *
+     * adv_recv takes the oldest write a client made and returns its length (0
+     * when none is waiting).  adv_last_write keeps only the newest, and a key's
+     * down and up arrive milliseconds apart - a reader that polls slower than
+     * that sees only the up.  NULL without the peripheral build.
+     *
+     * adv_mtu is how many bytes one adv_notify can carry to the client there
+     * now, 0 when nobody is connected and subscribed; adv_notify answers
+     * -AG_EAGAIN when the radio has no buffer yet, which is "not now", and
+     * -AG_ERANGE past adv_mtu.  NULL without the peripheral build.
+     *
+     * radio_on says whether the system has the radio up.  A driver that serves
+     * over BLE asks it rather than calling adv_start, which raises the radio:
+     * the radio is the system's to raise (`bt on`, `[bt] on`), as Wi-Fi is.
+     */
+    int32_t  (*adv_recv)(uint8_t *out, uint32_t max);
+    uint32_t (*adv_mtu)(void);
+    bool     (*radio_on)(void);
 } ag_ble_api_t;
 
 /* ------------------------------------------------------------------------ */
