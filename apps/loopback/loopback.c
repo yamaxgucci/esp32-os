@@ -42,8 +42,13 @@ AG_APP("LOOPBACK", "1.0", "argon", 0);
 #define CHANNELS 2
 #define CHUNK    256u
 
+/* A tenth of full scale: above the noise floor a dead codec returns, far
+ * below anything the cable carries when the chain is working. */
+#define HYST     3000
+
 static int16_t s_out[CHUNK * CHANNELS];
 static int16_t s_in[CHUNK * CHANNELS];
+static int      s_shown;
 
 /* Digits only, so that one number does not drag a libc in. */
 static int parse_int(const char *s, int def)
@@ -111,6 +116,8 @@ int ag_main(int argc, char **argv)
     uint32_t      in_peak = 0;
     uint64_t      in_sum = 0;   /* of squares, for a level that is not a spike */
     uint32_t      in_frames = 0;
+    uint32_t      crossings = 0;
+    int           armed_high = 0;
     int32_t       starved = 0;
     const uint32_t want_blocks =
         (secs > 0) ? ((uint32_t)secs * RATE / CHUNK) : 0u;
@@ -142,6 +149,26 @@ int ag_main(int argc, char **argv)
         if (got == 0) {
             starved++;
         }
+        /*
+         * The first block of every run, printed raw.
+         *
+         * Level and frequency between them describe three outcomes on this
+         * board - a clean 440 Hz, a full-scale signal with no period at all,
+         * and digital silence - and a summary cannot tell which of those is an
+         * analogue fault and which is a frame the two ends disagree about.
+         * Twelve samples can: alternating extremes are a bit alignment, a
+         * constant is a converter that is not converting, and a ragged small
+         * wave is the noise floor of one that is.
+         */
+        if (!s_shown && blocks > (RATE / CHUNK) && got > 6) {
+            s_shown = 1;
+            ag_printf("loopback: first samples %d %d %d %d %d %d %d %d "
+                      "%d %d %d %d\n",
+                      (int)s_in[0], (int)s_in[1], (int)s_in[2], (int)s_in[3],
+                      (int)s_in[4], (int)s_in[5], (int)s_in[6], (int)s_in[7],
+                      (int)s_in[8], (int)s_in[9], (int)s_in[10],
+                      (int)s_in[11]);
+        }
         for (int32_t i = 0; i < got * CHANNELS; i++) {
             int32_t v = s_in[i];
             if (v < 0) {
@@ -151,6 +178,31 @@ int ag_main(int argc, char **argv)
                 in_peak = (uint32_t)v;
             }
             in_sum += (uint64_t)((int64_t)s_in[i] * s_in[i]);
+        }
+        /*
+         * HOW FAST THE RETURNED TONE ACTUALLY IS.
+         *
+         * A level says whether anything came back; it cannot say whether what
+         * came back is the note that was sent.  The codec divides MCLK to make
+         * its own converter clock, so a wrong MCLK does not silence it - it
+         * shifts it, and a sine returning at twice or half its frequency is a
+         * clock fault wearing the costume of a working board.  Counting sign
+         * changes on the left channel is enough to tell 440 Hz from 880, which
+         * is the distinction that matters; it is not a tuner.
+         *
+         * A hysteresis band keeps the noise floor from counting as a tone: at
+         * peak 60 the crossings would otherwise read as several kilohertz of
+         * nothing.
+         */
+        for (int32_t i = 0; i < got; i++) {
+            const int16_t v = s_in[i * CHANNELS];
+            if (armed_high && v < -HYST) {
+                armed_high = 0;
+                crossings++;
+            } else if (!armed_high && v > HYST) {
+                armed_high = 1;
+                crossings++;
+            }
         }
         in_frames += (uint32_t)got;
 
@@ -179,13 +231,19 @@ int ag_main(int argc, char **argv)
              * input works and the signal is genuinely absent.  Those are
              * different faults and the print must not merge them.
              */
-            ag_printf("loopback: out %d%%, in peak %u rms %u of 32767 "
-                      "(%u frames, %d empty reads)\n",
-                      vol, (unsigned)in_peak, (unsigned)rms,
+            /* Two crossings to a cycle, over the seconds those frames took. */
+            const uint32_t hz =
+                (in_frames > 0u)
+                    ? (uint32_t)((uint64_t)crossings * RATE / (2ull * in_frames))
+                    : 0u;
+            ag_printf("loopback: out %d%%, in peak %u rms %u of 32767, "
+                      "%u Hz back (%u frames, %d empty reads)\n",
+                      vol, (unsigned)in_peak, (unsigned)rms, (unsigned)hz,
                       (unsigned)in_frames, (int)starved);
             in_peak = 0;
             in_sum = 0;
             in_frames = 0;
+            crossings = 0;
             starved = 0;
         }
         if (want_blocks > 0u && blocks >= want_blocks) {
