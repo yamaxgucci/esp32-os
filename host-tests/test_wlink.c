@@ -412,12 +412,57 @@ static void blocks_in_two_parts(void)
     end_close(&b);
 }
 
+/*
+ * AG_SPILINK_IDLE: background goes into a wire only when nothing in its ring
+ * is still waiting to go (27 Sep 2026), so what is written after it waits
+ * for one block of it and not for a window.
+ */
+static void idle_waits_for_the_wire(void)
+{
+    static wlink_t a, b;
+    end_open(&a, AG_SPILINK_BLOCKS);
+    end_open(&b, AG_SPILINK_BLOCKS);
+    const uint32_t bg = AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE |
+                        AG_SPILINK_YIELD | AG_SPILINK_IDLE;
+    uint8_t body[600];
+    for (uint32_t i = 0; i < sizeof(body); i++) {
+        body[i] = pat(i);
+    }
+    /* the two ends know each other first: before that nothing goes */
+    for (uint32_t k = 0; k < 20u; k++) {
+        tick();
+        one_frame(&a, &b, 0u, 0u);
+        one_frame(&b, &a, 0u, 0u);
+    }
+    CHECK(wl_send2(&a, NULL, 0u, body, sizeof(body), bg, 0u) ==
+          (int32_t)sizeof(body)); /* an idle wire takes it */
+    CHECK(wl_send2(&a, NULL, 0u, body, sizeof(body), bg, 0u) == -AG_EAGAIN);
+    /* anything else still goes in behind it */
+    CHECK(wl_send2(&a, NULL, 0u, body, 100u,
+                   AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE, 0u) == 100);
+    CHECK(wl_send2(&a, NULL, 0u, body, sizeof(body), bg, 0u) == -AG_EAGAIN);
+    uint32_t steps = 0;
+    while (a.tx.count > a.sent_off && steps++ < 1000u) {
+        tick();
+        one_frame(&a, &b, 0u, 0u);
+        one_frame(&b, &a, 0u, 0u);
+    }
+    CHECK(a.tx.count == a.sent_off); /* all of it on the wire now */
+    CHECK(wl_send2(&a, NULL, 0u, body, sizeof(body), bg, 0u) ==
+          (int32_t)sizeof(body));
+    printf("  wlink idle: refused while the ring had bytes waiting, taken once "
+           "they had gone (%u steps)\n", (unsigned)steps);
+    end_close(&a);
+    end_close(&b);
+}
+
 int main(void)
 {
     bytes_through_a_bad_wire();
     blocks_through_a_bad_wire();
     a_restart_starts_the_stream_over();
     blocks_in_two_parts();
+    idle_waits_for_the_wire();
     printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -358,11 +358,21 @@ static void print_stats(void)
                           "the longest wait between two %u ms\n",
                           (unsigned)sp, (unsigned)sl, (unsigned)sg);
     }
-    uint32_t whole = 0, passes = 0;
-    rdp_counts(&whole, &passes);
+    if (sl != 0u) {
+        uint32_t nd = 0, np = 0, mop = 0, mlen = 0, mf = 0;
+        ag_noderdev_draw_misses(&nd, &np, &mop, &mlen, &mf);
+        ag_console_printf("misses  %u with no device, %u that drew nothing "
+                          "(last op %u, %u bytes), %u faults\n",
+                          (unsigned)nd, (unsigned)np, (unsigned)mop,
+                          (unsigned)mlen, (unsigned)mf);
+    }
+    uint32_t whole = 0, passes = 0, pass_wait = 0;
+    rdp_counts(&whole, &passes, &pass_wait);
     if (passes != 0u) {
-        ag_console_printf("painter %u whole frames sent in %u passes\n",
-                          (unsigned)whole, (unsigned)passes);
+        ag_console_printf("painter %u whole frames sent in %u passes, the far "
+                          "end took %u ms a pass\n",
+                          (unsigned)whole, (unsigned)passes,
+                          (unsigned)(pass_wait / 1000u));
     }
     if (ss != 0u || sq != 0u) {
         ag_console_printf("sound   the longest wait between two periods %u ms,"
@@ -1158,6 +1168,7 @@ int ag_cmd_link(int argc, char **argv)
         const bool on = argc > 2 && ag_path_icmp(argv[2], "on") == 0;
         ag_noderdev_report(on);
         ag_linkprov_report(on);
+        rdp_report(on);
         ag_console_printf("the screen's report each second: %s\n",
                           on ? "on" : "off");
         return 0;

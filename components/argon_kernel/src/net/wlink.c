@@ -933,6 +933,10 @@ int32_t wl_send2(wlink_t *s, const void *head, size_t hlen, const void *body,
                 unlock(s);
                 return -AG_EAGAIN;
             }
+            if ((flags & AG_SPILINK_IDLE) != 0u && s->tx.count > s->sent_off) {
+                unlock(s);
+                return -AG_EAGAIN; /* bytes still waiting: not idle */
+            }
         }
         if (ring_space(&s->tx) >= WL_REC) {
             /*

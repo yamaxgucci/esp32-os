@@ -1337,6 +1337,11 @@ static uint32_t s_pour_said_periods;
 static uint32_t s_pour_said_lost;
 static uint32_t s_pour_last_ms;
 static bool     s_pour_said;
+/* of the pieces not drawn: no device for the handle, and nothing drawn -
+ * with the last such piece's op and length, for link */
+static uint32_t s_scr_nodev, s_scr_nopx;
+static uint8_t  s_scr_last_op;
+static uint16_t s_scr_last_len;
 
 static void serve_one(const uint8_t *b, uint16_t n)
 {
@@ -1691,6 +1696,13 @@ static void pour_screen_one(void)
      */
     const uint32_t faults = rdp_draw_faults();
     const uint32_t did = (dev != NULL) ? serve_poured_class(dev, pd) : 0u;
+    if (dev == NULL) {
+        s_scr_nodev++;
+    } else if (did == 0u) {
+        s_scr_nopx++;
+        s_scr_last_op = pd->op;
+        s_scr_last_len = pd->len;
+    }
     if (did > 0u) {
         s_pour_periods++;
         s_pour_bytes += did;
@@ -1953,6 +1965,16 @@ void ag_noderdev_screen_counts(uint32_t *passes, uint32_t *lost,
     *snd_gap_ms = (uint32_t)(s_all_snd_gap_max / 1000);
     *snd_q_max = s_all_snd_q_max;
     *snd_q_cap = RD_SND - 1u;
+}
+
+void ag_noderdev_draw_misses(uint32_t *nodev, uint32_t *nopx, uint32_t *op,
+                             uint32_t *len, uint32_t *faults)
+{
+    *nodev = s_scr_nodev;
+    *nopx = s_scr_nopx;
+    *op = s_scr_last_op;
+    *len = s_scr_last_len;
+    *faults = rdp_draw_faults();
 }
 
 void ag_noderdev_wait_counts(uint32_t *reader_waits, uint32_t *late)

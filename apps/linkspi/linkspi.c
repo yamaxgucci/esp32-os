@@ -167,7 +167,8 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
         nd->bus, head, LSPI_HEAD, buf, len,
         stream ? 0u
                : (cls == AG_LINK_BACKGROUND)
-                   ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_YIELD)
+                   ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_YIELD |
+                      AG_SPILINK_IDLE)
                    : AG_SPILINK_RELIABLE,
         stream ? 1u : LSPI_SEND_MS);
     int32_t r;

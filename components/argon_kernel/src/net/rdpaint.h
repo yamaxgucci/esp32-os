@@ -72,7 +72,11 @@ void rdp_set_sync(rdp_sync_fn sync);
 void rdp_forget(void);
 
 /* Since the board started: frames that went whole (a snapshot's every row),
- * and the passes they took.  Passes are not frames - a big one is several. */
-void rdp_counts(uint32_t *frames, uint32_t *passes);
+ * the passes they took - passes are not frames, a big one is several - and
+ * how long the far end took to say a pass was drawn, on average. */
+void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us);
+
+/* The painter's line a second in the journal: off unless asked. */
+void rdp_report(bool on);
 
 #endif /* ARGON_NET_RDPAINT_H */

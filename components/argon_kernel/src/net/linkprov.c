@@ -396,6 +396,52 @@ static void relay_meter(int64_t took)
     }
 }
 
+/*
+ * A BACKGROUND FRAME WAITS ASIDE, NOT IN FRONT (27 Sep 2026).  Background
+ * goes into a wire only when the wire has nothing waiting (AG_SPILINK_IDLE),
+ * so it is refused often - and a relay that waited on it, as it waits on
+ * everything else, would have the picture and the sound behind it in their
+ * own queues.  So it is taken out of its queue into its wire's own buffer,
+ * tried once, and left there while anything else for that wire goes first.
+ */
+typedef struct {
+    uint8_t       *buf; /* RELAY_FRAME, the first time a wire has one */
+    bool           on;
+    uint8_t        chan;
+    uint16_t       len;
+    ag_link_addr_t a;
+} bg_pend_t;
+
+static bg_pend_t s_bg_pend[LINK_WIRES];
+
+/* The waiting background frame of wire `i`, once.  True if it went (or is
+ * gone for good); false while the wire is busy. */
+static bool bg_pend_try(int i)
+{
+    bg_pend_t *const p = &s_bg_pend[i];
+    held_t           h;
+    if (!hold(&s_wire[i], &h)) {
+        relay_drop(2, p->a.dst, "the wire out of here has gone");
+        p->on = false;
+        return true;
+    }
+    const int32_t r = h.ops->send_a(h.dev, p->chan, p->buf, p->len, &p->a);
+    let_go(&h);
+    if (r == -AG_EAGAIN) {
+        return false;
+    }
+    if (r >= 0) {
+        s_relayed++;
+        if (s_rq_stalled) {
+            reader_wake();
+        }
+    } else {
+        relay_drop(2, p->a.dst, "the wire out of here refused it");
+    }
+    p->on = false;
+    return true;
+}
+
 /* One queued frame of wire `i` into the wire, waiting for room.  True if
  * there was one. */
 static bool rq_send_one(int i)
@@ -403,18 +449,39 @@ static bool rq_send_one(int i)
     const int64_t    began = ag_port_us();
     uint8_t *const   frame = s_rq_frame;
     (void)ag_port_mutex_take(s_rq_lock, AG_PORT_FOREVER);
-    /* the first class with anything in it: prompt, then bulk, then
-     * background */
+    /* the first class with anything in it: prompt, then bulk; background
+     * only when neither has anything, and aside (bg_pend_t) */
     relay_q_t *q = NULL;
-    for (unsigned c = 0; c < RQ_CLASSES; c++) {
+    for (unsigned c = 0; c + 1u < RQ_CLASSES; c++) {
         if (s_rq[i][c].used >= RELAY_REC) {
             q = &s_rq[i][c];
             break;
         }
     }
     if (q == NULL) {
+        bg_pend_t *const p = &s_bg_pend[i];
+        relay_q_t *const bq = &s_rq[i][RQ_CLASSES - 1u];
+        if (!p->on && bq->used >= RELAY_REC) {
+            if (p->buf == NULL) {
+                p->buf = (uint8_t *)ag_port_alloc(RELAY_FRAME, AG_MEM_BYTE);
+            }
+            if (p->buf != NULL) {
+                uint8_t hdr[RELAY_REC];
+                rq_get(bq, hdr, RELAY_REC);
+                const uint16_t len = (uint16_t)(hdr[0] | (hdr[1] << 8));
+                p->chan = hdr[2];
+                memcpy(&p->a, hdr + 3, sizeof(p->a));
+                p->len = (len <= RELAY_FRAME) ? len : (uint16_t)RELAY_FRAME;
+                rq_get(bq, p->buf, p->len);
+                for (uint16_t k = p->len; k < len; k++) {
+                    uint8_t skip;
+                    rq_get(bq, &skip, 1u);
+                }
+                p->on = true;
+            }
+        }
         (void)ag_port_mutex_give(s_rq_lock);
-        return false;
+        return p->on && bg_pend_try(i);
     }
     uint8_t        hdr[RELAY_REC];
     ag_link_addr_t a;
@@ -462,11 +529,16 @@ static void relay_task(void *arg)
     (void)arg;
     for (;;) {
         bool any = false;
+        bool waiting = false;
         for (int i = 0; i < (int)LINK_WIRES; i++) {
             any = rq_send_one(i) || any;
+            waiting = waiting || s_bg_pend[i].on;
         }
         if (!any) {
-            (void)ag_port_sem_take(s_rq_wake, ag_port_ms_to_ticks(20));
+            /* background aside is tried again at the next tick, not the
+             * next frame: the wire it waits for is sending */
+            (void)ag_port_sem_take(s_rq_wake,
+                                   ag_port_ms_to_ticks(waiting ? 1u : 20u));
         }
     }
 }
@@ -831,9 +903,22 @@ static void bg_note(uint16_t node, int32_t wire, uint16_t len)
  * the reader has spent its budget in this window - then they wait for the
  * next, and so does whoever is sending background at it.
  */
+static bool bg_may_relay(void);
+
 static void bg_answer(bool low, int64_t window)
 {
     if (low && ag_port_us() - window < READER_WINDOW_US) {
+        return;
+    }
+    /*
+     * AND ONLY WITH TIME TO SPARE HERE (27 Sep 2026).  The reader's budget
+     * does not see what receiving costs below it: on the CYD, which has no
+     * UART DMA, 304 KB/s of a file took 62% of a core in the wire's receive
+     * task at priority 9, and the picture's drawing, at 1, had what was left
+     * - 19 passes a second where it had 80.  A board that is a file's end
+     * answers it only while it has BG_IDLE_MIN idle, as a middle board does.
+     */
+    if (!bg_may_relay()) {
         return;
     }
     for (unsigned i = 0; i < BG_PEERS; i++) {

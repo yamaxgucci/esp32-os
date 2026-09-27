@@ -161,18 +161,25 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
      * somebody else's message is left behind it.  Stream is one attempt, as
      * it always was: late sound is worse than none.
      */
-    const uint32_t how = stream ? AG_SPILINK_WHOLE
-                         : (cls == AG_LINK_BULK || cls == AG_LINK_BACKGROUND)
-                             ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE |
-                                AG_SPILINK_YIELD)
-                             : (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE);
-    const uint32_t until = now_ms() + (stream ? 0u : ND_SEND_MS);
+    const uint32_t how =
+        stream ? AG_SPILINK_WHOLE
+        : (cls == AG_LINK_BACKGROUND)
+            ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_YIELD |
+               AG_SPILINK_IDLE)
+        : (cls == AG_LINK_BULK)
+            ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_YIELD)
+            : (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE);
+    /* background is one attempt too: its caller has other things to send
+     * while the wire is busy, and waiting here would be waiting in front of
+     * them */
+    const bool     once = stream || cls == AG_LINK_BACKGROUND;
+    const uint32_t until = now_ms() + (once ? 0u : ND_SEND_MS);
     int32_t        w;
     for (;;) {
         TASK->mutex_lock(nd->txlock, UINT32_MAX);
         w = IO->uart_link_send2(nd->uart, head, ND_HEAD, buf, len, how, 0u);
         TASK->mutex_unlock(nd->txlock);
-        if (w != -AG_EAGAIN || stream || (int32_t)(now_ms() - until) >= 0) {
+        if (w != -AG_EAGAIN || once || (int32_t)(now_ms() - until) >= 0) {
             break;
         }
         TASK->sleep_ms(1);

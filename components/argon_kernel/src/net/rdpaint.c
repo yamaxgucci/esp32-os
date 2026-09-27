@@ -199,6 +199,7 @@ static struct {
     /* the far end's pace: time waited in sync, this second - the total and
      * the longest; and the longest time from one pass's start to the next */
     int64_t  sync_us, sync_max_us, gap_max_us, last_pass_us;
+    int64_t  sync_total_us; /* since the board started, for rdp_counts */
 } s_p;
 
 static uint16_t get16(const uint8_t *p)
@@ -267,9 +268,25 @@ static bool put_run(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
     return false; /* cannot happen: RDP_CHUNK always fits an empty payload */
 }
 
+/*
+ * A second's line in the journal only when asked (`link report on`, 27 Sep
+ * 2026): it went out of a 115 200 console every second, some 16 ms under
+ * the console's lock, from the painter's own task - as the sound's meter
+ * did before it (cmd_link.c).
+ */
+static volatile bool s_report;
+
+void rdp_report(bool on)
+{
+    s_report = on;
+}
+
 static void report(void)
 {
     const int64_t now = ag_port_us();
+    if (!s_report) {
+        return;
+    }
     if (now - s_p.said_us < 1000000 || s_p.passes == s_p.said_passes) {
         return;
     }
@@ -513,6 +530,7 @@ static void pass(void)
                 sync(handle);
                 const int64_t w = ag_port_us() - t0;
                 s_p.sync_us += w;
+                s_p.sync_total_us += w;
                 if (w > s_p.sync_max_us) {
                     s_p.sync_max_us = w;
                 }
@@ -560,10 +578,13 @@ static void painter(void *arg)
     }
 }
 
-void rdp_counts(uint32_t *frames, uint32_t *passes)
+void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us)
 {
     *frames = s_p.frames;
     *passes = s_p.passes;
+    *wait_us = (s_p.passes != 0u)
+                   ? (uint32_t)(s_p.sync_total_us / (int64_t)s_p.passes)
+                   : 0u;
 }
 
 void rdp_forget(void)

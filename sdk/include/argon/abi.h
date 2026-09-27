@@ -446,9 +446,14 @@ extern "C" {
  *      windowed from end to end.  A link driver built before this refuses
  *      class 3 as one it does not know, so NODELINK and LINKSPI are rebuilt
  *      with it.
+ *
+ * 0.66 AG_SPILINK_IDLE: a block only into a wire with nothing waiting to go.
+ *      Background written this way takes the wire's idle time and nothing
+ *      else, so a picture behind it waits for one block of it, not a window.
+ *      A flag an older driver never sets; nothing moves.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 65u
+#define AG_ABI_MINOR 66u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1891,6 +1896,15 @@ typedef struct {
  */
 #define AG_SPILINK_WHOLE    2u
 #define AG_SPILINK_YIELD    4u
+/*
+ * With WHOLE (ABI 0.66): only into a wire with nothing waiting to go - every
+ * byte already in its ring sent at least once - or -AG_EAGAIN.  A wire sends
+ * its ring in order, so a file written at the rate the ring takes it put a
+ * picture behind a window of it on every hop; background written this way
+ * waits for the wire to be idle, and what comes after waits behind one block
+ * of it at most.
+ */
+#define AG_SPILINK_IDLE     8u
 /* ag_spilink_block_t.flags: blocks no..last were lost and not sent again */
 #define AG_SPILINK_LOST 0x80u
 

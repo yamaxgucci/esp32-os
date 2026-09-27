@@ -85,6 +85,10 @@ void ag_noderdev_report(bool on);
 /* Times the reader waited for room for the picture; periods of sound that
  * came more than 30 ms after the one before. */
 void ag_noderdev_wait_counts(uint32_t *reader_waits, uint32_t *late);
+/* Pieces of a picture not drawn here: no device for their handle, nothing
+ * drawn (the last one's op and length), and the drawing's faults. */
+void ag_noderdev_draw_misses(uint32_t *nodev, uint32_t *nopx, uint32_t *op,
+                             uint32_t *len, uint32_t *faults);
 /* A neighbour's picture here since the board started: passes drawn, pieces
  * not drawn, the longest wait between two passes and between two periods of
  * sound, and the fullest the sound queue got, of how many. */

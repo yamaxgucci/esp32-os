@@ -47,6 +47,18 @@ enum {
  * for.
  */
 #define NF_CHUNK_MAX 255u
+/*
+ * A FILE ON WHAT IS LEFT OVER (27 Sep 2026).  The bytes of a file go on the
+ * background class: behind the picture and the sound on every board, windowed
+ * from end to end (linkprov.c, BACKGROUND).  A window like that is opened by
+ * answers the READER takes in, so the file can no longer be served from the
+ * reader, as it was: it would wait for answers its own task was too busy to
+ * read.  A request is handed to a task of its own, which may wait as long as
+ * background must - NF_BG_WAIT_MS a frame before it gives up.
+ */
+#define NF_BG_WAIT_MS 60000u
+#define NF_TASK_STACK 8192u /* FAT and the card, as the reader's own stack */
+#define NF_TASK_PRIO  2u    /* an application's low class: a file waits */
 
 /* What one frame on the bound wire can hold, header aside.  Asked, not
  * assumed: the wire states its own shape and this is what info() is for.  A
@@ -109,8 +121,9 @@ static volatile bool     s_wanted;
  * in between and never passed home, and the asking node then waits for a file
  * that arrived somewhere else.
  */
-static ag_err_t send_msg(uint16_t dst, uint8_t op, uint8_t cls, int32_t code,
-                         const void *payload, uint16_t len)
+static ag_err_t send_msg_on(int32_t wire, uint16_t dst, uint8_t op,
+                            uint8_t cls, int32_t code, const void *payload,
+                            uint16_t len)
 {
     uint8_t buf[NF_HDR + NF_CHUNK_MAX];
     if (len > NF_CHUNK_MAX) {
@@ -129,22 +142,50 @@ static ag_err_t send_msg(uint16_t dst, uint8_t op, uint8_t cls, int32_t code,
      * and pumps while it waits.  Bounded, because a node that has gone away
      * must not hold a file open here for ever.
      */
-    for (int t = 0; t < 2000; t++) {
+    const bool    bg = (cls == AG_LINK_BACKGROUND);
+    const int64_t until =
+        ag_port_us() + (int64_t)(bg ? NF_BG_WAIT_MS : 4000u) * 1000;
+    for (;;) {
         const int32_t r =
-            ag_linkprov_send_to(dst, NF_CHAN, cls, buf, NF_HDR + len);
+            (wire >= 0)
+                ? ag_linkprov_send_to_on(wire, dst, NF_CHAN, cls, buf,
+                                         NF_HDR + len)
+                : ag_linkprov_send_to(dst, NF_CHAN, cls, buf, NF_HDR + len);
         if (r >= 0) {
             return AG_OK;
         }
         if (r != -AG_EAGAIN) {
             return (ag_err_t)r;
         }
-        ag_linkprov_poll(2);
+        if (ag_port_us() >= until) {
+            return -AG_ETIMEDOUT;
+        }
+        if (bg) {
+            ag_port_task_delay(1); /* its own task: the reader reads on */
+        } else {
+            ag_linkprov_poll(2);
+        }
     }
-    return -AG_ETIMEDOUT;
 }
 
-/* Read the file and push it, in order, on the bulk class. */
-static void serve_get(const uint8_t *payload, uint16_t len)
+static ag_err_t send_msg(uint16_t dst, uint8_t op, uint8_t cls, int32_t code,
+                         const void *payload, uint16_t len)
+{
+    return send_msg_on(-1, dst, op, cls, code, payload, len);
+}
+
+/* The request the server task is serving: one at a time. */
+static struct {
+    volatile bool busy;
+    uint16_t      from;
+    int32_t       wire;
+    uint16_t      len;
+    uint8_t       path[AG_PATH_MAX];
+} s_req;
+
+/* Read the file and push it, in order, on the background class. */
+static void serve_get(uint16_t from, int32_t wire, uint8_t cls,
+                      const uint8_t *payload, uint16_t len)
 {
     /*
      * WHOSE FILE THIS IS, taken once before the first byte moves.
@@ -158,7 +199,6 @@ static void serve_get(const uint8_t *payload, uint16_t len)
      * frame that said "for whoever is reading" instead would be taken by the
      * board in between and the asking node would wait for ever.
      */
-    const uint16_t from = ag_linkprov_from();
     char           path[AG_PATH_MAX];
     /* One frame's worth, from the wire rather than from a number here.
      * nf_payload_max() never answers more than sizeof(chunk). */
@@ -166,7 +206,8 @@ static void serve_get(const uint8_t *payload, uint16_t len)
     const uint32_t cap = nf_payload_max();
 
     if (len == 0 || len >= sizeof(path)) {
-        (void)send_msg(from, NF_OP_END, AG_LINK_CONTROL, -AG_EINVAL, NULL, 0);
+        (void)send_msg_on(wire, from, NF_OP_END, AG_LINK_CONTROL, -AG_EINVAL,
+                          NULL, 0);
         return;
     }
     memcpy(path, payload, len);
@@ -174,7 +215,8 @@ static void serve_get(const uint8_t *payload, uint16_t len)
 
     const ag_handle_t h = ag_vfs_open(path, "/", AG_O_RDONLY);
     if (h < 0) {
-        (void)send_msg(from, NF_OP_END, AG_LINK_CONTROL, (int32_t)h, NULL, 0);
+        (void)send_msg_on(wire, from, NF_OP_END, AG_LINK_CONTROL, (int32_t)h,
+                          NULL, 0);
         return;
     }
 
@@ -196,11 +238,11 @@ static void serve_get(const uint8_t *payload, uint16_t len)
             break;
         }
         /*
-         * BULK, not CONTROL.  This is the class the window and the
-         * retransmissions are for: it may wait behind anything with a deadline,
-         * and it is the only one here that could be made to.
+         * BACKGROUND, not CONTROL and no longer BULK: it may wait behind
+         * anything with a deadline - and behind a picture, which is BULK.
          */
-        err = send_msg(from, NF_OP_DATA, AG_LINK_BULK, 0, chunk, (uint16_t)n);
+        err = send_msg_on(wire, from, NF_OP_DATA, cls, 0, chunk,
+                          (uint16_t)n);
         if (err != AG_OK) {
             break;
         }
@@ -241,8 +283,48 @@ static void serve_get(const uint8_t *payload, uint16_t len)
      */
     uint8_t tail[4];
     put_u32(tail, sent);
-    (void)send_msg(from, NF_OP_END, AG_LINK_BULK, (int32_t)err, tail,
-                   (uint16_t)sizeof(tail));
+    (void)send_msg_on(wire, from, NF_OP_END, cls, (int32_t)err,
+                      tail, (uint16_t)sizeof(tail));
+}
+
+static void server_task(void *arg)
+{
+    (void)arg;
+    serve_get(s_req.from, s_req.wire, AG_LINK_BACKGROUND, s_req.path,
+              s_req.len);
+    s_req.busy = false;
+    ag_port_task_delete(NULL);
+}
+
+/* On the reader: the request, to the server task; nothing waited for here. */
+static void take_get(const uint8_t *payload, uint16_t len)
+{
+    const uint16_t from = ag_linkprov_from();
+    const int32_t  wire = ag_linkprov_current();
+    if (s_req.busy) {
+        (void)send_msg_on(wire, from, NF_OP_END, AG_LINK_CONTROL, -AG_EBUSY,
+                          NULL, 0);
+        return;
+    }
+    if (len > sizeof(s_req.path)) {
+        len = (uint16_t)sizeof(s_req.path); /* serve_get refuses it whole */
+    }
+    s_req.from = from;
+    s_req.wire = wire;
+    s_req.len = len;
+    memcpy(s_req.path, payload, len);
+    s_req.busy = true;
+    ag_port_task_t t = NULL;
+    if (!ag_port_task_create(server_task, "nodefs", NF_TASK_STACK, NULL,
+                             NF_TASK_PRIO, AG_PORT_ANY_CORE, 0u, &t)) {
+        /*
+         * No memory for the task - an emulated node has 5.5 KB free - so
+         * served here, on the reader, as before there was one: on BULK,
+         * because background waits for answers only this task can read.
+         */
+        serve_get(from, wire, AG_LINK_BULK, s_req.path, s_req.len);
+        s_req.busy = false;
+    }
 }
 
 static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
@@ -261,7 +343,7 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
 
     switch (op) {
     case NF_OP_GET:
-        serve_get(buf + NF_HDR, len);
+        take_get(buf + NF_HDR, len);
         break;
     case NF_OP_DATA:
         if (s_wanted && s_sink >= 0 && len > 0) {

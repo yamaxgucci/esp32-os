@@ -345,7 +345,14 @@ int32_t ag_port_audio_space(void)
  * buzz at that buffer's own frequency, which is the first thing anyone hears
  * when an application falls behind.  The price is a memset per descriptor.
  */
-#define I2S_DESCS   4
+/*
+ * Eight, not four (27 Sep 2026): sound poured from a neighbour arrives with
+ * the wire's jitter, and four descriptors are 22 ms at 44.1 kHz - the S3-Zero
+ * ran dry 70-115 times in five minutes with every period arriving, while the
+ * CYD beside it, whose converter holds some 90 ms, never did.  Eight are
+ * 44 ms, and 3.8 KB more while something plays.
+ */
+#define I2S_DESCS   8
 #define I2S_FRAMES  240
 #define I2S_WAIT_MS 120
 
