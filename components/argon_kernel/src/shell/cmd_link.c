@@ -11,12 +11,14 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "shell/cmd_link.h"
+#include "net/rdpaint.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <argon/abi.h>
+#include <argon/audio.h>
 #include <argon/console.h>
 #include <argon/linkprov.h>
 #include <argon/loader.h>
@@ -38,10 +40,10 @@
 #include <argon/path.h>
 
 /*
- * Channel 1 is this command's own conversation.  Channel 0 is reserved for the
- * link talking about itself, and the numbered ones above are for the things
- * that will come later - a remote device, a process's console - each of which
- * wants its own so that a stalled one does not hold up the others.
+ * Channel 1 is this command's own conversation.  Channel 0 is the hello
+ * exchange's (nodehello.c), and 15 the background window's credits
+ * (linkprov.c); the ones between are the services', each on its own so that
+ * a stalled one does not hold up the others.
  */
 #define LINK_CHAN_SHELL 1u
 
@@ -356,10 +358,39 @@ static void print_stats(void)
                           "the longest wait between two %u ms\n",
                           (unsigned)sp, (unsigned)sl, (unsigned)sg);
     }
+    uint32_t whole = 0, passes = 0;
+    rdp_counts(&whole, &passes);
+    if (passes != 0u) {
+        ag_console_printf("painter %u whole frames sent in %u passes\n",
+                          (unsigned)whole, (unsigned)passes);
+    }
     if (ss != 0u || sq != 0u) {
         ag_console_printf("sound   the longest wait between two periods %u ms,"
                           " its queue up to %u of %u\n",
                           (unsigned)ss, (unsigned)sq, (unsigned)sc);
+    }
+    uint32_t rw = 0, rl = 0;
+    ag_noderdev_wait_counts(&rw, &rl);
+    if (rw != 0u || rl != 0u) {
+        ag_console_printf("waits   the reader for picture room %u times; %u "
+                          "periods of sound late\n",
+                          (unsigned)rw, (unsigned)rl);
+    }
+    uint32_t bw = 0, bc = 0, br = 0, bh = 0;
+    ag_linkprov_bg_counts(&bw, &bc, &br, &bh);
+    if (bw != 0u || bc != 0u || br != 0u || bh != 0u) {
+        ag_console_printf("backgr  %u sends held for the window, %u answers "
+                          "given, %u counts started again, %u held here "
+                          "for want of time\n",
+                          (unsigned)bw, (unsigned)bc, (unsigned)br,
+                          (unsigned)bh);
+    }
+    uint32_t dry = 0, dry_us = 0;
+    ag_pcmhw_dry(&dry, &dry_us);
+    if (dry != 0u) {
+        ag_console_printf("dry     the converter ran out %u times, the "
+                          "longest %u ms\n",
+                          (unsigned)dry, (unsigned)(dry_us / 1000u));
     }
     uint32_t pp = 0, pl = 0, pf = 0, pq = 0;
     ag_noderdev_pour_counts(&pp, &pl, &pf, &pq);
@@ -1126,6 +1157,7 @@ int ag_cmd_link(int argc, char **argv)
     if (ag_path_icmp(argv[1], "report") == 0) {
         const bool on = argc > 2 && ag_path_icmp(argv[2], "on") == 0;
         ag_noderdev_report(on);
+        ag_linkprov_report(on);
         ag_console_printf("the screen's report each second: %s\n",
                           on ? "on" : "off");
         return 0;

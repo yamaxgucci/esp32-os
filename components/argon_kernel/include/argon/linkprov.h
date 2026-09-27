@@ -243,6 +243,14 @@ ag_err_t ag_linkprov_info_on(int32_t wire, ag_link_info_t *out);
 uint32_t ag_linkprov_reader_overruns(void);
 /* The same for the relay's task, which is on the same terms. */
 uint32_t ag_linkprov_relay_overruns(void);
+/* `link report on|off`: the link's second-by-second meters in the journal. */
+/* Background's window: sends it held back, answers this board gave, counts
+ * started again, and times this board, in the middle, held it for want of
+ * time. */
+void ag_linkprov_bg_counts(uint32_t *waits, uint32_t *credits,
+                           uint32_t *resyncs, uint32_t *relay_held);
+void ag_linkprov_report(bool on);
+bool ag_linkprov_reporting(void);
 
 void ag_linkprov_relay_counts(uint32_t *relayed, uint32_t *dropped,
                               uint32_t *held);

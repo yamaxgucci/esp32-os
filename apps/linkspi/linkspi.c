@@ -165,7 +165,11 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
     TASK->mutex_lock(nd->txlock, UINT32_MAX);
     const int32_t w = IO->spi_link_send2(
         nd->bus, head, LSPI_HEAD, buf, len,
-        stream ? 0u : AG_SPILINK_RELIABLE, stream ? 1u : LSPI_SEND_MS);
+        stream ? 0u
+               : (cls == AG_LINK_BACKGROUND)
+                   ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_YIELD)
+                   : AG_SPILINK_RELIABLE,
+        stream ? 1u : LSPI_SEND_MS);
     int32_t r;
     if (w > 0) {
         nd->sent++;

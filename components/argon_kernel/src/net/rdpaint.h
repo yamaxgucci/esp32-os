@@ -71,4 +71,8 @@ void rdp_set_sync(rdp_sync_fn sync);
  */
 void rdp_forget(void);
 
+/* Since the board started: frames that went whole (a snapshot's every row),
+ * and the passes they took.  Passes are not frames - a big one is several. */
+void rdp_counts(uint32_t *frames, uint32_t *passes);
+
 #endif /* ARGON_NET_RDPAINT_H */

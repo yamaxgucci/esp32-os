@@ -173,6 +173,62 @@ static ag_err_t pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
     return -AG_ENOTSUP;
 }
 
+/*
+ * WHAT A CLICK IS, COUNTED (27 Sep 2026).  Every counter the sound had was a
+ * piece turned away, and Maxim heard clicks far more often than any of them
+ * said: the converter running out between two pieces that both arrived.  The
+ * converter has no word for that here, so its clock is kept instead - frames
+ * given since a start against the time since it, at the stream's rate.  When
+ * the time has run past the frames by more than DRY_SLACK_US the converter
+ * played nothing for that long.  A pause of DRY_STOP_US or more is a sound
+ * that ended, not a click.
+ */
+#define DRY_SLACK_US 2000
+#define DRY_STOP_US  300000
+static int64_t  s_dry_t0_us;
+static uint64_t s_dry_frames;
+static uint32_t s_dry_times, s_dry_max_us;
+
+static void count_dry(uint32_t frames)
+{
+    const int64_t now = ag_port_us();
+    const uint32_t rate = (s_fmt.rate != 0u) ? s_fmt.rate : 22050u;
+    /*
+     * What the converter holds ahead of what it is playing covers a late
+     * piece: the S3's I2S chain is 960 frames, 43 ms at 22 kHz, and a clock
+     * that counted from the first write called every 3 ms late a click
+     * (27 Sep 2026).  Late by more than the chain is silence.
+     */
+    const int32_t chain = ag_port_audio_space();
+    const int64_t slack = DRY_SLACK_US +
+                          ((chain > 0) ? (int64_t)chain * 1000000 / rate : 0);
+    if (s_dry_t0_us != 0) {
+        const int64_t played_until =
+            s_dry_t0_us + (int64_t)(s_dry_frames * 1000000u / rate);
+        const int64_t late = now - played_until;
+        if (late > slack) {
+            if (late < DRY_STOP_US) {
+                s_dry_times++;
+                if ((uint32_t)late > s_dry_max_us) {
+                    s_dry_max_us = (uint32_t)late;
+                }
+            }
+            s_dry_t0_us = 0; /* a new start */
+        }
+    }
+    if (s_dry_t0_us == 0) {
+        s_dry_t0_us = now;
+        s_dry_frames = 0;
+    }
+    s_dry_frames += frames;
+}
+
+void ag_pcmhw_dry(uint32_t *times, uint32_t *longest_us)
+{
+    *times = s_dry_times;
+    *longest_us = s_dry_max_us;
+}
+
 static int32_t pcm_write(ag_device_t *dev, const void *buf, size_t len,
                          uint64_t off)
 {
@@ -201,6 +257,7 @@ static int32_t pcm_write(ag_device_t *dev, const void *buf, size_t len,
     }
     s_frames_in += frames;
     s_frames_out += (uint64_t)done;
+    count_dry((uint32_t)done);
 
     /*
      * Bytes accepted, which is what a caller checks against what it asked for.
@@ -279,6 +336,12 @@ ag_err_t ag_pcmhw_init(void)
 ag_err_t ag_pcmhw_init(void)
 {
     return AG_OK; /* nothing to register, and that is not a failure */
+}
+
+void ag_pcmhw_dry(uint32_t *times, uint32_t *longest_us)
+{
+    *times = 0;
+    *longest_us = 0;
 }
 
 #endif

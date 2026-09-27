@@ -82,6 +82,18 @@ static uint32_t s_window_tick; /* ticks into the current window            */
 static bool     s_hooked;
 
 /*
+ * THE BOARD'S SPARE TIME (27 Sep 2026), for whatever may only use what is
+ * left - a file relayed across the C3 beside a picture and sound, whose one
+ * core it had filled to 98.5%.  Ticks that found the idle task, and all
+ * ticks, over the last AG_IDLE_WINDOW_MS of both cores together.
+ */
+#define AG_IDLE_WINDOW_MS 20u
+static ag_port_task_t    s_idle_task[2];
+static uint32_t volatile s_idle_now[2], s_all_now[2];
+static uint32_t volatile s_idle_last, s_all_last;
+static uint32_t          s_idle_tick; /* ticks into the idle window, core 0 */
+
+/*
  * Interrupt context, both cores, every millisecond - and in IRAM, calling
  * nothing at all.
  *
@@ -111,6 +123,20 @@ static void AG_PORT_IRAM budget_tick(int core, ag_port_task_t running)
                     s_slots[i].fresh = true;
                 }
             }
+        }
+    }
+
+    if (core >= 0 && core < 2) {
+        s_all_now[core]++;
+        if (running != NULL && running == s_idle_task[core]) {
+            s_idle_now[core]++;
+        }
+        if (core == 0 && ++s_idle_tick >= AG_IDLE_WINDOW_MS) {
+            s_idle_tick = 0;
+            s_idle_last = s_idle_now[0] + s_idle_now[1];
+            s_all_last = s_all_now[0] + s_all_now[1];
+            s_idle_now[0] = s_idle_now[1] = 0;
+            s_all_now[0] = s_all_now[1] = 0;
         }
     }
 
@@ -154,6 +180,8 @@ void ag_budget_init(void)
     if (s_hooked) {
         return;
     }
+    s_idle_task[0] = ag_port_task_idle_of(0);
+    s_idle_task[1] = ag_port_task_idle_of(1);
     s_hooked = ag_port_tick_hook(budget_tick);
     if (!s_hooked) {
         ag_log(AG_LOG_WARN, "budget",
@@ -268,6 +296,15 @@ bool ag_budget_service(void)
     }
 
     return changed;
+}
+
+uint32_t ag_cpu_idle_percent(void)
+{
+    const uint32_t all = s_all_last;
+    if (!s_hooked || all == 0u) {
+        return 100u; /* not counted: nothing is held back on a guess */
+    }
+    return s_idle_last * 100u / all;
 }
 
 void ag_cpu_sample(bool on)

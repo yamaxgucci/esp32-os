@@ -96,8 +96,11 @@ static bool s_all_new; /* every pixel new every frame, as `noise` */
 /* Anything still marked for the far screen. */
 static bool dirty_left(void)
 {
+    if (s_p.cont) {
+        return true; /* the rest of a frame, out of the same snapshot */
+    }
     for (uint32_t y = 0; y < s_p.h; y++) {
-        if (s_p.dirty[y].x1 > s_p.dirty[y].x0) {
+        if (row_any(row_of(s_p.dirty, y))) {
             return true;
         }
     }
@@ -209,6 +212,111 @@ static void run(const char *name, uint32_t frames_a_pass)
     CHECK(bad_passes == 0u);
 }
 
+/*
+ * GFXNOISE's `balls`: eight solid balls over a flat background, each moving
+ * on its own.  The glass must match after every frame, and the count that
+ * matters on the CYD is rectangles a frame - a window costs its panel about
+ * 420 microseconds before the first pixel (27 Sep 2026).
+ */
+static void balls(void)
+{
+    enum { N = 8, R = 15 };
+    int32_t bx[N], by[N], vx[N], vy[N];
+    for (int i = 0; i < N; i++) {
+        bx[i] = 30 + i * 35;
+        by[i] = 30 + (i * 53) % 180;
+        vx[i] = (i & 1) ? 3 : -2;
+        vy[i] = (i & 2) ? 2 : -3;
+    }
+    const uint32_t r0 = s_rects, p0 = s_px_drawn;
+    uint32_t       bad = 0;
+    const uint32_t frames = 400;
+    for (uint32_t f = 0; f < frames; f++) {
+        for (uint32_t i = 0; i < W * H; i++) {
+            s_frame[i] = 0x0841u;
+        }
+        for (int i = 0; i < N; i++) {
+            for (int32_t y = by[i] - R; y <= by[i] + R; y++) {
+                for (int32_t x = bx[i] - R; x <= bx[i] + R; x++) {
+                    const int32_t dx = x - bx[i], dy = y - by[i];
+                    if (dx * dx + dy * dy <= R * R && x >= 0 && y >= 0 &&
+                        x < (int32_t)W && y < (int32_t)H) {
+                        s_frame[(uint32_t)y * W + (uint32_t)x] =
+                            (uint16_t)(0x1F00u + (uint32_t)i * 0x2345u);
+                    }
+                }
+            }
+            bx[i] += vx[i];
+            by[i] += vy[i];
+            if (bx[i] < R || bx[i] > (int32_t)W - 1 - R) {
+                vx[i] = -vx[i];
+            }
+            if (by[i] < R || by[i] > (int32_t)H - 1 - R) {
+                vy[i] = -vy[i];
+            }
+        }
+        present_frame();
+        uint32_t guard = 0;
+        do {
+            rdpaint_stub_now_us += 16000;
+            pass();
+        } while (dirty_left() && ++guard < 64u);
+        uint32_t at = 0;
+        if (diff(&at) != 0u) {
+            bad++;
+        }
+    }
+    printf("  rdpaint balls: %u frames, %u rectangles a frame, %u px a frame; "
+           "%u frames wrong\n",
+           (unsigned)frames, (unsigned)((s_rects - r0) / frames),
+           (unsigned)((s_px_drawn - p0) / frames), (unsigned)bad);
+    CHECK(bad == 0u);
+}
+
+/*
+ * A frame bigger than a pass, and the program presenting the next one while
+ * the rest of it is still to go: the glass must show the first frame whole -
+ * none of the second - when the rest has gone (27 Sep 2026, "the bottom lags
+ * the top").
+ */
+static void one_instant(void)
+{
+    static uint16_t first[W * H];
+    for (uint32_t i = 0; i < W * H; i++) {
+        s_frame[i] = noise();
+    }
+    present_frame();
+    memcpy(first, s_frame, sizeof(first));
+    rdpaint_stub_now_us += 16000;
+    pass();
+    CHECK(s_p.cont); /* cut short: the whole screen is more than a pass */
+    for (uint32_t i = 0; i < W * H; i++) {
+        s_frame[i] = noise();
+    }
+    present_frame();
+    uint32_t guard = 0;
+    while (s_p.cont && ++guard < 64u) {
+        rdpaint_stub_now_us += 16000;
+        pass();
+    }
+    CHECK(guard < 64u);
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < W * H; i++) {
+        n += (s_glass[i] != first[i]) ? 1u : 0u;
+    }
+    printf("  rdpaint one instant: %u px of the glass not the first frame\n",
+           (unsigned)n);
+    CHECK(n == 0u);
+    /* and the second frame follows whole */
+    guard = 0;
+    do {
+        rdpaint_stub_now_us += 16000;
+        pass();
+    } while (dirty_left() && ++guard < 64u);
+    uint32_t at = 0;
+    CHECK(diff(&at) == 0u);
+}
+
 int main(void)
 {
     s_ops.size = sizeof(s_ops);
@@ -217,6 +325,9 @@ int main(void)
     run("a pass every 3 frames", 3u);
     s_all_new = true;
     run("every pixel new every frame", 1u);
+    one_instant();
+    s_all_new = false;
+    balls();
     printf("rdpaint_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails == 0 ? 0 : 1;
 }

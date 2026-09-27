@@ -55,10 +55,108 @@
  * changes everywhere every frame is still sent round, not only at the top.
  */
 #define RDP_PASS_MAX_PX 4096u
+/* how long presents may pause before what they drew counts as a frame */
+#define RDP_FRAME_QUIET_US 30000
 
 typedef struct {
     uint16_t x0, x1; /* x1 <= x0: nothing */
 } span_t;
+
+/*
+ * A ROW IN PIECES (27 Sep 2026).  A row was one span, its first changed pixel
+ * to its last, and eight balls on the screen made most rows the whole width:
+ * the background between two balls went over the wire and was drawn again on
+ * a glass that draws about 157 000 pixels a second - 14 passes a second where
+ * the square had 55.  A row keeps up to RDP_SPANS pieces; pieces closer than
+ * RDP_SPAN_GAP pixels are one (a run's header costs about that much), and a
+ * piece with no place left joins its nearest.
+ */
+#define RDP_SPANS    4u
+#define RDP_SPAN_GAP 24u
+
+static span_t *row_of(span_t *set, uint32_t y)
+{
+    return set + (size_t)y * RDP_SPANS;
+}
+
+static bool row_any(const span_t *r)
+{
+    for (uint32_t i = 0; i < RDP_SPANS; i++) {
+        if (r[i].x1 > r[i].x0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void row_clear(span_t *r)
+{
+    memset(r, 0, RDP_SPANS * sizeof(span_t));
+}
+
+static void row_whole(span_t *r, uint16_t w)
+{
+    row_clear(r);
+    r[0].x1 = w;
+}
+
+/* in order of x, the empty ones last: see pass() for why */
+static void row_sort(span_t *r)
+{
+    for (uint32_t i = 1; i < RDP_SPANS; i++) {
+        const span_t v = r[i];
+        const bool   v_empty = v.x1 <= v.x0;
+        uint32_t     j = i;
+        while (j > 0) {
+            const span_t u = r[j - 1u];
+            const bool   u_empty = u.x1 <= u.x0;
+            if (v_empty || (!u_empty && u.x0 <= v.x0)) {
+                break;
+            }
+            r[j] = u;
+            j--;
+        }
+        r[j] = v;
+    }
+}
+
+static void row_add(span_t *r, uint32_t x0, uint32_t x1)
+{
+    /* every piece it touches, or nearly, becomes part of it */
+    for (bool again = true; again;) {
+        again = false;
+        for (uint32_t i = 0; i < RDP_SPANS; i++) {
+            if (r[i].x1 <= r[i].x0) {
+                continue;
+            }
+            if (r[i].x0 <= x1 + RDP_SPAN_GAP && x0 <= r[i].x1 + RDP_SPAN_GAP) {
+                x0 = (r[i].x0 < x0) ? r[i].x0 : x0;
+                x1 = (r[i].x1 > x1) ? r[i].x1 : x1;
+                r[i].x0 = r[i].x1 = 0;
+                again = true;
+            }
+        }
+    }
+    uint32_t best = 0, best_gap = UINT32_MAX;
+    for (uint32_t i = 0; i < RDP_SPANS; i++) {
+        if (r[i].x1 <= r[i].x0) {
+            r[i].x0 = (uint16_t)x0;
+            r[i].x1 = (uint16_t)x1;
+            row_sort(r);
+            return;
+        }
+        const uint32_t gap = (r[i].x0 > x1) ? r[i].x0 - x1 : x0 - r[i].x1;
+        if (gap < best_gap) {
+            best_gap = gap;
+            best = i;
+        }
+    }
+    /* no place: into the nearest, which may then reach another */
+    x0 = (r[best].x0 < x0) ? r[best].x0 : x0;
+    x1 = (r[best].x1 > x1) ? r[best].x1 : x1;
+    r[best].x0 = r[best].x1 = 0;
+    row_add(r, x0, x1);
+}
 
 /*
  * ONE PICTURE, NOT TWO.  The painter keeps a single copy of the screen, and it
@@ -84,14 +182,18 @@ static struct {
     uint32_t  cap_px;
     uint16_t  cap_rows;
     uint16_t *pic;       /* the one picture */
+    uint16_t *snap;      /* a pass's rows, copied at one instant (or NULL) */
+    volatile bool    frame_end;  /* a present reached the bottom row      */
+    volatile int64_t present_us; /* when the last present came            */
     uint8_t  *known;     /* per row: is the far screen known to match pic */
     span_t   *dirty;     /* rows of pic not yet sent, under the lock      */
     span_t   *work;
     uint8_t  *msg;
     uint32_t  len;
 
-    uint32_t passes, px_in, bytes_out;
+    uint32_t passes, frames, px_in, bytes_out;
     uint16_t next_y; /* where a pass cut short goes on from */
+    bool     cont;   /* ...and it goes on out of the same snapshot */
     int64_t  said_us;
     uint32_t said_passes, said_px, said_bytes;
     /* the far end's pace: time waited in sync, this second - the total and
@@ -195,6 +297,82 @@ static void report(void)
     s_p.said_bytes = s_p.bytes_out;
 }
 
+/* The piece of row `r` that has exactly columns x0..x1, or NULL. */
+static span_t *piece_at(span_t *r, uint16_t x0, uint16_t x1)
+{
+    for (uint32_t i = 0; i < RDP_SPANS; i++) {
+        if (r[i].x0 == x0 && r[i].x1 == x1 && x1 > x0) {
+            return &r[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * PIECES SQUARED INTO RECTANGLES (27 Sep 2026).  A ball is thirty rows of
+ * pieces each a little wider or narrower than the one above, so each was a
+ * rectangle of its own at the far end - and the CYD's panel pays about 420
+ * microseconds for a rectangle before its first pixel: five SPI transfers to
+ * set a window, some seventy each.  Eight balls were 250 windows a frame,
+ * about 100 ms, and 2.9 whole frames a second.  So the pieces that touch the
+ * piece above or below them take the columns of all of them: a ball goes as
+ * its box, a quarter more pixels in one window instead of thirty.
+ *
+ * Twice, down and then up, so the union reaches every row of a shape; and
+ * never wider than RDP_SQUARE_W or half as wide again as the wider of the
+ * two, so a diagonal line does not become the rectangle around it.
+ */
+#define RDP_SQUARE_W 64u
+
+static bool pieces_meet(const span_t *a, const span_t *b)
+{
+    return a->x1 > a->x0 && b->x1 > b->x0 && a->x0 < b->x1 && b->x0 < a->x1;
+}
+
+static void square_up(uint16_t h)
+{
+    for (int dir = 0; dir < 2; dir++) {
+        for (uint32_t k = 1; k < h; k++) {
+            const uint32_t y = (dir == 0) ? k : (uint32_t)h - 1u - k;
+            const uint32_t n = (dir == 0) ? y - 1u : y + 1u;
+            span_t *const       r = row_of(s_p.work, y);
+            const span_t *const q = row_of(s_p.work, n);
+            bool                grew = false;
+            for (uint32_t i = 0; i < RDP_SPANS; i++) {
+                for (uint32_t j = 0; j < RDP_SPANS; j++) {
+                    if (!pieces_meet(&r[i], &q[j])) {
+                        continue;
+                    }
+                    const uint32_t x0 = (q[j].x0 < r[i].x0) ? q[j].x0 : r[i].x0;
+                    const uint32_t x1 = (q[j].x1 > r[i].x1) ? q[j].x1 : r[i].x1;
+                    const uint32_t wa = (uint32_t)r[i].x1 - r[i].x0;
+                    const uint32_t wb = (uint32_t)q[j].x1 - q[j].x0;
+                    const uint32_t wide = (wa > wb) ? wa : wb;
+                    if (x1 - x0 > RDP_SQUARE_W && x1 - x0 > wide + wide / 2u) {
+                        continue;
+                    }
+                    if (x0 != r[i].x0 || x1 != r[i].x1) {
+                        r[i].x0 = (uint16_t)x0;
+                        r[i].x1 = (uint16_t)x1;
+                        grew = true;
+                    }
+                }
+            }
+            if (grew) {
+                /* a piece that grew may now meet its neighbour in the row */
+                span_t tmp[RDP_SPANS];
+                memcpy(tmp, r, sizeof(tmp));
+                row_clear(r);
+                for (uint32_t i = 0; i < RDP_SPANS; i++) {
+                    if (tmp[i].x1 > tmp[i].x0) {
+                        row_add(r, tmp[i].x0, tmp[i].x1);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /* One pass: every row marked since the last, out of the picture and into
  * the wire.  Apart from the loop so the host test can make passes itself. */
 static void pass(void)
@@ -203,8 +381,40 @@ static void pass(void)
         lock();
         const uint16_t w = s_p.w;
         const uint16_t h = s_p.h;
-        memcpy(s_p.work, s_p.dirty, (size_t)h * sizeof(span_t));
-        memset(s_p.dirty, 0, (size_t)h * sizeof(span_t));
+        /*
+         * THE REST OF THE SAME FRAME (27 Sep 2026).  A pass cut short at
+         * RDP_PASS_MAX_PX gave its rows back to the dirty set, and the next
+         * pass took them out of the picture again - a later frame's: the top
+         * of a big square from one instant and its bottom from the next, the
+         * tear Maxim still saw with the snapshot in.  Now what is left goes on
+         * from this snapshot, and the next is taken when all of it has gone.
+         */
+        const bool cont = s_p.cont && s_p.snap != NULL;
+        s_p.cont = false;
+        if (!cont) {
+        memcpy(s_p.work, s_p.dirty, (size_t)h * RDP_SPANS * sizeof(span_t));
+        memset(s_p.dirty, 0, (size_t)h * RDP_SPANS * sizeof(span_t));
+        square_up(h); /* before the snapshot: it copies what goes */
+        /*
+         * ONE INSTANT, NOT A PASS'S LENGTH OF THEM (27 Sep 2026).  The rows
+         * were sent out of the picture itself while the program went on
+         * presenting into it, so the top of the square went in one frame and
+         * its bottom in the next - "the bottom lags the top", Maxim.  What
+         * this pass sends is copied here, under the lock the presents take.
+         */
+        if (s_p.snap != NULL) {
+            for (uint32_t y = 0; y < h; y++) {
+                const span_t *const r = row_of(s_p.work, y);
+                for (uint32_t i = 0; i < RDP_SPANS; i++) {
+                    if (r[i].x1 > r[i].x0) {
+                        memcpy(s_p.snap + (size_t)y * w + r[i].x0,
+                               s_p.pic + (size_t)y * w + r[i].x0,
+                               (size_t)(r[i].x1 - r[i].x0) * 2u);
+                    }
+                }
+            }
+        }
+        }
         const uint32_t    handle = s_p.handle;
         const uint16_t    room = s_p.room;
         const rdp_send_fn send = s_p.send;
@@ -218,43 +428,66 @@ static void pass(void)
         s_p.len = RDP_HDR;
         const uint32_t first = (s_p.next_y < h) ? s_p.next_y : 0u;
         s_p.next_y = 0;
-        for (uint32_t k = 0; k < h && ok; k++) {
+        /*
+         * RECTANGLE BY RECTANGLE, not row by row: the far end joins runs of
+         * one x and width on rows one under another into a single blit, and
+         * a row's pieces taken in turn - the square's left edge, its right
+         * edge, the left again - joined none of them.  So a piece goes with
+         * every piece under it that has its columns (square_up made most of
+         * them so), down to the first row that has not.
+         */
+        bool cut = false;
+        for (uint32_t k = 0; k < h && ok && !cut; k++) {
             const uint32_t y = (first + k) % h;
-            const uint32_t x0 = s_p.work[y].x0;
-            const uint32_t x1 = s_p.work[y].x1;
-            if (x1 <= x0) {
-                continue;
-            }
-            if (changed >= RDP_PASS_MAX_PX) {
-                /* the rest of the rows for the next pass, back where the
-                 * presents meanwhile have been marking */
-                lock();
-                for (uint32_t j = k; j < h; j++) {
-                    const uint32_t yy = (first + j) % h;
-                    const span_t   ws = s_p.work[yy];
-                    if (ws.x1 <= ws.x0) {
-                        continue;
+            for (uint32_t i = 0; i < RDP_SPANS && ok && !cut; i++) {
+                span_t *p = row_of(s_p.work, y) + i;
+                if (p->x1 <= p->x0) {
+                    continue;
+                }
+                const uint16_t x0 = p->x0;
+                const uint16_t x1 = p->x1;
+                for (uint32_t yy = y; p != NULL && ok;) {
+                    if (changed >= RDP_PASS_MAX_PX) {
+                        cut = true;
+                        s_p.next_y = (uint16_t)yy;
+                        break;
                     }
-                    span_t *const dp = &s_p.dirty[yy];
-                    if (dp->x1 <= dp->x0) {
-                        *dp = ws;
-                    } else {
-                        dp->x0 = (ws.x0 < dp->x0) ? ws.x0 : dp->x0;
-                        dp->x1 = (ws.x1 > dp->x1) ? ws.x1 : dp->x1;
+                    any = true;
+                    const uint16_t *row =
+                        ((s_p.snap != NULL) ? s_p.snap : s_p.pic) +
+                        (size_t)yy * w;
+                    for (uint32_t x = x0; x < x1 && ok; x += RDP_CHUNK) {
+                        const uint32_t n = (x1 - x < RDP_CHUNK) ? x1 - x
+                                                                : RDP_CHUNK;
+                        ok = put_run(yy, x, row + x, n, room, handle, send);
+                        changed += n;
+                    }
+                    p->x0 = p->x1 = 0; /* sent: not again if continued */
+                    yy++;
+                    p = (yy < h) ? piece_at(row_of(s_p.work, yy), x0, x1)
+                                 : NULL;
+                }
+            }
+        }
+        if (cut && ok) {
+            if (s_p.snap != NULL) {
+                /* the rest stays in work, out of the snapshot */
+                s_p.cont = true;
+            } else {
+                /* the rest for the next pass, back where the presents
+                 * meanwhile have been marking */
+                lock();
+                for (uint32_t y = 0; y < h; y++) {
+                    const span_t *const ws = row_of(s_p.work, y);
+                    for (uint32_t i = 0; i < RDP_SPANS; i++) {
+                        if (ws[i].x1 > ws[i].x0) {
+                            row_add(row_of(s_p.dirty, y), ws[i].x0, ws[i].x1);
+                        }
                     }
                 }
                 unlock();
-                s_p.next_y = (uint16_t)y;
-                (void)ag_port_sem_give(s_p.wake);
-                break;
             }
-            any = true;
-            const uint16_t *row = s_p.pic + (size_t)y * w;
-            for (uint32_t x = x0; x < x1 && ok; x += RDP_CHUNK) {
-                const uint32_t n = (x1 - x < RDP_CHUNK) ? x1 - x : RDP_CHUNK;
-                ok = put_run(y, x, row + x, n, room, handle, send);
-                changed += n;
-            }
+            (void)ag_port_sem_give(s_p.wake);
         }
         if (ok) {
             ok = flush(handle, send);
@@ -262,14 +495,17 @@ static void pass(void)
         if (!ok) {
             /* the far screen is not known to show what the picture says:
              * all of it again, next time */
+            s_p.cont = false;
             lock();
             for (uint32_t y = 0; y < s_p.h; y++) {
-                s_p.dirty[y].x0 = 0;
-                s_p.dirty[y].x1 = s_p.w;
+                row_whole(row_of(s_p.dirty, y), s_p.w);
             }
             unlock();
         } else if (any) {
             s_p.passes++;
+            if (!cut) {
+                s_p.frames++; /* nothing of it left: a whole frame went */
+            }
             s_p.px_in += changed;
             const rdp_sync_fn sync = s_sync;
             if (sync != NULL) {
@@ -297,14 +533,37 @@ static void painter(void *arg)
     int64_t began = 0;
     for (;;) {
         (void)ag_port_sem_take(s_p.wake, ag_port_ms_to_ticks(1000));
+        /*
+         * A WHOLE FRAME, then a pass: a program presents a frame in bands
+         * from the top, and a pass taken while it is half way down is half
+         * one frame and half the other.  The band that reaches the bottom row
+         * ends a frame; a program that only ever changes a corner never
+         * reaches it, so a pause of RDP_FRAME_QUIET_US in the presents ends
+         * one too.
+         */
+        while (!s_p.cont && !s_p.frame_end &&
+               ag_port_us() - s_p.present_us < RDP_FRAME_QUIET_US) {
+            (void)ag_port_sem_take(s_p.wake, ag_port_ms_to_ticks(2));
+        }
+        /* the rest of a frame goes at once: it is the same frame */
+        const bool rest = s_p.cont;
+        if (!rest) {
+            s_p.frame_end = false;
+        }
         const int64_t since = ag_port_us() - began;
-        if (began != 0 && since < RDP_MIN_PASS_US) {
+        if (!rest && began != 0 && since < RDP_MIN_PASS_US) {
             ag_port_task_delay(ag_port_ms_to_ticks(
                 (uint32_t)((RDP_MIN_PASS_US - since) / 1000) + 1u));
         }
         began = ag_port_us();
         pass();
     }
+}
+
+void rdp_counts(uint32_t *frames, uint32_t *passes)
+{
+    *frames = s_p.frames;
+    *passes = s_p.passes;
 }
 
 void rdp_forget(void)
@@ -314,8 +573,7 @@ void rdp_forget(void)
     }
     lock();
     for (uint32_t y = 0; y < s_p.h; y++) {
-        s_p.dirty[y].x0 = 0;
-        s_p.dirty[y].x1 = s_p.w;
+        row_whole(row_of(s_p.dirty, y), s_p.w);
     }
     unlock();
     (void)ag_port_sem_give(s_p.wake);
@@ -328,13 +586,20 @@ static bool buffers(uint16_t w, uint16_t h, uint16_t room)
     s_p.cap_px = (uint32_t)w * h;
     s_p.cap_rows = h;
     s_p.pic = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_BYTE);
+    /* the snapshot is worth having, not worth failing for */
+    s_p.snap = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_SLOW | AG_MEM_BYTE);
+    if (s_p.snap == NULL) {
+        s_p.snap = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_BYTE);
+    }
     s_p.known = ag_port_alloc(h, AG_MEM_BYTE);
-    s_p.dirty = ag_port_alloc((size_t)h * sizeof(span_t), AG_MEM_BYTE);
-    s_p.work = ag_port_alloc((size_t)h * sizeof(span_t), AG_MEM_BYTE);
+    s_p.dirty = ag_port_alloc((size_t)h * RDP_SPANS * sizeof(span_t), AG_MEM_BYTE);
+    s_p.work = ag_port_alloc((size_t)h * RDP_SPANS * sizeof(span_t), AG_MEM_BYTE);
     s_p.msg = ag_port_alloc(room, AG_MEM_BYTE);
     if (s_p.pic == NULL || s_p.known == NULL || s_p.dirty == NULL ||
         s_p.work == NULL || s_p.msg == NULL) {
         ag_port_free(s_p.pic);
+        ag_port_free(s_p.snap);
+        s_p.snap = NULL;
         ag_port_free(s_p.known);
         ag_port_free(s_p.dirty);
         ag_port_free(s_p.work);
@@ -343,7 +608,7 @@ static bool buffers(uint16_t w, uint16_t h, uint16_t room)
         return false;
     }
     memset(s_p.known, 0, h);
-    memset(s_p.dirty, 0, (size_t)h * sizeof(span_t));
+    memset(s_p.dirty, 0, (size_t)h * RDP_SPANS * sizeof(span_t));
     s_p.w = w;
     s_p.h = h;
     s_p.room = room;
@@ -394,7 +659,7 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
         s_p.w = b->surf_w;
         s_p.h = b->surf_h;
         memset(s_p.known, 0, s_p.h);
-        memset(s_p.dirty, 0, (size_t)s_p.h * sizeof(span_t));
+        memset(s_p.dirty, 0, (size_t)s_p.h * RDP_SPANS * sizeof(span_t));
     }
     s_p.handle = handle;
     s_p.send = send;
@@ -405,33 +670,44 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
         const uint16_t *in = (const uint16_t *)(const void *)(
             (const uint8_t *)b->px + (size_t)(y - b->y) * b->stride);
         uint16_t *row = s_p.pic + (size_t)y * s_p.w;
-        uint32_t  x0 = b->x;
-        uint32_t  x1 = xe;
-        if (s_p.known[y]) {
-            /* what differs from what the far screen will show, and only
-             * that: a pointer that moved is a few pixels of a few rows */
-            while (x0 < x1 && in[x0 - b->x] == row[x0]) {
-                x0++;
+        span_t *const   r = row_of(s_p.dirty, y);
+        if (!s_p.known[y]) {
+            if (b->x == 0 && xe == s_p.w) {
+                s_p.known[y] = 1; /* a whole row: from now on it is known */
             }
-            while (x1 > x0 && in[x1 - 1u - b->x] == row[x1 - 1u]) {
-                x1--;
-            }
-            if (x1 <= x0) {
-                continue;
-            }
-        } else if (b->x == 0 && xe == s_p.w) {
-            s_p.known[y] = 1; /* a whole row: from now on it is known */
+            memcpy(row + b->x, in, (size_t)(xe - b->x) * 2u);
+            row_add(r, b->x, xe);
+            marked = true;
+            continue;
         }
-        memcpy(row + x0, in + (x0 - b->x), (size_t)(x1 - x0) * 2u);
-        span_t *sp = &s_p.dirty[y];
-        if (sp->x1 <= sp->x0) {
-            sp->x0 = (uint16_t)x0;
-            sp->x1 = (uint16_t)x1;
-        } else {
-            sp->x0 = (x0 < sp->x0) ? (uint16_t)x0 : sp->x0;
-            sp->x1 = (x1 > sp->x1) ? (uint16_t)x1 : sp->x1;
+        /* what differs from what the far screen will show, and only that,
+         * piece by piece: a pointer that moved is a few pixels of a few
+         * rows, and two balls are two pieces, not the row between them */
+        uint32_t x = b->x;
+        while (x < xe) {
+            while (x < xe && in[x - b->x] == row[x]) {
+                x++;
+            }
+            if (x >= xe) {
+                break;
+            }
+            /* a piece ends at RDP_SPAN_GAP pixels that are the same */
+            uint32_t e = x + 1u;
+            uint32_t same = 0;
+            while (e < xe && same < RDP_SPAN_GAP) {
+                same = (in[e - b->x] == row[e]) ? same + 1u : 0u;
+                e++;
+            }
+            const uint32_t end = e - same;
+            memcpy(row + x, in + (x - b->x), (size_t)(end - x) * 2u);
+            row_add(r, x, end);
+            marked = true;
+            x = e;
         }
-        marked = true;
+    }
+    s_p.present_us = ag_port_us();
+    if ((uint32_t)b->y + b->h >= s_p.h) {
+        s_p.frame_end = true;
     }
     unlock();
     if (marked) {

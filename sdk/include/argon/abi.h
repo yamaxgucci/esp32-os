@@ -1619,7 +1619,15 @@ enum ag_link_class {
     AG_LINK_CONTROL = 0, /* small, prompt, reliable - a spawn, a device call  */
     AG_LINK_STREAM = 1,  /* reserved rate, dropped rather than delayed        */
     AG_LINK_BULK = 2,    /* reliable, windowed, may wait as long as it must   */
-    AG_LINK_CLASSES = 3,
+    /*
+     * Reliable, and only on what the others leave (27 Sep 2026): a file sent
+     * beside a picture and sound.  Behind every other class on every board it
+     * crosses, and windowed from end to end - a sender has at most a few
+     * kilobytes of it unanswered - so it can fill no queue on the way.  A
+     * driver built before it refuses it as a class it does not know.
+     */
+    AG_LINK_BACKGROUND = 3,
+    AG_LINK_CLASSES = 4,
 };
 
 /*

@@ -46,6 +46,9 @@
  *       the task that was running there.  For charging processor time to whoever
  *       spent it.  Must be short and must not block.  Registered once and never
  *       taken back.
+ *   ag_port_task_t ag_port_task_idle_of(int core)
+ *       The scheduler's idle task on that core, NULL past the last core: for
+ *       counting the ticks nothing wanted.
  *   void ag_port_sched_lock(void)
  *   void ag_port_sched_unlock(void)
  *

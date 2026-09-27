@@ -82,6 +82,9 @@ void ag_noderdev_pour_counts(uint32_t *periods, uint32_t *lost,
 
 /* `link report on|off`: the screen's second-by-second journal lines. */
 void ag_noderdev_report(bool on);
+/* Times the reader waited for room for the picture; periods of sound that
+ * came more than 30 ms after the one before. */
+void ag_noderdev_wait_counts(uint32_t *reader_waits, uint32_t *late);
 /* A neighbour's picture here since the board started: passes drawn, pieces
  * not drawn, the longest wait between two passes and between two periods of
  * sound, and the fullest the sound queue got, of how many. */

@@ -162,7 +162,7 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
      * it always was: late sound is worse than none.
      */
     const uint32_t how = stream ? AG_SPILINK_WHOLE
-                         : (cls == AG_LINK_BULK)
+                         : (cls == AG_LINK_BULK || cls == AG_LINK_BACKGROUND)
                              ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE |
                                 AG_SPILINK_YIELD)
                              : (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE);

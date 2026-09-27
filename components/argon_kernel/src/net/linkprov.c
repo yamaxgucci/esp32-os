@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <string.h>
 
+#include <argon/budget.h>
 #include <argon/device.h>
 #include <argon/libc.h>
 #include <argon/log.h>
@@ -276,14 +277,42 @@ static void relay_drop(unsigned why, uint16_t dst, const char *what)
 #define RELAY_FRAME   4096u
 #define RELAY_REC     (2u + 1u + sizeof(ag_link_addr_t))
 
+/*
+ * A QUEUE PER CLASS, NOT ONE (27 Sep 2026).  One queue per wire out, in the
+ * order frames came, and a file sent at the lowest priority on the Zero filled
+ * the C3's queue for the CYD: the picture waited 55 to 230 ms a pass behind
+ * it, 7 KB/s of picture beside 199 KB/s of file, and the C3's own sound went
+ * out between them.  The priority of the task that sent the file was nowhere
+ * in the frames.  Their class is: prompt (control and sound), bulk (the
+ * picture, a device's data), background (a file, on what is left over), and
+ * the relay task always takes the first class that has anything.  Order is
+ * kept within a class; between classes it never meant anything.
+ *
+ * The prompt queue is smaller: its frames are small, and a frame too big for
+ * its queue is sent straight on as before a queue existed.  The background
+ * queue holds a whole BG_WINDOW and a frame, so the one sender the window
+ * allows never fills it (see BACKGROUND, below).
+ */
+#define RQ_CLASSES 3u
+static const uint32_t k_rq_cap[RQ_CLASSES] = {4096u, RELAY_Q_BYTES,
+                                              RELAY_Q_BYTES};
+
+static unsigned rq_class(uint8_t cls)
+{
+    return (cls == AG_LINK_BACKGROUND) ? 2u : (cls == AG_LINK_BULK) ? 1u : 0u;
+}
+
 typedef struct {
     uint8_t *mem;
+    uint32_t cap;
     uint32_t r, w, used;
 } relay_q_t;
 
 static void reader_wake(void);
+static bool credit_hold(int32_t to, uint8_t chan, const ag_link_addr_t *a,
+                        const uint8_t *buf, uint16_t len);
 
-static relay_q_t        s_rq[LINK_WIRES];
+static relay_q_t        s_rq[LINK_WIRES][RQ_CLASSES];
 static ag_port_mutex_t  s_rq_lock;
 static ag_port_sem_t    s_rq_wake;
 static ag_port_task_t   s_rq_task;
@@ -306,23 +335,25 @@ static volatile bool    s_rq_stalled; /* the reader stopped a wire for room  */
 static uint32_t         s_rq_stops;   /* how many times it did               */
 static uint8_t         *s_rq_frame; /* one frame out of a queue, RELAY_FRAME */
 
+/* In at most two copies: a division a byte cost the C3, whose one core was
+ * 98% busy moving a file across it (27 Sep 2026). */
 static void rq_put(relay_q_t *q, const void *src, uint32_t n)
 {
     const uint8_t *p = (const uint8_t *)src;
-    for (uint32_t i = 0; i < n; i++) {
-        q->mem[q->w] = p[i];
-        q->w = (q->w + 1u) % RELAY_Q_BYTES;
-    }
+    const uint32_t first = (n < q->cap - q->w) ? n : q->cap - q->w;
+    memcpy(q->mem + q->w, p, first);
+    memcpy(q->mem, p + first, n - first);
+    q->w = (q->w + n) % q->cap;
     q->used += n;
 }
 
 static void rq_get(relay_q_t *q, void *dst, uint32_t n)
 {
-    uint8_t *p = (uint8_t *)dst;
-    for (uint32_t i = 0; i < n; i++) {
-        p[i] = q->mem[q->r];
-        q->r = (q->r + 1u) % RELAY_Q_BYTES;
-    }
+    uint8_t       *p = (uint8_t *)dst;
+    const uint32_t first = (n < q->cap - q->r) ? n : q->cap - q->r;
+    memcpy(p, q->mem + q->r, first);
+    memcpy(p + first, q->mem, n - first);
+    q->r = (q->r + n) % q->cap;
     q->used -= n;
 }
 
@@ -332,6 +363,19 @@ static void rq_get(relay_q_t *q, void *dst, uint32_t n)
  */
 static int64_t  s_rl_max_us, s_rl_said_us;
 static uint32_t s_rl_sends;
+/* `link report on`: this and the sound's meter write the journal each
+ * second - from tasks that must not wait for a console (27 Sep 2026) */
+static volatile bool s_link_report;
+
+void ag_linkprov_report(bool on)
+{
+    s_link_report = on;
+}
+
+bool ag_linkprov_reporting(void)
+{
+    return s_link_report;
+}
 
 static void relay_meter(int64_t took)
 {
@@ -341,7 +385,7 @@ static void relay_meter(int64_t took)
     }
     const int64_t now = ag_port_us();
     if (now - s_rl_said_us >= 1000000) {
-        if (s_rl_said_us != 0) {
+        if (s_rl_said_us != 0 && s_link_report) {
             ag_log(AG_LOG_INFO, "link",
                    "relay: %u frames sent on, the longest send %u us",
                    (unsigned)s_rl_sends, (unsigned)s_rl_max_us);
@@ -358,9 +402,17 @@ static bool rq_send_one(int i)
 {
     const int64_t    began = ag_port_us();
     uint8_t *const   frame = s_rq_frame;
-    relay_q_t *const q = &s_rq[i];
     (void)ag_port_mutex_take(s_rq_lock, AG_PORT_FOREVER);
-    if (q->used < RELAY_REC) {
+    /* the first class with anything in it: prompt, then bulk, then
+     * background */
+    relay_q_t *q = NULL;
+    for (unsigned c = 0; c < RQ_CLASSES; c++) {
+        if (s_rq[i][c].used >= RELAY_REC) {
+            q = &s_rq[i][c];
+            break;
+        }
+    }
+    if (q == NULL) {
         (void)ag_port_mutex_give(s_rq_lock);
         return false;
     }
@@ -437,9 +489,20 @@ static bool relay_room_for(unsigned in, uint32_t frame)
     bool room = true;
     (void)ag_port_mutex_take(s_rq_lock, AG_PORT_FOREVER);
     for (unsigned j = 0; j < LINK_WIRES; j++) {
-        if (j != in && s_rq[j].mem != NULL &&
-            RELAY_Q_BYTES - s_rq[j].used < need) {
-            room = false;
+        /*
+         * Every class, background too: its window keeps it from filling,
+         * and when a busy middle board holds it anyway (bg_may_relay) a
+         * full queue stopping this wire is better than the reader waiting
+         * inside relay_queue for room that only its own relay can make.  A
+         * frame bigger than a queue goes around it, so the most a queue is
+         * asked to hold is itself.
+         */
+        for (unsigned c = 0; c < RQ_CLASSES; c++) {
+            const relay_q_t *const q = &s_rq[j][c];
+            const uint32_t n = (need < q->cap) ? need : q->cap;
+            if (j != in && q->mem != NULL && q->cap - q->used < n) {
+                room = false;
+            }
         }
     }
     (void)ag_port_mutex_give(s_rq_lock);
@@ -469,17 +532,22 @@ static bool relay_queue(int32_t to, uint8_t chan, const ag_link_addr_t *a,
             return false;
         }
     }
-    relay_q_t *const q = &s_rq[to];
+    const unsigned   c = rq_class(a->cls);
+    relay_q_t *const q = &s_rq[to][c];
+    const uint32_t   need = RELAY_REC + len;
+    if (need > k_rq_cap[c]) {
+        return false; /* bigger than its queue: straight on, as it was */
+    }
     if (q->mem == NULL) {
-        q->mem = (uint8_t *)ag_port_alloc(RELAY_Q_BYTES, AG_MEM_BYTE);
+        q->mem = (uint8_t *)ag_port_alloc(k_rq_cap[c], AG_MEM_BYTE);
         if (q->mem == NULL) {
             return false;
         }
+        q->cap = k_rq_cap[c];
     }
-    const uint32_t need = RELAY_REC + len;
     for (unsigned tries = 0;; tries++) {
         (void)ag_port_mutex_take(s_rq_lock, AG_PORT_FOREVER);
-        if (RELAY_Q_BYTES - q->used >= need) {
+        if (q->cap - q->used >= need) {
             uint8_t hdr[RELAY_REC];
             hdr[0] = (uint8_t)len;
             hdr[1] = (uint8_t)(len >> 8);
@@ -534,6 +602,9 @@ static void relay(wire_t *arrived, uint8_t chan, const ag_link_addr_t *a,
      * to, and if this board put its own name there the answer would come back
      * here instead of going home.
      */
+    if (credit_hold(to, chan, a, buf, len)) {
+        return; /* a background credit, kept until this board has time */
+    }
     if (relay_queue(to, chan, a, buf, len)) {
         return;
     }
@@ -608,6 +679,296 @@ bool ag_linkprov_in_reader(void)
 }
 
 /*
+ * BACKGROUND: A WINDOW FROM END TO END (27 Sep 2026).
+ *
+ * The lowest class has to be the lowest everywhere it passes, and a class
+ * alone is not enough for that: a file sent as fast as the first wire takes
+ * it still arrives at the middle board faster than the second wire can carry
+ * it away, and whatever queue is between them fills - and a full queue stops
+ * everything behind it.  So a sender keeps at most BG_WINDOW bytes of it
+ * unanswered to any one node, and the node it is for answers what it has
+ * received (a CREDIT on LINK_CHAN_SELF, the link's own).  Nothing on the way can
+ * then hold more than a window of it.
+ *
+ * And the answer is what makes it the LEFTOVER.  The far board answers from
+ * its reader, and only while the reader is inside its budget (2 ms in 10):
+ * a reader busy with sound and a picture spends its budget on them, the
+ * answer waits for the next window, and the file slows by exactly that much.
+ * Every class above it is answered, or not, as before.
+ *
+ * An answer can be lost with its wire; a sender that has heard nothing for
+ * BG_RESYNC_US with bytes outstanding starts its count again from what it
+ * has sent.  The cost is one window too many, once.  An answer is a step,
+ * not a total (see bg_heard), so a far board that starts again needs nothing.
+ */
+/* 2 KB, not 6: measured beside the balls, the picture 1.9 -> 3.4 whole frames a
+ * second and the CYD's converter never dry, for 181 -> 127 KB/s of file */
+#define BG_WINDOW      2048u
+#define BG_PEERS       4u
+#define BG_RESYNC_US   1000000
+#define BG_QUIET_US    5000
+/* not 0: that is the hello exchange's, and taking it here left every board
+ * with neighbours that never said who they were (27 Sep 2026) */
+#define LINK_CHAN_SELF 15u
+#define SELF_CREDIT    'C'
+
+typedef struct {
+    volatile uint16_t node;
+    volatile uint32_t sent;     /* bytes of background sent to it       */
+    volatile uint32_t heard;    /* ...and those it has said it received */
+    volatile int64_t  heard_us; /* when it last said so                 */
+} bg_out_t;
+
+typedef struct {
+    uint16_t node;
+    int32_t  wire; /* the wire its frames came in on: the answer's way home */
+    uint32_t got, said;
+    int64_t  last_us; /* when its last frame came */
+} bg_in_t;
+
+static bg_out_t s_bg_out[BG_PEERS];
+static bg_in_t  s_bg_in[BG_PEERS];
+static uint32_t s_bg_waits, s_bg_resyncs, s_bg_credits;
+static uint32_t s_bg_relay_held; /* held in the middle for want of time */
+
+static void     put32(uint8_t *p, uint32_t v);
+static uint32_t get32(const uint8_t *p);
+static int32_t  send_addressed(int32_t wire, uint16_t dst, uint8_t chan,
+                               uint8_t cls, const void *buf, size_t len);
+
+/* The sender's count for `node`; a new node takes a free slot, or the one
+ * heard from longest ago. */
+static bg_out_t *bg_out_for(uint16_t node)
+{
+    bg_out_t *oldest = &s_bg_out[0];
+    for (unsigned i = 0; i < BG_PEERS; i++) {
+        bg_out_t *const o = &s_bg_out[i];
+        if (o->node == node) {
+            return o;
+        }
+        if (o->node == 0u || o->heard_us < oldest->heard_us) {
+            oldest = o;
+        }
+    }
+    oldest->node = node;
+    oldest->sent = 0;
+    oldest->heard = 0;
+    oldest->heard_us = ag_port_us();
+    return oldest;
+}
+
+/* May `len` more bytes of background go to it now? */
+static bool bg_may_send(bg_out_t *o, size_t len)
+{
+    const int64_t  now = ag_port_us();
+    const uint32_t out = o->sent - o->heard;
+    if (out == 0u) {
+        o->heard_us = now; /* nothing outstanding: the clock starts now */
+        return true;
+    }
+    if (out > 4u * BG_WINDOW || now - o->heard_us > BG_RESYNC_US) {
+        /* one frame, not a window: an answer lost is rare, and a middle
+         * board holding background for want of time is not - a whole
+         * window more each time would fill its queue */
+        o->heard = o->sent + (uint32_t)len - BG_WINDOW;
+        o->heard_us = now;
+        s_bg_resyncs++;
+        return true;
+    }
+    return out + (uint32_t)len <= BG_WINDOW;
+}
+
+/*
+ * A credit from `node`: `more` bytes of background from here have arrived
+ * there since its last credit.  The bytes since, not a total: a total had to
+ * be compared with this side's count, and after any start-again here - a
+ * lost answer, a far end that rebooted - every total that came after looked
+ * like a far end that had started again, 5 588 times in five minutes (27 Sep
+ * 2026).  A step is simply added, never past what was sent.
+ */
+static void bg_heard(uint16_t node, uint32_t more)
+{
+    for (unsigned i = 0; i < BG_PEERS; i++) {
+        bg_out_t *const o = &s_bg_out[i];
+        if (o->node != node) {
+            continue;
+        }
+        const uint32_t out = o->sent - o->heard;
+        o->heard += (more < out) ? more : out;
+        o->heard_us = ag_port_us();
+        return;
+    }
+}
+
+/* On the reader: a frame of background for this board has arrived. */
+static void bg_note(uint16_t node, int32_t wire, uint16_t len)
+{
+    bg_in_t *slot = NULL;
+    for (unsigned i = 0; i < BG_PEERS; i++) {
+        if (s_bg_in[i].node == node) {
+            slot = &s_bg_in[i];
+            break;
+        }
+        if (slot == NULL && s_bg_in[i].node == 0u) {
+            slot = &s_bg_in[i];
+        }
+    }
+    if (slot == NULL) {
+        slot = &s_bg_in[0];
+    }
+    if (slot->node != node) {
+        slot->node = node;
+        slot->got = 0;
+        slot->said = 0;
+    }
+    slot->wire = wire;
+    slot->got += len;
+    slot->last_us = ag_port_us();
+}
+
+/*
+ * On the reader, after every round of the wires: the answers owed, unless
+ * the reader has spent its budget in this window - then they wait for the
+ * next, and so does whoever is sending background at it.
+ */
+static void bg_answer(bool low, int64_t window)
+{
+    if (low && ag_port_us() - window < READER_WINDOW_US) {
+        return;
+    }
+    for (unsigned i = 0; i < BG_PEERS; i++) {
+        bg_in_t *const in = &s_bg_in[i];
+        if (in->node == 0u || in->got == in->said) {
+            continue;
+        }
+        /*
+         * Half a window at a time, or what is owed once its frames have
+         * stopped for BG_QUIET_US.  An answer a frame was 72 000 messages
+         * in five minutes back through the middle board, and "when the
+         * reader found nothing" - true between nearly every two frames -
+         * made it 102 000, on a C3 already 98% busy (27 Sep 2026).
+         */
+        if (in->got - in->said < BG_WINDOW / 2u &&
+            ag_port_us() - in->last_us < BG_QUIET_US) {
+            continue;
+        }
+        uint8_t m[5];
+        m[0] = (uint8_t)SELF_CREDIT;
+        put32(m + 1, in->got - in->said);
+        if (send_addressed(in->wire, in->node, LINK_CHAN_SELF,
+                           AG_LINK_CONTROL, m, sizeof(m)) >= 0) {
+            in->said = in->got;
+            s_bg_credits++;
+        }
+    }
+}
+
+/*
+ * THE MIDDLE BOARD'S SPARE TIME, TOO (27 Sep 2026).  The window's answers
+ * come from the far end, which knows nothing of the board between: the C3,
+ * one core, moved the Zero's file to the CYD with 1.5% of its processor
+ * idle, and what it spent was the wire's send task at priority 9 - above
+ * TONE, which then made the sound of both rooms late.  So a board passes
+ * background on only while its processor had BG_IDLE_MIN of the last 20 ms
+ * to spare; the rest waits in its queue, the window closes behind it, and
+ * the sender slows to what this board can give.  (Held by the reader's and
+ * the relay's budgets instead, it waited while there was time and went
+ * while there was none: they are 2 ms of 10 each, not the processor.)
+ */
+/*
+ * 30, not 10: at 10 the C3 kept 11.6% of its time and the sound of both
+ * rooms was right, but a pass of the picture still took 50 ms through it -
+ * a board nine-tenths busy queues everything.  (Not charging background to
+ * the reader's budget instead made it 75: the reader, kept high, took the
+ * processor from TONE itself.)
+ */
+#define BG_IDLE_MIN 30u
+
+static bool bg_may_relay(void)
+{
+    return ag_cpu_idle_percent() >= BG_IDLE_MIN;
+}
+
+/*
+ * THE ANSWERS ARE WHAT A MIDDLE BOARD HOLDS, NOT THE FRAMES (27 Sep 2026).
+ * Holding the file's frames filled its queue, a full queue stopped the Zero's
+ * wire, and the picture on that wire waited behind the file: 50 ms a pass,
+ * the same at 10% and at 30%.  A credit on its way back through this board
+ * says "so many more bytes arrived"; held here, and added to the next one
+ * for the same pair, it closes the sender's window before any more of the
+ * file is sent - and what is on the way goes on at once.  Released as soon
+ * as this board has BG_IDLE_MIN to spare (credit_release, on the reader).
+ */
+#define BG_HOLD_PAIRS 4u
+
+typedef struct {
+    bool           used;
+    int32_t        to;
+    ag_link_addr_t a;
+    uint32_t       more;
+} bg_hold_t;
+
+static bg_hold_t s_bg_hold[BG_HOLD_PAIRS];
+
+static bool credit_hold(int32_t to, uint8_t chan, const ag_link_addr_t *a,
+                        const uint8_t *buf, uint16_t len)
+{
+    if (chan != LINK_CHAN_SELF || len < 5u || buf[0] != (uint8_t)SELF_CREDIT) {
+        return false;
+    }
+    bg_hold_t *slot = NULL;
+    for (unsigned i = 0; i < BG_HOLD_PAIRS; i++) {
+        bg_hold_t *const h = &s_bg_hold[i];
+        if (h->used && h->a.dst == a->dst && h->a.src == a->src) {
+            slot = h;
+            break;
+        }
+        if (!h->used && slot == NULL) {
+            slot = h;
+        }
+    }
+    const bool busy = !bg_may_relay();
+    if (slot == NULL || (!busy && !slot->used)) {
+        return false; /* time to spare, nothing held: on as it came */
+    }
+    if (!slot->used) {
+        slot->used = true;
+        slot->to = to;
+        slot->a = *a;
+        slot->more = 0;
+    }
+    slot->more += get32(buf + 1);
+    s_bg_relay_held++;
+    return true; /* kept, and sent with the rest by credit_release */
+}
+
+/* On the reader, after each round: what was held, if there is time now. */
+static void credit_release(void)
+{
+    for (unsigned i = 0; i < BG_HOLD_PAIRS; i++) {
+        bg_hold_t *const h = &s_bg_hold[i];
+        if (!h->used || !bg_may_relay()) {
+            continue;
+        }
+        uint8_t m[5];
+        m[0] = (uint8_t)SELF_CREDIT;
+        put32(m + 1, h->more);
+        if (relay_queue(h->to, LINK_CHAN_SELF, &h->a, m, sizeof(m))) {
+            h->used = false;
+        }
+    }
+}
+
+void ag_linkprov_bg_counts(uint32_t *waits, uint32_t *credits,
+                           uint32_t *resyncs, uint32_t *relay_held)
+{
+    *relay_held = s_bg_relay_held;
+    *waits = s_bg_waits;
+    *credits = s_bg_credits;
+    *resyncs = s_bg_resyncs;
+}
+
+/*
  * One message off a wire, and the decision this whole file now exists for.
  *
  * A frame with no destination, or with this board's own, is delivered upward
@@ -631,6 +992,16 @@ static void route(wire_t *w, uint8_t chan, const ag_link_addr_t *from,
      * Recorded before the handler runs, per wire.
      */
     s_from[wire_slot(w)] = from->src;
+    if (chan == LINK_CHAN_SELF) {
+        /* the window's own channel: only credits */
+        if (len >= 5u && buf[0] == (uint8_t)SELF_CREDIT) {
+            bg_heard(from->src, get32(buf + 1));
+        }
+        return;
+    }
+    if (from->cls == AG_LINK_BACKGROUND) {
+        bg_note(from->src, wire_slot(w), len);
+    }
     /*
      * The handler runs HERE, on the reader, with s_reading naming this wire,
      * and that is what makes a reply go back the way the question came:
@@ -750,6 +1121,7 @@ uint32_t ag_linkprov_reader_overruns(void)
 {
     return s_rd_drops;
 }
+
 
 /*
  * THE RELAY, ON THE SAME TERMS (26 Sep 2026).  At priority 1 on the C3 it
@@ -878,6 +1250,8 @@ static void reader_task(void *arg)
                 reader_charge(began);
             }
         }
+        bg_answer(s_rd_low, s_rd_window);
+        credit_release();
         if (!got) {
             (void)ag_port_sem_take(s_wake, ag_port_ms_to_ticks(READER_IDLE_MS));
         }
@@ -1044,7 +1418,7 @@ static void flood_task(void *arg)
         for (uint32_t k = 5; k < j->size; k++) {
             j->frame[k] = sink_byte(seq, k);
         }
-        const int32_t r = ag_linkprov_send(LINK_CHAN_SINK, AG_LINK_BULK,
+        const int32_t r = ag_linkprov_send(LINK_CHAN_SINK, AG_LINK_BACKGROUND,
                                            j->frame, j->size);
         if (r >= 0) {
             o->sent_bytes += j->size;
@@ -1315,13 +1689,45 @@ int32_t ag_linkprov_index_of(const char *name)
 static int32_t send_addressed(int32_t wire, uint16_t dst, uint8_t chan,
                               uint8_t cls, const void *buf, size_t len)
 {
-    held_t h;
-    if (wire < 0 || (unsigned)wire >= LINK_WIRES || !hold(&s_wire[wire], &h)) {
+    if (wire < 0 || (unsigned)wire >= LINK_WIRES) {
         return -AG_ENODEV;
+    }
+    bg_out_t *bo = NULL;
+    if (cls == AG_LINK_BACKGROUND) {
+        uint16_t node = dst;
+        if (node == 0u) {
+            /* "whoever reads it": the neighbour, who will answer as itself */
+            const char *peer = ag_node_peer_name_at(wire);
+            node = (peer != NULL) ? ag_node_hash(peer) : 0u;
+        }
+        if (node != 0u) {
+            bo = bg_out_for(node);
+            if (!bg_may_send(bo, len)) {
+                s_bg_waits++;
+                return -AG_EAGAIN; /* its window is out: it waits its turn */
+            }
+        }
+    }
+    held_t h;
+    if (!hold(&s_wire[wire], &h)) {
+        return -AG_ENODEV;
+    }
+    /*
+     * Counted as sent BEFORE it is: a sender at priority 1 is taken off its
+     * core the moment the wire has the frame, and the far end's answer came
+     * back before the count was made - told of more than it had sent, the
+     * sender took every answer for a far end that had started again, 13 559
+     * times in five minutes, and there was no window at all (27 Sep 2026).
+     */
+    if (bo != NULL) {
+        bo->sent += (uint32_t)len;
     }
     const ag_link_addr_t to = {dst, ag_linkprov_here(), cls};
     const int32_t r = h.ops->send_a(h.dev, chan, buf, len, &to);
     let_go(&h);
+    if (r < 0 && bo != NULL) {
+        bo->sent -= (uint32_t)len;
+    }
     return r;
 }
 

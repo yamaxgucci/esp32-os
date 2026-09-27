@@ -66,10 +66,21 @@
  * A piece of SOUND is at most this (27 Sep 2026): a mixer period of 256
  * frames of stereo is 1 024 bytes, and a sound slot sized for a 2 KB picture
  * message was half empty - nine of them, 9 KB of the CYD's memory holding
- * nothing.  The sender cuts sound to this, whole frames; the room it gives
- * back is what lets the picture queue hold six messages.
+ * nothing.  The sender cuts sound to this, whole frames: half a period now,
+ * see RD_SCR_CAP below.
  */
-#define RD_SND_CAP 1024u
+#define RD_SND_CAP 512u
+/*
+ * SMALL BLOCKS, AND MORE OF THEM (27 Sep 2026, Maxim: "от размера блока
+ * скорость передачи сильно не зависит, поэтому надо брать блоки поменьше,
+ * буфер на большее количество блоков").  A picture message is at most this
+ * on the wire, whatever the link would carry: a 2 KB message held the one
+ * reader of the wire for the time a 2 KB copy and a full queue took, and the
+ * sound behind it waited.  In the same memory the picture queue has 28
+ * places instead of 9 and sound 18 instead of 9.  rdp_damage needs a run's
+ * header and one packed chunk, about 526 bytes; 640 leaves it room.
+ */
+#define RD_SCR_CAP 640u
 #define RD_REPLY 0x80u
 
 /*
@@ -489,7 +500,7 @@ static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
         s_sent_max_us = took;
     }
     if (t0 - s_sent_said_us >= 1000000) {
-        if (s_sent_said_us != 0) {
+        if (s_sent_said_us != 0 && ag_linkprov_reporting()) {
             ag_log(AG_LOG_INFO, TAG,
                    "sound out: %u periods sent, %u dropped, the longest send "
                    "%u us",
@@ -790,8 +801,8 @@ static uint16_t rd_pour_payload(const rdev_t *p)
     if (ag_linkprov_info_on(proxy_wire(p), &li) == AG_OK && li.mtu > RD_HDR) {
         room = li.mtu - RD_HDR;
     }
-    if (room > RD_POUR_CAP) {
-        room = RD_POUR_CAP;
+    if (room > RD_SCR_CAP) {
+        room = RD_SCR_CAP;
     }
     if (room < RD_BLIT_HDR + 2u) {
         room = RD_BLIT_HDR + 2u;
@@ -1235,8 +1246,8 @@ static ag_port_task_t s_worker;
  * sound.  Now each has its own queue out of the same slots, and the task
  * draws whatever picture there is whenever the converter has no room.
  */
-#define RD_SND  9
-#define RD_SCR  6
+#define RD_SND  18
+#define RD_SCR  28
 #define RD_RING (RD_SND + RD_SCR)
 
 typedef struct {
@@ -1291,9 +1302,11 @@ typedef struct {
     volatile uint32_t w, r;
 } rd_q_t;
 
-static rd_period_t    s_ring[RD_RING];
-static rd_q_t         s_snd = {s_ring, RD_SND, 0, 0};
-static rd_q_t         s_scr = {s_ring + RD_SND, RD_SCR, 0, 0};
+/* made with s_ring_mem: forty-six slots are 1.3 KB of static memory the S3
+ * does not have spare */
+static rd_period_t   *s_ring;
+static rd_q_t         s_snd = {NULL, RD_SND, 0, 0};
+static rd_q_t         s_scr = {NULL, RD_SCR, 0, 0};
 static uint8_t       *s_ring_mem;
 static ag_port_task_t s_pour_task;
 
@@ -1627,65 +1640,15 @@ static void pour_report(void)
  */
 static uint32_t keep_pace(rd_period_t *pd)
 {
-    const uint8_t ch = (pd->handle < (uint32_t)RD_MAX_SESSIONS)
-                           ? s_session_ch[pd->handle]
-                           : 0u;
-    if (ch == 0u || pd->op != RD_WRITE) {
-        return pd->len;
-    }
     /*
-     * SQUEEZED IN PROPORTION, NOT A FRAME AT A TIME (26 Sep 2026).
-     *
-     * The sender's clock and this converter's are two crystals, and the
-     * CYD's plays slow: one frame taken out of a period near full was 0.4%
-     * and not enough - the queue filled anyway and whole periods were thrown
-     * away at the door, 238 of 12 583, a click each.  Now nothing is taken
-     * while the queue is at most half full, and above that the period is
-     * resampled - read out at a slightly faster step, between neighbouring
-     * frames - by up to 5% when the queue is full.  A few percent of pitch
-     * for a moment is not heard; a hole is.
+     * NOTHING IS TAKEN OUT OF A PERIOD (27 Sep 2026, Maxim: "не надо ужимать
+     * звук").  This squeezed a period by up to 5% whenever the queue stood
+     * above half, and before that took a frame out of each one near full.
+     * Alone the sound never needed it - 3 frames in a minute, the two clocks
+     * agree - and beside a picture it only bent a steady tone.  A period that
+     * finds the queue full is dropped and counted instead (take_period).
      */
-    const uint32_t cap = s_snd.n - 1u;
-    const uint32_t queued = q_used(&s_snd);
-    /* the sender's lead (PACE_LEAD_US, 20 ms) fills a little under half of
-     * it: above half it is the converter's clock that is slow */
-    if (queued * 2u <= cap) {
-        return pd->len;
-    }
-    const uint32_t frame = (uint32_t)ch * 2u;
-    const uint32_t frames = pd->len / frame;
-    if (frames < 16u) {
-        return pd->len;
-    }
-    /* per mille taken out: 0 at half, 50 at full */
-    const uint32_t half = cap / 2u;
-    const uint32_t over = (queued > half) ? queued - half : 0u;
-    const uint32_t pm = 50u * over / ((cap - half) ? (cap - half) : 1u);
-    uint32_t       take = frames * pm / 1000u;
-    if (take == 0u) {
-        take = 1u;
-    }
-    const uint32_t out = frames - take;
-    int16_t *const px = (int16_t *)(void *)pd->data;
-    /*
-     * In place, front to back: frame i is read from at or after i, so what
-     * is written never lands on anything still to be read.  Q16 steps.
-     */
-    const uint32_t step = (uint32_t)(((uint64_t)(frames - 1u) << 16) /
-                                     (out - 1u));
-    uint32_t       at = 0;
-    for (uint32_t k = 0; k < out; k++, at += step) {
-        const uint32_t a = at >> 16;
-        const uint32_t b = (a + 1u < frames) ? a + 1u : a;
-        const int32_t  f = (int32_t)(at & 0xffffu);
-        for (uint32_t c = 0; c < ch; c++) {
-            const int32_t va = px[a * ch + c];
-            const int32_t vb = px[b * ch + c];
-            px[k * ch + c] = (int16_t)(va + (((vb - va) * f) >> 16));
-        }
-    }
-    s_pour_paced += take;
-    return out * frame;
+    return pd->len;
 }
 
 /* The period being written, and how far: kept between laps, since the task
@@ -1706,7 +1669,7 @@ static void pour_pass_drawn(const rd_period_t *pd);
  * arrival, with a pass in flight and passes of at most RDP_PASS_MAX_PX, the
  * picture queue does not stay full anyway.
  */
-#define RD_ACK_WHEN_DRAWN 0
+#define RD_ACK_WHEN_DRAWN 1
 
 /* One entry of the picture's queue, drawn. */
 static void pour_screen_one(void)
@@ -1811,6 +1774,38 @@ static bool pour_sound_some(void)
     return true;
 }
 
+/*
+ * THE CONVERTER'S OWN TASK (27 Sep 2026).  One task drew the picture and fed
+ * the converter in turn, and while it drew a rectangle nobody fed it: the
+ * converter ran dry between periods, which no counter here saw and Maxim
+ * heard as clicks far more often than the four a minute counted.  Now sound
+ * has this, above the drawing, and does nothing else.
+ */
+static ag_port_task_t s_snd_task;
+static uint32_t       s_snd_late; /* periods that came > RD_SND_LATE_US late */
+#define RD_SND_LATE_US 30000
+
+static void sound_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (s_snd.r == s_snd.w) {
+            (void)ag_port_notify_take(true, ag_port_ms_to_ticks(20));
+            continue;
+        }
+        if (pour_sound_some()) {
+            s_snd_begun = false;
+            s_pour_last_ms = (uint32_t)(ag_port_us() / 1000);
+            s_pour_said = false;
+            s_snd.r = (s_snd.r + 1u) % s_snd.n;
+            continue;
+        }
+        /* the converter is full: it plays a millisecond, and lets its lock
+         * go meanwhile for anybody else who wants the device */
+        ag_port_task_delay(1);
+    }
+}
+
 static void pour_task(void *arg)
 {
     (void)arg;
@@ -1828,7 +1823,7 @@ static void pour_task(void *arg)
             busy = true;
         }
         bool full = false;
-        if (s_snd.r != s_snd.w) {
+        if (s_snd_task == NULL && s_snd.r != s_snd.w) {
             if (pour_sound_some()) {
                 s_snd_begun = false;
                 s_pour_last_ms = (uint32_t)(ag_port_us() / 1000);
@@ -1911,6 +1906,7 @@ static volatile bool s_glass_owed;
  * says so.
  */
 static uint32_t s_scr_lost;
+static uint32_t s_scr_waits; /* the reader waited for room in the picture */
 
 static void screen_lost(void)
 {
@@ -1957,6 +1953,12 @@ void ag_noderdev_screen_counts(uint32_t *passes, uint32_t *lost,
     *snd_gap_ms = (uint32_t)(s_all_snd_gap_max / 1000);
     *snd_q_max = s_all_snd_q_max;
     *snd_q_cap = RD_SND - 1u;
+}
+
+void ag_noderdev_wait_counts(uint32_t *reader_waits, uint32_t *late)
+{
+    *reader_waits = s_scr_waits;
+    *late = s_snd_late;
 }
 static int64_t  s_scr_us, s_scr_said_us;
 
@@ -2176,7 +2178,7 @@ static void take_period(const uint8_t *b, uint16_t n)
          * 2026).  A period is copied out of here once; PSRAM is fast enough.
          */
         const size_t bytes = (size_t)RD_SND * RD_SND_CAP +
-                             (size_t)RD_SCR * RD_POUR_CAP;
+                             (size_t)RD_SCR * RD_SCR_CAP;
         s_ring_mem = (uint8_t *)ag_port_alloc(bytes,
                                               AG_MEM_SLOW | AG_MEM_BYTE);
         if (s_ring_mem == NULL) {
@@ -2186,11 +2188,22 @@ static void take_period(const uint8_t *b, uint16_t n)
             s_pour_lost++;
             return;
         }
+        s_ring = (rd_period_t *)ag_port_alloc(RD_RING * sizeof(rd_period_t),
+                                              AG_MEM_BYTE);
+        if (s_ring == NULL) {
+            ag_port_free(s_ring_mem);
+            s_ring_mem = NULL;
+            s_pour_lost++;
+            return;
+        }
+        memset(s_ring, 0, RD_RING * sizeof(rd_period_t));
+        s_snd.e = s_ring;
+        s_scr.e = s_ring + RD_SND;
         for (uint32_t i = 0; i < RD_RING; i++) {
             s_ring[i].data =
                 (i < RD_SND) ? s_ring_mem + (size_t)i * RD_SND_CAP
                              : s_ring_mem + (size_t)RD_SND * RD_SND_CAP +
-                                   (size_t)(i - RD_SND) * RD_POUR_CAP;
+                                   (size_t)(i - RD_SND) * RD_SCR_CAP;
         }
     }
     if (s_pour_task == NULL) {
@@ -2209,6 +2222,10 @@ static void take_period(const uint8_t *b, uint16_t n)
             s_pour_lost++;
             return;
         }
+        /* the converter's task, above the drawing: without it the pour
+         * task feeds the converter as before */
+        (void)ag_proc_task_create(sound_task, "rdevsnd", 3072, NULL, 7,
+                                  AG_PORT_ANY_CORE, &s_snd_task);
         ag_log(AG_LOG_INFO, TAG, "sound is being poured at us from %s",
                ag_node_peer_name() != NULL ? ag_node_peer_name() : "the wire");
     }
@@ -2216,6 +2233,9 @@ static void take_period(const uint8_t *b, uint16_t n)
     rd_q_t *const q = (b[0] == RD_WRITE) ? &s_snd : &s_scr;
     if (q == &s_snd) {
         const int64_t now = ag_port_us();
+        if (s_snd_at != 0 && now - s_snd_at > RD_SND_LATE_US) {
+            s_snd_late++;
+        }
         if (s_snd_at != 0 && now - s_snd_at > s_all_snd_gap_max) {
             s_all_snd_gap_max = now - s_snd_at;
         }
@@ -2248,6 +2268,7 @@ static void take_period(const uint8_t *b, uint16_t n)
          * the pour task, and the wire waits behind it - which is the screen
          * being slower than the wire, said as back-pressure.
          */
+        s_scr_waits++;
         for (int k = 0; k < 1000 && next == q->r; k++) {
             ag_port_task_delay(1);
             next = (q->w + 1u) % q->n;
@@ -2264,7 +2285,7 @@ static void take_period(const uint8_t *b, uint16_t n)
     rd_period_t *pd = &q->e[q->w];
     uint16_t     plen = (uint16_t)(n - RD_HDR);
     const uint16_t cap = (q == &s_snd) ? (uint16_t)RD_SND_CAP
-                                       : (uint16_t)RD_POUR_CAP;
+                                       : (uint16_t)RD_SCR_CAP;
     if (plen > cap) {
         plen = cap; /* an older sender's longer piece: its tail is gone */
         s_pour_short++;
@@ -2281,7 +2302,11 @@ static void take_period(const uint8_t *b, uint16_t n)
     if (q == &s_scr && q_used(q) > s_scr_ring_max) {
         s_scr_ring_max = q_used(q);
     }
-    ag_port_notify_give(s_pour_task);
+    if (q == &s_snd && s_snd_task != NULL) {
+        ag_port_notify_give(s_snd_task);
+    } else {
+        ag_port_notify_give(s_pour_task);
+    }
 }
 
 static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)

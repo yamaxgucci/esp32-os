@@ -95,6 +95,9 @@ bool ag_budget_report(uint32_t index, const char **name, uint32_t *used_ms,
  * to a few tenths.
  */
 void     ag_cpu_sample(bool on);
+/* How much of the last 20 ms the processor had spare, 0-100, both cores
+ * together; 100 where it is not counted. */
+uint32_t ag_cpu_idle_percent(void);
 bool     ag_cpu_sampled(int core, uint32_t index, ag_port_task_t *task,
                         uint32_t *ticks);
 uint32_t ag_cpu_sampled_total(int core, uint32_t *lost);
