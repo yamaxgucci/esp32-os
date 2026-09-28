@@ -1927,9 +1927,18 @@ int ag_main(int argc, char **argv)
          * the board the second is the interesting half: the emulator can only
          * count instructions, and what a board answers is time.
          */
-        if (preset != NULL && amp_from_preset(preset) == 0) {
+        /*
+         * A named model is a chain too.  This used to measure only a preset,
+         * so `stomp jcm800 bench` on a board with no screen did nothing at all
+         * and said nothing about it - which is the one combination the board
+         * on the desk actually is.  Baking the model costs the solver's 882 ms
+         * once and then the numbers are the same numbers.
+         */
+        const int have_chain = (preset != NULL) ? (amp_from_preset(preset) == 0)
+                                                : (amp_from_model(s_model) == 0);
+        if (have_chain) {
             bench_audio();
-        } else if (preset != NULL) {
+        } else {
             ag_printf("stomp: no chain to measure\n");
         }
         if (!s_headless) {
