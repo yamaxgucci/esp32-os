@@ -138,6 +138,27 @@ static const es_step_t k_out[] = {
     {ES_DACCONTROL1, 0x18, "I2S, 16 bits - the same words the port sends"},
     {ES_DACCONTROL2, 0x02, "256x oversampling, which is what MCLK is set to"},
     {ES_LRC_SHARE, 0x80, "one word clock for both directions"},
+    /*
+     * AND RESTART THE DIGITAL ENGINE, because that register just moved.
+     *
+     * This is the one line this driver was missing, and it is taken from
+     * Espressif's own es8388_start: it reads DACCONTROL21 before and after
+     * writing it and, if the value changed, pulses CHIPPOWER 0xF0 -> 0x00.
+     * What that pulse does is stop and restart the chip's DEM and STM - the
+     * decimator/interpolator and the state machine that count the clocks.
+     *
+     * Reconfiguring which word clock those two run from, and leaving them
+     * running, is what produced the symptom this board spent a day on: six
+     * opens inside one boot giving alive, dead, alive, dead, alive, dead.  An
+     * exact alternation is a state machine left in the wrong phase, and the
+     * reference driver has always known to restart it.
+     *
+     * Found by Maxim's suggestion - stop theorising and go read a project
+     * that works - after five of my own theories had each been measured and
+     * each been wrong.
+     */
+    {ES_CHIPPOWER, 0xf0, "stop the decimator and the state machine"},
+    {ES_CHIPPOWER, 0x00, "and start them again on the clock just chosen"},
     {ES_MIX_LSEL, 0x00, "nothing from the analogue inputs into the output"},
     {ES_MIX_L, 0x90, "left converter into the left mixer"},
     {ES_MIX_R, 0x90, "right converter into the right mixer"},
