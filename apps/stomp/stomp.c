@@ -1476,7 +1476,7 @@ static int atoi_small(const char *s)
 }
 
 /* One block: the take, through the valves, through the loudspeaker, out. */
-static void audio_block(void)
+static AG_HOT void audio_block(void)
 {
     const ag_time_t t0 = ag_micros();
     uint32_t        i;

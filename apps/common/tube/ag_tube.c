@@ -15,6 +15,8 @@
  */
 #pragma GCC optimize("O2")
 
+#include <argon/argon.h>
+
 #include "ag_tube.h"
 
 #include "ag_mathf.h"
@@ -768,7 +770,7 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
  * an index.  Split out so that blocking, which needs the index for its own
  * table, does not compute it twice.
  */
-static float tick_at(ag_tube_t *tb, float x, float p)
+static AG_HOT float tick_at(ag_tube_t *tb, float x, float p)
 {
     float y;
 
@@ -813,7 +815,7 @@ static float grid_at(const ag_tube_t *tb, float p)
     return tb->g[i] + (tb->g[i + 1] - tb->g[i]) * (p - (float)i);
 }
 
-float ag_tube_tick(ag_tube_t *tb, float v)
+AG_HOT float ag_tube_tick(ag_tube_t *tb, float v)
 {
     float y, u, p, ig;
 
@@ -873,7 +875,7 @@ float ag_tube_tick(ag_tube_t *tb, float v)
     return y;
 }
 
-float ag_tube_tick_bias(ag_tube_t *tb, float v, float vbias)
+AG_HOT float ag_tube_tick_bias(ag_tube_t *tb, float v, float vbias)
 {
     const float x = v + vbias;
     if (tb == 0 || tb->t == 0) {
@@ -882,7 +884,7 @@ float ag_tube_tick_bias(ag_tube_t *tb, float v, float vbias)
     return tick_at(tb, x, tb->zero_p + x * tb->step_inv);
 }
 
-float ag_tube_curve(const ag_tube_t *tb, float v)
+AG_HOT float ag_tube_curve(const ag_tube_t *tb, float v)
 {
     if (tb == 0 || tb->t == 0) {
         return 0.0f;

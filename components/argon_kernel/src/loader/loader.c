@@ -374,6 +374,19 @@ static void release_image(ag_loaded_app_t *app)
     }
     memset(&app->place, 0, sizeof(app->place));
     app->code_from_xip = false;
+
+    /* The cold part: the scratch if it is still held, then the flash slot. */
+    if (app->cold_scratch != NULL) {
+        ag_port_free(app->cold_scratch);
+        app->cold_scratch = NULL;
+    }
+    if (app->cold_slot != NULL) {
+        ag_appfs_release((ag_appfs_slot_t *)app->cold_slot);
+        app->cold_slot = NULL;
+    }
+    app->place.cold = NULL;
+    app->place.cold_writable = NULL;
+    app->place.cold_capacity = 0;
     app->code_from_psram = false;
 }
 
@@ -783,7 +796,56 @@ void ag_loader_drivers_from_flash(bool on)
     s_drivers_xip = on;
 }
 
-static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
+/*
+ * The cold part of a split image: reserve flash for it and a buffer to
+ * relocate it in.
+ *
+ * Always flash, never the arena, and not as a fallback - that is what the
+ * split is for.  The hot part has already been placed by the time this runs,
+ * by whichever of the three strategies took it, and the cold part's placement
+ * does not depend on which one that was.
+ *
+ * The scratch is the size of the cold part, which is the larger half; it is
+ * taken from PSRAM first (scratch_alloc's own order) and freed the moment the
+ * slot is programmed.  A chunked version of this, like xip_load_chunked, would
+ * do without it - worth doing the day a board without PSRAM wants a split
+ * image, and not before.
+ */
+static ag_err_t place_cold(const ag_axe_header_t *header, ag_loaded_app_t *out)
+{
+    ag_appfs_slot_t *slot = NULL;
+    void            *exec = NULL;
+
+    ag_err_t err = ag_appfs_reserve(header->cold.size, &slot, &exec);
+    if (err != AG_OK) {
+        ag_log(AG_LOG_ERROR, "loader",
+               "no flash for %u bytes of cold code (%d)",
+               (unsigned)header->cold.size, (int)err);
+        return err;
+    }
+
+    void *scratch = scratch_alloc(header->cold.size);
+    if (scratch == NULL) {
+        ag_appfs_release(slot);
+        ag_log(AG_LOG_ERROR, "loader",
+               "no scratch for %u bytes of cold code; heap has %u free, "
+               "largest %u",
+               (unsigned)header->cold.size,
+               (unsigned)ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE),
+               (unsigned)ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE));
+        return -AG_ENOMEM;
+    }
+
+    out->place.cold = exec;
+    out->place.cold_capacity = header->cold.size;
+    out->place.cold_writable = scratch;
+    out->cold_scratch = scratch;
+    out->cold_slot = slot;
+    return AG_OK;
+}
+
+static ag_err_t place_parts(const ag_axe_header_t *header,
+                            ag_loaded_app_t *out)
 {
     arena_ready();
 
@@ -962,6 +1024,30 @@ static ag_err_t stream_code(ag_handle_t h, const ag_axe_part_t *part, void *dst)
 }
 
 /*
+ * Where the parts go: the hot ones by the rules above, and the cold one always
+ * in flash.
+ *
+ * Split out from place_parts rather than threaded through its several returns,
+ * because every one of them is a decision about the arena and none of them is
+ * a decision about the cold part.
+ */
+static ag_err_t place_image(const ag_axe_header_t *header,
+                            ag_loaded_app_t *out)
+{
+    ag_err_t err = place_parts(header, out);
+    if (err != AG_OK || !ag_axe_is_split(header)) {
+        return err;
+    }
+
+    err = place_cold(header, out);
+    if (err != AG_OK) {
+        release_image(out);
+        memset(out, 0, sizeof(*out));
+    }
+    return err;
+}
+
+/*
  * Loads an image without ever holding the whole file.
  *
  * The obvious way - read the file, then place it, then copy out of it - keeps
@@ -1011,6 +1097,25 @@ static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
         err = read_at(h, header->data.offset, out->place.data,
                       header->data.file_size);
     }
+    /*
+     * The cold part, into the scratch place_cold took for it.  Read straight
+     * rather than through stream_code: the destination is ordinary memory, not
+     * the arena, so none of the aligned-write care that function exists for
+     * applies here.
+     *
+     * Asked through ag_axe_is_split rather than by reading cold.file_size and
+     * seeing whether it is zero.  An image built before the cold part existed
+     * has a header too short to contain it, and the loader reads a whole
+     * struct's worth of file into the header - so those fields hold the
+     * image's own first bytes of code, which are not zero.  Reading them and
+     * believing them is what made every application built before today fail
+     * to load, with the format error that belongs to a malformed image.
+     */
+    if (err == AG_OK && ag_axe_is_split(header) &&
+        header->cold.file_size > 0) {
+        err = read_at(h, header->cold.offset, out->place.cold_writable,
+                      header->cold.file_size);
+    }
 
     uint32_t *rel = NULL;
     if (err == AG_OK && header->reloc_count > 0) {
@@ -1036,12 +1141,59 @@ static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
         }
     }
 
-    if (err == AG_OK) {
-        err = ag_axe_apply(&out->header, &out->place, rel,
-                           header->reloc_count, irel, inum, &out->binding);
+    const uint32_t     cnum = ag_axe_creloc_count(header);
+    ag_axe_creloc_t   *crel = NULL;
+    if (err == AG_OK && cnum > 0) {
+        const size_t cbytes = (size_t)cnum * sizeof(ag_axe_creloc_t);
+        crel = (ag_axe_creloc_t *)ag_port_alloc(cbytes,
+                                                AG_MEM_FAST | AG_MEM_BYTE);
+        if (crel == NULL) {
+            err = -AG_ENOMEM;
+        } else {
+            err = read_at(h, ag_axe_creloc_offset(header), crel, cbytes);
+        }
     }
+
+    if (err == AG_OK) {
+        err = ag_axe_apply_split(&out->header, &out->place, rel,
+                                 header->reloc_count, irel, inum, crel, cnum,
+                                 &out->binding);
+    }
+    ag_port_free(crel);
     ag_port_free(irel);
     ag_port_free(rel);
+
+    /*
+     * The cold part is relocated now, so it can be written to flash and the
+     * scratch given back.  Everything that points into it - every call from
+     * the hot part, the entry point itself - was relocated to the mapping
+     * address, so nothing has to be fixed up again afterwards.
+     */
+    if (err == AG_OK && out->cold_slot != NULL) {
+        err = ag_appfs_program((ag_appfs_slot_t *)out->cold_slot,
+                               out->cold_scratch, header->cold.size);
+        const void *mapped = NULL;
+        if (err == AG_OK) {
+            err = ag_appfs_mmap((ag_appfs_slot_t *)out->cold_slot, &mapped);
+        }
+        if (err == AG_OK && mapped != out->place.cold) {
+            /* The same check the code part makes, and for the same reason:
+             * every address written into the image assumed this number. */
+            ag_log(AG_LOG_ERROR, "loader",
+                   "cold XIP address moved: predicted %p, mapped %p",
+                   out->place.cold, mapped);
+            err = -AG_EIO;
+        }
+        if (err == AG_OK) {
+            ag_port_free(out->cold_scratch);
+            out->cold_scratch = NULL;
+            out->place.cold_writable = NULL;
+            ag_log(AG_LOG_INFO, "loader",
+                   "%s: hot %u B at %p, cold %u B XIP at %p",
+                   header->name, (unsigned)header->code.size, out->place.code,
+                   (unsigned)header->cold.size, out->place.cold);
+        }
+    }
 
 #if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
     /*

@@ -123,6 +123,15 @@ def command_for(app, defaults, extra_cflags, target_pair, forced_gcc):
     # decision, not a default.
     for lib in app.get("libs", []):
         cmd += ["--libs", lib]
+    if app.get("split_hot"):
+        # The image is built in three parts, with the functions marked AG_HOT
+        # in one the loader puts in the code arena and everything else in one
+        # it executes from flash.  Worth it only for an image that does not fit
+        # the arena whole; mkaxe prints both sizes and the arena check below
+        # measures the hot half, which is the half that has to fit.
+        cmd += ["--split-hot"]
+        for src in app.get("hot_src", []):
+            cmd += ["--hot-src", src]
     if app.get("icon"):
         # A program's own face, carried in its file (mkaxe --icon).  Kept in
         # apps.json beside its sources because that is where everything else

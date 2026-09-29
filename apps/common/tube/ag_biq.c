@@ -9,6 +9,8 @@
  */
 #pragma GCC optimize("O2")
 
+#include <argon/argon.h>
+
 #include "ag_biq.h"
 
 #include "ag_mathf.h"
@@ -235,7 +237,7 @@ float ag_biq_bandpass(ag_biq_t *s, float fs, float f0, float bw)
     return f;
 }
 
-float ag_biq_tick(ag_biq_t *s, float x)
+AG_HOT float ag_biq_tick(ag_biq_t *s, float x)
 {
     float y;
     if (s == 0) {
@@ -293,7 +295,7 @@ ag_biq_t *ag_biq_chain_push(ag_biq_chain_t *c)
  * percent of a core.  Bit for bit identical output - this is a call being
  * removed, not a formula being changed.
  */
-float ag_biq_chain_tick(ag_biq_chain_t *c, float x)
+AG_HOT float ag_biq_chain_tick(ag_biq_chain_t *c, float x)
 {
     int i, n;
     if (c == 0) {

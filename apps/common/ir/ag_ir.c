@@ -659,7 +659,7 @@ AG_IR_NOINLINE static void mac_part(int32_t *yre, int32_t *yim,
  * and the chip has no instruction fusing the two loads with the multiply:
  * four at a time is what stops the loop counter being a third of the work.
  */
-static void process_direct(ag_ir_t *ir, const int16_t *in, int16_t *out,
+static AG_HOT void process_direct(ag_ir_t *ir, const int16_t *in, int16_t *out,
                            uint32_t frames)
 {
     const int16_t *h = ir->h_dir;
@@ -708,7 +708,7 @@ static void process_direct(ag_ir_t *ir, const int16_t *in, int16_t *out,
  * Any number of frames, which the direct form allows and the partitioned one
  * does not: a transform answers in whole blocks or not at all.
  */
-void ag_ir_process_n(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out,
+AG_HOT void ag_ir_process_n(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out,
                      uint32_t frames)
 {
     uint32_t i;
@@ -733,7 +733,7 @@ void ag_ir_process_n(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out,
     }
 }
 
-void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out)
+AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out)
 {
     uint32_t i, p, parts;
     int      xref, ygain, pre;

@@ -3,6 +3,8 @@
  *
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
+#include <argon/argon.h>
+
 #include "ag_amp.h"
 
 #include "ag_mathf.h"
@@ -2222,7 +2224,7 @@ void ag_amp_reset(ag_amp_t *a)
  * Each valve carries its own coupling capacitor.s charge, so blocking is inside
  * ag_tube_tick rather than here.
  */
-static float run_stages(ag_amp_t *a, float v)
+static AG_HOT float run_stages(ag_amp_t *a, float v)
 {
     int i;
     if (a->tube[0].t != 0) {
@@ -2240,7 +2242,7 @@ static float run_stages(ag_amp_t *a, float v)
     return v;
 }
 
-float ag_amp_tick(ag_amp_t *a, float x)
+AG_HOT float ag_amp_tick(ag_amp_t *a, float x)
 {
     float v, y, p;
 

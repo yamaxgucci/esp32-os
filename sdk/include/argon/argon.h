@@ -141,7 +141,13 @@ extern "C" {
  *
  * Says nothing in a built-in build, for the same reason AG_HOT_RODATA does not.
  */
-#ifdef AG_BUILTIN
+#if defined(AG_BUILTIN) || !defined(__GNUC__)
+/*
+ * Nothing in a built-in build, for the reason AG_HOT_RODATA gives, and nothing
+ * under a compiler that is not GNU C: the DSP sources this marks are also
+ * built for the host test suite, where the compiler may be MSVC and where
+ * there is no arena and no flash to be divided between.
+ */
 #define AG_HOT
 #else
 #define AG_HOT __attribute__((section(".hot.text")))

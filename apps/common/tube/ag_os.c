@@ -10,13 +10,15 @@
  */
 #pragma GCC optimize("O2")
 
+#include <argon/argon.h>
+
 #include "ag_os.h"
 
 #include "ag_biq.h" /* ag_sincosf */
 
 #define OS_MASK (AG_OS_CAP - 1)
 
-static void push(float *buf, int *pos, float x)
+static AG_HOT void push(float *buf, int *pos, float x)
 {
     const int p = *pos;
     buf[p] = x;
@@ -98,7 +100,7 @@ void ag_os2_reset(ag_os2_t *s)
     s->ddpos = 0;
 }
 
-void ag_os2_up(ag_os2_t *s, float x, float *out2)
+AG_HOT void ag_os2_up(ag_os2_t *s, float x, float *out2)
 {
     const float *w;
     float        acc = 0.0f;
@@ -120,7 +122,7 @@ void ag_os2_up(ag_os2_t *s, float x, float *out2)
     out2[1] = 2.0f * acc;
 }
 
-float ag_os2_down(ag_os2_t *s, float a, float b)
+AG_HOT float ag_os2_down(ag_os2_t *s, float a, float b)
 {
     const float *we;
     const float *wo;
@@ -170,7 +172,7 @@ void ag_os4_reset(ag_os4_t *s)
     ag_os2_reset(&s->inner);
 }
 
-void ag_os4_up(ag_os4_t *s, float x, float *out4)
+AG_HOT void ag_os4_up(ag_os4_t *s, float x, float *out4)
 {
     float mid[2];
     if (s == 0 || out4 == 0) {
@@ -181,7 +183,7 @@ void ag_os4_up(ag_os4_t *s, float x, float *out4)
     ag_os2_up(&s->inner, mid[1], out4 + 2);
 }
 
-float ag_os4_down(ag_os4_t *s, const float *in4)
+AG_HOT float ag_os4_down(ag_os4_t *s, const float *in4)
 {
     float d0, d1;
     if (s == 0 || in4 == 0) {

@@ -66,6 +66,20 @@ typedef struct {
      * release, and the whole-arena mapping stays for the next image.
      */
     bool  code_from_psram;
+
+    /*
+     * The cold part of a split image: the run-once code, always in flash.
+     *
+     * It is placed exactly the way the whole code part is under R-1 - an appfs
+     * slot, relocated in a scratch buffer and programmed once - because that
+     * path already exists and is the same job.  What is new is only that the
+     * hot part is somewhere else at the same time, which is the point: the
+     * arena holds the loop and flash holds the setup.
+     *
+     * `cold_scratch` is freed as soon as the slot is programmed and mapped.
+     */
+    void *cold_scratch;
+    void *cold_slot;
 } ag_loaded_app_t;
 
 /*

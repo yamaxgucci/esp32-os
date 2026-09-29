@@ -283,7 +283,7 @@ def cold_block():
         "  }"]) + "\n"
 
 
-def code_block(rodata_in_code, split=False):
+def code_block(rodata_in_code, split=False, hot_objs=()):
     """The part that gets executed.
 
     The literals are interleaved with the code rather than gathered at the
@@ -306,7 +306,23 @@ def code_block(rodata_in_code, split=False):
     """
     # When the image is split this part collects only what AG_HOT marked, and
     # cold_block takes the rest.
-    text_input = HOT_INPUT if split else "*(.literal .text .literal.* .text.*)"
+    # Unsplit, this part takes everything, the marked functions included: a
+    # mark says which side of a seam a function is on, and without a seam it
+    # says nothing.  It still has to be named, or the linker leaves those
+    # sections out of every output section and mkaxe refuses the image - which
+    # is what marking the first function did to the five other applications
+    # that share these DSP sources.
+    text_input = (HOT_INPUT if split
+                  else "*(.literal .text .literal.* .text.*)\n    " + HOT_INPUT)
+
+    # Whole objects named hot, put before the pattern above so the linker takes
+    # them here rather than letting them fall through to the cold part.  Named
+    # by the object the source was compiled to - this tool's own sN.o - because
+    # a linker input specification matches the file a section came from, and
+    # that is the only handle there is on "everything in this source".
+    for obj in hot_objs:
+        text_input = ("%s(.literal .text .literal.* .text.*)\n    " % obj
+                      + text_input)
 
     # The two roots.  Nothing in the image refers to the entry point - the
     # loader jumps to it from outside - so with --gc-sections the linker is
@@ -398,7 +414,7 @@ def data_block(rodata_in_code):
 
 
 def linker_script(code_base, data_base, contiguous, rodata_in_code,
-                  split=False, cold_base=DEFAULT_COLD_BASE):
+                  split=False, cold_base=DEFAULT_COLD_BASE, hot_objs=()):
     """The script for one layout.
 
     Sections are emitted in address order, so that the ELF's own segments come
@@ -406,7 +422,7 @@ def linker_script(code_base, data_base, contiguous, rodata_in_code,
     than by position, so the ordering costs nothing; ld links them either way,
     which was checked rather than assumed.
     """
-    code = code_block(rodata_in_code, split)
+    code = code_block(rodata_in_code, split, hot_objs)
     data = data_block(rodata_in_code)
 
     if contiguous:
@@ -703,6 +719,12 @@ def main():
                          "flash.  For an image that does not fit the arena and "
                          "is therefore running entirely from flash at half "
                          "speed")
+    ap.add_argument("--hot-src", action="append", default=[],
+                    help="source file (by basename) whose whole contents go in "
+                         "the hot part, as though every function in it were "
+                         "marked AG_HOT.  For a file that is nothing but the "
+                         "inner loop, where marking each function one at a "
+                         "time only invites the next one to be forgotten")
     ap.add_argument("--cold-base", type=lambda v: int(v, 0),
                     default=DEFAULT_COLD_BASE,
                     help="where the cold part is linked (the loader relocates "
@@ -810,11 +832,29 @@ def main():
 
         rodata_in_code = args.rodata == "code"
 
+        # Which objects --hot-src named.  Worked out here rather than after the
+        # compile because the object names are this tool's own and are decided
+        # by position, and the linker script has to be written first.
+        hot_objs = []
+        wanted = {os.path.basename(h) for h in args.hot_src}
+        for i, src in enumerate(args.sources):
+            if os.path.basename(src) in wanted:
+                # A leading * because the objects are handed to the linker by
+                # absolute path, and an input specification matches the name as
+                # given: a bare "s9.o" is read as a file to open and the link
+                # fails with "cannot find s9.o".
+                hot_objs.append("*" + os.path.basename(src) if src.endswith(".o")
+                                else "*s%d.o" % i)
+        missing = wanted - {os.path.basename(s) for s in args.sources}
+        if missing:
+            raise SystemExit("mkaxe: --hot-src named %s, which this image does "
+                             "not build" % ", ".join(sorted(missing)))
+
         script = os.path.join(workdir, "axe.ld")
         with open(script, "w") as f:
             f.write(linker_script(args.code_base, args.data_base,
                                   args.contiguous, rodata_in_code,
-                                  args.split_hot, args.cold_base))
+                                  args.split_hot, args.cold_base, hot_objs))
 
         elf_path = os.path.join(workdir, "image.elf")
         ldflags = args.ldflags.split() if args.ldflags else []

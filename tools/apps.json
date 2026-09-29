@@ -83,7 +83,10 @@
               "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "STOMP.AXE", "group": "core", "arena": true,
+      "out": "STOMP.AXE", "group": "core", "arena": true, "split_hot": true,
+      "hot_src": ["ag_ir.c", "ag_tube.c", "ag_biq.c", "ag_os.c",
+                  "ag_tone.c", "ag_amp.c",
+                  "ag_mathf.c", "ag_dsp.c"],
       "_note": "the amplifier with its knobs on a screen; the knob list comes from the model",
       "include": ["apps/common", "apps/common/ckt", "apps/common/tube",
                   "apps/common/dsp", "apps/common/ir", "apps/common/pcm",

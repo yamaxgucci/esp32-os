@@ -150,6 +150,40 @@ ag_err_t ag_axe_validate(const ag_axe_header_t *header, size_t file_bytes,
     if (err != AG_OK) {
         return err;
     }
+    if (ag_axe_is_split(header)) {
+        err = check_part(&header->cold, file_bytes);
+        if (err != AG_OK) {
+            return err;
+        }
+        /*
+         * Overlap again, and for the same reason: with three parts there are
+         * three pairs that must not touch, because a relocation names the part
+         * its target is in and a target inside two parts at once has no single
+         * answer.  The build tool links them 64 MB apart; this is the check
+         * that says so rather than trusting it.
+         */
+        const uint32_t cold_end = header->cold.base + header->cold.size;
+        const uint32_t hot_end = header->code.base + header->code.size;
+        if (header->code.size > 0 && header->code.base < cold_end &&
+            header->cold.base < hot_end) {
+            return -AG_EFORMAT;
+        }
+        if (header->data.size > 0) {
+            const uint32_t dend = header->data.base + header->data.size;
+            if (header->data.base < cold_end && header->cold.base < dend) {
+                return -AG_EFORMAT;
+            }
+        }
+        /*
+         * A split image writes all its relocations in the wider table, so the
+         * narrow one must be empty.  Both populated would mean two
+         * descriptions of the same words, and the loader would apply one of
+         * them twice.
+         */
+        if (header->reloc_count != 0) {
+            return -AG_EFORMAT;
+        }
+    }
 
     if (header->data.size > 0) {
         /*
@@ -200,13 +234,27 @@ ag_err_t ag_axe_validate(const ag_axe_header_t *header, size_t file_bytes,
         return -AG_EFORMAT;
     }
 
-    /* Execution starts in the code part; the API slot is a variable, so it can
-     * be in either, and in practice it is in the data part's bss. */
-    if (!part_covers(&header->code, header->entry, 1)) {
+    if ((uint64_t)ag_axe_creloc_offset(header) +
+            (uint64_t)ag_axe_creloc_count(header) * sizeof(ag_axe_creloc_t) >
+        file_bytes) {
+        return -AG_EFORMAT;
+    }
+
+    /*
+     * Execution starts in the code part - or, in a split image, in the cold
+     * one, because ag_main is the setup and belongs with the run-once code.
+     * The API slot is a variable, so it can be in any of them, and in practice
+     * it is in the data part's bss.
+     */
+    if (!part_covers(&header->code, header->entry, 1) &&
+        !(ag_axe_is_split(header) &&
+          part_covers(&header->cold, header->entry, 1))) {
         return -AG_EFORMAT;
     }
     if (!part_covers(&header->code, header->api_slot, 4) &&
-        !part_covers(&header->data, header->api_slot, 4)) {
+        !part_covers(&header->data, header->api_slot, 4) &&
+        !(ag_axe_is_split(header) &&
+          part_covers(&header->cold, header->api_slot, 4))) {
         return -AG_EFORMAT;
     }
 
@@ -224,6 +272,10 @@ void *ag_axe_resolve(const ag_axe_header_t *header, const ag_axe_place_t *place,
     }
     if (place->data != NULL && part_covers(&header->data, linked_addr, 1)) {
         return (uint8_t *)place->data + (linked_addr - header->data.base);
+    }
+    if (place->cold != NULL && ag_axe_is_split(header) &&
+        part_covers(&header->cold, linked_addr, 1)) {
+        return (uint8_t *)place->cold + (linked_addr - header->cold.base);
     }
     return NULL;
 }
@@ -253,6 +305,26 @@ uint32_t ag_axe_ireloc_offset(const ag_axe_header_t *header)
         return 0;
     }
     return header->ireloc_offset;
+}
+
+bool ag_axe_is_split(const ag_axe_header_t *header)
+{
+    if (header == NULL ||
+        header->header_size < offsetof(ag_axe_header_t, creloc_count) +
+                                  sizeof(uint32_t)) {
+        return false;
+    }
+    return header->cold.size > 0;
+}
+
+uint32_t ag_axe_creloc_count(const ag_axe_header_t *header)
+{
+    return ag_axe_is_split(header) ? header->creloc_count : 0u;
+}
+
+uint32_t ag_axe_creloc_offset(const ag_axe_header_t *header)
+{
+    return ag_axe_is_split(header) ? header->creloc_offset : 0u;
 }
 
 /*
@@ -332,10 +404,72 @@ bool ag_axe_ireloc_apply(const ag_axe_header_t *header, uint8_t *code_bytes,
     return true;
 }
 
+/*
+ * One part of a split image, as the relocation loop needs it: where to write,
+ * how much of it the file carries, and where it finally sits.
+ *
+ * `write` and `final` differ for a part that will be programmed into flash -
+ * the bytes are patched in RAM while the addresses written into them point at
+ * the mapping they will be read through.
+ */
+typedef struct {
+    uint8_t *write;
+    uint32_t stored;
+    uint32_t final_base;
+} part_view_t;
+
+static bool view_of(uint32_t part, const ag_axe_header_t *header,
+                    uint8_t *code_write, uint8_t *code_final, uint8_t *data,
+                    uint8_t *cold_write, uint8_t *cold_final, part_view_t *out)
+{
+    switch (part) {
+    case AG_AXE_P_CODE:
+        out->write = code_write;
+        out->stored = header->code.file_size;
+        out->final_base = (uint32_t)(uintptr_t)code_final;
+        return true;
+    case AG_AXE_P_DATA:
+        if (data == NULL) {
+            return false;
+        }
+        out->write = data;
+        out->stored = header->data.file_size;
+        out->final_base = (uint32_t)(uintptr_t)data;
+        return true;
+    case AG_AXE_P_COLD:
+        if (cold_write == NULL) {
+            return false;
+        }
+        out->write = cold_write;
+        out->stored = header->cold.file_size;
+        out->final_base = (uint32_t)(uintptr_t)cold_final;
+        return true;
+    default:
+        return false;
+    }
+}
+
 ag_err_t ag_axe_apply(const ag_axe_header_t *header,
                       const ag_axe_place_t *place, const uint32_t *relocs,
                       uint32_t reloc_count, const ag_axe_ireloc_t *irelocs,
                       uint32_t ireloc_count, ag_axe_binding_t *out)
+{
+    if (ag_axe_is_split(header)) {
+        /* Its relocations are all in the other table, which this entry point
+         * cannot be given.  Refusing beats applying none of them. */
+        return -AG_ENOTSUP;
+    }
+    return ag_axe_apply_split(header, place, relocs, reloc_count, irelocs,
+                              ireloc_count, NULL, 0, out);
+}
+
+ag_err_t ag_axe_apply_split(const ag_axe_header_t *header,
+                            const ag_axe_place_t *place,
+                            const uint32_t *relocs, uint32_t reloc_count,
+                            const ag_axe_ireloc_t *irelocs,
+                            uint32_t ireloc_count,
+                            const ag_axe_creloc_t *crelocs,
+                            uint32_t creloc_count, ag_axe_binding_t *out)
 {
     if (header == NULL || place == NULL || out == NULL) {
         return -AG_EINVAL;
@@ -373,6 +507,27 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
     }
     if (ireloc_count > 0 && irelocs == NULL) {
         return -AG_EINVAL;
+    }
+    if (creloc_count != ag_axe_creloc_count(header)) {
+        return -AG_EINVAL;
+    }
+    if (creloc_count > 0 && crelocs == NULL) {
+        return -AG_EINVAL;
+    }
+
+    uint8_t *cold_final = NULL;
+    uint8_t *cold_write = NULL;
+    if (ag_axe_is_split(header)) {
+        if (place->cold == NULL) {
+            return -AG_EINVAL;
+        }
+        if (place->cold_capacity < header->cold.size) {
+            return -AG_ENOMEM;
+        }
+        cold_final = (uint8_t *)place->cold;
+        cold_write = (place->cold_writable != NULL)
+                         ? (uint8_t *)place->cold_writable
+                         : cold_final;
     }
 
     /* bss is whatever the file did not carry. */
@@ -457,12 +612,60 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
         }
     }
 
+    /*
+     * And the split table, which describes the same thing for an image whose
+     * code is in two pieces.  It replaces the word table rather than adding to
+     * it - a split image writes every relocation here - so the loop above runs
+     * zero times for one and this one runs zero times for everything else.
+     *
+     * The entry holds the target rather than a bias to add, so applying it
+     * twice is applying it once.  That is what lets the streamed flash path
+     * patch a word from both sides of a page boundary.
+     */
+    for (uint32_t i = 0; i < creloc_count; i++) {
+        part_view_t at_part;
+        part_view_t to_part;
+        const uint32_t at = AG_AXE_C_OFFSET(crelocs[i].site);
+        const uint32_t to = AG_AXE_C_OFFSET(crelocs[i].target);
+
+        if (!view_of(AG_AXE_C_PART(crelocs[i].site), header, code_write,
+                     code_final, data, cold_write, cold_final, &at_part) ||
+            !view_of(AG_AXE_C_PART(crelocs[i].target), header, code_write,
+                     code_final, data, cold_write, cold_final, &to_part)) {
+            return -AG_EFORMAT;
+        }
+
+        /* Same subtraction as above, for the same wrap-around reason. */
+        if (at_part.stored < 4 || at > at_part.stored - 4) {
+            return -AG_EFORMAT;
+        }
+
+        uint32_t *const slot = (uint32_t *)(void *)(at_part.write + at);
+        const uint32_t  word = to_part.final_base + to;
+        memcpy(slot, &word, sizeof(word));
+    }
+
     out->code_base = (uintptr_t)code_final;
     out->data_base = (uintptr_t)data;
-    out->entry = (void *)(code_final + (header->entry - header->code.base));
+    out->cold_base = (uintptr_t)cold_final;
+    /*
+     * The entry point is in whichever part holds it: the code part for an
+     * ordinary image, the cold part for a split one, where ag_main is the
+     * setup and belongs with the rest of the run-once code.
+     */
+    out->entry = ag_axe_resolve(header, place, header->entry);
+    /*
+     * The slot is written, not read, so it has to be reached through the
+     * writable view of whichever part holds it - the final address of a part
+     * bound for flash is not writable at all.
+     */
     if (part_covers(&header->code, header->api_slot, 4)) {
         out->api_slot =
             (uint32_t *)(code_write + (header->api_slot - header->code.base));
+    } else if (cold_write != NULL &&
+               part_covers(&header->cold, header->api_slot, 4)) {
+        out->api_slot =
+            (uint32_t *)(cold_write + (header->api_slot - header->cold.base));
     } else {
         out->api_slot =
             (uint32_t *)ag_axe_resolve(header, place, header->api_slot);
@@ -470,7 +673,7 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
     if (out->entry == NULL || out->api_slot == NULL) {
         return -AG_EFORMAT;
     }
-    out->relocated = reloc_count + ireloc_count;
+    out->relocated = reloc_count + ireloc_count + creloc_count;
     return AG_OK;
 }
 
