@@ -85,6 +85,9 @@ typedef struct {
      * BOARD.CFG under [i2c0] and one place is enough.
      */
     int16_t  i2c;
+    /* The codec's input preamplifier, in dB (0..24): what is plugged in, not
+     * what sounds nice.  See ag_board_audio_t. */
+    int16_t  ingain;
     uint32_t rate; /* the board's default; open() may still ask for another */
 } ag_port_audio_pins_t;
 

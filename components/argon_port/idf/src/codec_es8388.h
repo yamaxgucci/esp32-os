@@ -29,7 +29,7 @@
  * told to start converting with no clock to divide comes up in an undefined
  * state that the next write does not necessarily clear.
  */
-bool ag_codec_es8388_begin(int bus, bool capture);
+bool ag_codec_es8388_begin(int bus, bool capture, int gain_db);
 
 /* Puts the outputs back to muted and the converters back to unpowered, so a
  * board that stops playing does not sit with a live amplifier and an open

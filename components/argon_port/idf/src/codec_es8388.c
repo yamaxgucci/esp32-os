@@ -186,7 +186,7 @@ static const es_step_t k_out[] = {
  */
 static const es_step_t k_in[] = {
     {ES_ADCPOWER, 0xff, "input side fully down while it is configured"},
-    {ES_ADCCONTROL1, 0x00, "0 dB preamplifier: a guitar, not a microphone"},
+    /* ES_ADCCONTROL1 is written separately: it carries the board's ingain. */
     {ES_ADCCONTROL2, 0x50, "listen to LINPUT2/RINPUT2, the line input"},
     {ES_ADCCONTROL3, 0x02, "ordinary stereo, no swap"},
     {ES_ADCCONTROL4, 0x0c, "I2S, 16 bits, matching the output"},
@@ -253,7 +253,7 @@ void ag_codec_es8388_poll(int bus)
     }
 }
 
-bool ag_codec_es8388_begin(int bus, bool capture)
+bool ag_codec_es8388_begin(int bus, bool capture, int gain_db)
 {
     if (bus < 0) {
         return false;
@@ -287,6 +287,22 @@ bool ag_codec_es8388_begin(int bus, bool capture)
 
     if (!run(bus, k_out, sizeof(k_out) / sizeof(k_out[0]), "output setup")) {
         return false;
+    }
+    /*
+     * The preamplifier, from the board rather than from a constant.
+     *
+     * Register 0x09 carries two four-bit gains, left in the high nibble and
+     * right in the low, each a step of 3 dB up to 24.  Nothing here decides
+     * what a guitar needs; the board says what is wired to its jack.
+     */
+    if (capture) {
+        const uint8_t step = (uint8_t)((gain_db < 0 ? 0 : gain_db) / 3);
+        const uint8_t both = (uint8_t)((step > 8u ? 8u : step) * 0x11u);
+        if (wr(bus, ES_ADCCONTROL1, both) != AG_OK) {
+            ESP_LOGW(TAG, "the codec refused the input gain");
+        } else if (both != 0u) {
+            ESP_LOGI(TAG, "input preamplifier at +%d dB", (int)(step * 3));
+        }
     }
     if (capture &&
         !run(bus, k_in, sizeof(k_in) / sizeof(k_in[0]), "input setup")) {

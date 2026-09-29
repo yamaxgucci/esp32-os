@@ -1,0 +1,24 @@
+# ESP32-A1S Audio Kit with the radio on, so a phone can be its screen.
+#
+#   argon target esp32-a1s-net
+#
+# An overlay on sdkconfig.esp32.a1s, and it undoes that file's central trade.
+# The 60 KB code arena there exists because the radios were dropped; Wi-Fi
+# wants most of that instruction RAM back, and what it takes from the arena it
+# takes from the emulator, which stops fitting and relocates into flash to run
+# through the cache.
+#
+# Both images are kept because they are for different afternoons: this one to
+# turn knobs from a phone and see what the board is doing, the other to hear
+# the amplifier without a stumble.  Measured numbers for the difference are in
+# the commit that added this.
+#
+# Bluetooth stays off.  The phone link is Wi-Fi (PHONE.SYS serves its page on
+# :8765), and BLE would cost another slice of the same memory for nothing.
+CONFIG_ARGON_ENABLE_NET=y
+CONFIG_ARGON_NET_WIFI=y
+
+# The arena, cut to what is left once the radio has taken its share.  It is
+# still worth having: a smaller .AXE - the file manager, the console tools -
+# runs from RAM, and only the big ones fall back to flash.
+CONFIG_ARGON_APP_ARENA_KB=40

@@ -463,7 +463,8 @@ static bool i2s_be_open(uint32_t rate, uint8_t channels)
      * Whether it answers changes nothing about the I2S that is already up.  A
      * board with no codec plays exactly as it did before this existed.
      */
-    (void)ag_codec_es8388_begin((int)s_pins.i2c, s_rx != NULL);
+    (void)ag_codec_es8388_begin((int)s_pins.i2c, s_rx != NULL,
+                                (int)s_pins.ingain);
 
     s_i2s_channels = channels;
     ESP_LOGI(TAG, "i2s on bclk=%d ws=%d dout=%d din=%d mclk=%d, %u Hz, %u ch",

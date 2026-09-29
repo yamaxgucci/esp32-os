@@ -126,6 +126,7 @@ static int          s_take_done;
 static int16_t      s_in[CHUNK * 2];
 static int          s_in_ch = 2;
 static int          s_live;        /* the input is a converter, not a file */
+static int          s_in_sum;      /* add both channels in; see `inmix` */
 static uint32_t     s_in_starved;  /* blocks the converter had nothing for */
 static int16_t      s_mono[CHUNK];
 static int16_t      s_stereo[CHUNK * 2];
@@ -1202,10 +1203,26 @@ static int cabinet_from_wav(const char *path)
 {
     ag_wav_pcm_t w;
     int          rc;
+    uint32_t     frames;
     if (ag_wav_load(path, &w) != 0) {
         return -1;
     }
-    rc = cabinet_load(w.data, w.frames, w.rate);
+    frames = w.frames;
+    /*
+     * `cabms` applies here too, and it did not: the truncation lived only on
+     * the preset path, so a cabinet named on the command line was loaded whole.
+     * On the Audio Kit that was the difference between a chain at 65% of its
+     * block and one at 120% - a 150 ms impulse against the 46 ms asked for,
+     * three times the partitions, and nothing in the output saying so except
+     * the length it printed.
+     */
+    if (s_cab_ms > 0u) {
+        const uint32_t keep = s_cab_ms * w.rate / 1000u;
+        if (keep > 0u && keep < frames) {
+            frames = keep;
+        }
+    }
+    rc = cabinet_load(w.data, frames, w.rate);
     ag_wav_free(&w);
     return rc;
 }
@@ -1416,7 +1433,15 @@ static void audio_block(void)
             /* Left channel: a guitar is one string of wire, and a codec that
              * was opened in stereo sends the same thing twice or sends the
              * other jack - neither is worth summing in. */
-            x = (float)s_in[i * s_in_ch] * (1.0f / 32768.0f);
+            if (s_in_sum && s_in_ch > 1) {
+                /* Added, not averaged: the guitar is on one channel and the
+                 * other carries only the inverted microphone, so the sum is
+                 * the guitar at its own level rather than half of it. */
+                x = ((float)s_in[i * s_in_ch] + (float)s_in[i * s_in_ch + 1]) *
+                    (1.0f / 32768.0f);
+            } else {
+                x = (float)s_in[i * s_in_ch] * (1.0f / 32768.0f);
+            }
         } else if (s_di.data != NULL && s_di.frames > 0u && !s_take_done) {
             x = (float)s_di.data[s_di_at] * (1.0f / 32768.0f);
             if (++s_di_at >= s_di.frames) {
@@ -1861,6 +1886,7 @@ int ag_main(int argc, char **argv)
     const char *sink = NULL;
     const char *di_path = NULL;
     const char *preset = NULL;
+    const char *cab_path = NULL;
     int         want_os = 0;
     int         want_live = 0;
     const char *set[AG_AMP_POT_N];
@@ -1876,6 +1902,16 @@ int ag_main(int argc, char **argv)
             di_path = argv[++i];
         } else if (strcmp(argv[i], "out") == 0 && i + 1 < argc) {
             sink = argv[++i];
+        } else if (strcmp(argv[i], "cab") == 0 && i + 1 < argc) {
+            /*
+             * The cabinet, by name, because a board with no screen cannot use
+             * the chooser and the chooser was the only way in.  That is not a
+             * convenience: the whole point of the box on the desk is to run
+             * the chain a preset would, and a chain without its loudspeaker is
+             * not that chain - it is a distortion being judged through
+             * nothing.
+             */
+            cab_path = argv[++i];
         } else if (strcmp(argv[i], "cabms") == 0 && i + 1 < argc) {
             s_cab_ms = (uint32_t)atoi_small(argv[++i]);
         } else if (strcmp(argv[i], "vol") == 0 && i + 1 < argc) {
@@ -1885,6 +1921,24 @@ int ag_main(int argc, char **argv)
                                              96, 144, 168, 208, 255 };
             int v = atoi_small(argv[++i]);
             s_vol_num = k_vol[v < 0 ? 0 : (v > 10 ? 10 : v)];
+        } else if (strcmp(argv[i], "inmix") == 0) {
+            /*
+             * Live input, with the two channels summed instead of the left one
+             * taken - which on the AI-Thinker Audio Kit is not a stereo
+             * preference but a way round a fault in the board.
+             *
+             * Its line input is wired to LIN2/RIN2, the same pins as the second
+             * microphone, so the microphone is always in the signal and cannot
+             * be switched off from software.  It arrives inverted on the right
+             * channel, though, and what is inverted on one channel and not the
+             * other cancels when the two are added.  A guitar in a mono jack
+             * grounds the ring, so the sum keeps the guitar and loses the room.
+             *
+             * The proper repair is two capacitors off the board (C19, C20);
+             * this is what can be done without a soldering iron.
+             */
+            want_live = 1;
+            s_in_sum = 1;
         } else if (strcmp(argv[i], "in") == 0) {
             /* Take the guitar rather than a file.  It is the same device the
              * sound goes out of, so there is nothing to name. */
@@ -1974,6 +2028,25 @@ int ag_main(int argc, char **argv)
             } else {
                 ag_printf("stomp: %dx is not an oversampling this chain has\n",
                           want_os);
+            }
+        }
+        if (cab_path != NULL) {
+            /*
+             * After the chain, because a preset brings a cabinet of its own
+             * and this is meant to replace it, and before the sound starts,
+             * because loading an impulse allocates its partitions and that is
+             * not something to do between two blocks of audio.
+             */
+            status("loading the cabinet");
+            present();
+            if (cabinet_from_wav(cab_path) == 0) {
+                s_cab_on = 1;
+                ag_ir_set_bypass(&s_ir, 0);
+                (void)snprintf(s_cab, sizeof(s_cab), "%s", cab_path);
+                ag_printf("stomp: cabinet %s, %u ms of it\n", cab_path,
+                          (unsigned)(s_ir.ir_frames * 1000u / RATE));
+            } else {
+                ag_printf("stomp: cannot load the cabinet %s\n", cab_path);
             }
         }
         for (i = 0; i < n_set; i++) {

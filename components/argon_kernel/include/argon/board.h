@@ -133,6 +133,15 @@ typedef struct {
     int16_t  din;
     int16_t  mclk; /* optional; AG_PIN_NONE if unused */
     int16_t  i2c;  /* bus the codec is programmed over; AG_PIN_NONE if none */
+    /*
+     * How much the codec's own preamplifier adds, in dB, 0 to 24.
+     *
+     * Not a taste setting: it is what the thing plugged in produces.  A line
+     * output swings a volt and wants none of this; a guitar pickup swings a
+     * tenth of that and is inaudible without it.  The codec has the gain in
+     * 3 dB steps and this is rounded to them.
+     */
+    int16_t  ingain;
     uint32_t rate; /* default sample rate hint for pcmnull / drivers */
 } ag_board_audio_t;
 

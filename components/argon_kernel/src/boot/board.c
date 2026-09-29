@@ -120,6 +120,7 @@ static void apply_generic_defaults(void)
 
     strcpy(s_board.audio.driver, "auto");
     s_board.audio.i2c = AG_PIN_NONE;
+    s_board.audio.ingain = 0; /* line level; a guitar says so in BOARD.CFG */
     s_board.audio.bclk = AG_PIN_NONE;
     s_board.audio.ws = AG_PIN_NONE;
     s_board.audio.dout = AG_PIN_NONE;
@@ -339,6 +340,10 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
          * codec says which bus programs it; a board with a bare converter
          * leaves it out and nothing is opened on its behalf.
          */
+        const int32_t again = ag_cfg_get_int(cfg, "audio.ingain", -1);
+        if (again >= 0 && again <= 24) {
+            s_board.audio.ingain = (int16_t)again;
+        }
         const int32_t ai2c = ag_cfg_get_int(cfg, "audio.i2c", -1);
         if (ai2c >= 0 && ai2c < AG_I2C_BUSES) {
             s_board.audio.i2c = (int16_t)ai2c;
