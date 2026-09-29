@@ -83,7 +83,7 @@
               "apps/common/libc/libc_shim.c"]
     },
     {
-      "out": "STOMP.AXE", "group": "core",
+      "out": "STOMP.AXE", "group": "core", "arena": true,
       "_note": "the amplifier with its knobs on a screen; the knob list comes from the model",
       "include": ["apps/common", "apps/common/ckt", "apps/common/tube",
                   "apps/common/dsp", "apps/common/ir", "apps/common/pcm",
