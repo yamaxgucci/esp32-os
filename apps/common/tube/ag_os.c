@@ -3,6 +3,13 @@
  *
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
+/*
+ * Speed rather than size, for this file alone: the oversampling filter runs
+ * on every sample of every stage, twice over at 2x.  See the same note in
+ * ag_ir.c for why the rest of the application is built the other way.
+ */
+#pragma GCC optimize("O2")
+
 #include "ag_os.h"
 
 #include "ag_biq.h" /* ag_sincosf */

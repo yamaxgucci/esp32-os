@@ -3,6 +3,12 @@
  *
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
+/*
+ * Speed rather than size, for this file alone: every stage has filters and
+ * they run on every sample.  See ag_ir.c for why the rest is built -Os.
+ */
+#pragma GCC optimize("O2")
+
 #include "ag_biq.h"
 
 #include "ag_mathf.h"

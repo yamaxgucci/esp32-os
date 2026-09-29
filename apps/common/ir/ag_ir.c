@@ -2,6 +2,18 @@
  * Uniform partitioned convolution (overlap-add FFT) for IR FX.
  * SPDX-License-Identifier: Apache-2.0
  */
+/*
+ * Speed rather than size, for this file alone.
+ *
+ * The application is built -Os because it has to fit the code arena - past
+ * 60 KB it relocates into flash and everything gets slower - but the convolution: one multiply-accumulate per tap, 507 of them a sample is the
+ * inner loop of the whole pedal, and -Os there was measured at 8.4 cycles a
+ * tap where the chip should manage two or three.  A pragma keeps the choice
+ * next to the code it is about, and costs a kilobyte rather than the seven
+ * that -O2 over the whole image costs.
+ */
+#pragma GCC optimize("O2")
+
 #include "ag_ir.h"
 
 #include <string.h>
