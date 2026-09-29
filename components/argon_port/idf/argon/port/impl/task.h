@@ -84,6 +84,21 @@ static inline const char *ag_port_task_name(ag_port_task_t t)
     return (n != NULL) ? n : "?";
 }
 
+/*
+ * The core a task is tied to, or AG_PORT_CORE_ANY.
+ *
+ * Reporting only, and worth having: an application is created for one core and
+ * a shell for another, and the day the two disagree with what is actually
+ * running there, the argument is settled by asking rather than by reading the
+ * call that created them.
+ */
+static inline int ag_port_task_core(ag_port_task_t t)
+{
+    const BaseType_t c = xTaskGetCoreID((t != NULL) ? t
+                                                   : xTaskGetCurrentTaskHandle());
+    return (c == tskNO_AFFINITY) ? AG_PORT_CORE_ANY : (int)c;
+}
+
 static inline void ag_port_task_prio_set(ag_port_task_t t, unsigned prio)
 {
     vTaskPrioritySet(t, (UBaseType_t)prio);
