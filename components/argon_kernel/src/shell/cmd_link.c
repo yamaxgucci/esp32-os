@@ -36,6 +36,7 @@
 #include <argon/nodestandby.h>
 /* For the SPI slave service's own counters - see print_spilink below. */
 #include <argon/spilink.h>
+#include <argon/uartlink.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
 
@@ -289,6 +290,34 @@ static void print_spilink(void)
     }
 }
 
+/*
+ * THE UART WIRES' OWN COUNTERS (29 Sep 2026).  The C3 counted 2485 bad frames
+ * and 3088 holes from the Zero, and "bad" is two different faults: bytes that
+ * never arrived - a receive that fell behind the line, the DMA going round
+ * over what was not yet read - and bytes that arrived wrong, which is the
+ * line.  The port has counted both apart since it was written; nothing
+ * printed them.  Only a port with a link, and only what is not zero.
+ */
+static void print_uartlink(void)
+{
+    for (int port = 0; port < 3; port++) {
+        ag_spilink_stats_t u;
+        if (ag_uartlink_stats(port, &u) != AG_OK) {
+            continue;
+        }
+        if (u.short_frames == 0u && u.blocks_unarmed == 0u &&
+            u.stalls == 0u && u.timeouts == 0u) {
+            continue;
+        }
+        ag_console_printf("uart%d   %u frames short of bytes (%u bytes "
+                          "missing), %u the right length and wrong; the "
+                          "receive fell behind %u times; %u skipped\n",
+                          port, (unsigned)u.short_frames, (unsigned)u.wire_us,
+                          (unsigned)u.blocks_unarmed, (unsigned)u.stalls,
+                          (unsigned)u.timeouts);
+    }
+}
+
 static void print_stats(void)
 {
     ag_link_stats_t st;
@@ -430,6 +459,7 @@ static void print_stats(void)
                       (unsigned)ag_linkprov_reader_overruns(),
                       (unsigned)ag_linkprov_relay_overruns());
     print_spilink();
+    print_uartlink();
 }
 
 static int link_status(void)

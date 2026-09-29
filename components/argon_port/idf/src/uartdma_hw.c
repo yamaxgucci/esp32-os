@@ -108,6 +108,9 @@ typedef struct {
     uint32_t                 ring_nodes;
     uint32_t                 ring_node;
     volatile uint32_t        ring_done; /* descriptors closed so far */
+    /* does the DMA give a descriptor's owner bit back: 0 not known yet,
+     * 1 yes (ring_done takes every one it gave), 2 no (one a call) */
+    uint8_t                  ring_owner;
     gdma_link_list_handle_t  ring_link; /* ours: IDF's has 3 to 5 nodes */
 #endif
 } dma_port_t;
@@ -523,28 +526,80 @@ static ag_err_t rx_start(int port, dma_port_t *d)
 
 #if AG_UART_DMA_RING
 
-/* One descriptor of the ring closed - full, or cut short by an idle line -
- * and the DMA already in the next.  Nothing is stopped or mounted here. */
+/* A closed descriptor's bytes to the reader. */
+static void IRAM_ATTR ring_put(dma_port_t *d, uint32_t k, uint32_t n,
+                               BaseType_t *woken)
+{
+    const rx_piece_t piece = {d->rx_ring[0] + (size_t)k * d->ring_node, n,
+                              d->ring_done, 0, 0};
+    d->ring_done++;
+    if (n > 0u && xQueueSendFromISR(d->rx_q, &piece, woken) != pdTRUE) {
+        rx_piece_t old;
+        (void)xQueueReceiveFromISR(d->rx_q, &old, woken);
+        (void)xQueueSendFromISR(d->rx_q, &piece, woken);
+        d->rx_overrun++;
+    }
+}
+
+/*
+ * Descriptors of the ring closed - full, or cut short by an idle line - and
+ * the DMA already in the next.  Nothing is stopped or mounted here.
+ *
+ * EVERY ONE THE DMA HAS GIVEN BACK, NOT ONE A CALL (29 Sep 2026).  This took
+ * a call for one descriptor, and the channel's interrupt is a status bit:
+ * two descriptors closed before the handler ran are one call.  One of them
+ * was never handed to the reader, and nothing counted it - the C3 lost 4.6%
+ * of the bytes the Zero sent, 6 735 frames short of bytes and none wrong,
+ * with "fell behind" at 0.  Short descriptors make it likely: every ack and
+ * every marker of the picture is a burst an idle line ends, a few tens of
+ * microseconds apart.  And the length of one ended by an idle line was
+ * counted onwards to the next descriptor marked EOF, which after a missed
+ * call is a stale one from the lap before.
+ *
+ * So each descriptor is taken by its owner bit, which the DMA gives to the
+ * CPU when it has written it: every one that is the CPU's, in turn, with the
+ * length the DMA wrote there, and handed back.  The DMA does not check the
+ * bit on this ring (it goes round regardless), so handing back costs it
+ * nothing.  If this chip's DMA did not give the bit back, the first call
+ * would find its own descriptor still the DMA's: then it is one a call, as
+ * before.
+ */
 static bool IRAM_ATTR ring_done(gdma_channel_handle_t chan,
                                 gdma_event_data_t *ev, void *user)
 {
     (void)chan;
-    dma_port_t      *d = (dma_port_t *)user;
-    BaseType_t       woken = pdFALSE;
-    const uint32_t   k = d->ring_done % d->ring_nodes;
-    const uint32_t   n = ev->flags.normal_eof
-                             ? (uint32_t)gdma_link_count_buffer_size_till_eof(
-                                   d->ring_link, k)
-                             : d->ring_node;
-    const rx_piece_t piece = {d->rx_ring[0] + (size_t)k * d->ring_node, n,
-                              d->ring_done, 0, 0};
-    d->ring_done++;
-    if (n > 0u && xQueueSendFromISR(d->rx_q, &piece, &woken) != pdTRUE) {
-        rx_piece_t old;
-        (void)xQueueReceiveFromISR(d->rx_q, &old, &woken);
-        (void)xQueueSendFromISR(d->rx_q, &piece, &woken);
-        d->rx_overrun++;
+    dma_port_t *d = (dma_port_t *)user;
+    BaseType_t  woken = pdFALSE;
+    if (d->ring_owner != 2u) {
+        uint32_t taken = 0;
+        for (; taken < d->ring_nodes; taken++) {
+            const uint32_t   k = d->ring_done % d->ring_nodes;
+            gdma_lli_owner_t own = GDMA_LLI_OWNER_DMA;
+            (void)gdma_link_get_owner(d->ring_link, (int)k, &own);
+            if (own != GDMA_LLI_OWNER_CPU) {
+                break;
+            }
+            const uint32_t n =
+                (uint32_t)gdma_link_get_length(d->ring_link, (int)k);
+            (void)gdma_link_set_owner(d->ring_link, (int)k,
+                                      GDMA_LLI_OWNER_DMA);
+            ring_put(d, k, n, &woken);
+        }
+        if (taken != 0u) {
+            d->ring_owner = 1u; /* the DMA gives the bit back */
+            return woken == pdTRUE;
+        }
+        if (d->ring_owner == 1u) {
+            return woken == pdTRUE; /* taken by the call before */
+        }
+        d->ring_owner = 2u; /* never given back: one a call */
     }
+    const uint32_t k = d->ring_done % d->ring_nodes;
+    const uint32_t n = ev->flags.normal_eof
+                           ? (uint32_t)gdma_link_count_buffer_size_till_eof(
+                                 d->ring_link, k)
+                           : d->ring_node;
+    ring_put(d, k, n, &woken);
     return woken == pdTRUE;
 }
 
@@ -591,6 +646,7 @@ ag_err_t ag_port_uart_dma_listen_ring(int port, uint32_t bytes)
     d->ring_nodes = nodes;
     d->ring_node = node;
     d->ring_done = 0;
+    d->ring_owner = 0;
     gdma_buffer_mount_config_t mc[nodes];
     memset(mc, 0, sizeof(mc));
     for (uint32_t k = 0; k < nodes; k++) {
