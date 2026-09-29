@@ -198,26 +198,6 @@ static void normalize_peak(int16_t *x, uint32_t n, int32_t target_peak)
     }
 }
 
-static uint32_t isqrt64(uint64_t v)
-{
-    uint64_t rem = v;
-    uint64_t root = 0;
-    uint64_t bit = 1ull << 62;
-    while (bit > rem) {
-        bit >>= 2;
-    }
-    while (bit != 0ull) {
-        if (rem >= root + bit) {
-            rem -= root + bit;
-            root = (root >> 1) + bit;
-        } else {
-            root >>= 1;
-        }
-        bit >>= 2;
-    }
-    return (uint32_t)root;
-}
-
 /*
  * Scale the IR by its energy, not its peak.
  *
@@ -237,7 +217,7 @@ static void normalize_energy(int16_t *x, uint32_t n, int32_t target)
         const int32_t v = x[i];
         e2 += (uint64_t)(v * v);
     }
-    rms = isqrt64(e2);
+    rms = ag_isqrt64(e2);
     if (rms < 1u) {
         return;
     }

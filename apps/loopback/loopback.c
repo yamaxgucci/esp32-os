@@ -35,6 +35,7 @@
 #include <string.h>
 
 #include "ag_pcm.h"
+#include "ag_dsp.h"
 
 AG_APP("LOOPBACK", "1.0", "argon", 0);
 
@@ -297,20 +298,15 @@ int ag_main(int argc, char **argv)
 
         blocks++;
         if (blocks % say_every == 0u) {
-            /* Mean square, then a crude integer square root: the level wanted
+            /* Mean square, then an integer square root: the level wanted
              * here is "loud, quiet or nothing", and a decibel would need a
-             * logarithm for no extra meaning. */
+             * logarithm for no extra meaning.  ag_isqrt64 rather than a
+             * Newton iteration written out here - see ag_dsp.h for what that
+             * cost. */
             uint32_t rms = 0;
             if (in_frames > 0u) {
-                const uint64_t mean =
-                    in_sum / ((uint64_t)in_frames * CHANNELS);
-                uint64_t r = mean;
-                uint64_t last = 0;
-                while (r != last && r > 0u) {
-                    last = r;
-                    r = (r + mean / r) / 2u;
-                }
-                rms = (uint32_t)r;
+                rms = ag_isqrt64(in_sum /
+                                 ((uint64_t)in_frames * CHANNELS));
             }
             /*
              * Raw counts, not percentages.  A percentage rounds the two
