@@ -21,7 +21,7 @@ CONFIG_ARGON_NET_WIFI=y
 # The arena, cut to what is left once the radio has taken its share.  It is
 # still worth having: a smaller .AXE - the file manager, the console tools -
 # runs from RAM, and only the big ones fall back to flash.
-CONFIG_ARGON_APP_ARENA_KB=58
+CONFIG_ARGON_APP_ARENA_KB=60
 
 # THE INSTRUCTION RAM THE RADIO TOOK, BOUGHT BACK.
 #
@@ -51,10 +51,11 @@ CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
 # and the threat model is somebody standing in the room.
 CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
 
-# 58 rather than 60: the emulator is 57020 bytes of code, so 59392 holds it
-# with room and 61440 was asking for two kilobytes nothing uses.  If the .AXE
-# grows past this it falls back to flash silently and the cost reappears, so
-# the loader line is the thing to read after any change to it.
+# 60 is the ceiling with the radio linked in: 68 overflows instruction RAM by
+# 7264 bytes, so 61440 is every byte there is.  The emulator is 57868 of it,
+# which leaves about 3.5 KB.  Past that it relocates into flash silently and
+# the factor of two disappears - the loader says so in one line, and that line
+# is the thing to read after any change to the app.
 
 # The analogue input, which this board does not have.  It is on in the esp32
 # defaults for the CYD, which has a light sensor wired to GPIO34; there is
