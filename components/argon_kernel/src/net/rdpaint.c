@@ -200,6 +200,11 @@ static struct {
      * the longest; and the longest time from one pass's start to the next */
     int64_t  sync_us, sync_max_us, gap_max_us, last_pass_us;
     int64_t  sync_total_us; /* since the board started, for rdp_counts */
+    bool     pass_whole;    /* the pass just sent ended a frame */
+    /* the snapshot holds every pixel as the far screen shows it: a new one
+     * sends only what differs from it (trim_to_far) */
+    bool     snap_is_far;
+    uint32_t redraws;       /* times every row had to go again */
 } s_p;
 
 static uint16_t get16(const uint8_t *p)
@@ -390,6 +395,66 @@ static void square_up(uint16_t h)
     }
 }
 
+/*
+ * WHAT DIFFERS, NOT THE WAY THERE (29 Sep 2026).  A present marks what it
+ * changed against the present before it, so a ball that moved for 600 ms
+ * while a big frame was going out had marked its whole path - and the next
+ * frame sent the path, which took longer still, while the balls went on
+ * moving.  It fed itself: Maxim saw a picture standing still most of the
+ * time; the far screen counted 304 waits of a quarter of a second or more
+ * between two whole frames, 61% of five minutes, at "9.6 frames a second".
+ * The snapshot is what the far screen shows once all of it has gone - every
+ * pixel in it was sent - so what is marked is cut down to what differs from
+ * it: the ball where it was and where it is.
+ */
+static void trim_to_far(uint16_t w, uint16_t h)
+{
+    for (uint32_t y = 0; y < h; y++) {
+        span_t *const r = row_of(s_p.work, y);
+        if (!row_any(r)) {
+            continue;
+        }
+        span_t was[RDP_SPANS];
+        memcpy(was, r, sizeof(was));
+        row_clear(r);
+        const uint16_t *const pic = s_p.pic + (size_t)y * w;
+        const uint16_t *const far = s_p.snap + (size_t)y * w;
+        for (uint32_t i = 0; i < RDP_SPANS; i++) {
+            uint32_t       x = was[i].x0;
+            const uint32_t xe = was[i].x1;
+            while (x < xe) {
+                while (x < xe && pic[x] == far[x]) {
+                    x++;
+                }
+                if (x >= xe) {
+                    break;
+                }
+                /* a piece ends at RDP_SPAN_GAP pixels that are the same */
+                uint32_t e = x + 1u;
+                uint32_t same = 0;
+                while (e < xe && same < RDP_SPAN_GAP) {
+                    same = (pic[e] == far[e]) ? same + 1u : 0u;
+                    e++;
+                }
+                row_add(r, x, e - same);
+                x = e;
+            }
+        }
+    }
+}
+
+/* Every row of the work whole: a snapshot of it is all of the far screen. */
+static bool work_is_all(uint16_t w, uint16_t h)
+{
+    for (uint32_t y = 0; y < h; y++) {
+        const span_t *const r = row_of(s_p.work, y);
+        if (r[0].x0 != 0 || r[0].x1 != w) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* One pass: every row marked since the last, out of the picture and into
  * the wire.  Apart from the loop so the host test can make passes itself. */
 static void pass(void)
@@ -411,6 +476,11 @@ static void pass(void)
         if (!cont) {
         memcpy(s_p.work, s_p.dirty, (size_t)h * RDP_SPANS * sizeof(span_t));
         memset(s_p.dirty, 0, (size_t)h * RDP_SPANS * sizeof(span_t));
+        if (s_p.snap != NULL && s_p.snap_is_far) {
+            trim_to_far(w, h);
+        } else if (s_p.snap != NULL && work_is_all(w, h)) {
+            s_p.snap_is_far = true; /* this snapshot is the whole screen */
+        }
         square_up(h); /* before the snapshot: it copies what goes */
         /*
          * ONE INSTANT, NOT A PASS'S LENGTH OF THEM (27 Sep 2026).  The rows
@@ -513,13 +583,16 @@ static void pass(void)
             /* the far screen is not known to show what the picture says:
              * all of it again, next time */
             s_p.cont = false;
+            s_p.redraws++;
             lock();
+            s_p.snap_is_far = false;
             for (uint32_t y = 0; y < s_p.h; y++) {
                 row_whole(row_of(s_p.dirty, y), s_p.w);
             }
             unlock();
         } else if (any) {
             s_p.passes++;
+            s_p.pass_whole = !cut;
             if (!cut) {
                 s_p.frames++; /* nothing of it left: a whole frame went */
             }
@@ -587,12 +660,24 @@ void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us)
                    : 0u;
 }
 
+bool rdp_pass_whole(void)
+{
+    return s_p.pass_whole;
+}
+
+uint32_t rdp_redraws(void)
+{
+    return s_p.redraws;
+}
+
 void rdp_forget(void)
 {
     if (s_p.task == NULL || s_p.pic == NULL) {
         return;
     }
+    s_p.redraws++;
     lock();
+    s_p.snap_is_far = false;
     for (uint32_t y = 0; y < s_p.h; y++) {
         row_whole(row_of(s_p.dirty, y), s_p.w);
     }
@@ -677,6 +762,7 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
             return false; /* bigger than the picture was made for */
         }
         /* another shape: nothing of the far screen is known any more */
+        s_p.snap_is_far = false;
         s_p.w = b->surf_w;
         s_p.h = b->surf_h;
         memset(s_p.known, 0, s_p.h);

@@ -887,6 +887,8 @@ static volatile uint16_t s_paint_acked;
 static volatile bool     s_paint_heard;  /* the far end has answered once */
 static uint8_t           s_paint_silent; /* passes unanswered in a row */
 static uint32_t          s_paint_waits;  /* passes that waited, for `link` */
+static uint32_t          s_paint_timeouts, s_paint_unsent;
+static int64_t           s_paint_wait_max;
 /* messages each pass in flight took, by its number */
 static uint8_t           s_pass_msgs[16];
 
@@ -905,6 +907,8 @@ static uint32_t msgs_in_flight(uint16_t seq, uint16_t acked)
 }
 
 #define RD_PAINT_WAIT_MS 1000u
+/* in a marker's last word: this pass ended its frame */
+#define RD_PASS_WHOLE 1u
 #define RD_PAINT_LEGACY  3u
 
 /*
@@ -953,8 +957,11 @@ static void rd_sync_z(uint32_t handle)
     put16(msg + 2, seq);
     put32(msg + 4, handle);
     put32(msg + 8, 0);
-    put32(msg + 12, 0);
+    /* the last pass of its frame: the far end counts the frames it drew
+     * whole (older receivers leave this word alone) */
+    put32(msg + 12, rdp_pass_whole() ? RD_PASS_WHOLE : 0u);
     if (link_send(p->wire, p->node, AG_LINK_BULK, msg, RD_HDR) < 0) {
+        s_paint_unsent++;
         return;
     }
     if (!wait) {
@@ -970,12 +977,23 @@ static void rd_sync_z(uint32_t handle)
      * more than two passes behind.
      */
     s_paint_waits++;
-    const int64_t until = ag_port_us() + (int64_t)RD_PAINT_WAIT_MS * 1000;
-    while (((uint16_t)(seq - s_paint_acked) > RD_PAINT_AHEAD ||
-            ((uint16_t)(seq - s_paint_acked) > 1u &&
-             msgs_in_flight(seq, s_paint_acked) > RD_PAINT_MSGS)) &&
-           ag_port_us() < until) {
+    const int64_t t0 = ag_port_us();
+    const int64_t until = t0 + (int64_t)RD_PAINT_WAIT_MS * 1000;
+    bool          out = false;
+    while ((uint16_t)(seq - s_paint_acked) > RD_PAINT_AHEAD ||
+           ((uint16_t)(seq - s_paint_acked) > 1u &&
+            msgs_in_flight(seq, s_paint_acked) > RD_PAINT_MSGS)) {
+        if (ag_port_us() >= until) {
+            out = true;
+            break;
+        }
         ag_port_task_delay(1);
+    }
+    if (out) {
+        s_paint_timeouts++;
+    }
+    if (ag_port_us() - t0 > s_paint_wait_max) {
+        s_paint_wait_max = ag_port_us() - t0;
     }
     if (s_paint_acked != 0u &&
         (uint16_t)(seq - s_paint_acked) <= RD_PAINT_AHEAD) {
@@ -2057,11 +2075,50 @@ static void acker_task(void *arg)
     }
 }
 
+/* frames drawn whole here, and the waits between them (ag_noderdev_frames_seen) */
+#define RD_SEEN_SLOW_US  250000
+#define RD_SEEN_STALL_US 1000000
+static uint32_t s_seen_frames, s_seen_slow, s_seen_stalls;
+static int64_t  s_seen_at, s_seen_slow_us, s_seen_gap_max;
+
+void ag_noderdev_frames_seen(uint32_t *frames, uint32_t *slow, uint32_t *stalls,
+                             uint32_t *slow_ms, uint32_t *gap_max_ms)
+{
+    *frames = s_seen_frames;
+    *slow = s_seen_slow;
+    *stalls = s_seen_stalls;
+    *slow_ms = (uint32_t)(s_seen_slow_us / 1000);
+    *gap_max_ms = (uint32_t)(s_seen_gap_max / 1000);
+}
+
+void ag_noderdev_paint_waits(uint32_t *timeouts, uint32_t *wait_max_ms,
+                             uint32_t *unsent)
+{
+    *timeouts = s_paint_timeouts;
+    *wait_max_ms = (uint32_t)(s_paint_wait_max / 1000);
+    *unsent = s_paint_unsent;
+}
+
 /* A pass's marker, reached: every message of the pass is on the glass. */
 static void pour_pass_drawn(const rd_period_t *pd)
 {
     s_scr_passes++;
     const int64_t now = ag_port_us();
+    if ((pd->off & RD_PASS_WHOLE) != 0u) {
+        s_seen_frames++;
+        const int64_t gap = (s_seen_at != 0) ? now - s_seen_at : 0;
+        if (gap >= RD_SEEN_SLOW_US) {
+            s_seen_slow++;
+            s_seen_slow_us += gap;
+        }
+        if (gap >= RD_SEEN_STALL_US) {
+            s_seen_stalls++;
+        }
+        if (gap > s_seen_gap_max) {
+            s_seen_gap_max = gap;
+        }
+        s_seen_at = now;
+    }
     s_all_passes++;
     if (s_scr_pass_at != 0 && now - s_scr_pass_at > s_all_gap_max) {
         s_all_gap_max = now - s_scr_pass_at;
@@ -2081,7 +2138,10 @@ static void pour_pass_drawn(const rd_period_t *pd)
         return;
     }
     if (s_ack_w - s_ack_r >= RD_ACKS) {
-        return; /* four behind: the painter's wait will cover this one */
+        /* four behind: the painter's wait will cover this one - but not
+         * its "lost", which the next answer carries instead */
+        s_glass_owed = s_glass_owed || lost;
+        return;
     }
     s_ack[s_ack_w % RD_ACKS] = (rd_ack_t){pd->wire, pd->from, pd->tag, lost};
     s_ack_w++;
@@ -2260,8 +2320,16 @@ static void take_period(const uint8_t *b, uint16_t n)
             s_pour_lost++;
             return;
         }
+        /* and its places beside it: 46 of them are 1.3 KB, and on an
+         * emulated S3 that was the internal memory the next request's
+         * worker could not then be made in - the far end answered -12 and
+         * the mixer had nowhere to send sound (nodetest, 29 Sep 2026) */
         s_ring = (rd_period_t *)ag_port_alloc(RD_RING * sizeof(rd_period_t),
-                                              AG_MEM_BYTE);
+                                              AG_MEM_SLOW | AG_MEM_BYTE);
+        if (s_ring == NULL) {
+            s_ring = (rd_period_t *)ag_port_alloc(
+                RD_RING * sizeof(rd_period_t), AG_MEM_BYTE);
+        }
         if (s_ring == NULL) {
             ag_port_free(s_ring_mem);
             s_ring_mem = NULL;

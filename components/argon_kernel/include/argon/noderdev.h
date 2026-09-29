@@ -95,6 +95,20 @@ void ag_noderdev_draw_misses(uint32_t *nodev, uint32_t *nopx, uint32_t *op,
 void ag_noderdev_screen_counts(uint32_t *passes, uint32_t *lost,
                                uint32_t *gap_ms, uint32_t *snd_gap_ms,
                                uint32_t *snd_q_max, uint32_t *snd_q_cap);
+/*
+ * WHAT A PERSON SEES of a neighbour's picture here: frames drawn whole, the
+ * waits between two of them of a quarter of a second or more and of a
+ * second or more, the time those quarter-second waits took together, and the
+ * longest.  An average of frames a second hides a picture that stands still
+ * for two seconds and then runs (28 Sep 2026: "9.4 a second" where Maxim saw
+ * one frame in two seconds most of the time).
+ */
+void ag_noderdev_frames_seen(uint32_t *frames, uint32_t *slow, uint32_t *stalls,
+                             uint32_t *slow_ms, uint32_t *gap_max_ms);
+/* The painting board's side: passes whose wait for the far end ran out
+ * (RD_PAINT_WAIT_MS), the longest wait, and markers the wire refused. */
+void ag_noderdev_paint_waits(uint32_t *timeouts, uint32_t *wait_max_ms,
+                             uint32_t *unsent);
 
 #ifdef __cplusplus
 }

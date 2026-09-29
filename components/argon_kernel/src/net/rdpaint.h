@@ -76,6 +76,14 @@ void rdp_forget(void);
  * how long the far end took to say a pass was drawn, on average. */
 void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us);
 
+/* For the sync: whether the pass just sent was the last of its frame - the
+ * far end counts the frames it has drawn whole, which is what a person sees. */
+bool rdp_pass_whole(void);
+
+/* Times every row went again: the wire refused a pass, or the far screen
+ * said it no longer shows what was sent. */
+uint32_t rdp_redraws(void);
+
 /* The painter's line a second in the journal: off unless asked. */
 void rdp_report(bool on);
 

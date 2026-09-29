@@ -317,6 +317,58 @@ static void one_instant(void)
     CHECK(diff(&at) == 0u);
 }
 
+/*
+ * A ball that went a long way between two passes - thirty frames while a big
+ * one was going out: the next pass sends where it was and where it is, not
+ * the path (29 Sep 2026: the path made the next frame longer still, and the
+ * picture stood still 61% of the time).
+ */
+static void long_way(void)
+{
+    enum { R = 15, STEP = 4, FRAMES = 30 };
+    const int32_t y0 = 120;
+    int32_t       x = 40;
+    for (uint32_t f = 0; f <= FRAMES; f++) {
+        for (uint32_t i = 0; i < W * H; i++) {
+            s_frame[i] = 0x0841u;
+        }
+        for (int32_t y = y0 - R; y <= y0 + R; y++) {
+            for (int32_t xx = x - R; xx <= x + R; xx++) {
+                const int32_t dx = xx - x, dy = y - y0;
+                if (dx * dx + dy * dy <= R * R) {
+                    s_frame[(uint32_t)y * W + (uint32_t)xx] = 0xF800u;
+                }
+            }
+        }
+        present_frame();
+        if (f == 0u) {
+            /* the ball's first place, on the glass */
+            uint32_t guard = 0;
+            do {
+                rdpaint_stub_now_us += 16000;
+                pass();
+            } while (dirty_left() && ++guard < 64u);
+        }
+        x += STEP;
+    }
+    const uint32_t p1 = s_px_drawn;
+    uint32_t guard = 0;
+    do {
+        rdpaint_stub_now_us += 16000;
+        pass();
+    } while (dirty_left() && ++guard < 64u);
+    const uint32_t sent = s_px_drawn - p1;
+    uint32_t       at = 0;
+    const uint32_t n = diff(&at);
+    printf("  rdpaint a long way: %u px sent for a ball that went %u px "
+           "(its box is %u); %u px of the glass wrong\n",
+           (unsigned)sent, (unsigned)(STEP * FRAMES),
+           (unsigned)((2 * R + 1) * (2 * R + 1)), (unsigned)n);
+    CHECK(n == 0u);
+    /* two boxes, not the path: the path would be ~150 x 31 */
+    CHECK(sent <= 2u * (2 * R + 1) * (2 * R + 1) + 200u);
+}
+
 int main(void)
 {
     s_ops.size = sizeof(s_ops);
@@ -328,6 +380,7 @@ int main(void)
     one_instant();
     s_all_new = false;
     balls();
+    long_way();
     printf("rdpaint_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails == 0 ? 0 : 1;
 }

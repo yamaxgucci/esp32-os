@@ -366,13 +366,28 @@ static void print_stats(void)
                           (unsigned)nd, (unsigned)np, (unsigned)mop,
                           (unsigned)mlen, (unsigned)mf);
     }
+    uint32_t fs = 0, fsl = 0, fst = 0, fsms = 0, fmax = 0;
+    ag_noderdev_frames_seen(&fs, &fsl, &fst, &fsms, &fmax);
+    if (fs != 0u) {
+        ag_console_printf("seen    %u frames drawn whole here; %u waits of "
+                          "250 ms or more between two (%u ms together), %u of "
+                          "a second or more, the longest %u ms\n",
+                          (unsigned)fs, (unsigned)fsl, (unsigned)fsms,
+                          (unsigned)fst, (unsigned)fmax);
+    }
     uint32_t whole = 0, passes = 0, pass_wait = 0;
     rdp_counts(&whole, &passes, &pass_wait);
     if (passes != 0u) {
+        uint32_t pto = 0, pmax = 0, pun = 0;
+        ag_noderdev_paint_waits(&pto, &pmax, &pun);
         ag_console_printf("painter %u whole frames sent in %u passes, the far "
                           "end took %u ms a pass\n",
                           (unsigned)whole, (unsigned)passes,
                           (unsigned)(pass_wait / 1000u));
+        ag_console_printf("        %u times all of it again, %u waits ran "
+                          "out, the longest %u ms, %u markers refused\n",
+                          (unsigned)rdp_redraws(), (unsigned)pto,
+                          (unsigned)pmax, (unsigned)pun);
     }
     if (ss != 0u || sq != 0u) {
         ag_console_printf("sound   the longest wait between two periods %u ms,"
