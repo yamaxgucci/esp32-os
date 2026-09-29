@@ -2264,10 +2264,19 @@ int ag_main(int argc, char **argv)
                         s_us_total = 0;
                         s_us_blocks = 0;
                     }
+                    /*
+                     * `late` alone says almost nothing here: the sink's write
+                     * blocks, so the loop reaches the pacing call after its
+                     * due time on nearly every block and the counter climbs
+                     * for ever while the sound is perfect.  `resync` is the
+                     * one that means a whole block was lost from the clock,
+                     * and `drop` that one was thrown away.
+                     */
                     ag_printf("stomp: %u blocks, %u%% cpu, %u late, %u drop, "
-                              "amp %u%%, out %u%%%s\n",
+                              "%u resync, amp %u%%, out %u%%%s\n",
                               (unsigned)s_blocks, (unsigned)s_out.load_pct,
                               (unsigned)s_out.late, (unsigned)s_out.drop,
+                              (unsigned)s_out.resync,
                               (unsigned)(s_amp_peak * 100.0f),
                               (unsigned)(s_peak * 100.0f),
                               s_out_clipped > 0u ? " CLIP" : "");
