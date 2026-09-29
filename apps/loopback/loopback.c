@@ -123,6 +123,56 @@ int ag_main(int argc, char **argv)
         (secs > 0) ? ((uint32_t)secs * RATE / CHUNK) : 0u;
     const uint32_t say_every = RATE / CHUNK; /* about a second */
 
+    /*
+     * ROUND TRIP, MEASURED, before anything else runs.
+     *
+     * One full-scale sample out and the count of frames until it comes back:
+     * that is the whole path - the output ring, the converter, the cable, the
+     * input ring - in one number, and it is the number a guitarist is
+     * complaining about when a pedal feels slow.  Arithmetic over buffer sizes
+     * predicts it; this measures it, and the two disagreeing is how a
+     * forgotten buffer is found.
+     *
+     * The click is sent alone and the search is for anything above a tenth of
+     * full scale, so a noise floor cannot answer for it.
+     */
+    {
+        uint32_t sent = 0, found = 0, scanned = 0;
+        for (sent = 0; sent < 200u && found == 0u; sent++) {
+            uint32_t j;
+            for (j = 0; j < CHUNK * CHANNELS; j++) {
+                s_out[j] = 0;
+            }
+            if (sent == 1u) { /* one block of silence first, then the click */
+                s_out[0] = 32000;
+                s_out[1] = 32000;
+            }
+            if (ag_pcm_write(&pcm, s_out, (int32_t)CHUNK) < 0) {
+                break;
+            }
+            {
+                const int32_t got = ag_pcm_read(&pcm, s_in, (int32_t)CHUNK);
+                for (int32_t j2 = 0; j2 < got && found == 0u; j2++) {
+                    const int16_t v = s_in[j2 * CHANNELS];
+                    if (v > 3000 || v < -3000) {
+                        found = scanned + (uint32_t)j2;
+                    }
+                }
+                if (got > 0) {
+                    scanned += (uint32_t)got;
+                }
+            }
+        }
+        if (found > 0u && sent > 2u) {
+            /* The click left one block in: everything after that is the path. */
+            const uint32_t frames = (found > CHUNK) ? (found - CHUNK) : 0u;
+            ag_printf("loopback: round trip %u frames, %u ms\n",
+                      (unsigned)frames, (unsigned)(frames * 1000u / RATE));
+        } else {
+            ag_printf("loopback: the click did not come back - cable out?\n");
+        }
+    }
+
     osc_init(&osc, freq);
     ag_pcm_pace_start(&pcm);
 

@@ -121,6 +121,7 @@ static void apply_generic_defaults(void)
     strcpy(s_board.audio.driver, "auto");
     s_board.audio.i2c = AG_PIN_NONE;
     s_board.audio.ingain = 0; /* line level; a guitar says so in BOARD.CFG */
+    s_board.audio.dma_frames = 0; /* the port's default unless a board asks */
     s_board.audio.bclk = AG_PIN_NONE;
     s_board.audio.ws = AG_PIN_NONE;
     s_board.audio.dout = AG_PIN_NONE;
@@ -343,6 +344,10 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
         const int32_t again = ag_cfg_get_int(cfg, "audio.ingain", -1);
         if (again >= 0 && again <= 24) {
             s_board.audio.ingain = (int16_t)again;
+        }
+        const int32_t adma = ag_cfg_get_int(cfg, "audio.dma_frames", 0);
+        if (adma >= 64 && adma <= 4096) {
+            s_board.audio.dma_frames = (uint16_t)adma;
         }
         const int32_t ai2c = ag_cfg_get_int(cfg, "audio.i2c", -1);
         if (ai2c >= 0 && ai2c < AG_I2C_BUSES) {

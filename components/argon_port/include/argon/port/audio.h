@@ -88,6 +88,23 @@ typedef struct {
     /* The codec's input preamplifier, in dB (0..24): what is plugged in, not
      * what sounds nice.  See ag_board_audio_t. */
     int16_t  ingain;
+    /*
+     * How many frames the converter may hold in each direction, or 0 for the
+     * port's own default.
+     *
+     * This is latency, and on an instrument it is the whole difference between
+     * an amplifier and a delay pedal.  The port's default is generous because
+     * most sound is played rather than performed - a synthesiser or a game can
+     * be forty milliseconds behind and nobody can tell.  A guitar cannot: the
+     * player hears the string and the speaker at once, and twenty milliseconds
+     * between them is felt in the hands.
+     *
+     * The floor is two of whatever the application writes at a time: one
+     * buffer playing while the next is computed.  Below that the converter
+     * runs dry between blocks and the sound breaks up, which is worse than
+     * being late.
+     */
+    uint16_t dma_frames;
     uint32_t rate; /* the board's default; open() may still ask for another */
 } ag_port_audio_pins_t;
 

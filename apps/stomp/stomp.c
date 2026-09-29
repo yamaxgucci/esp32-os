@@ -103,6 +103,22 @@ enum { BROWSE_OFF, BROWSE_CAB, BROWSE_PRESET };
 #define RATE  22050u
 #define CHUNK AG_IR_BLOCK
 
+/*
+ * How many frames the loop actually does at a time, which is latency.
+ *
+ * CHUNK above is only the size of the buffers - the most this will ever ask
+ * for.  What it asks for is s_chunk, and on an instrument that number is the
+ * whole argument: 256 frames at 22050 Hz is 11.6 ms between a string being
+ * struck and the first sample of it leaving, with a converter buffer on each
+ * side of that.  A guitarist feels twenty milliseconds.
+ *
+ * It can be smaller than a block only because the cabinet no longer needs one:
+ * a short impulse is convolved directly (ag_ir_process_n), and it is the
+ * transform that forces whole blocks.
+ */
+static uint32_t     s_chunk = CHUNK;
+static int          s_quiet; /* no periodic status; see `quiet` */
+
 static ag_gfxinfo_t s_info;  /* the display, held for as long as we run */
 static int          s_headless; /* no panel on this board: play, do not draw */
 
@@ -906,7 +922,7 @@ static void bench_audio(void)
 {
     static const int oss[] = { 1, 2, 4 };
     const uint32_t   blocks = 40;
-    const uint32_t   budget_us = (CHUNK * 1000000u) / RATE;
+    const uint32_t   budget_us = (s_chunk * 1000000u) / RATE;
     uint32_t         i, b, k;
     ag_time_t        t0, t1;
 
@@ -922,7 +938,7 @@ static void bench_audio(void)
         }
         t0 = ag_micros();
         for (b = 0; b < blocks; b++) {
-            for (i = 0; i < CHUNK; i++) {
+            for (i = 0; i < s_chunk; i++) {
                 /* A ramp through the curve rather than a constant, which the
                  * compiler could hoist and the table would answer from one
                  * cache line. */
@@ -1476,11 +1492,11 @@ static void audio_block(void)
      * input has stopped being a pedal.
      */
     if (s_live) {
-        const int32_t got = ag_pcm_read(&s_out, s_in, (int32_t)CHUNK);
+        const int32_t got = ag_pcm_read(&s_out, s_in, (int32_t)s_chunk);
         uint32_t      have = (got > 0) ? (uint32_t)got : 0u;
-        if (have < CHUNK) {
+        if (have < s_chunk) {
             memset(s_in + have * s_in_ch, 0,
-                   (CHUNK - have) * s_in_ch * sizeof(int16_t));
+                   (s_chunk - have) * s_in_ch * sizeof(int16_t));
             if (got < 0) {
                 s_in_starved++;
             }
@@ -1499,7 +1515,7 @@ static void audio_block(void)
     s_us_in += (uint32_t)(ag_micros() - t0);
     const ag_time_t t_valves = ag_micros();
 
-    for (i = 0; i < CHUNK; i++) {
+    for (i = 0; i < s_chunk; i++) {
         float x = 0.0f, y;
         int   v;
         if (s_live) {
@@ -1546,9 +1562,9 @@ static void audio_block(void)
     s_us_valves += (uint32_t)(ag_micros() - t_valves);
     const ag_time_t t_ir = ag_micros();
     if (s_ir_ready) {
-        ag_ir_process_block(&s_ir, s_mono, s_stereo);
+        ag_ir_process_n(&s_ir, s_mono, s_stereo, s_chunk);
     } else {
-        for (i = 0; i < CHUNK; i++) {
+        for (i = 0; i < s_chunk; i++) {
             s_stereo[2 * i] = s_mono[i];
             s_stereo[2 * i + 1] = s_mono[i];
         }
@@ -1566,7 +1582,7 @@ static void audio_block(void)
      */
     {
         int      hi = 0;
-        uint32_t n = CHUNK * 2u;
+        uint32_t n = s_chunk * 2u;
         for (i = 0; i < n; i++) {
             int v = s_stereo[i];
             if (s_vol_num != 64) {
@@ -1603,14 +1619,15 @@ static void audio_block(void)
     s_us_blocks++;
     ag_pcm_mark_render(&s_out, (uint32_t)(ag_micros() - t0));
     {
-        const int32_t wrote = ag_pcm_write(&s_out, s_stereo, (int32_t)CHUNK);
+        const int32_t wrote =
+            ag_pcm_write(&s_out, s_stereo, (int32_t)s_chunk);
         s_blocks++;
         if (s_blocks == 1u) {
             /* The first block is the one worth saying out loud: on a box with
              * no screen it is the only evidence that the chain reached the
              * converter at all, and a sink that refuses is silent otherwise. */
             ag_printf("stomp: first block: %d of %u frames written\n",
-                      (int)wrote, (unsigned)CHUNK);
+                      (int)wrote, (unsigned)s_chunk);
         }
         if (wrote < 0) {
             s_short++; /* the sink refused it; frames and bytes differ by sink */
@@ -1959,7 +1976,7 @@ static int sound_start(const char *sink, const char *di_path)
         ag_wav_free(&s_di);
         return -1;
     }
-    ag_pcm_set_chunk(&s_out, CHUNK);
+    ag_pcm_set_chunk(&s_out, s_chunk);
     /* A file sink is a render, not a performance: the take is played once and
      * then this stops, rather than filling the card with a loop. */
     s_di_loop = !ends_with(s_out.path, ".wav");
@@ -2000,6 +2017,36 @@ int ag_main(int argc, char **argv)
              * nothing.
              */
             cab_path = argv[++i];
+        } else if (strcmp(argv[i], "quiet") == 0) {
+            /*
+             * No periodic status while playing.
+             *
+             * The line is about sixty characters and the console is a UART at
+             * 115200 or a WebSocket to a phone; either takes longer than a
+             * block once the block is 64 frames, and the loop comes back to
+             * find the clock has moved on.  Measured: one resync every two
+             * seconds, which is exactly how often it was printed.
+             *
+             * Not silence, though: once every thirty seconds instead of every
+             * two, so the counters can still be read and the cost is a
+             * fifteenth.  A number nobody can see is how a board ends up with
+             * a fault nobody can name.
+             */
+            s_quiet = 1;
+        } else if (strcmp(argv[i], "blk") == 0 && i + 1 < argc) {
+            /*
+             * Frames a block, and therefore latency.
+             *
+             * 256 is what the convolution wanted when it was a transform; 64
+             * is 2.9 ms and is what a guitar wants.  The converter's own
+             * buffer has to come down with it - `audio.dma_frames` in
+             * BOARD.CFG, at least twice this - or the chain is punctual into a
+             * ring that is still a tenth of a second deep.
+             */
+            const int v = atoi_small(argv[++i]);
+            if (v >= 16 && v <= (int)CHUNK) {
+                s_chunk = (uint32_t)v;
+            }
         } else if (strcmp(argv[i], "cabms") == 0 && i + 1 < argc) {
             s_cab_ms = (uint32_t)atoi_small(argv[++i]);
         } else if (strcmp(argv[i], "vol") == 0 && i + 1 < argc) {
@@ -2159,12 +2206,13 @@ int ag_main(int argc, char **argv)
             return 1;
         }
         ag_printf("stomp: sound = %s @ %u Hz, %u frames a block\n", s_out.path,
-                  (unsigned)RATE, (unsigned)CHUNK);
+                  (unsigned)RATE, (unsigned)s_chunk);
         if (want_live) {
             /* Ask for one block before promising anything.  A device with no
              * line in answers -AG_ENOSYS, and finding that out now is better
              * than a silence nobody can explain later. */
-            const int32_t probe = ag_pcm_read(&s_out, s_in, (int32_t)CHUNK);
+            const int32_t probe =
+                ag_pcm_read(&s_out, s_in, (int32_t)s_chunk);
             if (probe < 0) {
                 ag_printf("stomp: %s has no input (%d) - playing the take\n",
                           s_out.path, (int)probe);
@@ -2243,12 +2291,12 @@ int ag_main(int argc, char **argv)
                  * plays without dropping blocks" are different claims, and only
                  * the counters can tell them apart.
                  */
-                if (ms - s_say_ms >= 2000u) {
+                if (ms - s_say_ms >= (s_quiet ? 30000u : 2000u)) {
                     s_say_ms = ms;
                     ag_pcm_poll_stats(&s_out);
                     if (s_us_blocks > 0u) {
                         const uint32_t n = s_us_blocks;
-                        const uint32_t budget = (CHUNK * 1000000u) / RATE;
+                        const uint32_t budget = (s_chunk * 1000000u) / RATE;
                         ag_printf("stomp: of %u us a block: waiting for input "
                                   "%u, valves %u, cabinet %u, the rest %u "
                                   "(%u total)\n",

@@ -384,6 +384,23 @@ static bool i2s_be_open(uint32_t rate, uint8_t channels)
         I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     chan.dma_desc_num = I2S_DESCS;
     chan.dma_frame_num = I2S_FRAMES;
+    /*
+     * Unless the board says how much it is willing to be behind.
+     *
+     * The default 4 x 240 is 960 frames, which at 22050 Hz is 43 ms in each
+     * direction - nearly a tenth of a second round trip before the chain has
+     * done anything, and on a guitar that is felt in the hands rather than
+     * heard.  A board that is an instrument says a smaller number and accepts
+     * that it must keep up.
+     *
+     * Two descriptors, because DMA needs one playing while the other is
+     * filled, and that is also the floor: a ring shorter than two of the
+     * application's blocks runs dry between them.
+     */
+    if (s_pins.dma_frames >= 64u) {
+        chan.dma_desc_num = 2;
+        chan.dma_frame_num = (uint32_t)s_pins.dma_frames / 2u;
+    }
     chan.auto_clear = true;
 
     /* Both handles from one call: that is what makes them share a clock. */
@@ -467,6 +484,10 @@ static bool i2s_be_open(uint32_t rate, uint8_t channels)
                                 (int)s_pins.ingain);
 
     s_i2s_channels = channels;
+    ESP_LOGI(TAG, "i2s buffer %u frames each way (%u ms)",
+             (unsigned)(chan.dma_desc_num * chan.dma_frame_num),
+             (unsigned)((chan.dma_desc_num * chan.dma_frame_num * 1000u) /
+                        (rate > 0u ? rate : 1u)));
     ESP_LOGI(TAG, "i2s on bclk=%d ws=%d dout=%d din=%d mclk=%d, %u Hz, %u ch",
              (int)s_pins.bclk, (int)s_pins.ws, (int)s_pins.dout,
              (int)s_pins.din, (int)s_pins.mclk, (unsigned)rate,
@@ -605,7 +626,11 @@ static int32_t i2s_be_write(const int16_t *pcm, int32_t frames)
  */
 static int32_t i2s_be_space(void)
 {
-    return (s_tx != NULL) ? (int32_t)(I2S_DESCS * I2S_FRAMES) : 0;
+    if (s_tx == NULL) {
+        return 0;
+    }
+    return (s_pins.dma_frames >= 64u) ? (int32_t)s_pins.dma_frames
+                                      : (int32_t)(I2S_DESCS * I2S_FRAMES);
 }
 
 #endif /* SOC_I2S_SUPPORTED */

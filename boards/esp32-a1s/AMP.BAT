@@ -5,10 +5,19 @@ REM   run c:\take.bat       the recorded take instead, for measuring
 REM
 REM os 2      two times oversampling.  4x costs 9300 us of an 11609 us block
 REM           and does not fit on this chip whatever the cabinet is set to.
-REM cabms 46  the impulse is truncated to 45 ms.  Its length is nearly free -
-REM           23 ms costs 2606 us against 2696 for 45 - so keep the long one.
+REM blk 64    64 frames a block: 2.9 ms instead of 11.6, because latency is
+REM           what a guitarist feels.  It must be half of audio.dma_frames in
+REM           BOARD.CFG or the converter runs dry between blocks.
+REM cabms 23  23 ms of the impulse, which measures within half a decibel of 45
+REM           in every octave band - and 507 taps is short enough to convolve
+REM           directly, which is where the other 11.6 ms of delay went.
+REM quiet     no periodic status.  Printing one costs longer than a 64-frame
+REM           block, and the loop comes back to a clock that has moved: it was
+REM           measured as one lost block every two seconds, which is how often
+REM           the line was printed.  TAKE.BAT leaves it on, because a run being
+REM           measured should say what it is doing.
 REM inmix     both input channels added.  The board wires its line input to
 REM           MIC2's pins, so a microphone is always in the signal; this is the
 REM           attempt at cancelling it without a soldering iron.  Use `in` for
 REM           the left channel alone.
-run c:\STOMP.AXE jcm800 os 2 cabms 46 cab c:\CAB.WAV inmix out pcm0
+run c:\STOMP.AXE jcm800 os 2 blk 64 cabms 23 cab c:\CAB.WAV inmix quiet out pcm0

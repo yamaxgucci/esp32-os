@@ -272,6 +272,7 @@ ag_err_t ag_pcmhw_init(void)
         .mclk = a->mclk,
         .i2c = a->i2c,
         .ingain = a->ingain,
+        .dma_frames = a->dma_frames,
         .rate = a->rate,
     };
     ag_port_audio_pins(&pins);

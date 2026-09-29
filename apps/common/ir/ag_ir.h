@@ -22,6 +22,18 @@
 #define AG_IR_MAX_MS 1000u
 
 /*
+ * Up to this many taps the impulse is convolved directly, above it by parts.
+ *
+ * The line is where the transform stops paying for its latency rather than
+ * where it stops paying for its arithmetic: a block costs 11.6 ms at 22050 Hz
+ * and an instrument feels that, so the direct form is preferred wherever it
+ * can be afforded.  768 taps is 35 ms at 22050 and about a fifth of a core on
+ * an LX6 - against a measured 25% for the partitioned form at 45 ms, so this
+ * is not a trade of speed for latency; it is both.
+ */
+#define AG_IR_DIRECT_MAX 768u
+
+/*
  * The synthetic reverbs are 500 ms whatever the cap is.  Tied to the cap they
  * would change character every time it moved, and "hall" is a description of a
  * sound rather than of how much memory happened to be allowed.
@@ -96,6 +108,30 @@ typedef struct ag_ir {
      */
     int8_t  *x_sh;
     uint32_t x_pos;
+
+    /*
+     * THE SHORT WAY: a plain FIR, for an impulse that does not earn a
+     * transform.
+     *
+     * The partitioned convolution above costs one block of latency because it
+     * cannot answer until a whole block has arrived, and on an instrument that
+     * block is felt in the hands: 256 frames at 22050 Hz is 11.6 ms, on top of
+     * everything else in the path.  A direct form has none - sample in, sample
+     * out - and for a cabinet short enough it costs about the same arithmetic,
+     * because the transform's advantage only pays from a few hundred taps up.
+     *
+     * Measured on the AC30 impulse this project ships: 23 ms of it is within
+     * half a decibel of 45 ms in every octave band, so a cabinet that fits
+     * here is not a compromised cabinet.
+     *
+     * `hist` is twice the tap count with each sample written in two places, so
+     * the inner loop walks both arrays forwards and needs no wrapping test.
+     */
+    int16_t *h_dir;
+    int16_t *hist;
+    uint32_t n_dir;
+    uint32_t hist_pos;
+    uint8_t  dir_shift;
     /*
      * How far H had to be shifted right to fit int16, picked from the IR that
      * was actually loaded and undone again on the output.  A fixed shift
@@ -161,5 +197,17 @@ void ag_ir_set_bypass(ag_ir_t *ir, int on);
  * Wet/dry mix applied; bypass copies dry to L/R.
  */
 void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out);
+
+/*
+ * The same, for any number of frames.
+ *
+ * A short impulse is convolved directly and does not care about block
+ * boundaries; a long one is still done in whole AG_IR_BLOCK pieces and any
+ * remainder is left.  Prefer this in new code: it is what lets an application
+ * pick its block size for latency rather than for the transform, which on an
+ * instrument is the difference between 11.6 ms of delay and none.
+ */
+void ag_ir_process_n(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out,
+                     uint32_t frames);
 
 #endif /* AG_IR_H */

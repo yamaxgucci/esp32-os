@@ -44,6 +44,16 @@ static void free_spectra(ag_ir_t *ir)
         ag_free(ir->x_sh);
         ir->x_sh = NULL;
     }
+    if (ir->h_dir != NULL) {
+        ag_free(ir->h_dir);
+        ir->h_dir = NULL;
+    }
+    if (ir->hist != NULL) {
+        ag_free(ir->hist);
+        ir->hist = NULL;
+    }
+    ir->n_dir = 0;
+    ir->hist_pos = 0;
     ir->parts = 0;
     ir->ir_frames = 0;
     ir->ready = 0;
@@ -274,6 +284,59 @@ static int part_fft(const int16_t *mono, uint32_t frames, uint32_t p, int pre,
     return ag_fft_real_fwd(re, im, (int)AG_IR_FFT);
 }
 
+/*
+ * The direct form, built instead of the partitions when the impulse is short.
+ *
+ * Nothing clever: the taps as they arrived, and a history twice as long with
+ * every sample written in two places so the inner loop is two forward walks.
+ *
+ * The only arithmetic decision is the shift.  Accumulating 507 taps of int16
+ * against int16 input can reach 2^39 in theory, so the taps come down by
+ * enough that the worst case still fits int32 - computed from the sum of
+ * their magnitudes, which on a real cabinet is one or two bits rather than
+ * the eight the bound would suggest.  Doing it from the actual impulse rather
+ * than from the bound is the difference between losing two bits and losing
+ * eight.
+ */
+static int build_direct(ag_ir_t *ir, const int16_t *mono, uint32_t frames)
+{
+    uint32_t i;
+    uint64_t sum = 0;
+    uint8_t  shift = 0;
+
+    free_spectra(ir);
+    if (frames < 4u) {
+        return -1;
+    }
+
+    for (i = 0; i < frames; i++) {
+        sum += (uint64_t)(mono[i] < 0 ? -(int32_t)mono[i] : (int32_t)mono[i]);
+    }
+    /* The worst an accumulator can see is sum|h| * 32768; keep it inside
+     * int32 with a bit to spare. */
+    while ((sum * 32768u) >> shift > 0x3fffffffu && shift < 16u) {
+        shift++;
+    }
+
+    ir->h_dir = (int16_t *)ag_malloc(sizeof(int16_t) * frames);
+    ir->hist = (int16_t *)ag_malloc(sizeof(int16_t) * frames * 2u);
+    if (ir->h_dir == NULL || ir->hist == NULL) {
+        free_spectra(ir);
+        return -1;
+    }
+    for (i = 0; i < frames; i++) {
+        ir->h_dir[i] = (int16_t)(mono[i] >> shift);
+    }
+    memset(ir->hist, 0, sizeof(int16_t) * frames * 2u);
+    ir->n_dir = frames;
+    ir->hist_pos = frames - 1u;
+    ir->dir_shift = shift;
+    ir->ir_frames = frames;
+    ir->parts = 0;
+    ir->ready = 1;
+    return 0;
+}
+
 static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
 {
     uint32_t parts, p, i;
@@ -396,7 +459,8 @@ int ag_ir_load(ag_ir_t *ir, const int16_t *mono, uint32_t frames, uint32_t src_r
         return -1;
     }
     normalize_energy(tmp, n, AG_IR_ENERGY);
-    rc = build_partitions(ir, tmp, n);
+    rc = (n <= AG_IR_DIRECT_MAX) ? build_direct(ir, tmp, n)
+                                : build_partitions(ir, tmp, n);
     ag_free(tmp);
     if (rc == 0) {
         /*
@@ -479,7 +543,8 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
         }
         n = cab_n;
         normalize_energy(buf, n, AG_IR_ENERGY);
-        rc = build_partitions(ir, buf, n);
+        rc = (n <= AG_IR_DIRECT_MAX) ? build_direct(ir, buf, n)
+                                : build_partitions(ir, buf, n);
         ag_free(buf);
         if (rc == 0) {
             /* A cabinet is fully wet: see ag_ir_load. */
@@ -520,7 +585,8 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
     }
 
     normalize_energy(buf, n, AG_IR_ENERGY);
-    rc = build_partitions(ir, buf, n);
+    rc = (n <= AG_IR_DIRECT_MAX) ? build_direct(ir, buf, n)
+                                : build_partitions(ir, buf, n);
     ag_free(buf);
     if (rc == 0) {
         /*
@@ -572,6 +638,89 @@ AG_IR_NOINLINE static void mac_part(int32_t *yre, int32_t *yim,
     }
 }
 
+/*
+ * The direct form, sample by sample, with the same gain and wet the
+ * partitioned path applies so that one can be swapped for the other without
+ * anything else moving.
+ *
+ * The inner loop is unrolled by four because the tap count is what this costs
+ * and the chip has no instruction fusing the two loads with the multiply:
+ * four at a time is what stops the loop counter being a third of the work.
+ */
+static void process_direct(ag_ir_t *ir, const int16_t *in, int16_t *out,
+                           uint32_t frames)
+{
+    const int16_t *h = ir->h_dir;
+    const uint32_t n = ir->n_dir;
+    /*
+     * The taps are Q15 gains scaled down by dir_shift, so undoing both leaves
+     * the convolution at the input's own scale.
+     */
+    const uint32_t rsh = (ir->dir_shift < 15u) ? (15u - ir->dir_shift) : 0u;
+    const int32_t  half = (rsh > 0u) ? ((int32_t)1 << (rsh - 1u)) : 0;
+    const uint32_t tail = n & 3u;
+    uint32_t       i, k, pos = ir->hist_pos;
+
+    for (i = 0; i < frames; i++) {
+        const int32_t  dry = in[i];
+        const int16_t *x;
+        int32_t        acc = 0, y, m;
+
+        pos = (pos == 0u) ? (n - 1u) : (pos - 1u);
+        ir->hist[pos] = in[i];
+        ir->hist[pos + n] = in[i]; /* the second copy is what removes the wrap */
+        x = ir->hist + pos;
+
+        for (k = 0; k + 4u <= n; k += 4u) {
+            acc += (int32_t)h[k] * (int32_t)x[k];
+            acc += (int32_t)h[k + 1u] * (int32_t)x[k + 1u];
+            acc += (int32_t)h[k + 2u] * (int32_t)x[k + 2u];
+            acc += (int32_t)h[k + 3u] * (int32_t)x[k + 3u];
+        }
+        for (k = n - tail; k < n; k++) {
+            acc += (int32_t)h[k] * (int32_t)x[k];
+        }
+
+        y = (acc + half) >> rsh;
+        y = (y * (int32_t)ir->gain + 32) >> 6;
+        y = ag_sat16(y);
+        m = dry + (((y - dry) * (int32_t)ir->wet + 64) >> 7);
+        m = ag_sat16(m);
+        out[i * 2u] = (int16_t)m;
+        out[i * 2u + 1u] = (int16_t)m;
+    }
+    ir->hist_pos = pos;
+}
+
+/*
+ * Any number of frames, which the direct form allows and the partitioned one
+ * does not: a transform answers in whole blocks or not at all.
+ */
+void ag_ir_process_n(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out,
+                     uint32_t frames)
+{
+    uint32_t i;
+
+    if (ir == NULL || mono_in == NULL || stereo_out == NULL) {
+        return;
+    }
+    if (!ir->ready || ir->bypass) {
+        for (i = 0; i < frames; i++) {
+            stereo_out[i * 2u] = mono_in[i];
+            stereo_out[i * 2u + 1u] = mono_in[i];
+        }
+        return;
+    }
+    if (ir->n_dir > 0u) {
+        process_direct(ir, mono_in, stereo_out, frames);
+        return;
+    }
+    /* Partitioned: whole blocks only, and the caller is expected to know. */
+    for (i = 0; i + AG_IR_BLOCK <= frames; i += AG_IR_BLOCK) {
+        ag_ir_process_block(ir, mono_in + i, stereo_out + i * 2u);
+    }
+}
+
 void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out)
 {
     uint32_t i, p, parts;
@@ -587,6 +736,10 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
         return;
     }
 
+    if (ir->n_dir > 0u && ir->ready && !ir->bypass) {
+        process_direct(ir, mono_in, stereo_out, AG_IR_BLOCK);
+        return;
+    }
     if (!ir->ready || ir->bypass || ir->parts == 0u) {
         for (i = 0; i < AG_IR_BLOCK; i++) {
             stereo_out[i * 2u] = mono_in[i];

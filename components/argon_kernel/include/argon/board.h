@@ -142,6 +142,9 @@ typedef struct {
      * 3 dB steps and this is rounded to them.
      */
     int16_t  ingain;
+    /* Frames the converter may hold each way; 0 takes the port's default.
+     * It is latency - see ag_port_audio_pins_t. */
+    uint16_t dma_frames;
     uint32_t rate; /* default sample rate hint for pcmnull / drivers */
 } ag_board_audio_t;
 
