@@ -848,6 +848,8 @@ static ag_err_t rd_gfxinfo(ag_handle_t h, ag_gfxinfo_t *out)
  * A painter's payload out: RD_BLITZ, reliable, on the painter's own task -
  * which is why it may wait for the wire, and why one buffer serves.
  */
+static uint32_t s_pass_msgs_now; /* messages of the pass being sent */
+
 static ag_err_t rd_send_z(uint32_t handle, const uint8_t *pay, uint16_t len)
 {
     if (s_blitmsg == NULL) {
@@ -873,20 +875,52 @@ static ag_err_t rd_send_z(uint32_t handle, const uint8_t *pay, uint16_t len)
     }
     const int32_t r = link_send(p->wire, p->node, AG_LINK_BULK, msg,
                                 (uint16_t)(RD_HDR + len));
+    if (r >= 0) {
+        s_pass_msgs_now++;
+    }
     return (r >= 0) ? AG_OK : (ag_err_t)r;
 }
 
-/* The far screen's pace (rdp_set_sync): one pass in flight end to end. */
+/* The far screen's pace (rdp_set_sync): passes in flight end to end. */
 static volatile uint16_t s_paint_seq;
 static volatile uint16_t s_paint_acked;
 static volatile bool     s_paint_heard;  /* the far end has answered once */
 static uint8_t           s_paint_silent; /* passes unanswered in a row */
 static uint32_t          s_paint_waits;  /* passes that waited, for `link` */
+/* messages each pass in flight took, by its number */
+static uint8_t           s_pass_msgs[16];
+
+/* Messages of the passes after `acked`, up to `seq`. */
+static uint32_t msgs_in_flight(uint16_t seq, uint16_t acked)
+{
+    uint32_t n = 0;
+    for (uint16_t k = (uint16_t)(acked + 1u), i = 0;
+         (uint16_t)(seq - k) < 0x8000u && i < 16u; k++, i++) {
+        n += s_pass_msgs[k % 16u];
+        if (k == seq) {
+            break;
+        }
+    }
+    return n;
+}
 
 #define RD_PAINT_WAIT_MS 1000u
 #define RD_PAINT_LEGACY  3u
 
-#define RD_PAINT_AHEAD 1u
+/*
+ * PASSES IN FLIGHT: THREE, OR AS MANY AS THE FAR QUEUE HOLDS (28 Sep 2026).
+ * One pass beyond the one being drawn made the picture's rate one pass per
+ * round trip, and a file beside it stretched the trip from 10 ms to 17-19:
+ * 8 whole frames a second where 14 went without it, with the CYD's drawing
+ * waiting for data and half a core idle.  So up to three passes go ahead -
+ * and since a pass of noise is some ten messages where a pass of balls is
+ * two, never more than RD_PAINT_MSGS messages unanswered, which the far
+ * picture queue (RD_SCR slots) takes without its reader waiting for room.
+ * (Four and twenty filled it: the reader waited 33 times, and the sound
+ * behind the picture came 218 ms late.)
+ */
+#define RD_PAINT_AHEAD 2u
+#define RD_PAINT_MSGS  12u
 
 static void rd_sync_z(uint32_t handle)
 {
@@ -910,6 +944,9 @@ static void rd_sync_z(uint32_t handle)
         seq = 1u;
     }
     s_paint_seq = seq;
+    s_pass_msgs[seq % 16u] =
+        (uint8_t)((s_pass_msgs_now < 255u) ? s_pass_msgs_now : 255u);
+    s_pass_msgs_now = 0;
     uint8_t msg[RD_HDR];
     msg[0] = RD_PAINTED;
     msg[1] = RD_F_NOREPLY;
@@ -934,9 +971,11 @@ static void rd_sync_z(uint32_t handle)
      */
     s_paint_waits++;
     const int64_t until = ag_port_us() + (int64_t)RD_PAINT_WAIT_MS * 1000;
-    while ((uint16_t)(seq - s_paint_acked) > RD_PAINT_AHEAD &&
+    while (((uint16_t)(seq - s_paint_acked) > RD_PAINT_AHEAD ||
+            ((uint16_t)(seq - s_paint_acked) > 1u &&
+             msgs_in_flight(seq, s_paint_acked) > RD_PAINT_MSGS)) &&
            ag_port_us() < until) {
-        ag_port_task_delay(ag_port_ms_to_ticks(2));
+        ag_port_task_delay(1);
     }
     if (s_paint_acked != 0u &&
         (uint16_t)(seq - s_paint_acked) <= RD_PAINT_AHEAD) {
