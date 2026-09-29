@@ -46,6 +46,13 @@ AG_APP("LOOPBACK", "1.0", "argon", 0);
  * below anything the cable carries when the chain is working. */
 #define HYST     3000
 
+/* Which 64-frame piece carries the timing burst: 200 of them is about a third
+ * of a second, which is past the codec's own setup.  It was 40 while the
+ * probe still used 256-frame pieces, and moving to 64 quietly made that 58 ms
+ * - early enough that the burst went into a chip still muted, and the probe
+ * reported nothing three times running. */
+#define BURST_AT 200u
+
 static int16_t s_out[CHUNK * CHANNELS];
 static int16_t s_in[CHUNK * CHANNELS];
 static int      s_shown;
@@ -137,39 +144,71 @@ int ag_main(int argc, char **argv)
      * full scale, so a noise floor cannot answer for it.
      */
     {
-        uint32_t sent = 0, found = 0, scanned = 0;
-        for (sent = 0; sent < 200u && found == 0u; sent++) {
+        /*
+         * ROUND TRIP, MEASURED, and by the clock rather than by counting
+         * frames.
+         *
+         * Counting was tried and is wrong: the input stream starts later than
+         * the output one, so the two counters have no common origin, and the
+         * answer came out at 21 frames when the buffers alone are 256.  Two
+         * timestamps have no such problem, and they measure exactly what a
+         * player feels - from the application producing a sample to the
+         * application seeing it again.
+         *
+         * The probe runs in 64-frame pieces so the answer lands within a
+         * millisecond and a half, and the burst goes out a quarter of a second
+         * in: opening the device programs the codec, which is muted for most
+         * of that, and a burst sent earlier reads as "loudest 129".
+         */
+        const uint32_t pchunk = 64u;
+        uint32_t       sent, took = 0;
+        int32_t        seen = 0;
+        ag_time_t      t_burst = 0;
+
+        ag_pcm_set_chunk(&pcm, pchunk);
+        for (sent = 0; sent < BURST_AT + 200u && took == 0u; sent++) {
             uint32_t j;
-            for (j = 0; j < CHUNK * CHANNELS; j++) {
+            for (j = 0; j < pchunk * CHANNELS; j++) {
                 s_out[j] = 0;
             }
-            if (sent == 1u) { /* one block of silence first, then the click */
-                s_out[0] = 32000;
-                s_out[1] = 32000;
+            if (sent == BURST_AT) {
+                /*
+                 * Sixteen samples rather than one: a single impulse comes back
+                 * through the converter's filters spread and small, and never
+                 * rose above the threshold at all.
+                 */
+                for (j = 0; j < 16u; j++) {
+                    s_out[j * CHANNELS] = 30000;
+                    s_out[j * CHANNELS + 1u] = 30000;
+                }
             }
-            if (ag_pcm_write(&pcm, s_out, (int32_t)CHUNK) < 0) {
+            if (ag_pcm_write(&pcm, s_out, (int32_t)pchunk) < 0) {
                 break;
             }
+            if (sent == BURST_AT) {
+                t_burst = ag_micros();
+            }
             {
-                const int32_t got = ag_pcm_read(&pcm, s_in, (int32_t)CHUNK);
-                for (int32_t j2 = 0; j2 < got && found == 0u; j2++) {
+                const int32_t got = ag_pcm_read(&pcm, s_in, (int32_t)pchunk);
+                int32_t       j2;
+                for (j2 = 0; j2 < got && took == 0u; j2++) {
                     const int16_t v = s_in[j2 * CHANNELS];
-                    if (v > 3000 || v < -3000) {
-                        found = scanned + (uint32_t)j2;
+                    const int32_t a = (v < 0) ? -(int32_t)v : (int32_t)v;
+                    if (a > seen) {
+                        seen = a;
                     }
-                }
-                if (got > 0) {
-                    scanned += (uint32_t)got;
+                    if (a > 3000 && sent >= BURST_AT) {
+                        took = (uint32_t)(ag_micros() - t_burst);
+                    }
                 }
             }
         }
-        if (found > 0u && sent > 2u) {
-            /* The click left one block in: everything after that is the path. */
-            const uint32_t frames = (found > CHUNK) ? (found - CHUNK) : 0u;
-            ag_printf("loopback: round trip %u frames, %u ms\n",
-                      (unsigned)frames, (unsigned)(frames * 1000u / RATE));
+        ag_pcm_set_chunk(&pcm, CHUNK);
+        if (took > 0u) {
+            ag_printf("loopback: round trip %u us\n", (unsigned)took);
         } else {
-            ag_printf("loopback: the click did not come back - cable out?\n");
+            ag_printf("loopback: nothing came back (loudest %d) - cable out?\n",
+                      (int)seen);
         }
     }
 
