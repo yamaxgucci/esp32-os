@@ -113,6 +113,35 @@ void ag_port_wifi_ap_tune(int beacon_ms, int tx_quarter_dbm)
                        : 0;
 }
 
+ag_err_t ag_port_wifi_tx_power_set(int quarter_dbm)
+{
+    if (quarter_dbm < 8 || quarter_dbm > 80) {
+        return -AG_EINVAL;
+    }
+    const esp_err_t e = esp_wifi_set_max_tx_power((int8_t)quarter_dbm);
+    if (e == ESP_ERR_WIFI_NOT_INIT || e == ESP_ERR_WIFI_NOT_STARTED) {
+        return -AG_ENODEV;
+    }
+    return (e == ESP_OK) ? AG_OK : -AG_EIO;
+}
+
+ag_err_t ag_port_wifi_tx_power_get(int *quarter_dbm)
+{
+    if (quarter_dbm == NULL) {
+        return -AG_EINVAL;
+    }
+    int8_t         q = 0;
+    const esp_err_t e = esp_wifi_get_max_tx_power(&q);
+    if (e == ESP_ERR_WIFI_NOT_INIT || e == ESP_ERR_WIFI_NOT_STARTED) {
+        return -AG_ENODEV;
+    }
+    if (e != ESP_OK) {
+        return -AG_EIO;
+    }
+    *quarter_dbm = (int)q;
+    return AG_OK;
+}
+
 static esp_err_t apply_mode(void) { return esp_wifi_set_mode(desired_mode()); }
 
 /*
@@ -711,6 +740,22 @@ ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
             s_ap_netif = NULL;
         }
         return -AG_EIO;
+    }
+
+    /*
+     * The transmitter's power, which until now was stored by ap_tune and
+     * never applied on this path: only the station start set it, so
+     * `ap.txpower` in SYSTEM.CFG did nothing at all for a board that only
+     * raises a point.  That is not a small omission here - on the ESP32-A1S
+     * the transmitter is audible in the codec's input, and the measured floor
+     * runs from peak 416 at 19.5 dBm to 23 at 2, against 16 with the radio
+     * off.  The board was being told to be quiet and staying loud.
+     *
+     * After set_config, because the radio applies it to the interface as it
+     * stands.
+     */
+    if (s_ap_tx_qdbm > 0) {
+        (void)esp_wifi_set_max_tx_power((int8_t)s_ap_tx_qdbm);
     }
 
     snprintf(s_ap_ssid, sizeof(s_ap_ssid), "%s", ssid);

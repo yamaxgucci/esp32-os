@@ -2837,6 +2837,91 @@ static int cmd_wifi(int argc, char **argv)
      * network, and it puts the point back from SYSTEM.CFG afterwards.  A reset
      * does the same thing if it goes wrong.
      */
+    /*
+     * The transmitter's power, in dBm, on the radio as it stands.
+     *
+     * This is an audio command on this board.  The transmitter's current is
+     * measurable in the codec's analogue input - the loopback reads a floor of
+     * peak 455 with the point up against 16 with the radio off - and it is
+     * heard as a click on every packet, one per key pressed on the phone that
+     * is driving the pedal.  Turning it down is the one thing that can be
+     * tried without a soldering iron and without taking the radio away, and
+     * trying it used to mean raising the point again, which drops the client
+     * and twice left the board not answering its console at all.
+     */
+    if (ag_path_icmp(argv[1], "power") == 0) {
+        int now = 0;
+        if (argc < 3) {
+            const ag_err_t rerr = ag_port_wifi_tx_power_get(&now);
+            if (rerr != AG_OK) {
+                ag_console_printf("wifi power: %s\n",
+                                  ag_loader_api()->sys->strerror(rerr));
+                return 1;
+            }
+            ag_console_printf("transmitter at %d.%d dBm (%d quarter-dBm)\n",
+                              now / 4, (now % 4) * 25, now);
+            return 0;
+        }
+
+        int want = 0;
+        for (const char *c = argv[2]; *c >= '0' && *c <= '9'; c++) {
+            want = want * 10 + (*c - '0');
+        }
+        /* Given in dBm, because that is how a radio is spoken about; the
+         * driver counts in quarters. */
+        if (want < 2 || want > 20) {
+            ag_console_puts("wifi power: 2 to 20 dBm\n");
+            return 1;
+        }
+        const ag_err_t serr = ag_port_wifi_tx_power_set(want * 4);
+        if (serr != AG_OK) {
+            ag_console_printf("wifi power: %s\n",
+                              ag_loader_api()->sys->strerror(serr));
+            return 1;
+        }
+        if (ag_port_wifi_tx_power_get(&now) == AG_OK) {
+            ag_console_printf("transmitter at %d.%d dBm (asked %d)\n",
+                              now / 4, (now % 4) * 25, want);
+        }
+
+        /*
+         * And keep it, because a setting that has to be typed again after
+         * every boot is a setting that will be forgotten on the boot that
+         * matters.  The whole [ap] section is rewritten from what is in
+         * effect now - the six keys below are all of them.
+         */
+        char body[256];
+        const char *p_ssid = ag_cfg_get(ag_sysconfig(), "ap.ssid", "");
+        const char *p_pass = ag_cfg_get(ag_sysconfig(), "ap.pass", "");
+        const int   p_chan = ag_cfg_get_int(ag_sysconfig(), "ap.channel", 0);
+        const int   p_hide = ag_cfg_get_int(ag_sysconfig(), "ap.hidden", 0);
+        const int   p_beac = ag_cfg_get_int(ag_sysconfig(), "ap.beacon_ms", 0);
+        int         n = snprintf(body, sizeof(body), "ssid = %s\n", p_ssid);
+        if (p_pass[0] != '\0') {
+            n += snprintf(body + n, sizeof(body) - (size_t)n,
+                          "pass = %s\n", p_pass);
+        }
+        if (p_chan > 0) {
+            n += snprintf(body + n, sizeof(body) - (size_t)n,
+                          "channel = %d\n", p_chan);
+        }
+        if (p_hide != 0) {
+            n += snprintf(body + n, sizeof(body) - (size_t)n, "hidden = 1\n");
+        }
+        if (p_beac > 0) {
+            n += snprintf(body + n, sizeof(body) - (size_t)n,
+                          "beacon_ms = %d\n", p_beac);
+        }
+        (void)snprintf(body + n, sizeof(body) - (size_t)n,
+                       "txpower = %d\n", want * 4);
+        const ag_err_t cerr = cfg_replace_section("ap", body);
+        if (cerr != AG_OK) {
+            ag_console_printf("set for now, but not saved (%s)\n",
+                              ag_loader_api()->sys->strerror(cerr));
+        }
+        return 0;
+    }
+
     if (ag_path_icmp(argv[1], "quiet") == 0) {
         uint32_t secs = 60;
         if (argc > 2) {
@@ -5186,7 +5271,7 @@ static const ag_command_t k_commands[] = {
     {"power", "[full|eco|doze|screen on|off|auto on|off]",
      "the clock, the screen, and what applications make of it", ag_cmd_power},
 #if AG_PORT_HAS_WIFI
-    {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|ap <ssid> [pass]|forget]",
+    {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|ap <ssid> [pass]|power <dBm>|forget]",
      "the radio", cmd_wifi},
 #endif
 #if AG_PORT_HAS_ESPNOW
