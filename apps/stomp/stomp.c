@@ -109,6 +109,9 @@ static int          s_headless; /* no panel on this board: play, do not draw */
 /* The chain, when there is one.  Large enough to be worth the heap. */
 static ag_amp_t *s_amp;
 static float    *s_tab;
+/* One block per stage when internal memory will give them; see tab_reserve. */
+static float       *s_tabs[AG_AMP_STAGES];
+static int          s_tab_split;
 static ag_ir_t   s_ir;
 static int       s_ir_ready;
 
@@ -127,6 +130,11 @@ static int16_t      s_in[CHUNK * 2];
 static int          s_in_ch = 2;
 static int          s_live;        /* the input is a converter, not a file */
 static int          s_in_sum;      /* add both channels in; see `inmix` */
+/* What each part of a block costs, summed over blocks and divided when said. */
+static uint32_t     s_us_valves;
+static uint32_t     s_us_cab;
+static uint32_t     s_us_total;
+static uint32_t     s_us_blocks;
 static uint32_t     s_in_starved;  /* blocks the converter had nothing for */
 static int16_t      s_mono[CHUNK];
 static int16_t      s_stereo[CHUNK * 2];
@@ -1080,24 +1088,70 @@ static void status(const char *s)
  * budget and a late block almost every time.  So ask for internal memory first
  * and only fall back to the arena, where it will run but not in time.
  */
+/* Everything tab_reserve may have taken, whichever shape it took it in. */
+static void tab_release(void)
+{
+    int i;
+    for (i = 0; i < AG_AMP_STAGES; i++) {
+        if (s_tabs[i] != NULL) {
+            ag_free(s_tabs[i]);
+            s_tabs[i] = NULL;
+        }
+    }
+    if (s_tab != NULL) {
+        ag_free(s_tab);
+        s_tab = NULL;
+    }
+    s_tab_split = 0;
+}
+
 static int tab_reserve(int want, int stages)
 {
     const size_t floats = (size_t)stages * 3u * (size_t)want;
     const size_t bytes = floats * sizeof(float);
-    if (s_tab != NULL && s_tab_n >= want && s_tab_stages >= stages) {
+    const size_t per_stage = 3u * (size_t)want * sizeof(float);
+    int          i;
+
+    if (s_tab_n >= want && s_tab_stages >= stages &&
+        (s_tab != NULL || s_tabs[0] != NULL)) {
         return 0;
     }
-    if (s_tab != NULL) {
-        ag_free(s_tab);
+    tab_release();
+
+    /*
+     * ONE BLOCK PER STAGE FIRST, and the whole thing only if that fails.
+     *
+     * Measured on the Audio Kit: the table is 96 KB, internal memory has 133
+     * KB free and its largest single block is 76, so asking for it whole sends
+     * every curve lookup to external memory - and in the running loop those
+     * lookups cost more than the bench ever showed, because the bench keeps
+     * the table in cache and a real block does not.  A stage is 24 KB and four
+     * of those fit where one 96 KB block does not.  ag_amp_build_split takes
+     * them separately; the floats and their order are identical either way.
+     */
+    for (i = 0; i < stages; i++) {
+        s_tabs[i] = (float *)ag_malloc_caps(per_stage, AG_MEM_FAST);
+        if (s_tabs[i] == NULL) {
+            break;
+        }
     }
-    s_tab = (float *)ag_malloc_caps(bytes, AG_MEM_FAST);
-    s_tab_fast = s_tab != NULL;
-    if (s_tab == NULL) {
-        s_tab = (float *)ag_malloc(bytes);
+    s_tab_split = (i == stages);
+    s_tab_fast = s_tab_split;
+    if (!s_tab_split) {
+        while (i-- > 0) {
+            ag_free(s_tabs[i]);
+            s_tabs[i] = NULL;
+        }
+        s_tab = (float *)ag_malloc_caps(bytes, AG_MEM_FAST);
+        s_tab_fast = s_tab != NULL;
+        if (s_tab == NULL) {
+            s_tab = (float *)ag_malloc(bytes);
+        }
     }
-    s_tab_n = (s_tab != NULL) ? want : 0;
-    s_tab_stages = (s_tab != NULL) ? stages : 0;
-    if (s_tab != NULL) {
+    const int have = s_tab_split || (s_tab != NULL);
+    s_tab_n = have ? want : 0;
+    s_tab_stages = have ? stages : 0;
+    if (have) {
         ag_meminfo_t mem;
         size_t       probe = 0;
         ag_meminfo(&mem);
@@ -1120,14 +1174,15 @@ static int tab_reserve(int want, int stages)
                 try_bytes -= 4096u;
             }
         }
-        ag_printf("stomp: %u KB of curves in %s memory (%u KB fast free, "
+        ag_printf("stomp: %u KB of curves in %s memory, %s (%u KB fast free, "
                   "largest %u KB)\n",
                   (unsigned)(bytes / 1024u),
                   s_tab_fast ? "internal" : "extended",
+                  s_tab_split ? "one block a stage" : "one block",
                   (unsigned)(mem.fast_free / 1024u),
                   (unsigned)((s_tab_fast ? bytes : probe) / 1024u));
     }
-    return s_tab != NULL ? 0 : -1;
+    return have ? 0 : -1;
 }
 
 static int amp_reserve(void)
@@ -1303,7 +1358,9 @@ static int amp_from_preset(const char *path)
         status("preset: not one this build reads");
         return -1;
     }
-    rc = ag_amp_preset_load(s_amp, buf, n, s_tab, (float)RATE);
+    rc = s_tab_split
+             ? ag_amp_preset_load_split(s_amp, buf, n, s_tabs, (float)RATE)
+             : ag_amp_preset_load(s_amp, buf, n, s_tab, (float)RATE);
     if (rc != 0) {
         ag_free(buf);
         status("preset: refused");
@@ -1372,7 +1429,10 @@ static int amp_from_model(int model)
         return -1;
     }
     ag_amp_probe_pluck(probe, probe_n, (float)RATE);
-    rc = ag_amp_build(s_amp, scratch, &cfg, s_tab, AG_AMP_TAB_N, probe, probe_n);
+    rc = s_tab_split ? ag_amp_build_split(s_amp, scratch, &cfg, s_tabs,
+                                         AG_AMP_TAB_N, probe, probe_n)
+                     : ag_amp_build(s_amp, scratch, &cfg, s_tab, AG_AMP_TAB_N,
+                                    probe, probe_n);
     ag_free(scratch);
     ag_free(probe);
     if (rc != 0) {
@@ -1470,6 +1530,8 @@ static void audio_block(void)
         s_mono[i] = (int16_t)v;
     }
     s_amp_peak = peak;
+    s_us_valves += (uint32_t)(ag_micros() - t0);
+    const ag_time_t t_ir = ag_micros();
     if (s_ir_ready) {
         ag_ir_process_block(&s_ir, s_mono, s_stereo);
     } else {
@@ -1478,6 +1540,7 @@ static void audio_block(void)
             s_stereo[2 * i + 1] = s_mono[i];
         }
     }
+    s_us_cab += (uint32_t)(ag_micros() - t_ir);
     /*
      * The output trim, and the peak measured where it matters.
      *
@@ -1513,6 +1576,18 @@ static void audio_block(void)
         }
         s_peak = (float)hi / 32768.0f;
     }
+    /*
+     * Three numbers instead of one.
+     *
+     * The single load figure covers the whole block and cannot say whether the
+     * budget went on the valves, on the loudspeaker or on the plumbing around
+     * them - and a bench that times the first two in isolation said 65% while
+     * the running loop said 84-99%.  Rather than attribute the gap by
+     * subtraction, which is how the cabinet was blamed for 40% it did not
+     * cost, the loop times its own parts.
+     */
+    s_us_total += (uint32_t)(ag_micros() - t0);
+    s_us_blocks++;
     ag_pcm_mark_render(&s_out, (uint32_t)(ag_micros() - t0));
     {
         const int32_t wrote = ag_pcm_write(&s_out, s_stereo, (int32_t)CHUNK);
@@ -2158,6 +2233,22 @@ int ag_main(int argc, char **argv)
                 if (ms - s_say_ms >= 2000u) {
                     s_say_ms = ms;
                     ag_pcm_poll_stats(&s_out);
+                    if (s_us_blocks > 0u) {
+                        const uint32_t n = s_us_blocks;
+                        const uint32_t budget = (CHUNK * 1000000u) / RATE;
+                        ag_printf("stomp: of %u us a block: valves %u, "
+                                  "cabinet %u, the rest %u (%u total)\n",
+                                  (unsigned)budget,
+                                  (unsigned)(s_us_valves / n),
+                                  (unsigned)(s_us_cab / n),
+                                  (unsigned)((s_us_total - s_us_valves -
+                                              s_us_cab) / n),
+                                  (unsigned)(s_us_total / n));
+                        s_us_valves = 0;
+                        s_us_cab = 0;
+                        s_us_total = 0;
+                        s_us_blocks = 0;
+                    }
                     ag_printf("stomp: %u blocks, %u%% cpu, %u late, %u drop, "
                               "amp %u%%, out %u%%%s\n",
                               (unsigned)s_blocks, (unsigned)s_out.load_pct,

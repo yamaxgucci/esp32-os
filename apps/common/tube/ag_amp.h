@@ -698,6 +698,24 @@ void ag_amp_probe_pluck(float *buf, int n, float fs);
  * and brings it to 364 ms.  Both are preset loads; see ag_tube.h for the change
  * that would make it a knob and why it has not been made.
  */
+/*
+ * The same build, with one block of floats per stage instead of one for all
+ * of them - `tabs[i]` holding 3 * n floats.
+ *
+ * It exists for a machine where the whole table will not fit in one piece of
+ * the memory worth having: on the ESP32-A1S it is 96 KB and the largest
+ * internal block is 76, so the stages fit separately where they do not fit
+ * together, and every curve lookup that would have gone to external memory
+ * stays inside.  Nothing else differs - the same floats in the same order.
+ */
+int ag_amp_build_split(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
+                       float *const *tabs, int n, const float *probe,
+                       int probe_n);
+
+/* The same preset, read into one block per stage. */
+int ag_amp_preset_load_split(ag_amp_t *a, const void *buf, uint32_t n,
+                             float *const *tabs, float fs);
+
 int ag_amp_build(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
                  float *tab, int n, const float *probe, int probe_n);
 
