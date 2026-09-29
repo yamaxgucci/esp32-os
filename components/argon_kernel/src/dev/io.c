@@ -914,15 +914,18 @@ static ag_err_t io_uart_link_open(int port, uint32_t baud, uint32_t frame,
      * with no flow control needs: the link's own task empties it at once.
      */
     const bool     dma = (flags & AG_UARTLINK_DMA) != 0u;
+    /* a chip that receives by DMA may still send through the driver (the
+     * ESP32, 29 Sep 2026): then the driver has its transmit ring */
+    const bool     dma_tx = dma && ag_port_uart_dma_can_send();
     const uint32_t f = ag_uartlink_frame(frame);
     lock();
     ag_err_t err = dma ? uart_bring_up_sized(port, &cfg, AG_IO_UART_DMA_RX_BUF,
-                                             AG_IO_UART_DMA_TX_BUF)
+                                             dma_tx ? AG_IO_UART_DMA_TX_BUF
+                                                    : AG_IO_UART_TX_BUF)
                        : uart_bring_up_sized(port, &cfg, 4u * f,
                                              AG_IO_UART_TX_BUF);
     unlock();
-    if (err == AG_OK && dma &&
-        !ag_port_uart_dma_ready(port)) {
+    if (err == AG_OK && dma_tx && !ag_port_uart_dma_ready(port)) {
         err = -AG_ENOTSUP; /* asked for DMA on a port that has none */
     }
     if (err == AG_OK) {

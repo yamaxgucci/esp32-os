@@ -13,9 +13,10 @@
  * which matters here: the picture is in PSRAM and copying it into internal
  * memory first would put back the pass this exists to remove.
  *
- * Not every chip has it: SOC_UHCI_SUPPORTED is absent on the original ESP32
- * and on the S2, and there this file compiles to a port that answers
- * -AG_ENOTSUP in so many words.
+ * Not every chip has it in IDF: SOC_UHCI_SUPPORTED is absent on the original
+ * ESP32 and on the S2.  On the ESP32 the block is there and this file drives
+ * its receive by register (below); on the S2 the port answers -AG_ENOTSUP in
+ * so many words.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -305,6 +306,17 @@ static dma_port_t *dma_for(int port)
 bool ag_port_uart_dma_ready(int port)
 {
     return dma_for(port) != NULL;
+}
+
+bool ag_port_uart_dma_can_send(void)
+{
+    return true;
+}
+
+void ag_port_uart_dma_diag(int port, uint32_t out[4])
+{
+    (void)port;
+    out[0] = out[1] = out[2] = out[3] = 0u;
 }
 
 /* One finished transfer, waited for.  A minute of patience is not a timeout
@@ -750,11 +762,345 @@ int32_t ag_port_uart_dma_read(int port, void *buf, size_t len,
     return (int32_t)got;
 }
 
+#elif CONFIG_IDF_TARGET_ESP32
+
+/*
+ * THE ORIGINAL ESP32: A RECEIVE BY ITS OWN UHCI, BY REGISTER (29 Sep 2026).
+ *
+ * IDF has no driver for it here - SOC_UHCI_SUPPORTED is absent - but the chip
+ * has two UHCI blocks with a DMA of their own (not a GDMA: the older engine,
+ * lldesc_t descriptors), and the registers are in soc/uhci_struct.h.  The CYD
+ * took its wire through the driver's interrupt, which at 8 Mbaud came every
+ * 120 bytes: some 300 KB/s was all it could receive, 62% of a core, and a
+ * picture that changes everywhere is 150 KB a frame - 1.2 frames a second.
+ *
+ * The same shape as the C3's never-stopped receive (above): one ring of 1 KB
+ * descriptors, going round for as long as the port is open; an idle line ends
+ * the descriptor it is in and the DMA goes on into the next; the handler hands
+ * the reader every descriptor the DMA has given back to the CPU by its owner
+ * bit, with the length the DMA wrote, and gives it back.  The reader checks
+ * after copying that the DMA has not been round to that descriptor since.
+ *
+ * Only the receive.  What goes out still goes through the driver, which does
+ * it well enough: ag_port_uart_dma_ready says no, and the link sends by the
+ * driver (uartlink.c).  One port: UHCI0 serves it.
+ */
+#include "driver/uart.h"
+#include "hal/uart_ll.h"
+#include "hal/uhci_ll.h"
+#include "soc/uhci_struct.h"
+#include "soc/interrupts.h"
+#include "esp_rom_lldesc.h"
+#include "esp_intr_alloc.h"
+#include "esp_private/periph_ctrl.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include <string.h>
+
+#define E32_NODE 1024u
+#define E32_EVQ  48u
+
+typedef struct {
+    const uint8_t *p;
+    uint32_t       n;
+    uint32_t       no; /* which descriptor it was, counted from the start */
+} e32_piece_t;
+
+static struct {
+    int                port;       /* -1: none yet */
+    lldesc_t          *d;
+    uint8_t           *buf;
+    uint32_t           nodes;
+    volatile uint32_t  done;       /* descriptors given to the reader */
+    volatile uint32_t  overrun;
+    QueueHandle_t      q;
+    intr_handle_t      ih;
+    e32_piece_t        cur;
+    uint32_t           at;
+    volatile uint32_t  calls, empty_calls, passed, ended;
+} s_e32 = {.port = -1};
+
+/* The descriptor the DMA is in, by its buffer; UINT32_MAX if that does not
+ * read as one of ours. */
+static uint32_t IRAM_ATTR e32_current(void)
+{
+    const uint32_t a = UHCI0.dma_in_dscr_bf1; /* its second word: the buffer */
+    const uint32_t base = (uint32_t)(uintptr_t)s_e32.buf;
+    if (a < base || a >= base + s_e32.nodes * E32_NODE) {
+        return UINT32_MAX;
+    }
+    return (a - base) / E32_NODE;
+}
+
+/*
+ * WHERE THE DMA IS, NOT ONLY WHAT IT GAVE BACK (29 Sep 2026).  Taking the
+ * descriptors by their owner bit alone, as the C3's are, the wire came up -
+ * acknowledgements and short bursts, each ended by an idle line - and died
+ * under the first real load: a descriptor the DMA fills whole and goes on
+ * from does not come back with its bit given, and the handler stopped at it
+ * for good.  So every descriptor from the last one taken up to the one the
+ * DMA is in now is closed, whole unless the DMA wrote a length and an end in
+ * it; the one it is in is taken only once it says it ended there (an idle
+ * line), and nothing past it.
+ */
+static void IRAM_ATTR e32_isr(void *arg)
+{
+    (void)arg;
+    const uint32_t st = UHCI0.int_st.val;
+    UHCI0.int_clr.val = st;
+    BaseType_t     woken = pdFALSE;
+    uint32_t       taken = 0;
+    const uint32_t cur = e32_current();
+    s_e32.calls++;
+    for (; taken < s_e32.nodes; taken++) {
+        const uint32_t  k = s_e32.done % s_e32.nodes;
+        lldesc_t *const d = &s_e32.d[k];
+        const bool      wrote = d->eof != 0u || d->owner == 0u;
+        bool            last = false;
+        if (cur == UINT32_MAX) {
+            if (!wrote) {
+                break; /* where the DMA is cannot be read: its word alone */
+            }
+        } else if (k == cur) {
+            if (!wrote) {
+                break; /* being filled */
+            }
+            last = true; /* ended here by an idle line: nothing after it */
+        }
+        uint32_t n = d->length;
+        if (!wrote) {
+            n = E32_NODE; /* passed by, filled whole */
+            s_e32.passed++;
+        } else {
+            s_e32.ended++;
+        }
+        const e32_piece_t pc = {(const uint8_t *)d->buf, n, s_e32.done};
+        d->length = 0;
+        d->eof = 0;
+        d->owner = 1;
+        s_e32.done++;
+        if (pc.n > 0u && xQueueSendFromISR(s_e32.q, &pc, &woken) != pdTRUE) {
+            e32_piece_t old;
+            (void)xQueueReceiveFromISR(s_e32.q, &old, &woken);
+            (void)xQueueSendFromISR(s_e32.q, &pc, &woken);
+            s_e32.overrun++;
+        }
+        if (last) {
+            taken++;
+            break;
+        }
+    }
+    if (taken == 0u) {
+        s_e32.empty_calls++;
+    }
+    if (woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+void ag_port_uart_dma_diag(int port, uint32_t out[4])
+{
+    const bool mine = (port == s_e32.port);
+    out[0] = mine ? s_e32.calls : 0u;
+    out[1] = mine ? s_e32.empty_calls : 0u;
+    out[2] = mine ? s_e32.passed : 0u;
+    out[3] = mine ? s_e32.ended : 0u;
+}
+
+bool ag_port_uart_dma_ready(int port)
+{
+    (void)port;
+    return false; /* nothing goes out by DMA here: the driver sends */
+}
+
+bool ag_port_uart_dma_can_send(void)
+{
+    return false;
+}
+
+ag_err_t ag_port_uart_dma_listen(int port)
+{
+    (void)port;
+    return -AG_ENOTSUP;
+}
+
+ag_err_t ag_port_uart_dma_listen_ring(int port, uint32_t bytes)
+{
+    if (port < 0 || port > 2) {
+        return -AG_EINVAL;
+    }
+    if (s_e32.port >= 0) {
+        return (s_e32.port == port) ? AG_OK : -AG_EBUSY;
+    }
+    uint32_t nodes = (bytes != 0u ? bytes : 8192u) / E32_NODE;
+    if (nodes < 4u) {
+        nodes = 4u;
+    }
+    s_e32.d = heap_caps_calloc(nodes, sizeof(lldesc_t),
+                               MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    s_e32.buf = heap_caps_malloc((size_t)nodes * E32_NODE,
+                                 MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    s_e32.q = xQueueCreate(E32_EVQ, sizeof(e32_piece_t));
+    if (s_e32.d == NULL || s_e32.buf == NULL || s_e32.q == NULL) {
+        heap_caps_free(s_e32.d);
+        heap_caps_free(s_e32.buf);
+        if (s_e32.q != NULL) {
+            vQueueDelete(s_e32.q);
+        }
+        s_e32.d = NULL;
+        s_e32.buf = NULL;
+        s_e32.q = NULL;
+        return -AG_ENOMEM;
+    }
+    s_e32.nodes = nodes;
+    s_e32.done = 0;
+    for (uint32_t k = 0; k < nodes; k++) {
+        lldesc_t *const d = &s_e32.d[k];
+        d->size = E32_NODE;
+        d->length = 0;
+        d->owner = 1;
+        d->eof = 0;
+        d->buf = s_e32.buf + (size_t)k * E32_NODE;
+        d->qe.stqe_next = &s_e32.d[(k + 1u) % nodes]; /* round */
+    }
+
+    PERIPH_RCC_ATOMIC() {
+        uhci_ll_enable_bus_clock(0, true);
+        uhci_ll_reset_register(0);
+    }
+    uhci_dev_t *const h = &UHCI0;
+    h->int_ena.val = 0;
+    h->int_clr.val = UINT32_MAX;
+    h->conf0.val = 0;
+    h->conf0.in_rst = 1;
+    h->conf0.in_rst = 0;
+    h->conf0.ahbm_fifo_rst = 1;
+    h->conf0.ahbm_fifo_rst = 0;
+    h->conf0.ahbm_rst = 1;
+    h->conf0.ahbm_rst = 0;
+    /* the bytes as they came: no SLIP separators, headers, CRCs or escapes,
+     * which are the block's reason for being and would each change a byte */
+    h->conf1.val = 0;
+    h->conf1.crc_disable = 1;
+    h->escape_conf.val = 0;
+    h->hung_conf.val = 0;
+    h->conf0.clk_en = 1;
+    h->conf0.uart_idle_eof_en = 1; /* an idle line ends a descriptor */
+    h->conf0.indscr_burst_en = 1;
+    h->conf0.uart0_ce = (port == 0);
+    h->conf0.uart1_ce = (port == 1);
+    h->conf0.uart2_ce = (port == 2);
+
+    /* the longest the line may pause inside what one frame is: 1023 bit
+     * times, 128 us at 8 Mbaud, the most the register holds */
+    uart_ll_set_rx_idle_thr(UART_LL_GET_HW(port), 1023);
+    /* two readers of one FIFO would each get half the bytes */
+    uart_disable_rx_intr((uart_port_t)port);
+
+    if (esp_intr_alloc(ETS_UHCI0_INTR_SOURCE, 0, e32_isr, NULL, &s_e32.ih) !=
+        ESP_OK) {
+        return -AG_EIO;
+    }
+    h->int_ena.in_done = 1;
+    h->int_ena.in_suc_eof = 1;
+    h->dma_in_link.addr = (uint32_t)(uintptr_t)&s_e32.d[0] & 0xFFFFFu;
+    h->dma_in_link.start = 1;
+    s_e32.port = port;
+    ESP_LOGI("uartdma", "uart%d: receiving by UHCI0, %u descriptors of %u",
+             port, (unsigned)nodes, (unsigned)E32_NODE);
+    return AG_OK;
+}
+
+uint32_t ag_port_uart_dma_overruns(int port)
+{
+    return (port == s_e32.port) ? s_e32.overrun : 0u;
+}
+
+int32_t ag_port_uart_dma_read(int port, void *buf, size_t len,
+                              uint32_t timeout_ms)
+{
+    if (buf == NULL || len == 0u) {
+        return -AG_EINVAL;
+    }
+    if (port != s_e32.port) {
+        return -AG_ENOTSUP;
+    }
+    size_t got = 0;
+    while (got < len) {
+        if (s_e32.at >= s_e32.cur.n) {
+            const TickType_t wait = (got == 0u) ? pdMS_TO_TICKS(timeout_ms) : 0;
+            if (xQueueReceive(s_e32.q, &s_e32.cur, wait) != pdTRUE) {
+                break;
+            }
+            s_e32.at = 0;
+        }
+        size_t n = s_e32.cur.n - s_e32.at;
+        if (n > len - got) {
+            n = len - got;
+        }
+        memcpy((uint8_t *)buf + got, s_e32.cur.p + s_e32.at, n);
+        /* its descriptor comes round again after `nodes` more: until then
+         * nothing has written over it */
+        if ((uint32_t)(s_e32.done - s_e32.cur.no) >= s_e32.nodes) {
+            s_e32.overrun++;
+            s_e32.at = s_e32.cur.n;
+            continue;
+        }
+        s_e32.at += (uint32_t)n;
+        got += n;
+    }
+    return (int32_t)got;
+}
+
+/* Nothing goes out by DMA here (ag_port_uart_dma_ready): the link sends
+ * through the driver, and these are never called. */
+int32_t ag_port_uart_dma_write(int port, const void *buf, size_t len)
+{
+    (void)port;
+    (void)buf;
+    (void)len;
+    return -AG_ENOTSUP;
+}
+
+int32_t ag_port_uart_dma_submit(int port, const void *buf, size_t len)
+{
+    (void)port;
+    (void)buf;
+    (void)len;
+    return -AG_ENOTSUP;
+}
+
+ag_err_t ag_port_uart_dma_drain(int port)
+{
+    (void)port;
+    return -AG_ENOTSUP;
+}
+
+ag_err_t ag_port_uart_dma_settle(int port, uint32_t max_out)
+{
+    (void)port;
+    (void)max_out;
+    return -AG_ENOTSUP;
+}
+
 #else /* !SOC_UHCI_SUPPORTED */
 
 bool ag_port_uart_dma_ready(int port)
 {
     (void)port;
+    return false;
+}
+
+void ag_port_uart_dma_diag(int port, uint32_t out[4])
+{
+    (void)port;
+    out[0] = out[1] = out[2] = out[3] = 0u;
+}
+
+bool ag_port_uart_dma_can_send(void)
+{
     return false;
 }
 

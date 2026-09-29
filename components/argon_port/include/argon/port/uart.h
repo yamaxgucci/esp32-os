@@ -117,6 +117,10 @@ int32_t  ag_port_uart_pending(int port);
 ag_err_t ag_port_uart_tx_wait(int port, uint32_t timeout_ms);
 
 bool     ag_port_uart_dma_ready(int port);
+/* Whether this chip sends by DMA at all, asked before a port is brought up
+ * and without making anything: the ESP32 receives by its UHCI and sends
+ * through the driver, which then needs a transmit ring. */
+bool     ag_port_uart_dma_can_send(void);
 int32_t  ag_port_uart_dma_write(int port, const void *buf, size_t len);
 
 /*
@@ -162,6 +166,10 @@ ag_err_t ag_port_uart_dma_listen_ring(int port, uint32_t bytes);
 /* Pieces of what arrived that were thrown away: overwritten in the ring
  * before anybody read them, or pushed out of a full queue of them. */
 uint32_t ag_port_uart_dma_overruns(int port);
+/* A receive by a DMA the port drives itself (the ESP32's UHCI): its
+ * interrupts, those that found nothing, descriptors taken as filled whole and
+ * as ended by an idle line.  Zeros where there is none. */
+void     ag_port_uart_dma_diag(int port, uint32_t out[4]);
 
 #include <argon/port/impl/uart.h>
 

@@ -459,8 +459,25 @@ static int cmd_cpu(int argc, char **argv)
 {
     enum { MAX_TASKS = 48 };
     const uint32_t secs = (argc > 1) ? (uint32_t)atoi(argv[1]) : 3u;
+    /*
+     * THE TASKS BEFORE AS WELL AS AFTER (29 Sep 2026).  The list was taken
+     * when the sampling ended, and a task that spent the processor and then
+     * ended - a request's worker, a file's server - was "(ended)", a name
+     * that said nothing.  The list before names it; one made and gone
+     * inside the window is still unnamed, and says so.  A second list is
+     * the first thing given up when memory is short.
+     */
     ag_port_task_info_t *t =
-        ag_port_alloc(sizeof(*t) * MAX_TASKS, AG_MEM_BYTE);
+        ag_port_alloc(sizeof(*t) * MAX_TASKS * 2u, AG_MEM_BYTE);
+    uint32_t before = 0;
+    if (t == NULL) {
+        t = ag_port_alloc(sizeof(*t) * MAX_TASKS, AG_MEM_BYTE);
+    } else {
+        before = ag_port_task_list(t + MAX_TASKS, MAX_TASKS);
+        if (before > MAX_TASKS) {
+            before = MAX_TASKS;
+        }
+    }
     if (t == NULL) {
         ag_console_puts("cpu: no memory for the list\n");
         return 1;
@@ -501,21 +518,32 @@ static int cmd_cpu(int argc, char **argv)
                 break;
             }
             done_mask[best_i / 32u] |= 1u << (best_i % 32u);
-            const char *name = "(ended)";
+            const char *name = "(came and went)";
+            const char *gone = "";
             unsigned    prio = 0;
+            bool        found = false;
             for (uint32_t k = 0; k < n; k++) {
                 if (t[k].task == best_task) {
                     name = t[k].name;
                     prio = t[k].prio;
+                    found = true;
+                }
+            }
+            for (uint32_t k = 0; !found && k < before; k++) {
+                if (t[MAX_TASKS + k].task == best_task) {
+                    name = t[MAX_TASKS + k].name;
+                    prio = t[MAX_TASKS + k].prio;
+                    gone = " (ended)";
+                    found = true;
                 }
             }
             const uint32_t tenths = (uint32_t)((uint64_t)best * 1000u / total);
             if (tenths == 0u) {
                 continue;
             }
-            ag_console_printf("  %3u.%u%%  %-16s prio %u\n",
+            ag_console_printf("  %3u.%u%%  %-16s prio %u%s\n",
                               (unsigned)(tenths / 10u),
-                              (unsigned)(tenths % 10u), name, prio);
+                              (unsigned)(tenths % 10u), name, prio, gone);
         }
     }
     ag_port_free(t);

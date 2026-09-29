@@ -37,6 +37,7 @@
 /* For the SPI slave service's own counters - see print_spilink below. */
 #include <argon/spilink.h>
 #include <argon/uartlink.h>
+#include <argon/port/uart.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
 
@@ -305,6 +306,15 @@ static void print_uartlink(void)
         if (ag_uartlink_stats(port, &u) != AG_OK) {
             continue;
         }
+        uint32_t dd[4];
+        ag_port_uart_dma_diag(port, dd);
+        if (dd[0] != 0u) {
+            ag_console_printf("uart%d   by DMA: %u interrupts (%u found "
+                              "nothing), %u descriptors filled whole, %u "
+                              "ended by an idle line\n",
+                              port, (unsigned)dd[0], (unsigned)dd[1],
+                              (unsigned)dd[2], (unsigned)dd[3]);
+        }
         if (u.short_frames == 0u && u.blocks_unarmed == 0u &&
             u.stalls == 0u && u.timeouts == 0u) {
             continue;
@@ -419,9 +429,13 @@ static void print_stats(void)
                           (unsigned)pmax, (unsigned)pun);
     }
     if (ss != 0u || sq != 0u) {
+        uint32_t wm = 0, wg = 0;
+        ag_noderdev_snd_writes(&wm, &wg);
         ag_console_printf("sound   the longest wait between two periods %u ms,"
-                          " its queue up to %u of %u\n",
-                          (unsigned)ss, (unsigned)sq, (unsigned)sc);
+                          " its queue up to %u of %u; the converter's "
+                          "longest write %u ms, longest between two %u ms\n",
+                          (unsigned)ss, (unsigned)sq, (unsigned)sc,
+                          (unsigned)wm, (unsigned)wg);
     }
     uint32_t rw = 0, rl = 0;
     ag_noderdev_wait_counts(&rw, &rl);
@@ -441,10 +455,24 @@ static void print_stats(void)
     }
     uint32_t dry = 0, dry_us = 0;
     ag_pcmhw_dry(&dry, &dry_us);
-    if (dry != 0u) {
+    uint32_t dry_at[8], pauses = 0;
+    const uint32_t dry_n = ag_pcmhw_dry_at(dry_at, 8u, &pauses);
+    if (dry != 0u || pauses != 0u) {
         ag_console_printf("dry     the converter ran out %u times, the "
-                          "longest %u ms\n",
-                          (unsigned)dry, (unsigned)(dry_us / 1000u));
+                          "longest %u ms; %u pauses of 300 ms or more\n",
+                          (unsigned)dry, (unsigned)(dry_us / 1000u),
+                          (unsigned)pauses);
+    }
+    if (dry_n != 0u) {
+        /* when, since this board's first sound: the start or the middle */
+        ag_console_printf("        at");
+        for (uint32_t i = 0; i < dry_n; i++) {
+            const uint32_t ms = dry_at[i] & 0x7FFFFFFFu;
+            ag_console_printf(" %u.%u s%s", (unsigned)(ms / 1000u),
+                              (unsigned)(ms % 1000u / 100u),
+                              (dry_at[i] & 0x80000000u) ? " (pause)" : "");
+        }
+        ag_console_printf("\n");
     }
     uint32_t pp = 0, pl = 0, pf = 0, pq = 0;
     ag_noderdev_pour_counts(&pp, &pl, &pf, &pq);
@@ -453,6 +481,21 @@ static void print_stats(void)
                           " %u frames squeezed out\n",
                           (unsigned)pp, (unsigned)pl, (unsigned)pf,
                           (unsigned)pq);
+        uint32_t       lat[8];
+        uint8_t        lwhy[8];
+        const uint32_t ln = ag_noderdev_lost_at(lat, lwhy, 8u);
+        static const char *const why_s[] = {"?", "drew nothing", "no device",
+                                            "converter slow", "no memory",
+                                            "queue full"};
+        if (ln != 0u) {
+            ag_console_printf("        lost at");
+            for (uint32_t i = 0; i < ln; i++) {
+                ag_console_printf(" %u.%u s (%s)", (unsigned)(lat[i] / 1000u),
+                                  (unsigned)(lat[i] % 1000u / 100u),
+                                  why_s[(lwhy[i] <= 5u) ? lwhy[i] : 0u]);
+            }
+            ag_console_printf("\n");
+        }
     }
     ag_console_printf("reader  above applications for 2 ms in 10; ran over "
                       "%u times, the relay %u\n",

@@ -57,7 +57,13 @@ enum {
  * background must - NF_BG_WAIT_MS a frame before it gives up.
  */
 #define NF_BG_WAIT_MS 60000u
-#define NF_TASK_STACK 8192u /* FAT and the card, as the reader's own stack */
+/*
+ * 6 KB, measured (29 Sep 2026): a file served from each board - LittleFS on
+ * the Zero and the C3, FAT on the CYD's card - took at most 4 324 bytes of the
+ * 8 KB it had been given by guess ("as the reader's own stack"), and on the C3
+ * playing sound 8 KB was sometimes more than there was.
+ */
+#define NF_TASK_STACK 6144u
 #define NF_TASK_PRIO  2u    /* an application's low class: a file waits */
 
 /* What one frame on the bound wire can hold, header aside.  Asked, not
@@ -293,6 +299,10 @@ static void server_task(void *arg)
     serve_get(s_req.from, s_req.wire, AG_LINK_BACKGROUND, s_req.path,
               s_req.len);
     s_req.busy = false;
+    /* what of NF_TASK_STACK a file took: the C3 under sound has not got 8 KB
+     * to give, and the size was a guess (29 Sep 2026) */
+    ag_log(AG_LOG_INFO, "nodefs", "a file served; %u of %u stack bytes unused",
+           (unsigned)ag_port_task_stack_unused(NULL), (unsigned)NF_TASK_STACK);
     ag_port_task_delete(NULL);
 }
 

@@ -1384,6 +1384,47 @@ static uint32_t q_used(const rd_q_t *q)
 static uint32_t s_pour_periods;
 static uint32_t s_pour_bytes;
 static uint32_t s_pour_lost;
+/*
+ * WHEN AND WHY, the first few (29 Sep 2026): Maxim hears clicks at the start
+ * and none after, and both rooms lost some fifteen periods in five minutes -
+ * a count that cannot say whether they were the start.  Milliseconds since
+ * the first period poured here, and the reason.
+ */
+enum {
+    RD_LOST_NOTHING = 1, /* a piece of picture that drew nothing */
+    RD_LOST_NODEV,       /* no open device for its handle yet */
+    RD_LOST_SHORT,       /* the converter took only part of it in 40 ms */
+    RD_LOST_NOMEM,       /* no memory for the ring or its task */
+    RD_LOST_FULL,        /* the queue was full */
+};
+#define RD_LOST_KEEP 8u
+static int64_t  s_pour_first_us;
+static uint32_t s_lost_at[RD_LOST_KEEP];
+static uint8_t  s_lost_why[RD_LOST_KEEP];
+static uint32_t s_lost_n;
+
+static void pour_lost(uint8_t why)
+{
+    s_pour_lost++;
+    if (s_lost_n < RD_LOST_KEEP) {
+        const int64_t now = ag_port_us();
+        s_lost_at[s_lost_n] =
+            (s_pour_first_us != 0) ? (uint32_t)((now - s_pour_first_us) / 1000)
+                                   : 0u;
+        s_lost_why[s_lost_n] = why;
+        s_lost_n++;
+    }
+}
+
+uint32_t ag_noderdev_lost_at(uint32_t *at_ms, uint8_t *why, uint32_t cap)
+{
+    const uint32_t n = (s_lost_n < cap) ? s_lost_n : cap;
+    for (uint32_t i = 0; i < n; i++) {
+        at_ms[i] = s_lost_at[i];
+        why[i] = s_lost_why[i];
+    }
+    return n;
+}
 /* of those: a full ring on arrival, and a converter that stayed full */
 static uint32_t s_pour_full;
 static uint32_t s_pour_short;
@@ -1703,14 +1744,62 @@ static void pour_report(void)
 static uint32_t keep_pace(rd_period_t *pd)
 {
     /*
-     * NOTHING IS TAKEN OUT OF A PERIOD (27 Sep 2026, Maxim: "не надо ужимать
-     * звук").  This squeezed a period by up to 5% whenever the queue stood
-     * above half, and before that took a frame out of each one near full.
-     * Alone the sound never needed it - 3 frames in a minute, the two clocks
-     * agree - and beside a picture it only bent a steady tone.  A period that
-     * finds the queue full is dropped and counted instead (take_period).
+     * NOTHING WAS TAKEN OUT OF A PERIOD from 27 Sep 2026 (Maxim: "не надо
+     * ужимать звук"): this had squeezed a period by up to 5% whenever the
+     * queue stood above half, which bent a steady tone, and before that cut
+     * the last frame out of every period near full - a grain.  A period that
+     * found the queue full was dropped whole instead.
+     *
+     * AND THAT WAS A CLICK EVERY THIRTEEN SECONDS (29 Sep 2026).  With the
+     * picture's holes gone the losses could be timed: none for the first
+     * hundred seconds, then one period every 13-14 s on the Zero and on the
+     * CYD, every one of them to a full queue.  The C3 makes sound some 0.08%
+     * faster than either converter plays it; the queue filled in a hundred
+     * seconds and then overflowed by one period a period's worth of drift.
+     * Two crystals never agree, so something has to give.
+     *
+     * So past three quarters full a period is made ONE frame shorter, drawn
+     * again over its whole length by straight lines between its frames - no
+     * jump anywhere in it, 0.4% higher for that one period - and nothing
+     * else changes.  It runs about one period in five, which is the 0.08%
+     * the clocks disagree by.  Only for a session whose format this board
+     * was told, and 16-bit mono or stereo.
      */
-    return pd->len;
+    const uint8_t ch = (pd->handle < (uint32_t)RD_MAX_SESSIONS)
+                           ? s_session_ch[pd->handle]
+                           : 0u;
+    if (ch == 0u || ch > 2u || pd->op != RD_WRITE ||
+        q_used(&s_snd) * 4u < (RD_SND - 1u) * 3u) {
+        return pd->len;
+    }
+    const uint32_t frames = pd->len / (ch * 2u);
+    if (frames < 16u) {
+        return pd->len;
+    }
+    int16_t *const s = (int16_t *)(void *)pd->data;
+    const uint32_t out = frames - 1u;
+    /* frame j of the shorter period is read at j * (frames-1) / (out-1) of
+     * the longer, in 16.16: never behind j, so in place, front to back */
+    const uint32_t step =
+        (uint32_t)(((uint64_t)(frames - 1u) << 16) / (out - 1u));
+    for (uint32_t j = 0; j < out; j++) {
+        const uint32_t p = j * step;
+        const uint32_t i = p >> 16;
+        const int32_t  fr = (int32_t)(p & 0xFFFFu);
+        if (i >= frames - 1u) {
+            for (uint32_t c = 0; c < ch; c++) {
+                s[j * ch + c] = s[(frames - 1u) * ch + c]; /* the last */
+            }
+            continue;
+        }
+        for (uint32_t c = 0; c < ch; c++) {
+            const int32_t a = s[i * ch + c];
+            const int32_t b = s[(i + 1u) * ch + c];
+            s[j * ch + c] = (int16_t)(a + (((b - a) * fr) >> 16));
+        }
+    }
+    s_pour_paced++;
+    return out * ch * 2u;
 }
 
 /* The period being written, and how far: kept between laps, since the task
@@ -1764,7 +1853,7 @@ static void pour_screen_one(void)
         s_pour_periods++;
         s_pour_bytes += did;
     } else {
-        s_pour_lost++;
+        pour_lost(RD_LOST_NOTHING);
     }
     if (did == 0u || rdp_draw_faults() != faults) {
         screen_lost();
@@ -1778,6 +1867,16 @@ static void pour_screen_one(void)
  * the next can start; false when the converter is full and it is to be tried
  * again after whatever picture has arrived meanwhile.
  */
+/* the sound task's writes: the longest one, and the longest between two that
+ * took something (ag_noderdev_snd_writes) */
+static int64_t s_snd_write_max, s_snd_wgap_max, s_snd_wrote_at;
+
+void ag_noderdev_snd_writes(uint32_t *write_max_ms, uint32_t *gap_max_ms)
+{
+    *write_max_ms = (uint32_t)(s_snd_write_max / 1000);
+    *gap_max_ms = (uint32_t)(s_snd_wgap_max / 1000);
+}
+
 static bool pour_sound_some(void)
 {
     rd_period_t *pd = &s_snd.e[s_snd.r];
@@ -1797,7 +1896,7 @@ static bool pour_sound_some(void)
                    "handle %u", (unsigned)pd->handle);
             s_no_sink_said = true;
         }
-        s_pour_lost++;
+        pour_lost(RD_LOST_NODEV);
         return true;
     }
     if (!s_snd_begun) {
@@ -1818,9 +1917,20 @@ static bool pour_sound_some(void)
         if (s_snd_done >= s_snd_len) {
             break;
         }
+        const int64_t w0 = ag_port_us();
         const int32_t n = ag_dev_write(dev, pd->data + s_snd_done,
                                        s_snd_len - s_snd_done,
                                        pd->off + s_snd_done);
+        const int64_t w1 = ag_port_us();
+        if (w1 - w0 > s_snd_write_max) {
+            s_snd_write_max = w1 - w0;
+        }
+        if (n > 0) {
+            if (s_snd_wrote_at != 0 && w1 - s_snd_wrote_at > s_snd_wgap_max) {
+                s_snd_wgap_max = w1 - s_snd_wrote_at;
+            }
+            s_snd_wrote_at = w1;
+        }
         if (n < 0) {
             break;
         }
@@ -1837,7 +1947,7 @@ static bool pour_sound_some(void)
         s_pour_bytes += s_snd_done;
     }
     if (s_snd_done < s_snd_len) {
-        s_pour_lost++;
+        pour_lost(RD_LOST_SHORT);
         s_pour_short++;
     }
     return true;
@@ -1966,6 +2076,16 @@ static int64_t s_glass_last_us;
  */
 #define RD_PAINTED_LOST 1
 /*
+ * OR THAT IT HAS NO SUCH SESSION AT ALL (29 Sep 2026): it restarted, and
+ * every handle it gave out went with it.  The CYD is not the Zero's
+ * neighbour - the C3 is - so the Zero is not told by a hello, and it painted
+ * into a handle that was no longer there: 82 935 pieces with no device, 88 s
+ * of a dead screen, until the Zero itself was restarted.  The answer says
+ * which handle, in its last word, and the painter opens the screen again
+ * and sends all of it.
+ */
+#define RD_PAINTED_GONE 2
+/*
  * And in the answer's next word, what this screen can draw beyond rows: a
  * rectangle sent as one run (rdpaint.c, 29 Sep 2026).  A painter that is
  * never told so sends rows, which every screen draws; a screen that is older
@@ -2061,7 +2181,8 @@ typedef struct {
     int32_t  wire;
     uint16_t from;
     uint16_t tag;
-    bool     lost;
+    uint8_t  status;  /* 0, RD_PAINTED_LOST or RD_PAINTED_GONE */
+    uint32_t handle;  /* the pass's, for a GONE */
 } rd_ack_t;
 
 static rd_ack_t          s_ack[RD_ACKS];
@@ -2069,12 +2190,13 @@ static volatile uint32_t s_ack_w, s_ack_r;
 static ag_port_task_t    s_acker;
 
 /* "That pass is drawn", with what this screen can draw. */
-static void paint_answer(int32_t wire, uint16_t from, uint16_t tag, bool lost)
+static void paint_answer(int32_t wire, uint16_t from, uint16_t tag,
+                         uint8_t status, uint32_t handle)
 {
     const ag_err_t e = send_raw(
-        wire, from, (uint8_t)(RD_PAINTED | RD_REPLY), 0, tag,
-        (uint32_t)(lost ? RD_PAINTED_LOST : 0),
-        rdp_draws_rects() ? RD_CAN_RECTS : 0u, 0, AG_LINK_CONTROL, NULL, 0);
+        wire, from, (uint8_t)(RD_PAINTED | RD_REPLY), 0, tag, status,
+        rdp_draws_rects() ? RD_CAN_RECTS : 0u, handle, AG_LINK_CONTROL, NULL,
+        0);
     if (e != AG_OK) {
         ag_log(AG_LOG_WARN, TAG, "a pass's answer did not go out: %d", (int)e);
     }
@@ -2087,7 +2209,7 @@ static void acker_task(void *arg)
         while (s_ack_r != s_ack_w) {
             const rd_ack_t a = s_ack[s_ack_r % RD_ACKS];
             s_ack_r++;
-            paint_answer(a.wire, a.from, a.tag, a.lost);
+            paint_answer(a.wire, a.from, a.tag, a.status, a.handle);
         }
         ag_port_notify_take(true, ag_port_ms_to_ticks(100));
     }
@@ -2147,11 +2269,15 @@ static void pour_pass_drawn(const rd_period_t *pd)
     s_scr_pass_at = now;
     const bool lost = s_glass_owed;
     s_glass_owed = false;
+    const bool gone = pd->handle >= (uint32_t)RD_MAX_SESSIONS ||
+                      s_session[pd->handle] == NULL;
+    const uint8_t status = gone ? RD_PAINTED_GONE
+                                : (lost ? RD_PAINTED_LOST : 0u);
     if (s_acker == NULL &&
         !ag_proc_task_create(acker_task, "rdevack", 2048, NULL, 6,
                              AG_PORT_ANY_CORE, &s_acker)) {
         /* no task: answered here, as it was, rather than not at all */
-        paint_answer(pd->wire, pd->from, pd->tag, lost);
+        paint_answer(pd->wire, pd->from, pd->tag, status, pd->handle);
         return;
     }
     if (s_ack_w - s_ack_r >= RD_ACKS) {
@@ -2160,7 +2286,8 @@ static void pour_pass_drawn(const rd_period_t *pd)
         s_glass_owed = s_glass_owed || lost;
         return;
     }
-    s_ack[s_ack_w % RD_ACKS] = (rd_ack_t){pd->wire, pd->from, pd->tag, lost};
+    s_ack[s_ack_w % RD_ACKS] =
+        (rd_ack_t){pd->wire, pd->from, pd->tag, status, pd->handle};
     s_ack_w++;
     ag_port_notify_give(s_acker);
 }
@@ -2318,6 +2445,9 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
 
 static void take_period(const uint8_t *b, uint16_t n)
 {
+    if (s_pour_first_us == 0) {
+        s_pour_first_us = ag_port_us();
+    }
     if (s_ring_mem == NULL) {
         /*
          * Twenty kilobytes, out of PSRAM where there is any.  Taken from
@@ -2334,7 +2464,7 @@ static void take_period(const uint8_t *b, uint16_t n)
             s_ring_mem = (uint8_t *)ag_port_alloc(bytes, AG_MEM_BYTE);
         }
         if (s_ring_mem == NULL) {
-            s_pour_lost++;
+            pour_lost(RD_LOST_NOMEM);
             return;
         }
         /* and its places beside it: 46 of them are 1.3 KB, and on an
@@ -2350,7 +2480,7 @@ static void take_period(const uint8_t *b, uint16_t n)
         if (s_ring == NULL) {
             ag_port_free(s_ring_mem);
             s_ring_mem = NULL;
-            s_pour_lost++;
+            pour_lost(RD_LOST_NOMEM);
             return;
         }
         memset(s_ring, 0, RD_RING * sizeof(rd_period_t));
@@ -2376,7 +2506,7 @@ static void take_period(const uint8_t *b, uint16_t n)
          * and every period poured at it was lost (nodetest, 27 Sep 2026) */
         if (!ag_proc_task_create(pour_task, "rdevpour", 4096, NULL, 1,
                                  AG_PORT_ANY_CORE, &s_pour_task)) {
-            s_pour_lost++;
+            pour_lost(RD_LOST_NOMEM);
             return;
         }
         /* the converter's task, above the drawing: without it the pour
@@ -2432,7 +2562,7 @@ static void take_period(const uint8_t *b, uint16_t n)
         }
     }
     if (next == q->r) {
-        s_pour_lost++; /* full: this one missed its moment */
+        pour_lost(RD_LOST_FULL); /* full: this one missed its moment */
         s_pour_full++;
         if (q == &s_scr) {
             screen_lost();
@@ -2512,6 +2642,17 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         s_paint_acked = get16(b + 2);
         s_paint_heard = true; /* this screen answers: wait for it from now */
         rdp_far_rects((get32(b + 8) & RD_CAN_RECTS) != 0u);
+        rdev_t *const dp = s_display_proxy;
+        if ((int32_t)get32(b + 4) == RD_PAINTED_GONE && dp != NULL &&
+            dp->far_handle >= 0 && (uint32_t)dp->far_handle == get32(b + 12)) {
+            /* the screen restarted: opened again on the next present */
+            ag_log(AG_LOG_INFO, TAG,
+                   "%s has no session %d any more (it restarted?): opening "
+                   "it again", dp->qualified, (int)dp->far_handle);
+            dp->far_handle = -1;
+            rdp_forget();
+            return;
+        }
         if ((int32_t)get32(b + 4) == RD_PAINTED_LOST) {
             rdp_forget(); /* its console drew over it: all of it again */
         }

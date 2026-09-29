@@ -188,11 +188,26 @@ static ag_err_t pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
 static int64_t  s_dry_t0_us;
 static uint64_t s_dry_frames;
 static uint32_t s_dry_times, s_dry_max_us;
+/*
+ * AND WHEN (29 Sep 2026).  Maxim hears clicks at the start and none after;
+ * a count cannot say which.  The first few are kept as milliseconds since
+ * the first sound this board played, the top bit set for a pause of
+ * DRY_STOP_US or more - which the count leaves out as a sound that ended,
+ * and which at the start of one may be exactly what is heard.
+ */
+#define DRY_KEEP 8u
+#define DRY_PAUSE_BIT 0x80000000u
+static int64_t  s_dry_first_us;
+static uint32_t s_dry_at[DRY_KEEP];
+static uint32_t s_dry_at_n, s_dry_pauses;
 
 static void count_dry(uint32_t frames)
 {
     const int64_t now = ag_port_us();
     const uint32_t rate = (s_fmt.rate != 0u) ? s_fmt.rate : 22050u;
+    if (s_dry_first_us == 0) {
+        s_dry_first_us = now;
+    }
     /*
      * What the converter holds ahead of what it is playing covers a late
      * piece: the S3's I2S chain is 960 frames, 43 ms at 22 kHz, and a clock
@@ -212,6 +227,14 @@ static void count_dry(uint32_t frames)
                 if ((uint32_t)late > s_dry_max_us) {
                     s_dry_max_us = (uint32_t)late;
                 }
+            } else {
+                s_dry_pauses++;
+            }
+            if (s_dry_at_n < DRY_KEEP) {
+                const uint32_t at =
+                    (uint32_t)((now - s_dry_first_us) / 1000) & ~DRY_PAUSE_BIT;
+                s_dry_at[s_dry_at_n++] =
+                    at | ((late >= DRY_STOP_US) ? DRY_PAUSE_BIT : 0u);
             }
             s_dry_t0_us = 0; /* a new start */
         }
@@ -227,6 +250,16 @@ void ag_pcmhw_dry(uint32_t *times, uint32_t *longest_us)
 {
     *times = s_dry_times;
     *longest_us = s_dry_max_us;
+}
+
+uint32_t ag_pcmhw_dry_at(uint32_t *at_ms, uint32_t cap, uint32_t *pauses)
+{
+    const uint32_t n = (s_dry_at_n < cap) ? s_dry_at_n : cap;
+    for (uint32_t i = 0; i < n; i++) {
+        at_ms[i] = s_dry_at[i];
+    }
+    *pauses = s_dry_pauses;
+    return n;
 }
 
 static int32_t pcm_write(ag_device_t *dev, const void *buf, size_t len,
@@ -342,6 +375,14 @@ void ag_pcmhw_dry(uint32_t *times, uint32_t *longest_us)
 {
     *times = 0;
     *longest_us = 0;
+}
+
+uint32_t ag_pcmhw_dry_at(uint32_t *at_ms, uint32_t cap, uint32_t *pauses)
+{
+    (void)at_ms;
+    (void)cap;
+    *pauses = 0;
+    return 0;
 }
 
 #endif

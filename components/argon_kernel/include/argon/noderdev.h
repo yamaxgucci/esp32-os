@@ -79,6 +79,13 @@ void ag_noderdev_far_named(int32_t via, const char *name, uint8_t starts);
  * never pauses never says it (`link` prints these). */
 void ag_noderdev_pour_counts(uint32_t *periods, uint32_t *lost,
                              uint32_t *full, uint32_t *paced);
+/* The first poured periods lost: ms since the first poured here, and why
+ * (1 drew nothing, 2 no device yet, 3 converter too slow, 4 no memory,
+ * 5 queue full); how many kept. */
+uint32_t ag_noderdev_lost_at(uint32_t *at_ms, uint8_t *why, uint32_t cap);
+/* The converter's writes from poured sound: the longest one, and the longest
+ * between two that took something. */
+void ag_noderdev_snd_writes(uint32_t *write_max_ms, uint32_t *gap_max_ms);
 
 /* `link report on|off`: the screen's second-by-second journal lines. */
 void ag_noderdev_report(bool on);

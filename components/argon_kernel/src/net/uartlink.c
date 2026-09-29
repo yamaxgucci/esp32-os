@@ -124,6 +124,9 @@ typedef struct {
     wlink_t w;
     int     port;
     bool    dma; /* by the UART's DMA, or through its driver */
+    /* and what goes out: by DMA where the port has one to send with - the
+     * ESP32 receives by its UHCI and sends through the driver (29 Sep 2026) */
+    bool    dma_tx;
     /* two allocations: the transmit buffers, which the DMA reads and so must
      * be in memory it can reach, and the frame finder's buffer with the two
      * rings, which can be anywhere - on the Zero, PSRAM; as one 42 KB piece
@@ -334,7 +337,7 @@ static int32_t take_in(uartlink_t *u)
  * back; through the driver it is copied and the caller's again at once. */
 static int32_t put_out(uartlink_t *u, const uint8_t *f, uint32_t len)
 {
-    if (u->dma) {
+    if (u->dma_tx) {
         return ag_port_uart_dma_submit(u->port, f, len);
     }
     uint32_t done = 0;
@@ -430,7 +433,7 @@ static void tx_task(void *arg)
             }
             /* the older transmit buffer back: the other may still be on
              * the wire */
-            if (u->dma) {
+            if (u->dma_tx) {
                 const ag_err_t e =
                     ag_port_uart_dma_settle(u->port, UL_TXBUF - 1u);
                 if (e != AG_OK) {
@@ -455,11 +458,11 @@ static void tx_task(void *arg)
             if (retell) {
                 u->retells++;
             }
-            u->txk = u->dma ? (u->txk + 1u) % UL_TXBUF : 0u;
+            u->txk = u->dma_tx ? (u->txk + 1u) % UL_TXBUF : 0u;
             u->frames_tx++;
         }
     }
-    if (u->dma) {
+    if (u->dma_tx) {
         (void)ag_port_uart_dma_drain(u->port);
     }
     (void)ag_port_sem_give(u->exit_sem);
@@ -552,7 +555,8 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
                    : ((UL_TX_FRAMES * pay + 3u) & ~3u);
     w->rxcap = (3u * pay + 3u) & ~3u;
     u->pcap = frame + UL_READ;
-    const size_t dbytes = (size_t)(dma ? UL_TXBUF : 1u) * frame;
+    const bool   dma_tx = dma && ag_port_uart_dma_ready(port);
+    const size_t dbytes = (size_t)(dma_tx ? UL_TXBUF : 1u) * frame;
     const size_t bytes = (size_t)u->pcap + w->txcap + w->rxcap;
     u->dmem = ag_port_alloc_aligned(4u, dbytes, AG_MEM_DMA);
     u->mem = (u->dmem != NULL) ? ag_port_alloc(bytes, AG_MEM_BYTE) : NULL;
@@ -566,7 +570,7 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
         return -AG_ENOMEM;
     }
     for (unsigned k = 0; k < UL_TXBUF; k++) {
-        u->txf[k] = u->dmem + (dma ? (size_t)k * frame : 0u);
+        u->txf[k] = u->dmem + (dma_tx ? (size_t)k * frame : 0u);
     }
     uint8_t *p = u->mem;
     u->pbuf = p;
@@ -586,6 +590,7 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
     wl_reset(w, frame, flags);
     u->port = port;
     u->dma = dma;
+    u->dma_tx = dma_tx;
     u->txk = 0;
     u->have = 0;
     u->ack_sent = 0;

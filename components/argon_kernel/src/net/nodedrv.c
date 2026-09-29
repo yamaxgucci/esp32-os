@@ -319,7 +319,7 @@ static void nd_unlock(void)
  */
 /* background: a frame may wait this long for its window (see fetch_task) */
 #define ND_BG_WAIT_MS   60000u
-#define ND_FETCH_STACK  8192u
+#define ND_FETCH_STACK  6144u /* as nodefs.c's server, measured there */
 #define ND_FETCH_PRIO   2u
 
 static ag_err_t send_frame_on(int32_t wire, uint16_t dst, uint8_t op,
@@ -490,6 +490,8 @@ static void fetch_task(void *arg)
     fetch_serve(s_fsrv.wire, s_fsrv.peer, s_fsrv.tag, s_fsrv.h,
                 s_fsrv.want, s_fsrv.chunk, AG_LINK_BACKGROUND, obuf);
     s_fsrv.busy = false;
+    ag_log(AG_LOG_INFO, "nodedrv", "a read served; %u of %u stack bytes unused",
+           (unsigned)ag_port_task_stack_unused(NULL), (unsigned)ND_FETCH_STACK);
     ag_port_task_delete(NULL);
 }
 
