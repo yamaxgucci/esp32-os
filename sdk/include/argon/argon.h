@@ -120,6 +120,43 @@ extern "C" {
 #define AG_HOT_RODATA __attribute__((used, section(".hot_rodata")))
 #endif
 
+/*
+ * Keeps one function in the arena when the rest of the image goes to flash.
+ *
+ * An image that outgrows the code arena does not fail to load.  It relocates
+ * into flash and runs, and on the ESP32-A1S that was measured at half the
+ * speed - 168% of an audio block against 79% - with no sign of it except one
+ * line at load time.  Most of an image is not why it is slow: of STOMP's 53 KB
+ * the twenty largest functions are all the command line, the model build and
+ * the curve baking, which run once.
+ *
+ * So mark the loop, not the program:
+ *
+ *     AG_HOT void mix_block(float *dst, const float *src, size_t n) { ... }
+ *
+ * Everything unmarked is cold and is executed from flash.  That is the right
+ * default because the cold set is the larger one, and because a function
+ * nobody has measured has no business in the arena.
+ *
+ * The literals go with it.  On Xtensa an address is fetched with l32r from a
+ * pool that must sit within 256 KB behind the instruction, and the compiler
+ * puts the pool in a section named after this one - .hot.literal beside
+ * .hot.text - so the two stay together whatever the linker does with the rest.
+ *
+ * Calls across the seam cost nothing to write: applications are compiled
+ * -mlongcalls (Xtensa) or with absolute addressing (RISC-V), so a call already
+ * goes through an address the loader relocates, and the two parts may be
+ * anywhere.  They cost a flash read on the way in, which is why this marks a
+ * loop and not one function inside it.
+ *
+ * Says nothing in a built-in build, for the same reason AG_HOT_RODATA does not.
+ */
+#ifdef AG_BUILTIN
+#define AG_HOT
+#else
+#define AG_HOT __attribute__((section(".hot.text")))
+#endif
+
 /* ---- sys ---------------------------------------------------------------- */
 
 static inline void ag_exit(int code) { g_ag_api->sys->exit(code); }
