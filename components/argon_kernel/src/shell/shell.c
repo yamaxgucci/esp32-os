@@ -2822,6 +2822,55 @@ static int cmd_wifi(int argc, char **argv)
 #endif /* AG_PORT_WIFI_HAS_AP */
     }
 
+#if AG_PORT_WIFI_HAS_AP
+    /*
+     * QUIET FOR A WHILE, THEN BACK BY ITSELF.
+     *
+     * On the ESP32-A1S the point costs the audio input more than twenty
+     * decibels of noise floor and is heard as a knock at the beacon rate, so a
+     * board that is both controlled from a phone and played through wants the
+     * radio off exactly while somebody is playing - and nobody can turn it
+     * back on from a phone that has just been disconnected.
+     *
+     * So the command does both halves.  It runs on the shell's own task, which
+     * keeps running when the console it was typed on goes away with the
+     * network, and it puts the point back from SYSTEM.CFG afterwards.  A reset
+     * does the same thing if it goes wrong.
+     */
+    if (ag_path_icmp(argv[1], "quiet") == 0) {
+        uint32_t secs = 60;
+        if (argc > 2) {
+            uint32_t v = 0;
+            for (const char *c = argv[2]; *c >= '0' && *c <= '9'; c++) {
+                v = v * 10u + (uint32_t)(*c - '0');
+            }
+            if (v >= 1u && v <= 3600u) {
+                secs = v;
+            }
+        }
+        ag_console_printf("radio off for %u s; this console goes with it\n",
+                          (unsigned)secs);
+        (void)ag_port_wifi_stop();
+        ag_port_task_delay(ag_port_ms_to_ticks(secs * 1000u));
+
+        const ag_err_t rerr = ag_net_init();
+        if (rerr != AG_OK) {
+            ag_console_printf("radio back: %d\n", (int)rerr);
+            return 1;
+        }
+        const char *q_ssid = ag_cfg_get(ag_sysconfig(), "ap.ssid", NULL);
+        if (q_ssid != NULL && q_ssid[0] != '\0') {
+            ag_port_wifi_ap_tune(
+                ag_cfg_get_int(ag_sysconfig(), "ap.beacon_ms", 0),
+                ag_cfg_get_int(ag_sysconfig(), "ap.txpower", 0));
+            (void)ag_port_wifi_ap_start(
+                q_ssid, ag_cfg_get(ag_sysconfig(), "ap.pass", ""), 0, false);
+            ag_console_printf("access point %s again\n", q_ssid);
+        }
+        return 0;
+    }
+#endif /* AG_PORT_WIFI_HAS_AP */
+
     if (ag_path_icmp(argv[1], "off") == 0) {
         const size_t before = ag_port_mem_free(AG_MEM_FAST);
         (void)ag_port_wifi_stop();
