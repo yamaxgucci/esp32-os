@@ -98,6 +98,21 @@ static wifi_mode_t desired_mode(void)
     return WIFI_MODE_STA;
 }
 
+/*
+ * Set by the board before the point goes up; 0 means the driver's default.
+ * See ag_port_wifi_ap_tune in the contract for why an audio board cares.
+ */
+static int s_ap_beacon_ms;
+static int s_ap_tx_qdbm;
+
+void ag_port_wifi_ap_tune(int beacon_ms, int tx_quarter_dbm)
+{
+    s_ap_beacon_ms = (beacon_ms >= 100 && beacon_ms <= 60000) ? beacon_ms : 0;
+    s_ap_tx_qdbm = (tx_quarter_dbm >= 8 && tx_quarter_dbm <= 80)
+                       ? tx_quarter_dbm
+                       : 0;
+}
+
 static esp_err_t apply_mode(void) { return esp_wifi_set_mode(desired_mode()); }
 
 /*
@@ -118,16 +133,9 @@ static esp_err_t apply_ap_config(void)
     cfg.ap.channel = (s_ap_channel == 0u) ? 1u : s_ap_channel;
     cfg.ap.ssid_hidden = s_ap_hidden ? 1 : 0;
     cfg.ap.max_connection = 4;
-    /*
-     * EXPERIMENT (temporary): a slow beacon.
-     *
-     * On the Audio Kit the point costs the audio input more than twenty
-     * decibels of noise floor - measured with the loopback, peak 455 against
-     * 17 with the radio off - and it is heard as a knock about ten times a
-     * second, which is exactly the beacon rate.  If the knock is the
-     * transmitter's current, fewer bursts should be quieter.
-     */
-    cfg.ap.beacon_interval = 500;
+    if (s_ap_beacon_ms > 0) {
+        cfg.ap.beacon_interval = (uint16_t)s_ap_beacon_ms;
+    }
 
     const size_t pl = strnlen(s_ap_pass, sizeof(cfg.ap.password));
     if (pl > 0u) {
@@ -306,16 +314,9 @@ ag_err_t ag_port_wifi_start(void)
     if (esp_wifi_start() != ESP_OK) {
         return -AG_EIO;
     }
-    /*
-     * EXPERIMENT (temporary): the weakest transmitter the driver allows.
-     *
-     * 8 quarter-dBm is 2 dBm, against the 20 the radio defaults to - a
-     * sixtieth of the power, and a sixtieth of the current burst that goes
-     * with it.  A phone a metre from the board does not need more, and this
-     * board's audio input is measurably paying for every milliamp the
-     * transmitter draws.
-     */
-    (void)esp_wifi_set_max_tx_power(8);
+    if (s_ap_tx_qdbm > 0) {
+        (void)esp_wifi_set_max_tx_power((int8_t)s_ap_tx_qdbm);
+    }
 
     /* ESP-IDF narrates association at INFO; the kernel prints its own line. */
     esp_log_level_set("wifi", ESP_LOG_WARN);

@@ -131,6 +131,7 @@ static int          s_in_ch = 2;
 static int          s_live;        /* the input is a converter, not a file */
 static int          s_in_sum;      /* add both channels in; see `inmix` */
 /* What each part of a block costs, summed over blocks and divided when said. */
+static uint32_t     s_us_in;
 static uint32_t     s_us_valves;
 static uint32_t     s_us_cab;
 static uint32_t     s_us_total;
@@ -1486,6 +1487,18 @@ static void audio_block(void)
         }
     }
 
+    /*
+     * The wait for the converter is not the valves' cost.
+     *
+     * ag_pcm_read blocks until a block has arrived, so with a guitar plugged
+     * in that wait lands inside whatever timer is running - and it read as the
+     * valves costing 8000 us against the 5450 the same chain takes on a file.
+     * Timed apart it is a wait, which is what a pedal should be doing between
+     * blocks rather than something to optimise away.
+     */
+    s_us_in += (uint32_t)(ag_micros() - t0);
+    const ag_time_t t_valves = ag_micros();
+
     for (i = 0; i < CHUNK; i++) {
         float x = 0.0f, y;
         int   v;
@@ -1530,7 +1543,7 @@ static void audio_block(void)
         s_mono[i] = (int16_t)v;
     }
     s_amp_peak = peak;
-    s_us_valves += (uint32_t)(ag_micros() - t0);
+    s_us_valves += (uint32_t)(ag_micros() - t_valves);
     const ag_time_t t_ir = ag_micros();
     if (s_ir_ready) {
         ag_ir_process_block(&s_ir, s_mono, s_stereo);
@@ -2236,14 +2249,16 @@ int ag_main(int argc, char **argv)
                     if (s_us_blocks > 0u) {
                         const uint32_t n = s_us_blocks;
                         const uint32_t budget = (CHUNK * 1000000u) / RATE;
-                        ag_printf("stomp: of %u us a block: valves %u, "
-                                  "cabinet %u, the rest %u (%u total)\n",
-                                  (unsigned)budget,
+                        ag_printf("stomp: of %u us a block: waiting for input "
+                                  "%u, valves %u, cabinet %u, the rest %u "
+                                  "(%u total)\n",
+                                  (unsigned)budget, (unsigned)(s_us_in / n),
                                   (unsigned)(s_us_valves / n),
                                   (unsigned)(s_us_cab / n),
-                                  (unsigned)((s_us_total - s_us_valves -
-                                              s_us_cab) / n),
+                                  (unsigned)((s_us_total - s_us_in -
+                                              s_us_valves - s_us_cab) / n),
                                   (unsigned)(s_us_total / n));
+                        s_us_in = 0;
                         s_us_valves = 0;
                         s_us_cab = 0;
                         s_us_total = 0;

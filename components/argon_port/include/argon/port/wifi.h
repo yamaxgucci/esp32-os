@@ -171,6 +171,23 @@ const char *ag_port_wifi_reason(int reason);
  */
 #if AG_PORT_WIFI_HAS_AP
 
+/*
+ * How loudly and how often the point announces itself.
+ *
+ * Both are ordinary radio settings everywhere else and an audio setting here:
+ * on the ESP32-A1S the transmitter's current is measurable in the codec's
+ * analogue input - the loopback reads a noise floor of peak 455 with the
+ * point up against 17 with the radio off, and it is heard as a knock at the
+ * beacon rate.  A slow beacon and a weak transmitter bring it to 330, which
+ * is better and not a cure; the numbers belong to the board, so the board
+ * sets them.
+ *
+ * beacon_ms 0 or tx_quarter_dbm 0 means "leave the driver's own default".
+ * Call before ag_port_wifi_ap_start; a port with nothing to tune does
+ * nothing, which is the correct implementation rather than a missing one.
+ */
+void ag_port_wifi_ap_tune(int beacon_ms, int tx_quarter_dbm);
+
 ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
                                uint8_t channel, bool hidden);
 ag_err_t ag_port_wifi_ap_stop(void);
