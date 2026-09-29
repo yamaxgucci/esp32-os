@@ -1,7 +1,19 @@
 /*
- * STOMP - the valve amplifier with its knobs on a screen.
+ * STOMP - the valve amplifier with its knobs on a screen, or in text.
  *
  *   run a:\stomp.axe [model]
+ *
+ * TWO FACES, ONE SET OF KNOBS
+ *
+ * With a panel it paints them.  With no panel it draws the same knobs as text
+ * on the console - which on the Audio Kit is a phone, because PHONE.SYS serves
+ * the console over HTTP with a keyboard under it, and a pedal with no screen
+ * is still a pedal whose gain has to be turned up somehow.  `notext` leaves
+ * the console alone for a run that is being measured.
+ *
+ * Up and down pick a row, left and right turn it, a digit sets it outright and
+ * `=` is the tenth mark.  There is no slider to open first: a row of text
+ * already shows the number the painted knob needs a slider to show.
  *
  * The knobs are not a list kept here.  A model says how many controls its
  * amplifier has and what they are called - see ag_amp_pot_count - and this lays
@@ -121,6 +133,32 @@ static int          s_quiet; /* no periodic status; see `quiet` */
 
 static ag_gfxinfo_t s_info;  /* the display, held for as long as we run */
 static int          s_headless; /* no panel on this board: play, do not draw */
+
+/*
+ * THE SAME AMPLIFIER, DRAWN AS TEXT
+ *
+ * A pedal has no screen, and the thing looking at it is a phone: PHONE.SYS
+ * serves the console as 40x25 cells over HTTP, with a keyboard under it.  So
+ * the knobs want a text face as well as a painted one - not a second set of
+ * knobs, the same ones.  Everything below asks the model how many controls it
+ * has and what they are called, exactly as the painted panel does, so a model
+ * with a gain pot between its valves shows six rows and the pedal shows three,
+ * and neither list is written down here.
+ *
+ * It rides on the same dirty marks the painted panel uses.  A knob turned by
+ * any route - a key, a tap, `pot drive=8` on the command line - calls
+ * dirty_item, and that is what makes the row redraw; there is no second path
+ * that could disagree with the first.
+ *
+ * One row at a time is the whole point.  The console is a serial line as well
+ * as a phone, and forty characters is a millisecond of it against 2.9 ms of
+ * audio in a block, where the whole screen would be ten blocks and a click in
+ * the sound on every keystroke.
+ */
+static int      s_text = 1;  /* draw the amplifier as text when headless */
+static int      s_text_all;  /* the panel, whole */
+static uint32_t s_text_rows; /* which item rows changed; bit per item */
+static uint16_t s_text_w = 40, s_text_h = 25;
 
 /* The chain, when there is one.  Large enough to be worth the heap. */
 static ag_amp_t *s_amp;
@@ -650,6 +688,7 @@ static int s_band; /* which band of a full repaint comes next */
 
 static void dirty_all(void)
 {
+    s_text_all = 1;
     s_dirty_all = 1;
     s_band = 0;
     s_ndirty = 0;
@@ -697,6 +736,12 @@ static void dirty_item(int i)
     int       x, y, w, h;
     if (i < 0 || i >= item_count()) {
         return;
+    }
+    /* The text panel's row for the same item.  Marked here rather than at
+     * every call site, so that a knob turned by any route redraws by the one
+     * path the painted panel already uses. */
+    if (i < 32) {
+        s_text_rows |= (uint32_t)1 << i;
     }
     if (i < knob_n()) {
         knob_box(i, &x, &y, &w, &h, sw, sh);
@@ -797,11 +842,156 @@ static void paint(void)
  * moves in between, because a band is painted from the same state the last one
  * was - it is one picture arriving in pieces, not several pictures.
  */
+/*
+ * THE PANEL, AS TEXT
+ *
+ * Laid out from the model rather than from a list here: however many controls
+ * ag_amp_pot_count reports, with the names ag_amp_pot_name gives them, then
+ * the same three buttons the painted bar carries.  A model that grows a knob
+ * grows a row, and nothing in this file has to be told.
+ */
+#define TXT_TOP 2 /* the model's name, a rule, then the items */
+
+static int text_row_of(int item) { return TXT_TOP + item; }
+
+/* One row, padded to the width, written where it is rather than printed: a
+ * print at the bottom of the screen scrolls the panel off it. */
+static void text_line(int row, const char *str)
+{
+    char     buf[81];
+    uint16_t i;
+    uint16_t w = s_text_w;
+
+    if (row < 0 || row >= (int)s_text_h) {
+        return;
+    }
+    if (w > (uint16_t)(sizeof(buf) - 1)) {
+        w = (uint16_t)(sizeof(buf) - 1);
+    }
+    for (i = 0; i < w; i++) {
+        buf[i] = (str[i] != '\0') ? str[i] : ' ';
+        if (str[i] == '\0') {
+            break;
+        }
+    }
+    for (; i < w; i++) {
+        buf[i] = ' ';
+    }
+    buf[w] = '\0';
+    ag_gotoxy(0, (uint16_t)row);
+    (void)ag_print(buf);
+}
+
+/*
+ * A knob as a row: its name, a bar of ten, and the number under the mark.
+ *
+ * Ten positions because that is what a pedal is marked with, and the same
+ * `marks()` the painted knob uses - two faces of one number, never two
+ * numbers.
+ */
+static void text_item(int i)
+{
+    const int n = knob_n();
+    char      line[81];
+    char      bar[12];
+    int       j;
+
+    if (i < 0 || i >= item_count()) {
+        return;
+    }
+    if (i < n) {
+        const int v = marks(s_cfg.pot[ag_amp_pot_id(s_model, i)]);
+        for (j = 0; j < 10; j++) {
+            bar[j] = (j < v) ? '#' : '-';
+        }
+        bar[10] = '\0';
+        (void)snprintf(line, sizeof(line), "%c %-6s %s %2d",
+                       (i == s_sel) ? '>' : ' ',
+                       ag_amp_pot_name(s_model, i), bar, v);
+    } else if (i == n) {
+        (void)snprintf(line, sizeof(line), "%c cab    %s",
+                       (i == s_sel) ? '>' : ' ',
+                       s_cab[0] != '\0' ? leaf(s_cab) : "from the preset");
+    } else if (i == n + 1) {
+        (void)snprintf(line, sizeof(line), "%c cab is %s",
+                       (i == s_sel) ? '>' : ' ', s_cab_on ? "ON" : "OFF");
+    } else {
+        (void)snprintf(line, sizeof(line), "%c preset %s",
+                       (i == s_sel) ? '>' : ' ', leaf(s_preset));
+    }
+    text_line(text_row_of(i), line);
+}
+
+/* What the periodic status says, in two rows that stay where they are instead
+ * of scrolling the panel away. */
+static void text_status(uint32_t budget, uint32_t total, uint32_t cpu)
+{
+    char      line[81];
+    const int row = text_row_of(item_count()) + 1;
+
+    (void)snprintf(line, sizeof(line), "  %u of %u us   %u%% cpu   %u resync",
+                   (unsigned)total, (unsigned)budget, (unsigned)cpu,
+                   (unsigned)s_out.resync);
+    text_line(row, line);
+    (void)snprintf(line, sizeof(line), "  in %2u%%  out %2u%%%s",
+                   (unsigned)(s_amp_peak * 100.0f),
+                   (unsigned)(s_peak * 100.0f),
+                   s_out_clipped > 0u ? "   CLIP" : "");
+    text_line(row + 1, line);
+}
+
+static void text_all(void)
+{
+    char line[81];
+    int  i;
+
+    (void)snprintf(line, sizeof(line), "STOMP  %s  %dx  cab %u ms",
+                   ag_amp_model_name(s_model), s_cfg.os,
+                   (unsigned)s_cab_ms);
+    text_line(0, line);
+    for (i = 0; i < (int)s_text_w && i < (int)sizeof(line) - 1; i++) {
+        line[i] = '-';
+    }
+    line[i] = '\0';
+    text_line(1, line);
+    for (i = 0; i < item_count(); i++) {
+        text_item(i);
+    }
+    text_line(text_row_of(item_count()), "");
+    text_line(text_row_of(item_count()) + 3, "");
+    text_line(text_row_of(item_count()) + 4,
+              "  up/down pick   left/right turn");
+    text_line(text_row_of(item_count()) + 5,
+              "  0-9 set   enter choose   q quit");
+}
+
+static void text_present(void)
+{
+    if (s_text_all) {
+        text_all();
+    } else {
+        int i;
+        for (i = 0; i < item_count() && i < 32; i++) {
+            if ((s_text_rows & ((uint32_t)1 << i)) != 0u) {
+                text_item(i);
+            }
+        }
+    }
+    s_text_all = 0;
+    s_text_rows = 0;
+}
+
 #define BANDS 8
 
 static void present(void)
 {
     int i;
+    if (s_text) {
+        text_present();
+        s_dirty_all = 0;
+        s_ndirty = 0;
+        return;
+    }
     if (s_headless) {
         s_dirty_all = 0;
         s_ndirty = 0;
@@ -1822,6 +2012,81 @@ static void on_key(uint16_t k, int *quit)
         }
         return;
     }
+    /*
+     * The text panel turns a knob with left and right, without opening it
+     * first.  The painted one has a slider to open because a knob there is a
+     * picture and the slider is where the number is; a row of text already
+     * shows the number, so the extra press would buy nothing.
+     *
+     * Digits set it outright, which is what a phone's keyboard is good at:
+     * 0 is off, 9 is nine, and the tenth mark is `=`, because there is no key
+     * for ten.
+     */
+    if (s_text && !s_editing) {
+        int set = -1;
+        switch (k) {
+        case AG_KEY_LEFT:
+            if (s_sel < knob_n()) {
+                nudge(-1);
+                return;
+            }
+            break;
+        case AG_KEY_RIGHT:
+            if (s_sel < knob_n()) {
+                nudge(1);
+                return;
+            }
+            break;
+        case AG_KEY_MINUS:
+            if (s_sel < knob_n()) {
+                nudge(-1);
+                return;
+            }
+            break;
+        /* One column here, so up and down are one row, not the painted
+         * panel's walk across three knobs to a row. */
+        case AG_KEY_UP:
+            if (s_sel > 0) {
+                s_sel--;
+                dirty_item(s_sel);
+                dirty_item(s_sel + 1);
+            }
+            return;
+        case AG_KEY_DOWN:
+            if (s_sel + 1 < item_count()) {
+                s_sel++;
+                dirty_item(s_sel);
+                dirty_item(s_sel - 1);
+            }
+            return;
+        case AG_KEY_EQUAL:
+            set = 10;
+            break;
+        case AG_KEY_0:
+            set = 0;
+            break;
+        case AG_KEY_1:
+        case AG_KEY_2:
+        case AG_KEY_3:
+        case AG_KEY_4:
+        case AG_KEY_5:
+        case AG_KEY_6:
+        case AG_KEY_7:
+        case AG_KEY_8:
+        case AG_KEY_9:
+            set = 1 + (int)(k - AG_KEY_1);
+            break;
+        default:
+            break;
+        }
+        if (set >= 0 && s_sel < knob_n()) {
+            s_cfg.pot[ag_amp_pot_id(s_model, s_sel)] = (float)set / 10.0f;
+            apply_knobs();
+            dirty_item(s_sel);
+            return;
+        }
+    }
+
     switch (k) {
     case AG_KEY_ESC:
     case AG_KEY_Q:
@@ -2033,6 +2298,10 @@ int ag_main(int argc, char **argv)
              * a fault nobody can name.
              */
             s_quiet = 1;
+        } else if (strcmp(argv[i], "notext") == 0) {
+            /* No panel of any kind: play, and leave the console alone.  For a
+             * run being measured, where the console is the instrument. */
+            s_text = 0;
         } else if (strcmp(argv[i], "blk") == 0 && i + 1 < argc) {
             /*
              * Frames a block, and therefore latency.
@@ -2109,6 +2378,36 @@ int ag_main(int argc, char **argv)
         s_info.width = 0;
         s_info.height = 0;
         ag_printf("stomp: no display - playing without one\n");
+    }
+
+    /*
+     * With no panel the console is the panel.  That is not a consolation
+     * prize on this board: PHONE.SYS serves the console over HTTP with a
+     * keyboard under it, so a pedal with no screen is still a pedal whose
+     * knobs can be turned from a phone.
+     *
+     * `notext` puts it back to the silent headless behaviour, for a run being
+     * measured that wants the console to itself.
+     */
+    if (s_text && !s_headless) {
+        s_text = 0; /* the painted panel is the better one when there is one */
+    }
+    if (s_text) {
+        ag_coninfo_t ci;
+        ag_coninfo(&ci);
+        if (ci.cols >= 20u && ci.rows >= 12u) {
+            s_text_w = ci.cols;
+            s_text_h = ci.rows;
+        }
+        /*
+         * Quiet by force.  The status lines scroll, and a panel drawn at
+         * fixed rows plus something that scrolls is a panel that walks up the
+         * screen.  The same numbers go into two rows of the panel instead.
+         */
+        s_quiet = 1;
+        ag_cls();
+        ag_cursor(false);
+        dirty_all();
     }
     if (want_bench) {
         /*
@@ -2291,10 +2590,30 @@ int ag_main(int argc, char **argv)
                  * plays without dropping blocks" are different claims, and only
                  * the counters can tell them apart.
                  */
-                if (ms - s_say_ms >= (s_quiet ? 30000u : 2000u)) {
+                if (ms - s_say_ms >= (s_text ? 1000u
+                                             : (s_quiet ? 30000u : 2000u))) {
                     s_say_ms = ms;
                     ag_pcm_poll_stats(&s_out);
-                    if (s_us_blocks > 0u) {
+                    /*
+                     * The panel's own two rows rather than a line that
+                     * scrolls.  Once a second, and two rows of forty is under
+                     * a millisecond of the serial line - a third of one audio
+                     * block, against ten for the printed pair.
+                     */
+                    if (s_text) {
+                        const uint32_t n = s_us_blocks;
+                        const uint32_t budget = (s_chunk * 1000000u) / RATE;
+                        text_status(budget, (n > 0u) ? s_us_total / n : 0u,
+                                    s_out.load_pct);
+                        if (n > 0u) {
+                            s_us_in = 0;
+                            s_us_valves = 0;
+                            s_us_cab = 0;
+                            s_us_total = 0;
+                            s_us_blocks = 0;
+                        }
+                        s_out_clipped = 0;
+                    } else if (s_us_blocks > 0u) {
                         const uint32_t n = s_us_blocks;
                         const uint32_t budget = (s_chunk * 1000000u) / RATE;
                         ag_printf("stomp: of %u us a block: waiting for input "
@@ -2320,14 +2639,17 @@ int ag_main(int argc, char **argv)
                      * one that means a whole block was lost from the clock,
                      * and `drop` that one was thrown away.
                      */
-                    ag_printf("stomp: %u blocks, %u%% cpu, %u late, %u drop, "
-                              "%u resync, amp %u%%, out %u%%%s\n",
-                              (unsigned)s_blocks, (unsigned)s_out.load_pct,
-                              (unsigned)s_out.late, (unsigned)s_out.drop,
-                              (unsigned)s_out.resync,
-                              (unsigned)(s_amp_peak * 100.0f),
-                              (unsigned)(s_peak * 100.0f),
-                              s_out_clipped > 0u ? " CLIP" : "");
+                    if (!s_text) {
+                        ag_printf("stomp: %u blocks, %u%% cpu, %u late, "
+                                  "%u drop, %u resync, amp %u%%, out %u%%%s\n",
+                                  (unsigned)s_blocks,
+                                  (unsigned)s_out.load_pct,
+                                  (unsigned)s_out.late, (unsigned)s_out.drop,
+                                  (unsigned)s_out.resync,
+                                  (unsigned)(s_amp_peak * 100.0f),
+                                  (unsigned)(s_peak * 100.0f),
+                                  s_out_clipped > 0u ? " CLIP" : "");
+                    }
                 }
             }
             /*
@@ -2335,8 +2657,23 @@ int ag_main(int argc, char **argv)
              * paint is 4.3 ms and a block is 11.6, so this is not a formality:
              * without it the first chooser opened would be a dropout.
              */
-            if ((s_dirty_all || s_ndirty > 0) &&
-                ag_pcm_slack_us(&s_out) >= 6000) {
+            /*
+             * The text panel's marks count too.  Its rows are not rectangles,
+             * so s_ndirty stays at zero while a turned knob is waiting to be
+             * drawn - and without this the row never appeared until something
+             * else asked for the whole screen.
+             */
+            /*
+             * Six milliseconds of slack is the painted panel's price - 4.3 ms
+             * for a full paint against an 11.6 ms block.  A text row is forty
+             * characters handed to a console driver that queues them, so it
+             * asks for a millisecond; at 64 frames a block there is never six
+             * to be had, and with the painted panel's threshold a turned knob
+             * was applied to the sound and never drawn.
+             */
+            if ((s_dirty_all || s_ndirty > 0 || s_text_all ||
+                 s_text_rows != 0u) &&
+                ag_pcm_slack_us(&s_out) >= (s_text ? 1000 : 6000)) {
                 ag_pcm_poll_stats(&s_out);
                 present();
             }
@@ -2344,6 +2681,13 @@ int ag_main(int argc, char **argv)
         } else {
             present();
         }
+    }
+    if (s_text) {
+        /* Hand the console back the way it was found: a cursor, and a line
+         * below the panel rather than on top of it. */
+        ag_gotoxy(0, (uint16_t)(s_text_h - 1u));
+        ag_cursor(true);
+        (void)ag_print("\n");
     }
     if (s_sound) {
         ag_pcm_close(&s_out);

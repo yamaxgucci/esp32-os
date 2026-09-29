@@ -20,6 +20,10 @@ REM           block, and the loop comes back to a clock that has moved: it was
 REM           measured as one lost block every two seconds, which is how often
 REM           the line was printed.  TAKE.BAT leaves it on, because a run being
 REM           measured should say what it is doing.
+REM The knobs are on the console while this runs: open the phone at
+REM http://192.168.4.1:8765/ and the same panel is there, with a keyboard.
+REM Up/down picks a knob, left/right turns it, a digit sets it, = is ten.
+REM On the JCM800 the gain knob is DRIVE.
 REM inmix     both input channels added.  The board wires its line input to
 REM           MIC2's pins, so a microphone is always in the signal; this is the
 REM           attempt at cancelling it without a soldering iron.  Use `in` for
