@@ -2527,6 +2527,21 @@ enum ag_spawn_flags {
     AG_SPAWN_NO_CONSOLE = 1u << 2,
     /* Caller will ag_session_bind_to(); do not auto-bind (avoids wiping parked builtins). */
     AG_SPAWN_NO_SESSION = 1u << 3,
+    /*
+     * Run on the system core instead of the application core.
+     *
+     * The default is the application core, which is what keeps a busy
+     * application off the core the console and the shells run on.  That was
+     * not always so: the core used to be chosen by AG_SPAWN_BACKGROUND, which
+     * the shell's `run` sets for a different reason entirely - so that it is
+     * not blocked while the image loads - and so every application ever
+     * started from a prompt ran on the system core.  A program that never
+     * yielded then took every shell with it and the board had to be reset.
+     *
+     * Ask for this only for work that belongs beside the system: it buys
+     * nothing and costs the console its core.
+     */
+    AG_SPAWN_SYSTEM_CORE = 1u << 4,
 };
 
 typedef struct ag_proc_api {
