@@ -80,6 +80,11 @@ void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us);
  * far end counts the frames it has drawn whole, which is what a person sees. */
 bool rdp_pass_whole(void);
 
+/* The far screen said it draws a rectangle sent as one run; this screen
+ * does (it has the buffer to unpack one into).  See rdpaint.c. */
+void rdp_far_rects(bool yes);
+bool rdp_draws_rects(void);
+
 /* Times every row went again: the wire refused a pass, or the far screen
  * said it no longer shows what was sent. */
 uint32_t rdp_redraws(void);

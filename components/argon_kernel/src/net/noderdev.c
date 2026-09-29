@@ -1965,6 +1965,13 @@ static int64_t s_glass_last_us;
  * row again.
  */
 #define RD_PAINTED_LOST 1
+/*
+ * And in the answer's next word, what this screen can draw beyond rows: a
+ * rectangle sent as one run (rdpaint.c, 29 Sep 2026).  A painter that is
+ * never told so sends rows, which every screen draws; a screen that is older
+ * leaves the word 0.
+ */
+#define RD_CAN_RECTS 1u
 static volatile bool s_glass_owed;
 /*
  * AND ANY PIECE OF THE PICTURE NOT DRAWN owes the same: a message dropped
@@ -2061,6 +2068,18 @@ static rd_ack_t          s_ack[RD_ACKS];
 static volatile uint32_t s_ack_w, s_ack_r;
 static ag_port_task_t    s_acker;
 
+/* "That pass is drawn", with what this screen can draw. */
+static void paint_answer(int32_t wire, uint16_t from, uint16_t tag, bool lost)
+{
+    const ag_err_t e = send_raw(
+        wire, from, (uint8_t)(RD_PAINTED | RD_REPLY), 0, tag,
+        (uint32_t)(lost ? RD_PAINTED_LOST : 0),
+        rdp_draws_rects() ? RD_CAN_RECTS : 0u, 0, AG_LINK_CONTROL, NULL, 0);
+    if (e != AG_OK) {
+        ag_log(AG_LOG_WARN, TAG, "a pass's answer did not go out: %d", (int)e);
+    }
+}
+
 static void acker_task(void *arg)
 {
     (void)arg;
@@ -2068,8 +2087,7 @@ static void acker_task(void *arg)
         while (s_ack_r != s_ack_w) {
             const rd_ack_t a = s_ack[s_ack_r % RD_ACKS];
             s_ack_r++;
-            reply_to(a.wire, a.from, RD_PAINTED, a.tag,
-                     a.lost ? RD_PAINTED_LOST : 0, AG_LINK_CONTROL, NULL, 0);
+            paint_answer(a.wire, a.from, a.tag, a.lost);
         }
         ag_port_notify_take(true, ag_port_ms_to_ticks(100));
     }
@@ -2133,8 +2151,7 @@ static void pour_pass_drawn(const rd_period_t *pd)
         !ag_proc_task_create(acker_task, "rdevack", 2048, NULL, 6,
                              AG_PORT_ANY_CORE, &s_acker)) {
         /* no task: answered here, as it was, rather than not at all */
-        reply_to(pd->wire, pd->from, RD_PAINTED, pd->tag,
-                 lost ? RD_PAINTED_LOST : 0, AG_LINK_CONTROL, NULL, 0);
+        paint_answer(pd->wire, pd->from, pd->tag, lost);
         return;
     }
     if (s_ack_w - s_ack_r >= RD_ACKS) {
@@ -2494,6 +2511,7 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
     if (b[0] == (uint8_t)(RD_PAINTED | RD_REPLY)) {
         s_paint_acked = get16(b + 2);
         s_paint_heard = true; /* this screen answers: wait for it from now */
+        rdp_far_rects((get32(b + 8) & RD_CAN_RECTS) != 0u);
         if ((int32_t)get32(b + 4) == RD_PAINTED_LOST) {
             rdp_forget(); /* its console drew over it: all of it again */
         }

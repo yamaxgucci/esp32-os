@@ -6,6 +6,14 @@
  * a row, a column, a count of pixels (up to RDP_CHUNK) and the length of its
  * packing (2 bytes each), and the packing (net/rdcodec.h).
  *
+ * OR A RECTANGLE (29 Sep 2026): the count with RDP_RECT_BIT set is its width,
+ * and a fifth word its height; the packing is its rows', one after another,
+ * which unpacks as one run of width x height pixels.  A frame of eight balls
+ * was some 500 runs of a row each - 8 bytes of header to 9 of packing - and
+ * thirteen messages, more than the far screen's queue takes in a pass, so it
+ * went in two, and a picture of any kind with many rows changed the same.
+ * Sent only to a screen that says it draws them (rdp_far_rects).
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "net/rdpaint.h"
@@ -27,6 +35,8 @@
 /* the most pixels one run carries: its packing then always fits a payload */
 #define RDP_CHUNK 256u
 #define RDP_RUN_HDR 8u
+#define RDP_RECT_HDR 10u
+#define RDP_RECT_BIT 0x8000u
 #define RDP_HDR 4u
 /* how long a pass waits for the wire before it gives the screen up as
  * unknown and sends the whole of it next time */
@@ -43,18 +53,36 @@
  */
 #define RDP_MIN_PASS_US 16000
 /*
- * AND AT MOST THIS MUCH IN A PASS (26 Sep 2026).  The first pass is the whole
- * screen, 76 800 pixels, and the far screen draws them at about the pace of
- * the wire: for two hundred milliseconds its reader waited on a full picture
- * queue and read nothing else off the wire - the sound behind it included,
- * which arrived 60 ms late and overflowed its queue in one burst.  A big
- * change now goes out over several passes, each short enough to draw in
- * about 12 ms (4 096 pixels; 8 192 was still 25 ms, and the
- * sound behind it overflowed); an ordinary pass - a moving square is 2 500 pixels - is never
- * cut.  The next pass starts where this one stopped, so a picture that
- * changes everywhere every frame is still sent round, not only at the top.
+ * AT MOST WHAT THE FAR QUEUE HOLDS IN A PASS.  The first pass is the whole
+ * screen, and on 26 Sep 2026 the far screen's reader waited two hundred
+ * milliseconds on a full picture queue and read nothing else off the wire -
+ * the sound behind it included, which arrived 60 ms late.  So a big change
+ * goes out over several passes, and the next starts where this one stopped:
+ * a picture that changes everywhere every frame is still sent round, not
+ * only at the top.
+ *
+ * The cut was at 4 096 pixels until 29 Sep 2026, and it fell inside
+ * rectangles.  The far screen draws a pass as soon as it has arrived, on the
+ * glass people are looking at (the CYD has no memory for a second picture),
+ * so the top of a ball came in one pass and its bottom in the next: 84
+ * passes a second of torn balls ("the balls are torn", Maxim).  And pixels
+ * are the wrong measure: eight balls on a few rows are 28 000 pixels of rows
+ * that pack into two messages, and cut there for nothing.  What fills the far
+ * queue is messages.
+ *
+ * So a pass is cut only where a rectangle begins, once it has RDP_PASS_MSGS
+ * messages; inside one - a rectangle the size of the screen, the first
+ * frame's - only at RDP_PASS_MSGS_HARD.  It is looked at where a row
+ * begins, and a row of noise the width of the screen is two messages, so a
+ * pass is at most two over it: twelve and twelve, with their markers, are
+ * 26 of the 27 places the CYD's 28-place ring holds, so the pass being drawn
+ * and the next fit without its reader waiting for room.  (Nine and twelve
+ * made passes of fourteen, and the CYD's reader waited 46 times in three
+ * minutes of noise.)  Nothing here is about any one picture: a frame goes
+ * whole whenever the far screen can hold it.
  */
-#define RDP_PASS_MAX_PX 4096u
+#define RDP_PASS_MSGS      8u
+#define RDP_PASS_MSGS_HARD 10u
 /* how long presents may pause before what they drew counts as a frame */
 #define RDP_FRAME_QUIET_US 30000
 
@@ -201,6 +229,12 @@ static struct {
     int64_t  sync_us, sync_max_us, gap_max_us, last_pass_us;
     int64_t  sync_total_us; /* since the board started, for rdp_counts */
     bool     pass_whole;    /* the pass just sent ended a frame */
+    uint32_t pass_msgs;     /* messages this pass has sent so far */
+    bool     rects;         /* the far screen draws a rectangle as one run */
+    uint32_t rect_at;       /* where the open rectangle's header is, or 0 */
+    uint16_t rect_x, rect_y, rect_w, rect_h, rect_plen;
+    uint32_t cuts_inside;   /* passes cut inside a rectangle, for tests */
+    uint32_t pass_msgs_max; /* the most messages a pass took, for tests */
     /* the snapshot holds every pixel as the far screen shows it: a new one
      * sends only what differs from it (trim_to_far) */
     bool     snap_is_far;
@@ -243,15 +277,76 @@ static bool flush(uint32_t handle, rdp_send_fn send)
     }
     if (r == AG_OK) {
         s_p.bytes_out += s_p.len;
+        s_p.pass_msgs++;
     }
     s_p.len = RDP_HDR;
+    s_p.rect_at = 0;
     return r == AG_OK;
+}
+
+/* The rectangle rdp_draw can hold: its pixels are unpacked there whole. */
+#define RDP_RECT_PX 4096u
+
+/*
+ * A row of a rectangle into the payload: onto the rectangle open there when
+ * it is the next row of it, else as a new one.  1 if it went, 0 if the wire
+ * would not take the payload, -1 if the row does not fit even an empty one
+ * (a row of noise the width of the screen): then it goes as runs.
+ */
+static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
+                        uint16_t room, uint32_t handle, rdp_send_fn send)
+{
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (s_p.rect_at != 0u && s_p.rect_x == x && s_p.rect_w == n &&
+            (uint32_t)s_p.rect_y + s_p.rect_h == y &&
+            ((uint32_t)s_p.rect_h + 1u) * n <= RDP_RECT_PX) {
+            const uint32_t packed =
+                rdc_pack(px, n, s_p.msg + s_p.len, room - s_p.len);
+            if (packed > 0u) {
+                s_p.len += packed;
+                s_p.rect_h++;
+                s_p.rect_plen = (uint16_t)(s_p.rect_plen + packed);
+                put16(s_p.msg + s_p.rect_at + 6, s_p.rect_plen);
+                put16(s_p.msg + s_p.rect_at + 8, s_p.rect_h);
+                return 1;
+            }
+        }
+        s_p.rect_at = 0;
+        if (s_p.len + RDP_RECT_HDR < room) {
+            uint8_t *const at = s_p.msg + s_p.len;
+            const uint32_t packed = rdc_pack(px, n, at + RDP_RECT_HDR,
+                                             room - s_p.len - RDP_RECT_HDR);
+            if (packed > 0u) {
+                put16(at, (uint16_t)y);
+                put16(at + 2, (uint16_t)x);
+                put16(at + 4, (uint16_t)(n | RDP_RECT_BIT));
+                put16(at + 6, (uint16_t)packed);
+                put16(at + 8, 1u);
+                s_p.rect_at = s_p.len;
+                s_p.rect_x = (uint16_t)x;
+                s_p.rect_y = (uint16_t)y;
+                s_p.rect_w = (uint16_t)n;
+                s_p.rect_h = 1u;
+                s_p.rect_plen = (uint16_t)packed;
+                s_p.len += RDP_RECT_HDR + packed;
+                return 1;
+            }
+        }
+        if (s_p.len <= RDP_HDR) {
+            return -1; /* an empty payload does not take it */
+        }
+        if (!flush(handle, send)) {
+            return 0;
+        }
+    }
+    return -1;
 }
 
 /* A run of the row into the payload, sending the payload first if full. */
 static bool put_run(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
                     uint16_t room, uint32_t handle, rdp_send_fn send)
 {
+    s_p.rect_at = 0; /* what follows is not the open rectangle's */
     for (int attempt = 0; attempt < 2; attempt++) {
         if (s_p.len + RDP_RUN_HDR < room) {
             uint8_t *const at = s_p.msg + s_p.len;
@@ -464,8 +559,8 @@ static void pass(void)
         const uint16_t w = s_p.w;
         const uint16_t h = s_p.h;
         /*
-         * THE REST OF THE SAME FRAME (27 Sep 2026).  A pass cut short at
-         * RDP_PASS_MAX_PX gave its rows back to the dirty set, and the next
+         * THE REST OF THE SAME FRAME (27 Sep 2026).  A pass cut short
+         * (RDP_PASS_MSGS) gave its rows back to the dirty set, and the next
          * pass took them out of the picture again - a later frame's: the top
          * of a big square from one instant and its bottom from the next, the
          * tear Maxim still saw with the snapshot in.  Now what is left goes on
@@ -513,6 +608,7 @@ static void pass(void)
         put16(s_p.msg, w);
         put16(s_p.msg + 2, h);
         s_p.len = RDP_HDR;
+        s_p.pass_msgs = 0;
         const uint32_t first = (s_p.next_y < h) ? s_p.next_y : 0u;
         s_p.next_y = 0;
         /*
@@ -533,9 +629,17 @@ static void pass(void)
                 }
                 const uint16_t x0 = p->x0;
                 const uint16_t x1 = p->x1;
+                /* a new rectangle: the one place a pass is cut */
+                if (s_p.pass_msgs >= RDP_PASS_MSGS) {
+                    cut = true;
+                    s_p.next_y = (uint16_t)y;
+                    break;
+                }
                 for (uint32_t yy = y; p != NULL && ok;) {
-                    if (changed >= RDP_PASS_MAX_PX) {
+                    /* inside one only when it alone is more than a pass */
+                    if (s_p.pass_msgs >= RDP_PASS_MSGS_HARD) {
                         cut = true;
+                        s_p.cuts_inside++;
                         s_p.next_y = (uint16_t)yy;
                         break;
                     }
@@ -543,7 +647,17 @@ static void pass(void)
                     const uint16_t *row =
                         ((s_p.snap != NULL) ? s_p.snap : s_p.pic) +
                         (size_t)yy * w;
-                    for (uint32_t x = x0; x < x1 && ok; x += RDP_CHUNK) {
+                    const int rr =
+                        (s_p.rects && (uint32_t)(x1 - x0) <= RDP_RECT_PX)
+                            ? put_rect_row(yy, x0, row + x0, (uint32_t)(x1 - x0), room,
+                                           handle, send)
+                            : -1;
+                    if (rr >= 0) {
+                        ok = rr > 0;
+                        changed += (uint32_t)(x1 - x0);
+                    }
+                    for (uint32_t x = x0; rr < 0 && x < x1 && ok;
+                         x += RDP_CHUNK) {
                         const uint32_t n = (x1 - x < RDP_CHUNK) ? x1 - x
                                                                 : RDP_CHUNK;
                         ok = put_run(yy, x, row + x, n, room, handle, send);
@@ -578,6 +692,9 @@ static void pass(void)
         }
         if (ok) {
             ok = flush(handle, send);
+        }
+        if (s_p.pass_msgs > s_p.pass_msgs_max) {
+            s_p.pass_msgs_max = s_p.pass_msgs;
         }
         if (!ok) {
             /* the far screen is not known to show what the picture says:
@@ -658,6 +775,11 @@ void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us)
     *wait_us = (s_p.passes != 0u)
                    ? (uint32_t)(s_p.sync_total_us / (int64_t)s_p.passes)
                    : 0u;
+}
+
+void rdp_far_rects(bool yes)
+{
+    s_p.rects = yes;
 }
 
 bool rdp_pass_whole(void)
@@ -841,12 +963,13 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
  * full buffer, draws what is gathered first.  The buffer is taken the first
  * time a board draws a neighbour's picture, not by every board.
  */
-#define RDP_RECT_PX 4096u
 static uint16_t *s_rect;
 static uint16_t  s_rx, s_ry, s_rw, s_rh, s_sw, s_sh;
 static uint32_t  s_draw_faults;
 
 uint32_t rdp_draw_faults(void) { return s_draw_faults; }
+
+bool rdp_draws_rects(void) { return s_rect != NULL; }
 
 static void rect_flush(const ag_display_ops_t *d)
 {
@@ -888,6 +1011,42 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
         const uint16_t x = get16(pay + at + 2);
         const uint16_t n = get16(pay + at + 4);
         const uint16_t plen = get16(pay + at + 6);
+        if ((n & RDP_RECT_BIT) != 0u) {
+            /* a rectangle: its width, and its height in a fifth word */
+            if (at + RDP_RECT_HDR > len) {
+                s_draw_faults++;
+                break;
+            }
+            const uint16_t rw = (uint16_t)(n & ~RDP_RECT_BIT);
+            const uint16_t rh = get16(pay + at + 8);
+            at += RDP_RECT_HDR;
+            if (s_rect == NULL || rw == 0u || rh == 0u ||
+                (uint32_t)rw * rh > RDP_RECT_PX || at + plen > len ||
+                (uint32_t)y + rh > h || (uint32_t)x + rw > w) {
+                s_draw_faults++;
+                break;
+            }
+            const bool joins = s_rh != 0u && x == s_rx && rw == s_rw &&
+                               y == (uint16_t)(s_ry + s_rh) &&
+                               ((uint32_t)s_rh + rh) * rw <= RDP_RECT_PX;
+            if (!joins) {
+                rect_flush(d);
+            }
+            if (rdc_unpack(pay + at, plen, s_rect + (size_t)s_rh * rw,
+                           (uint32_t)rw * rh) != plen) {
+                s_draw_faults++;
+                break;
+            }
+            at += plen;
+            drawn += (uint32_t)rw * rh;
+            if (s_rh == 0u) {
+                s_rx = x;
+                s_ry = y;
+                s_rw = rw;
+            }
+            s_rh = (uint16_t)(s_rh + rh);
+            continue;
+        }
         at += RDP_RUN_HDR;
         if (n == 0u || n > RDP_CHUNK || at + plen > len || y >= h ||
             (uint32_t)x + n > w) {

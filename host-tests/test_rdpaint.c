@@ -48,7 +48,7 @@ static int s_checks, s_fails;
 #define H    240u
 #define BOX  48u
 #define ROWS 8u
-#define ROOM 2024u /* rd_pour_payload on a 2040-byte wire */
+#define ROOM 640u /* rd_pour_payload to the CYD: RD_SCR_CAP */
 
 static uint16_t s_frame[W * H]; /* what the program presented             */
 static uint16_t s_glass[W * H]; /* what the far screen shows              */
@@ -73,8 +73,11 @@ static void glass_blit(ag_handle_t h, const ag_blit_t *b)
 static ag_display_ops_t s_ops;
 
 /* The wire: every payload straight into the far end's drawing. */
+static uint32_t s_sends; /* payloads the painter sent */
+
 static ag_err_t send_to_glass(uint32_t handle, const uint8_t *pay, uint16_t len)
 {
+    s_sends++;
     (void)handle;
     CHECK(len <= ROOM);
     (void)rdp_draw(&s_ops, pay, len);
@@ -229,6 +232,7 @@ static void balls(void)
         vy[i] = (i & 2) ? 2 : -3;
     }
     const uint32_t r0 = s_rects, p0 = s_px_drawn;
+    uint32_t       pa0 = s_p.passes, in0 = s_p.cuts_inside;
     uint32_t       bad = 0;
     const uint32_t frames = 400;
     for (uint32_t f = 0; f < frames; f++) {
@@ -261,6 +265,12 @@ static void balls(void)
             rdpaint_stub_now_us += 16000;
             pass();
         } while (dirty_left() && ++guard < 64u);
+        if (f == 0u) {
+            /* the first is the whole screen changing from the test before:
+             * more than a pass, and rightly */
+            pa0 = s_p.passes;
+            in0 = s_p.cuts_inside;
+        }
         uint32_t at = 0;
         if (diff(&at) != 0u) {
             bad++;
@@ -271,6 +281,13 @@ static void balls(void)
            (unsigned)frames, (unsigned)((s_rects - r0) / frames),
            (unsigned)((s_px_drawn - p0) / frames), (unsigned)bad);
     CHECK(bad == 0u);
+    printf("  rdpaint balls: %u passes for the %u frames after the first, "
+           "%u cut inside a rectangle\n",
+           (unsigned)(s_p.passes - pa0), (unsigned)(frames - 1u),
+           (unsigned)(s_p.cuts_inside - in0));
+    /* a frame of balls is one pass, and no ball is ever cut in two */
+    CHECK(s_p.passes - pa0 == frames - 1u);
+    CHECK(s_p.cuts_inside == in0);
 }
 
 /*
@@ -369,18 +386,73 @@ static void long_way(void)
     CHECK(sent <= 2u * (2 * R + 1) * (2 * R + 1) + 200u);
 }
 
+/*
+ * THE WHOLE SCREEN CHANGES - one flat picture for another, a window over the
+ * desktop, a picture of noise: every kind of change, not only balls.  Each
+ * must end on the glass exactly, from one instant (not half of the next),
+ * and a flat change must be small.
+ */
+static void switches(void)
+{
+    static const uint16_t flat[3] = {0x001Fu, 0xF800u, 0x07E0u};
+    uint32_t              bad = 0;
+    uint32_t              flat_msgs = 0;
+    for (uint32_t k = 0; k < 6; k++) {
+        for (uint32_t i = 0; i < W * H; i++) {
+            s_frame[i] = (k == 3u) ? noise() : flat[k % 3u];
+        }
+        if (k == 4u) {
+            /* a window on the flat screen */
+            for (uint32_t y = 40; y < 200; y++) {
+                for (uint32_t x = 60; x < 260; x++) {
+                    s_frame[y * W + x] = (y < 56u) ? 0x0010u : 0xFFFFu;
+                }
+            }
+        }
+        present_frame();
+        const uint32_t m0 = s_sends;
+        uint32_t       guard = 0;
+        do {
+            rdpaint_stub_now_us += 16000;
+            pass();
+        } while (dirty_left() && ++guard < 400u);
+        uint32_t at = 0;
+        const uint32_t n = diff(&at);
+        if (n != 0u) {
+            bad++;
+        }
+        if (k < 3u) {
+            flat_msgs += s_sends - m0;
+        }
+        printf("  rdpaint switch %u: %u messages, %u px wrong\n",
+               (unsigned)k, (unsigned)(s_sends - m0), (unsigned)n);
+    }
+    CHECK(bad == 0u);
+    /* a flat screen is 240 rows of one colour: a few messages, one pass,
+     * where the rows alone were some twenty */
+    CHECK(flat_msgs <= 15u);
+}
+
 int main(void)
 {
     s_ops.size = sizeof(s_ops);
     s_ops.blit_rect = glass_blit;
+    run("a pass a frame, rows only", 1u);
+    rdp_far_rects(true); /* the far screen draws a rectangle as one run */
     run("a pass a frame", 1u);
     run("a pass every 3 frames", 3u);
     s_all_new = true;
     run("every pixel new every frame", 1u);
+    /* whatever the picture, two passes and their markers fit the CYD's 27
+     * places (RDP_PASS_MSGS_HARD, rdpaint.c) */
+    printf("  rdpaint the biggest pass: %u messages\n",
+           (unsigned)s_p.pass_msgs_max);
+    CHECK(s_p.pass_msgs_max <= 12u);
     one_instant();
     s_all_new = false;
     balls();
     long_way();
+    switches();
     printf("rdpaint_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails == 0 ? 0 : 1;
 }
