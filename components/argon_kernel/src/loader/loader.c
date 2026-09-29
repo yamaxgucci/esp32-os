@@ -772,6 +772,17 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
     return AG_OK;
 }
 
+/*
+ * Set from SYSTEM.CFG (`[modules] xip`).  False everywhere it is not asked
+ * for, so no board that works today changes.
+ */
+static bool s_drivers_xip;
+
+void ag_loader_drivers_from_flash(bool on)
+{
+    s_drivers_xip = on;
+}
+
 static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
 {
     arena_ready();
@@ -784,8 +795,28 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
      * Honoured only for a non-contiguous image - flash cannot host a contiguous
      * image's data, so a contiguous one takes the arena regardless of the flag.
      */
+    /*
+     * And the same answer asked of the board rather than of the image.
+     *
+     * A driver is loaded at boot, before any application exists, so on a
+     * machine with one arena it takes the arena first and whatever runs later
+     * gets what is left.  That is right when the driver is the hot thing and
+     * wrong when it is not: on the Audio Kit the phone's screen driver is 23 KB
+     * and the amplifier is 57 KB, the arena holds 58, and the driver arriving
+     * first is the difference between the emulator running from RAM and
+     * running through the flash cache - which was measured at 79% of an audio
+     * block against 168%.
+     *
+     * So the board says, in SYSTEM.CFG, whether its drivers should live in
+     * flash.  The image keeps its own AG_AXE_WANT_XIP; this only adds a second
+     * way to reach the same placement, for the case the image cannot know
+     * about.
+     */
+    const bool driver_to_flash =
+        s_drivers_xip && (header->flags & AG_AXE_DRIVER) != 0;
     const bool want_xip =
-        (header->flags & AG_AXE_WANT_XIP) != 0 && !contiguous;
+        ((header->flags & AG_AXE_WANT_XIP) != 0 || driver_to_flash) &&
+        !contiguous;
     const size_t want =
         contiguous ? (size_t)header->code.size + header->data.size
                    : (size_t)header->code.size;

@@ -21,4 +21,86 @@ CONFIG_ARGON_NET_WIFI=y
 # The arena, cut to what is left once the radio has taken its share.  It is
 # still worth having: a smaller .AXE - the file manager, the console tools -
 # runs from RAM, and only the big ones fall back to flash.
-CONFIG_ARGON_APP_ARENA_KB=40
+CONFIG_ARGON_APP_ARENA_KB=58
+
+# THE INSTRUCTION RAM THE RADIO TOOK, BOUGHT BACK.
+#
+# With Wi-Fi linked in, a 60 KB arena overflows instruction RAM by 14096
+# bytes, and 60 KB is what the emulator needs to run from RAM instead of
+# through the flash cache - the difference between 168% of its audio block and
+# 79%.  So the fourteen kilobytes have to come from somewhere, and these are
+# the honest places.
+#
+# Size rather than speed, for the firmware only.  The kernel's part in a block
+# of audio is the I2S write and a context switch; the arithmetic is all in the
+# .AXE, which is compiled -Os already and is the thing being made to fit.
+# Trading the kernel's -O2 for the emulator's residency is trading a percent
+# for a factor.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=n
+
+# Assertions keep their abort and lose their strings.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_ENABLE=n
+
+# Coexistence arbitrates Wi-Fi against Bluetooth, and there is no Bluetooth in
+# this image at all.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
+# WPA3 for an access point a phone joins on a stage: the key is in SYSTEM.CFG
+# and the threat model is somebody standing in the room.
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
+
+# 58 rather than 60: the emulator is 57020 bytes of code, so 59392 holds it
+# with room and 61440 was asking for two kilobytes nothing uses.  If the .AXE
+# grows past this it falls back to flash silently and the cost reappears, so
+# the loader line is the thing to read after any change to it.
+
+# The analogue input, which this board does not have.  It is on in the esp32
+# defaults for the CYD, which has a light sensor wired to GPIO34; there is
+# nothing on this one to measure.
+CONFIG_ARGON_ENABLE_ADC=n
+
+# The task watchdog watches for a task that never yields.  What this board
+# runs is one audio loop that yields on every block by construction, and the
+# interrupt watchdog - the one that catches a wedged interrupt - stays.
+CONFIG_ESP_TASK_WDT_EN=n
+
+# EVERYTHING THIS BOARD IS NOT.
+#
+# A pedal has a guitar jack, a headphone jack and a phone looking at it.  It
+# has no industrial bus, no sensor net, no shell over the network and no USB
+# device hanging off it, and every one of those drivers keeps interrupt code
+# in the same instruction RAM the emulator is trying to live in.
+#
+# Plain TCP stays, because that is what the phone's page and its WebSocket
+# ride on.  TLS does not: the link is a phone a metre away on a network this
+# board made, and the key for it is in SYSTEM.CFG.
+CONFIG_ARGON_CAN=n
+CONFIG_ARGON_ONEWIRE=n
+CONFIG_ARGON_RMT=n
+CONFIG_ARGON_MCPWM=n
+CONFIG_ARGON_NET_MODBUS=n
+CONFIG_ARGON_NET_MQTT=n
+CONFIG_ARGON_NET_SSH=n
+CONFIG_ARGON_NET_TLS=n
+CONFIG_ARGON_NET_TELNET=n
+CONFIG_ARGON_NET_SNTP=n
+CONFIG_ARGON_NET_ESPNOW=n
+CONFIG_ARGON_NET_OTA=n
+CONFIG_ARGON_USB_HOST=n
+CONFIG_ARGON_ENABLE_CAMERA=n
+
+# The last two kilobytes, from the heap.
+#
+# The map says where the instruction RAM goes: 49152 bytes of it are the arena
+# itself (a static buffer in loader.c), and the other 71 KB is FreeRTOS, the
+# PHY, the flash driver, the HAL and the heap.  The heap's own functions are
+# 5148 of that, kept resident so that they can run with the flash cache off -
+# which matters to code that allocates from an interrupt, and this system does
+# not.
+#
+# It is the supported option for exactly this trade, and unlike the FreeRTOS
+# one it does not put the scheduler out of reach: see the note in
+# sdkconfig.esp32.a1s about the reboot loop that bought.
+CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y

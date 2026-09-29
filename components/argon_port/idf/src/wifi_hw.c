@@ -118,6 +118,16 @@ static esp_err_t apply_ap_config(void)
     cfg.ap.channel = (s_ap_channel == 0u) ? 1u : s_ap_channel;
     cfg.ap.ssid_hidden = s_ap_hidden ? 1 : 0;
     cfg.ap.max_connection = 4;
+    /*
+     * EXPERIMENT (temporary): a slow beacon.
+     *
+     * On the Audio Kit the point costs the audio input more than twenty
+     * decibels of noise floor - measured with the loopback, peak 455 against
+     * 17 with the radio off - and it is heard as a knock about ten times a
+     * second, which is exactly the beacon rate.  If the knock is the
+     * transmitter's current, fewer bursts should be quieter.
+     */
+    cfg.ap.beacon_interval = 500;
 
     const size_t pl = strnlen(s_ap_pass, sizeof(cfg.ap.password));
     if (pl > 0u) {
@@ -296,6 +306,16 @@ ag_err_t ag_port_wifi_start(void)
     if (esp_wifi_start() != ESP_OK) {
         return -AG_EIO;
     }
+    /*
+     * EXPERIMENT (temporary): the weakest transmitter the driver allows.
+     *
+     * 8 quarter-dBm is 2 dBm, against the 20 the radio defaults to - a
+     * sixtieth of the power, and a sixtieth of the current burst that goes
+     * with it.  A phone a metre from the board does not need more, and this
+     * board's audio input is measurably paying for every milliamp the
+     * transmitter draws.
+     */
+    (void)esp_wifi_set_max_tx_power(8);
 
     /* ESP-IDF narrates association at INFO; the kernel prints its own line. */
     esp_log_level_set("wifi", ESP_LOG_WARN);

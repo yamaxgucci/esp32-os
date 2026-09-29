@@ -1990,6 +1990,18 @@ int ag_main(int argc, char **argv)
          */
         const int have_chain = (preset != NULL) ? (amp_from_preset(preset) == 0)
                                                 : (amp_from_model(s_model) == 0);
+        if (have_chain && cab_path != NULL) {
+            /*
+             * The cabinet counts in the measurement or the measurement is of
+             * half the chain.  Subtracting a total from a total is how "the
+             * cabinet costs 40% here against 12% on the S3" got written down
+             * without anybody timing the convolution itself.
+             */
+            if (cabinet_from_wav(cab_path) == 0) {
+                s_cab_on = 1;
+                ag_ir_set_bypass(&s_ir, 0);
+            }
+        }
         if (have_chain) {
             bench_audio();
         } else {

@@ -72,6 +72,15 @@ typedef struct {
  * Reads a .AXE, places its code in executable memory and its data in writable
  * memory, and binds the syscall table into it.  Nothing runs yet.
  */
+/*
+ * Put drivers in flash rather than in the code arena.
+ *
+ * A board whose one large application must run from RAM says so here, because
+ * drivers load first and would otherwise have the arena.  Off unless a board
+ * asks; see the comment at the placement decision.
+ */
+void ag_loader_drivers_from_flash(bool on);
+
 ag_err_t ag_loader_load(const char *path, const char *cwd,
                         ag_loaded_app_t *out);
 
