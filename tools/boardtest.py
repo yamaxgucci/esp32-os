@@ -259,8 +259,8 @@ def main():
         if args.peek:
             # Nothing sent, deliberately.  --no-reset still wakes the prompt
             # with a carriage return, and to a program that stops on any key
-            # a carriage return is a key: REMTERM ended every time its own
-            # counters were read this way, and the screen went with it.
+            # a carriage return is a key: REMTERM (since removed) ended every
+            # time its own counters were read this way.
             board.pump(args.seconds)
             return
         if args.no_reset:

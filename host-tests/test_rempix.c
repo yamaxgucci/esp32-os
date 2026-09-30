@@ -16,8 +16,9 @@
  *
  * The implementations are copied rather than shared, and that is a real cost
  * that has to be paid attention to: they live in apps/remdisp/remdisp.c and
- * apps/remterm/remterm.c, which are a .SYS and an .AXE for two different
- * instruction sets and cannot be linked into a host binary as they stand.  What
+ * monitor/main/monitor.c, which are a .SYS and a firmware of its own for two
+ * different instruction sets and cannot be linked into a host binary as they
+ * stand.  What
  * this test therefore proves is that the *algorithm pair* is sound.  A change to
  * either file that is not mirrored here will pass this test and break the
  * screen, so the header of each says to come here.
@@ -210,7 +211,7 @@ static uint32_t encode_indexed(const uint16_t *px, uint32_t n, uint8_t *out,
     return at + packed;
 }
 
-/* ---- the decoder, mirroring apps/remterm/remterm.c ---------------------- */
+/* ---- the decoder, mirroring monitor/main/monitor.c ---------------------- */
 
 static uint16_t d_px[MAX_PX];
 

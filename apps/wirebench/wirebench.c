@@ -10,7 +10,7 @@
  * So this writes bytes to /dev/wire0, which REMDISP publishes beside its
  * display: the same framing, the same one-transaction-per-frame, the same
  * checksum at the far end, and nothing about pixels anywhere in it.  The far
- * end (REMTERM) counts what arrives and what failed its checksum.
+ * end (the monitor firmware) counts what arrives and what failed its checksum.
  *
  *   wirebench [seconds] [chunk]
  *
