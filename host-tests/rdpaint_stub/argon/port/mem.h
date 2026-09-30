@@ -24,4 +24,20 @@ static inline void *ag_port_alloc(size_t bytes, unsigned caps)
 
 static inline void ag_port_free(void *p) { free(p); }
 
+/* As much as a test says there is: plenty unless it sets it lower, so a test
+ * can put the painter under memory pressure (rdpaint_stub_mem_free). */
+static size_t rdpaint_stub_mem_free = 64u * 1024u * 1024u;
+
+static inline size_t ag_port_mem_free(unsigned caps)
+{
+    (void)caps;
+    return rdpaint_stub_mem_free;
+}
+
+static inline size_t ag_port_mem_largest(unsigned caps)
+{
+    (void)caps;
+    return rdpaint_stub_mem_free;
+}
+
 #endif /* RDPAINT_STUB_MEM_H */

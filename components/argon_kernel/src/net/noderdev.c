@@ -2216,6 +2216,11 @@ void ag_noderdev_screen_done(void) { rdp_screen_done(); }
 
 void ag_noderdev_screen_taken(void) { rdp_screen_taken(); }
 
+void ag_noderdev_stable_surface(const uint16_t *px, uint16_t w, uint16_t h)
+{
+    rdp_stable_surface(px, w, h);
+}
+
 void ag_noderdev_report(bool on)
 {
     s_report = on;

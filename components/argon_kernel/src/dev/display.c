@@ -1831,6 +1831,7 @@ ag_err_t ag_display_init(void)
     s_front = front;
     s_back = back;
     s_draw = front;
+    ag_noderdev_stable_surface(front, w, h);
     s_front_owned = owned;
     s_snap = snap;
     s_w = w;
@@ -1860,6 +1861,7 @@ ag_err_t ag_display_init(void)
         if (snap != NULL) {
             ag_port_free(snap);
         }
+        ag_noderdev_stable_surface(NULL, 0, 0);
         s_front = NULL;
         s_back = NULL;
         s_draw = NULL;

@@ -101,6 +101,9 @@ bool rdp_draws_rects(void);
 /* The same for indices into a palette (see rdpaint.c, OR INDICES), and the
  * pixels the painter sent each way since it began. */
 void rdp_far_idx(bool yes);
+/* The screen's own framebuffer (w x h, rows back to back): presents out of
+ * it are read there by the painter instead of copied.  NULL for none. */
+void rdp_stable_surface(const uint16_t *px, uint16_t w, uint16_t h);
 bool rdp_draws_idx(void);
 void rdp_idx_counts(uint32_t *idx_px, uint32_t *rgb_px);
 /* Whether rdp_draw holds pixels not yet on the glass. */

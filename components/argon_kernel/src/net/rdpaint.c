@@ -244,7 +244,19 @@ static struct {
     uint16_t  w, h;      /* the surface now; the buffers hold cap pixels  */
     uint32_t  cap_px;
     uint16_t  cap_rows;
-    uint16_t *pic;       /* the one picture */
+    uint16_t *pic;       /* the one picture, when presents are copied */
+    /*
+     * WHAT A PASS READS (1 Oct 2026): pic, or the screen's own framebuffer
+     * (rdp_stable_surface) when that is where the presents come from.  A
+     * game drawing into it and flushing handed the painter every frame to
+     * copy, 150 KB read and 150 KB written in PSRAM in the game's own
+     * thread - 4-5 ms a frame while its map scrolled - into a picture that
+     * was the framebuffer again.  Read where it is, and the 150 KB of pic
+     * are free: under Fallout, the snapshot fits in them.
+     */
+    const uint16_t *src;
+    const uint16_t *st_px; /* the screen's framebuffer, or NULL */
+    uint16_t        st_w, st_h;
     uint16_t *snap;      /* a pass's rows, copied at one instant (or NULL) */
     volatile bool    frame_end;  /* a present reached the bottom row      */
     volatile int64_t present_us; /* when the last present came            */
@@ -678,7 +690,7 @@ static void trim_to_far(uint16_t w, uint16_t h)
         span_t was[RDP_SPANS];
         memcpy(was, r, sizeof(was));
         row_clear(r);
-        const uint16_t *const pic = s_p.pic + (size_t)y * w;
+        const uint16_t *const pic = s_p.src + (size_t)y * w;
         const uint16_t *const far = s_p.snap + (size_t)y * w;
         for (uint32_t i = 0; i < RDP_SPANS; i++) {
             uint32_t       x = was[i].x0;
@@ -698,6 +710,13 @@ static void trim_to_far(uint16_t w, uint16_t h)
                     e++;
                 }
                 row_add(r, x, e - same);
+                /* and into the snapshot as it is found: the pixels that
+                 * differ are the ones it has to take, and this is the one
+                 * pass over them (1 Oct 2026: compared here, then copied
+                 * again below - the frame through PSRAM twice more than
+                 * needed, under a game that wanted the bus) */
+                memcpy(s_p.snap + (size_t)y * w + x, pic + x,
+                       (size_t)(e - same - x) * 2u);
                 x = e;
             }
         }
@@ -718,6 +737,38 @@ static bool work_is_all(uint16_t w, uint16_t h)
 
 /* One pass: every row marked since the last, out of the picture and into
  * the wire.  Apart from the loop so the host test can make passes itself. */
+/*
+ * THE SNAPSHOT ONLY WHILE MEMORY IS PLENTIFUL (1 Oct 2026).  It is 150 KB of
+ * the same picture again, taken at the first present - at boot, before any
+ * program - and a game started after it found that much less for itself:
+ * Fallout could not open a script and faulted.  So it is taken when a new
+ * frame starts and there is RDP_SNAP_SPARE left beside it, and given back
+ * when the free memory falls under RDP_SNAP_FLOOR.  Without it a frame goes
+ * out of the picture as it is (s_p.more), which a game under memory
+ * pressure can afford and 150 KB it cannot.
+ */
+#define RDP_SNAP_SPARE (1024u * 1024u)
+#define RDP_SNAP_FLOOR (384u * 1024u)
+static void snap_mind(void)
+{
+    const size_t bytes = (size_t)s_p.cap_px * 2u;
+    const size_t free_slow = ag_port_mem_free(AG_MEM_SLOW | AG_MEM_BYTE);
+    if (s_p.snap == NULL) {
+        if (ag_port_mem_largest(AG_MEM_SLOW | AG_MEM_BYTE) >= bytes + RDP_SNAP_SPARE) {
+            s_p.snap = ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+            s_p.snap_is_far = false;
+        }
+    } else if (free_slow < RDP_SNAP_FLOOR) {
+        ag_port_free(s_p.snap);
+        s_p.snap = NULL;
+        s_p.snap_is_far = false;
+        s_p.cont = false;
+        ag_log(AG_LOG_INFO, TAG, "memory short (%u KB free): the snapshot "
+                                 "given back",
+               (unsigned)(free_slow / 1024u));
+    }
+}
+
 static void pass(void)
 {
     {
@@ -733,6 +784,9 @@ static void pass(void)
          * tear Maxim still saw with the snapshot in.  Now what is left goes on
          * from this snapshot, and the next is taken when all of it has gone.
          */
+        if (!s_p.cont && !s_p.more) {
+            snap_mind(); /* between frames: take it, or give it back */
+        }
         const bool cont = s_p.cont && s_p.snap != NULL;
         s_p.cont = false;
         rpal_t *const pl = (s_p.far_idx && s_p.pal != NULL) ? s_p.pal : NULL;
@@ -759,8 +813,10 @@ static void pass(void)
         if (!cont) {
         memcpy(s_p.work, s_p.dirty, (size_t)h * RDP_SPANS * sizeof(span_t));
         memset(s_p.dirty, 0, (size_t)h * RDP_SPANS * sizeof(span_t));
+        bool taken = false; /* the snapshot has what goes already */
         if (s_p.snap != NULL && s_p.snap_is_far) {
             trim_to_far(w, h);
+            taken = true;
         } else if (s_p.snap != NULL && work_is_all(w, h)) {
             s_p.snap_is_far = true; /* this snapshot is the whole screen */
         }
@@ -772,13 +828,13 @@ static void pass(void)
          * its bottom in the next - "the bottom lags the top", Maxim.  What
          * this pass sends is copied here, under the lock the presents take.
          */
-        if (s_p.snap != NULL) {
+        if (s_p.snap != NULL && !taken) {
             for (uint32_t y = 0; y < h; y++) {
                 const span_t *const r = row_of(s_p.work, y);
                 for (uint32_t i = 0; i < RDP_SPANS; i++) {
                     if (r[i].x1 > r[i].x0) {
                         memcpy(s_p.snap + (size_t)y * w + r[i].x0,
-                               s_p.pic + (size_t)y * w + r[i].x0,
+                               s_p.src + (size_t)y * w + r[i].x0,
                                (size_t)(r[i].x1 - r[i].x0) * 2u);
                     }
                 }
@@ -835,7 +891,7 @@ static void pass(void)
                     }
                     any = true;
                     const uint16_t *row =
-                        ((s_p.snap != NULL) ? s_p.snap : s_p.pic) +
+                        ((s_p.snap != NULL) ? s_p.snap : s_p.src) +
                         (size_t)yy * w;
                     const uint8_t *ix =
                         (pl != NULL && pl->rest == 0u)
@@ -1015,6 +1071,13 @@ void rdp_far_rects(bool yes)
     s_p.rects = yes;
 }
 
+void rdp_stable_surface(const uint16_t *px, uint16_t w, uint16_t h)
+{
+    s_p.st_px = px;
+    s_p.st_w = w;
+    s_p.st_h = h;
+}
+
 void rdp_far_idx(bool yes)
 {
     if (yes && !s_p.far_idx) {
@@ -1041,7 +1104,7 @@ bool rdp_pass_done(void)
 
 void rdp_screen_done(void)
 {
-    if (s_p.task == NULL || s_p.pic == NULL) {
+    if (s_p.task == NULL || s_p.src == NULL) {
         return; /* nothing was ever sent: nothing to say */
     }
     s_p.done_asked = true;
@@ -1064,7 +1127,7 @@ uint32_t rdp_redraws(void)
 
 void rdp_forget(void)
 {
-    if (s_p.task == NULL || s_p.pic == NULL) {
+    if (s_p.task == NULL || s_p.src == NULL) {
         return;
     }
     s_p.redraws++;
@@ -1080,16 +1143,15 @@ void rdp_forget(void)
 
 /* The buffers, once, for the first surface's size; false if there is no
  * memory for them - then the proxy sends raw, as it did. */
-static bool buffers(uint16_t w, uint16_t h, uint16_t room)
+static bool buffers(uint16_t w, uint16_t h, uint16_t room, bool stable)
 {
     s_p.cap_px = (uint32_t)w * h;
     s_p.cap_rows = h;
-    s_p.pic = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_BYTE);
-    /* the snapshot is worth having, not worth failing for */
-    s_p.snap = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_SLOW | AG_MEM_BYTE);
-    if (s_p.snap == NULL) {
-        s_p.snap = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_BYTE);
-    }
+    s_p.pic = stable ? NULL : ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_BYTE);
+    s_p.src = stable ? s_p.st_px : s_p.pic;
+    /* the snapshot is taken later, when there is memory to spare for it
+     * (snap_mind) */
+    s_p.snap = NULL;
     s_p.known = ag_port_alloc(h, AG_MEM_BYTE);
     s_p.dirty = ag_port_alloc((size_t)h * RDP_SPANS * sizeof(span_t), AG_MEM_BYTE);
     s_p.work = ag_port_alloc((size_t)h * RDP_SPANS * sizeof(span_t), AG_MEM_BYTE);
@@ -1100,7 +1162,7 @@ static bool buffers(uint16_t w, uint16_t h, uint16_t room)
         memset(s_p.pal, 0, sizeof(rpal_t));
         pal_reset(s_p.pal);
     }
-    if (s_p.pic == NULL || s_p.known == NULL || s_p.dirty == NULL ||
+    if (s_p.src == NULL || s_p.known == NULL || s_p.dirty == NULL ||
         s_p.work == NULL || s_p.msg == NULL) {
         ag_port_free(s_p.pic);
         ag_port_free(s_p.snap);
@@ -1110,6 +1172,7 @@ static bool buffers(uint16_t w, uint16_t h, uint16_t room)
         ag_port_free(s_p.work);
         ag_port_free(s_p.msg);
         s_p.pic = NULL;
+        s_p.src = NULL;
         return false;
     }
     memset(s_p.known, 0, h);
@@ -1127,6 +1190,11 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
         room < RDP_HDR + RDP_RUN_HDR + RDC_PACK_MAX(RDP_CHUNK)) {
         return false;
     }
+    const bool stable =
+        s_p.st_px != NULL && b->surf_w == s_p.st_w && b->surf_h == s_p.st_h &&
+        b->stride == (uint32_t)s_p.st_w * 2u &&
+        (const uint16_t *)b->px >= s_p.st_px &&
+        (const uint16_t *)b->px < s_p.st_px + (size_t)s_p.st_w * s_p.st_h;
     if (s_p.task == NULL) {
         if (s_p.failed) {
             return false;
@@ -1141,7 +1209,7 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
          * rate, and below the application it would only paint when the
          * application waited. */
         if (s_p.lock == NULL || s_p.wake == NULL ||
-            !buffers(b->surf_w, b->surf_h, room) ||
+            !buffers(b->surf_w, b->surf_h, room, stable) ||
             !ag_port_task_create(painter, "rdpaint", 3072, NULL, 5,
                                  AG_PORT_ANY_CORE, 0, &s_p.task)) {
             s_p.failed = true;
@@ -1176,7 +1244,33 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
     const uint32_t y1 = ((uint32_t)b->y + b->h < s_p.h) ? b->y + b->h : s_p.h;
     const uint32_t xe = ((uint32_t)b->x + b->w < s_p.w) ? b->x + b->w : s_p.w;
     bool           marked = false;
-    for (uint32_t y = b->y; y < y1 && b->x < xe; y++) {
+    if (stable != (s_p.src == s_p.st_px && s_p.st_px != NULL)) {
+        /* the presents changed where they come from: a picture of our own
+         * (taken now, if it never was), or the screen's again - and the
+         * far screen known from neither */
+        if (!stable && s_p.pic == NULL) {
+            s_p.pic = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_BYTE);
+            if (s_p.pic == NULL) {
+                unlock();
+                return false; /* no memory for it: raw */
+            }
+        }
+        s_p.src = stable ? s_p.st_px : s_p.pic;
+        s_p.snap_is_far = false;
+        memset(s_p.known, 0, s_p.h);
+        for (uint32_t y = 0; y < s_p.h && stable; y++) {
+            row_whole(row_of(s_p.dirty, y), s_p.w);
+        }
+        marked = stable;
+    }
+    if (stable) {
+        /* the pixels are where the painter will read them: only mark */
+        for (uint32_t y = b->y; y < y1 && b->x < xe; y++) {
+            row_add(row_of(s_p.dirty, y), b->x, xe);
+        }
+        marked = marked || (b->y < y1 && b->x < xe);
+    }
+    for (uint32_t y = b->y; y < y1 && b->x < xe && !stable; y++) {
         const uint16_t *in = (const uint16_t *)(const void *)(
             (const uint8_t *)b->px + (size_t)(y - b->y) * b->stride);
         uint16_t *row = s_p.pic + (size_t)y * s_p.w;

@@ -121,6 +121,9 @@ void ag_noderdev_blit_counts(uint32_t *calls, uint32_t *noproxy,
                              uint32_t *raw);
 /* ...and taken again: the neighbour's screen gets the whole picture. */
 void ag_noderdev_screen_taken(void);
+/* The display's own framebuffer, so a neighbour's screen reads it where it
+ * is (net/rdpaint.h, rdp_stable_surface); NULL when it goes. */
+void ag_noderdev_stable_surface(const uint16_t *px, uint16_t w, uint16_t h);
 
 void ag_noderdev_frames_seen(uint32_t *frames, uint32_t *slow, uint32_t *stalls,
                              uint32_t *slow_ms, uint32_t *gap_max_ms,

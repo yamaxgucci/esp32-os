@@ -522,6 +522,48 @@ static void palette_scroll(void)
     rdp_far_idx(false);
 }
 
+/*
+ * OUT OF THE SCREEN'S OWN FRAMEBUFFER (1 Oct 2026): presents that come out
+ * of the registered surface are only marked, and the painter reads them
+ * there.  The glass must end exactly like the frame, whatever changes -
+ * a map scrolling, then a small square on a still picture.
+ */
+static void stable_surface(void)
+{
+    rdp_stable_surface(s_frame, W, H);
+    uint32_t bad = 0, at = 0;
+    for (uint32_t f = 0; f < 5u; f++) {
+        map_frame(5000u + f * 4u);
+        (void)frame_out();
+        bad += (diff(&at) != 0u) ? 1u : 0u;
+    }
+    for (uint32_t f = 0; f < 5u; f++) {
+        for (uint32_t y = 100; y < 120; y++) {
+            for (uint32_t x = 10u * f; x < 10u * f + 20u; x++) {
+                s_frame[y * W + x] = 0xFFFFu;
+            }
+        }
+        (void)frame_out();
+        bad += (diff(&at) != 0u) ? 1u : 0u;
+    }
+    printf("  rdpaint out of the framebuffer: %u frames wrong\n", (unsigned)bad);
+    CHECK(bad == 0u);
+    /* memory short: the snapshot is given back, and frames still end exact */
+    CHECK(s_p.snap != NULL);
+    rdpaint_stub_mem_free = 100u * 1024u;
+    for (uint32_t f = 0; f < 4u; f++) {
+        map_frame(7000u + f * 4u);
+        (void)frame_out();
+        bad += (diff(&at) != 0u) ? 1u : 0u;
+    }
+    printf("  rdpaint memory short: snapshot %s, %u frames wrong\n",
+           (s_p.snap == NULL) ? "given back" : "KEPT", (unsigned)bad);
+    CHECK(s_p.snap == NULL);
+    CHECK(bad == 0u);
+    rdpaint_stub_mem_free = 64u * 1024u * 1024u;
+    rdp_stable_surface(NULL, 0, 0);
+}
+
 int main(void)
 {
     s_ops.size = sizeof(s_ops);
@@ -543,6 +585,7 @@ int main(void)
     long_way();
     switches();
     palette_scroll();
+    stable_surface();
     printf("rdpaint_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails == 0 ? 0 : 1;
 }
