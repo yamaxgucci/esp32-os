@@ -33,4 +33,19 @@ uint32_t rdc_pack_some(const uint16_t *px, uint32_t n, uint8_t *out,
  * pixels' worth of a packing (short, long, or damaged). */
 uint32_t rdc_unpack(const uint8_t *in, uint32_t len, uint16_t *px, uint32_t n);
 
+/*
+ * THE SAME ON INDICES INTO A PALETTE (30 Sep 2026): a byte a pixel.  A
+ * painted game has at most 256 colours on the screen, and a picture that
+ * changes everywhere - its map scrolling - packs to almost as much as it
+ * was in RGB565: the byte halves it.  Control bytes as above, the literals
+ * and the repeated value one byte each.
+ */
+#define RDC_PACK8_MAX(n) ((n) + ((n) + 127u) / 128u)
+uint32_t rdc_pack8_some(const uint8_t *ix, uint32_t n, uint8_t *out,
+                        uint32_t cap, uint32_t *taken);
+/* Exactly n pixels out of in[0..len), each index looked up in pal; the bytes
+ * read, or 0 if in is not n pixels' worth of a packing. */
+uint32_t rdc_unpack8(const uint8_t *in, uint32_t len, const uint16_t *pal,
+                     uint16_t *px, uint32_t n);
+
 #endif /* ARGON_NET_RDCODEC_H */

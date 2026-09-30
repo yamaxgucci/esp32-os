@@ -585,6 +585,9 @@ ag_err_t ag_powerctl_apply(const ag_power_target_t *want,
  */
 static bool demands_full(void)
 {
+    if (ag_power_full_only_held()) {
+        return true; /* a process said so, or the kernel's own work */
+    }
     if (!s_auto.cruise_strict) {
         return ag_power_full_only_held();
     }

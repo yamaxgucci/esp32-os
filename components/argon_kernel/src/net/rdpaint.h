@@ -98,6 +98,11 @@ void rdp_screen_taken(void);
  * does (it has the buffer to unpack one into).  See rdpaint.c. */
 void rdp_far_rects(bool yes);
 bool rdp_draws_rects(void);
+/* The same for indices into a palette (see rdpaint.c, OR INDICES), and the
+ * pixels the painter sent each way since it began. */
+void rdp_far_idx(bool yes);
+bool rdp_draws_idx(void);
+void rdp_idx_counts(uint32_t *idx_px, uint32_t *rgb_px);
 /* Whether rdp_draw holds pixels not yet on the glass. */
 bool rdp_draw_holds(void);
 /* Why a strip gathered by rdp_draw went to the glass. */

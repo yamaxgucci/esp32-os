@@ -168,6 +168,10 @@ const char *ag_power_why(ag_pid_t pid);
  */
 bool ag_power_full_only_held(void);
 
+/* Kernel work that needs the full clock while it lasts (a neighbour's
+ * picture being drawn here): one true per holder, one false to let go. */
+void ag_power_kernel_full(bool on);
+
 /*
  * What one process has said about itself, standing.  AG_POWER_FIT_ASK for a
  * process that has said nothing, which is also the answer for one this table

@@ -442,6 +442,86 @@ static void switches(void)
     CHECK(flat_msgs <= 15u);
 }
 
+
+/*
+ * A PAINTED MAP SCROLLING (30 Sep 2026): every pixel changes every frame in
+ * at most 256 colours, as when a game moves its map.  Sent as indices it must
+ * end on the glass exactly and in fewer messages than in RGB565; a frame of
+ * noise between - more colours than a palette holds - must end exactly too,
+ * and the map after it as well.
+ */
+static uint16_t s_mpal[256];
+static uint8_t  s_mtex[64 * 64];
+
+static void map_frame(uint32_t sx)
+{
+    for (uint32_t y = 0; y < H; y++) {
+        for (uint32_t x = 0; x < W; x++) {
+            const uint32_t mx = x + sx, my = y + sx / 2u;
+            s_frame[y * W + x] = s_mpal[s_mtex[(my % 64u) * 64u + mx % 64u] ^
+                                        (uint8_t)((mx / 64u) * 37u)];
+        }
+    }
+}
+
+static uint32_t frame_out(void)
+{
+    const uint32_t m0 = s_sends;
+    present_frame();
+    uint32_t guard = 0;
+    do {
+        rdpaint_stub_now_us += 16000;
+        pass();
+    } while (dirty_left() && ++guard < 400u);
+    return s_sends - m0;
+}
+
+static void palette_scroll(void)
+{
+    for (uint32_t i = 0; i < 256u; i++) {
+        s_mpal[i] = noise();
+    }
+    uint8_t v = 0;
+    for (uint32_t i = 0; i < 64u * 64u; i++) {
+        if ((noise() % 3u) != 0u) {
+            v = (uint8_t)noise();
+        }
+        s_mtex[i] = v;
+    }
+    uint32_t msgs[2] = {0, 0};
+    uint32_t bad = 0;
+    for (int with = 0; with < 2; with++) {
+        rdp_far_idx(with != 0);
+        for (uint32_t f = 0; f < 6u; f++) {
+            map_frame(f * 4u + (uint32_t)with * 1000u);
+            msgs[with] += frame_out();
+            uint32_t at = 0;
+            bad += (diff(&at) != 0u) ? 1u : 0u;
+        }
+    }
+    /* more colours than a palette: noise, exactly - then the map again */
+    for (uint32_t i = 0; i < W * H; i++) {
+        s_frame[i] = noise();
+    }
+    (void)frame_out();
+    uint32_t at = 0;
+    bad += (diff(&at) != 0u) ? 1u : 0u;
+    for (uint32_t f = 0; f < 3u; f++) {
+        map_frame(3000u + f * 4u);
+        (void)frame_out();
+        bad += (diff(&at) != 0u) ? 1u : 0u;
+    }
+    uint32_t ipx = 0, rpx = 0;
+    rdp_idx_counts(&ipx, &rpx);
+    printf("  rdpaint palette map: %u messages in RGB565, %u as indices; %u "
+           "frames wrong; %u px as indices, %u as RGB565\n",
+           (unsigned)msgs[0], (unsigned)msgs[1], (unsigned)bad, (unsigned)ipx,
+           (unsigned)rpx);
+    CHECK(bad == 0u);
+    CHECK(msgs[1] * 10u < msgs[0] * 7u); /* at least 30% fewer */
+    rdp_far_idx(false);
+}
+
 int main(void)
 {
     s_ops.size = sizeof(s_ops);
@@ -462,6 +542,7 @@ int main(void)
     balls();
     long_way();
     switches();
+    palette_scroll();
     printf("rdpaint_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails == 0 ? 0 : 1;
 }

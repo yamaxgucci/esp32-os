@@ -84,6 +84,81 @@ uint32_t rdc_pack_some(const uint16_t *px, uint32_t n, uint8_t *out,
     return pack(px, n, out, cap, taken);
 }
 
+uint32_t rdc_pack8_some(const uint8_t *ix, uint32_t n, uint8_t *out,
+                        uint32_t cap, uint32_t *taken)
+{
+    uint32_t at = 0;
+    uint32_t i = 0;
+    while (i < n) {
+        uint32_t run = 1;
+        while (i + run < n && run < RDC_RUN_MAX && ix[i + run] == ix[i]) {
+            run++;
+        }
+        if (run >= RDC_RUN_MIN) {
+            if (at + 2u > cap) {
+                break;
+            }
+            out[at] = (uint8_t)(run + 125u);
+            out[at + 1u] = ix[i];
+            at += 2u;
+            i += run;
+            continue;
+        }
+        uint32_t lit = 0;
+        while (i + lit < n && lit < RDC_LIT_MAX) {
+            const uint32_t j = i + lit;
+            if (j + 2u < n && ix[j] == ix[j + 1u] && ix[j] == ix[j + 2u]) {
+                break;
+            }
+            lit++;
+        }
+        if (at + 1u + lit > cap) {
+            lit = (at + 2u <= cap) ? cap - at - 1u : 0u;
+            if (lit == 0u) {
+                break;
+            }
+        }
+        out[at++] = (uint8_t)(lit - 1u);
+        memcpy(out + at, ix + i, lit);
+        at += lit;
+        i += lit;
+    }
+    *taken = i;
+    return at;
+}
+
+uint32_t rdc_unpack8(const uint8_t *in, uint32_t len, const uint16_t *pal,
+                     uint16_t *px, uint32_t n)
+{
+    uint32_t at = 0;
+    uint32_t i = 0;
+    while (i < n) {
+        if (at >= len) {
+            return 0u;
+        }
+        const uint32_t c = in[at++];
+        if (c < 128u) {
+            const uint32_t lit = c + 1u;
+            if (i + lit > n || at + lit > len) {
+                return 0u;
+            }
+            for (uint32_t k = 0; k < lit; k++) {
+                px[i++] = pal[in[at++]];
+            }
+        } else {
+            const uint32_t run = c - 125u;
+            if (i + run > n || at + 1u > len) {
+                return 0u;
+            }
+            const uint16_t v = pal[in[at++]];
+            for (uint32_t k = 0; k < run; k++) {
+                px[i++] = v;
+            }
+        }
+    }
+    return at;
+}
+
 uint32_t rdc_unpack(const uint8_t *in, uint32_t len, uint16_t *px, uint32_t n)
 {
     uint32_t at = 0;

@@ -311,8 +311,28 @@ bool ag_power_refused(ag_pid_t pid)
            w->answer == AG_POWER_UNFIT;
 }
 
+/*
+ * THE KERNEL'S OWN WORK HOLDS THE CLOCK TOO (1 Oct 2026).  A CYD drawing its
+ * neighbour's picture runs no process at all - the drawing is the pour task's -
+ * so nothing had said it needed the full clock, and it drew at 160 MHz in
+ * cruise while the picture scrolled.  ag_power_kernel_full counts holders.
+ */
+static volatile uint32_t s_kernel_full;
+
+void ag_power_kernel_full(bool on)
+{
+    if (on) {
+        s_kernel_full++;
+    } else if (s_kernel_full != 0u) {
+        s_kernel_full--;
+    }
+}
+
 bool ag_power_full_only_held(void)
 {
+    if (s_kernel_full != 0u) {
+        return true;
+    }
     for (uint32_t i = 0; i < AG_POWER_WATCHERS; i++) {
         if (s_watch[i].used &&
             s_watch[i].fitness == AG_POWER_FIT_FULL_ONLY) {

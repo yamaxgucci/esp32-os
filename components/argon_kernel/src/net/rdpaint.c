@@ -14,6 +14,16 @@
  * went in two, and a picture of any kind with many rows changed the same.
  * Sent only to a screen that says it draws them (rdp_far_rects).
  *
+ * OR INDICES (30 Sep 2026): with RDP_IDX_BIT in the count as well, the
+ * packing is of a byte a pixel (rdc_pack8), each an index into a palette
+ * the far screen keeps; a run with the row 0xFFFF sets entries of it - the
+ * column is the first index, the count how many, and the packing their
+ * colours, two bytes each.  A colour is always set before a run uses it,
+ * in the same stream.  Fallout's map scrolling is every pixel of the
+ * screen changing in at most 256 colours, and in RGB565 it packed to 93%
+ * of itself: the byte halves what crosses.  Sent only to a screen that
+ * says it takes them (rdp_far_idx).
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "net/rdpaint.h"
@@ -38,6 +48,8 @@
 #define RDP_RUN_HDR 8u
 #define RDP_RECT_HDR 10u
 #define RDP_RECT_BIT 0x8000u
+#define RDP_IDX_BIT  0x4000u
+#define RDP_PAL_ROW  0xFFFFu
 #define RDP_HDR 4u
 /* how long a pass waits for the wire before it gives the screen up as
  * unknown and sends the whole of it next time */
@@ -197,6 +209,28 @@ static void row_add(span_t *r, uint32_t x0, uint32_t x1)
  * "the latest" - would have made the comparing simpler and cost another
  * 150 KB at 320x240, which most boards do not have to give.
  */
+/*
+ * THE PAINTER'S PALETTE: colour to index, by a hash of the colour, and what
+ * the far screen has been told.  Entries are handed out in order and never
+ * moved, so the untold ones are always [told, n).  Full, a colour goes in
+ * RGB565 and the table starts again with the next frame; a frame that
+ * missed again turns indices off for a while (noise has 65 536 colours).
+ */
+#define RDP_PAL_SLOTS 512u
+#define RDP_PAL_REST  30u /* frames without indices after two that missed */
+typedef struct {
+    uint16_t col[256];
+    uint16_t key[RDP_PAL_SLOTS];
+    int16_t  slot[RDP_PAL_SLOTS]; /* the key's index, or -1 */
+    uint16_t n, told;
+    bool     missed;
+    uint8_t  misses_in_row, rest;
+    bool     last_ok;
+    uint16_t last_c;
+    uint8_t  last_i;
+    uint8_t  ix[]; /* one row's indices */
+} rpal_t;
+
 static struct {
     ag_port_mutex_t lock;
     ag_port_sem_t   wake;
@@ -245,6 +279,18 @@ static struct {
     volatile bool done_asked;
     bool          pass_done;
     volatile bool done_sent; /* ...and the far screen was told */
+    /* the last pass was cut with no snapshot to go on from: the rest is in
+     * dirty, and goes at once like the rest of a snapshot */
+    volatile bool more;
+    bool          far_idx;     /* the far screen takes indices */
+    rpal_t       *pal;         /* or NULL: no memory for it */
+    volatile bool pal_forget;  /* start the palette again */
+    bool          rect_idx;    /* the open rectangle is of indices */
+    uint32_t      idx_px, rgb_px; /* pixels sent each way, for tests */
+    /* this second's time: taking a pass's snapshot, packing and sending
+     * it, and the program's own presents marking what changed */
+    int64_t t_snap_us, t_send_us, t_damage_us, t_damage_wait_us;
+    uint32_t damages;
 } s_p;
 
 static uint16_t get16(const uint8_t *p)
@@ -293,6 +339,91 @@ static bool flush(uint32_t handle, rdp_send_fn send)
 /* The rectangle rdp_draw can hold: its pixels are unpacked there whole. */
 #define RDP_RECT_PX 4096u
 
+static void pal_reset(rpal_t *pl)
+{
+    pl->n = pl->told = 0u;
+    pl->missed = false;
+    pl->last_ok = false;
+    for (uint32_t i = 0; i < RDP_PAL_SLOTS; i++) {
+        pl->slot[i] = -1;
+    }
+}
+
+/* n pixels as indices into pl->ix, new colours given the next entries;
+ * NULL when the palette is full (and it says so for the frame's end). */
+static const uint8_t *pal_index(rpal_t *pl, const uint16_t *px, uint32_t n)
+{
+    for (uint32_t k = 0; k < n; k++) {
+        const uint16_t c = px[k];
+        if (pl->last_ok && c == pl->last_c) {
+            pl->ix[k] = pl->last_i;
+            continue;
+        }
+        uint32_t h = ((uint32_t)c * 40503u >> 7) & (RDP_PAL_SLOTS - 1u);
+        while (pl->slot[h] >= 0 && pl->key[h] != c) {
+            h = (h + 1u) & (RDP_PAL_SLOTS - 1u);
+        }
+        if (pl->slot[h] < 0) {
+            if (pl->n >= 256u) {
+                pl->missed = true;
+                return NULL;
+            }
+            pl->key[h] = c;
+            pl->slot[h] = (int16_t)pl->n;
+            pl->col[pl->n] = c;
+            pl->n++;
+        }
+        pl->last_c = c;
+        pl->last_i = (uint8_t)pl->slot[h];
+        pl->last_ok = true;
+        pl->ix[k] = pl->last_i;
+    }
+    return pl->ix;
+}
+
+/* The entries the far screen has not been told, ahead of what uses them. */
+static bool pal_tell(rpal_t *pl, uint16_t room, uint32_t handle,
+                     rdp_send_fn send)
+{
+    while (pl->told < pl->n) {
+        s_p.rect_at = 0; /* a palette between rows ends the rectangle */
+        uint32_t fit = (s_p.len + RDP_RUN_HDR + 2u <= room)
+                           ? (room - s_p.len - RDP_RUN_HDR) / 2u
+                           : 0u;
+        const uint32_t want = (uint32_t)(pl->n - pl->told);
+        if (fit == 0u) {
+            if (!flush(handle, send)) {
+                return false;
+            }
+            continue;
+        }
+        const uint32_t k = (want < fit) ? want : fit;
+        uint8_t *const at = s_p.msg + s_p.len;
+        put16(at, RDP_PAL_ROW);
+        put16(at + 2, pl->told);
+        put16(at + 4, (uint16_t)k);
+        put16(at + 6, (uint16_t)(k * 2u));
+        for (uint32_t i = 0; i < k; i++) {
+            put16(at + RDP_RUN_HDR + i * 2u, pl->col[pl->told + i]);
+        }
+        s_p.len += RDP_RUN_HDR + k * 2u;
+        pl->told = (uint16_t)(pl->told + k);
+    }
+    return true;
+}
+
+/* n pixels packed whole, as indices when ix is given: 0 if they do not fit. */
+static uint32_t pack_whole(const uint16_t *px, const uint8_t *ix, uint32_t n,
+                           uint8_t *out, uint32_t cap)
+{
+    if (ix == NULL) {
+        return rdc_pack(px, n, out, cap);
+    }
+    uint32_t       taken = 0;
+    const uint32_t at = rdc_pack8_some(ix, n, out, cap, &taken);
+    return (taken == n) ? at : 0u;
+}
+
 /*
  * A row of a rectangle into the payload: onto the rectangle open there when
  * it is the next row of it, else as a new one.  1 if it went, -1 if it
@@ -302,17 +433,19 @@ static bool flush(uint32_t handle, rdp_send_fn send)
  * messages half full (30 Sep 2026): 643 bytes do not fit in 640, and the
  * 64 pixels over went alone.
  */
-static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
-                        uint16_t room, uint32_t handle, rdp_send_fn send)
+static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px,
+                        const uint8_t *ix, uint32_t n, uint16_t room,
+                        uint32_t handle, rdp_send_fn send)
 {
     (void)handle;
     (void)send;
     {
         if (s_p.rect_at != 0u && s_p.rect_x == x && s_p.rect_w == n &&
+            s_p.rect_idx == (ix != NULL) &&
             (uint32_t)s_p.rect_y + s_p.rect_h == y &&
             ((uint32_t)s_p.rect_h + 1u) * n <= RDP_RECT_PX) {
             const uint32_t packed =
-                rdc_pack(px, n, s_p.msg + s_p.len, room - s_p.len);
+                pack_whole(px, ix, n, s_p.msg + s_p.len, room - s_p.len);
             if (packed > 0u) {
                 s_p.len += packed;
                 s_p.rect_h++;
@@ -325,12 +458,13 @@ static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
         s_p.rect_at = 0;
         if (s_p.len + RDP_RECT_HDR < room) {
             uint8_t *const at = s_p.msg + s_p.len;
-            const uint32_t packed = rdc_pack(px, n, at + RDP_RECT_HDR,
-                                             room - s_p.len - RDP_RECT_HDR);
+            const uint32_t packed = pack_whole(px, ix, n, at + RDP_RECT_HDR,
+                                               room - s_p.len - RDP_RECT_HDR);
             if (packed > 0u) {
                 put16(at, (uint16_t)y);
                 put16(at + 2, (uint16_t)x);
-                put16(at + 4, (uint16_t)(n | RDP_RECT_BIT));
+                put16(at + 4, (uint16_t)(n | RDP_RECT_BIT |
+                                         ((ix != NULL) ? RDP_IDX_BIT : 0u)));
                 put16(at + 6, (uint16_t)packed);
                 put16(at + 8, 1u);
                 s_p.rect_at = s_p.len;
@@ -338,6 +472,7 @@ static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
                 s_p.rect_y = (uint16_t)y;
                 s_p.rect_w = (uint16_t)n;
                 s_p.rect_h = 1u;
+                s_p.rect_idx = (ix != NULL);
                 s_p.rect_plen = (uint16_t)packed;
                 s_p.len += RDP_RECT_HDR + packed;
                 return 1;
@@ -349,23 +484,30 @@ static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
 
 /* A run of the row into the payload: as much of it as there is room for,
  * and the rest in the next payload after sending this one. */
-static bool put_run(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
-                    uint16_t room, uint32_t handle, rdp_send_fn send)
+static bool put_run(uint32_t y, uint32_t x, const uint16_t *px,
+                    const uint8_t *ix, uint32_t n, uint16_t room,
+                    uint32_t handle, rdp_send_fn send)
 {
     s_p.rect_at = 0; /* what follows is not the open rectangle's */
     while (n != 0u) {
         uint32_t taken = 0;
         if (s_p.len + RDP_RUN_HDR < room) {
             uint8_t *const at = s_p.msg + s_p.len;
-            const uint32_t packed = rdc_pack_some(
-                px, n, at + RDP_RUN_HDR, room - s_p.len - RDP_RUN_HDR, &taken);
+            const uint32_t cap = room - s_p.len - RDP_RUN_HDR;
+            const uint32_t packed =
+                (ix != NULL)
+                    ? rdc_pack8_some(ix, n, at + RDP_RUN_HDR, cap, &taken)
+                    : rdc_pack_some(px, n, at + RDP_RUN_HDR, cap, &taken);
             if (taken != 0u) {
                 put16(at, (uint16_t)y);
                 put16(at + 2, (uint16_t)x);
-                put16(at + 4, (uint16_t)taken);
+                put16(at + 4, (uint16_t)(taken | ((ix != NULL) ? RDP_IDX_BIT : 0u)));
                 put16(at + 6, (uint16_t)packed);
                 s_p.len += RDP_RUN_HDR + packed;
                 px += taken;
+                if (ix != NULL) {
+                    ix += taken;
+                }
                 x += taken;
                 n -= taken;
             }
@@ -419,6 +561,16 @@ static void report(void)
            (unsigned)kout,
            (unsigned)(passes ? s_p.sync_us / 1000 / passes : 0),
            (unsigned)(s_p.sync_max_us / 1000), (unsigned)(s_p.gap_max_us / 1000));
+    /* apart: a journal line has a length, and the end of one line was lost */
+    ag_log(AG_LOG_INFO, TAG,
+           "the painter's second: %u ms snapshots, %u ms packing and sending; "
+           "the program's: %u ms in %u presents, %u of it waiting for the lock",
+           (unsigned)(s_p.t_snap_us / 1000), (unsigned)(s_p.t_send_us / 1000),
+           (unsigned)(s_p.t_damage_us / 1000), (unsigned)s_p.damages,
+           (unsigned)(s_p.t_damage_wait_us / 1000));
+    s_p.t_damage_wait_us = 0;
+    s_p.t_snap_us = s_p.t_send_us = s_p.t_damage_us = 0;
+    s_p.damages = 0;
     s_p.sync_us = 0;
     s_p.sync_max_us = 0;
     s_p.gap_max_us = 0;
@@ -569,6 +721,7 @@ static bool work_is_all(uint16_t w, uint16_t h)
 static void pass(void)
 {
     {
+        const int64_t t_in = ag_port_us();
         lock();
         const uint16_t w = s_p.w;
         const uint16_t h = s_p.h;
@@ -582,6 +735,25 @@ static void pass(void)
          */
         const bool cont = s_p.cont && s_p.snap != NULL;
         s_p.cont = false;
+        rpal_t *const pl = (s_p.far_idx && s_p.pal != NULL) ? s_p.pal : NULL;
+        if (s_p.pal != NULL && s_p.pal_forget) {
+            s_p.pal_forget = false;
+            pal_reset(s_p.pal);
+        }
+        if (pl != NULL && !cont && !s_p.more && pl->missed) {
+            /* a new frame: the colours that did not fit, a table again -
+             * and after two frames that missed, a rest from indices */
+            pal_reset(pl);
+            if (++pl->misses_in_row >= 2u) {
+                pl->misses_in_row = 0;
+                pl->rest = RDP_PAL_REST;
+            }
+        } else if (pl != NULL && !cont && !s_p.more) {
+            pl->misses_in_row = 0;
+            if (pl->rest != 0u) {
+                pl->rest--;
+            }
+        }
         /* asked before this snapshot: it holds the program's last frame */
         const bool done = s_p.done_asked;
         if (!cont) {
@@ -617,6 +789,8 @@ static void pass(void)
         const uint16_t    room = s_p.room;
         const rdp_send_fn send = s_p.send;
         unlock();
+        const int64_t t_snapped = ag_port_us();
+        s_p.t_snap_us += t_snapped - t_in;
 
         bool     any = false;
         bool     ok = true;
@@ -663,10 +837,26 @@ static void pass(void)
                     const uint16_t *row =
                         ((s_p.snap != NULL) ? s_p.snap : s_p.pic) +
                         (size_t)yy * w;
+                    const uint8_t *ix =
+                        (pl != NULL && pl->rest == 0u)
+                            ? pal_index(pl, row + x0, (uint32_t)(x1 - x0))
+                            : NULL;
+                    if (ix != NULL && pl->told < pl->n) {
+                        ok = pal_tell(pl, room, handle, send);
+                        if (!ok) {
+                            break;
+                        }
+                    }
+                    if (ix != NULL) {
+                        s_p.idx_px += (uint32_t)(x1 - x0);
+                    } else {
+                        s_p.rgb_px += (uint32_t)(x1 - x0);
+                    }
                     const int rr =
                         (s_p.rects && (uint32_t)(x1 - x0) <= RDP_RECT_PX)
-                            ? put_rect_row(yy, x0, row + x0, (uint32_t)(x1 - x0), room,
-                                           handle, send)
+                            ? put_rect_row(yy, x0, row + x0, ix,
+                                           (uint32_t)(x1 - x0), room, handle,
+                                           send)
                             : -1;
                     if (rr >= 0) {
                         ok = rr > 0;
@@ -676,7 +866,9 @@ static void pass(void)
                          x += RDP_CHUNK) {
                         const uint32_t n = (x1 - x < RDP_CHUNK) ? x1 - x
                                                                 : RDP_CHUNK;
-                        ok = put_run(yy, x, row + x, n, room, handle, send);
+                        ok = put_run(yy, x, row + x,
+                                     (ix != NULL) ? ix + (x - x0) : NULL, n, room,
+                                     handle, send);
                         changed += n;
                     }
                     p->x0 = p->x1 = 0; /* sent: not again if continued */
@@ -686,6 +878,7 @@ static void pass(void)
                 }
             }
         }
+        s_p.more = cut && ok && s_p.snap == NULL;
         if (cut && ok) {
             if (s_p.snap != NULL) {
                 /* the rest stays in work, out of the snapshot */
@@ -709,6 +902,7 @@ static void pass(void)
         if (ok) {
             ok = flush(handle, send);
         }
+        s_p.t_send_us += ag_port_us() - t_snapped;
         if (s_p.pass_msgs > s_p.pass_msgs_max) {
             s_p.pass_msgs_max = s_p.pass_msgs;
         }
@@ -717,6 +911,7 @@ static void pass(void)
              * all of it again, next time */
             s_p.cont = false;
             s_p.redraws++;
+            s_p.pal_forget = true;
             lock();
             s_p.snap_is_far = false;
             for (uint32_t y = 0; y < s_p.h; y++) {
@@ -779,12 +974,20 @@ static void painter(void *arg)
          * reaches it, so a pause of RDP_FRAME_QUIET_US in the presents ends
          * one too.
          */
-        while (!s_p.cont && !s_p.frame_end &&
+        /*
+         * AND WITHOUT A SNAPSHOT TOO (30 Sep 2026).  Under Fallout there is no
+         * memory for the second picture, and the rest of a cut pass went back
+         * to the dirty rows to wait - for the program's next frame, and the
+         * pause between passes after it: one pass of eight messages a frame
+         * while the map scrolled, 45 passes and a third of the wire a second,
+         * a picture Maxim saw at two frames a second.
+         */
+        while (!s_p.cont && !s_p.more && !s_p.frame_end &&
                ag_port_us() - s_p.present_us < RDP_FRAME_QUIET_US) {
             (void)ag_port_sem_take(s_p.wake, ag_port_ms_to_ticks(2));
         }
         /* the rest of a frame goes at once: it is the same frame */
-        const bool rest = s_p.cont;
+        const bool rest = s_p.cont || s_p.more;
         if (!rest) {
             s_p.frame_end = false;
         }
@@ -810,6 +1013,20 @@ void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us)
 void rdp_far_rects(bool yes)
 {
     s_p.rects = yes;
+}
+
+void rdp_far_idx(bool yes)
+{
+    if (yes && !s_p.far_idx) {
+        s_p.pal_forget = true; /* whatever it had, it has from us no more */
+    }
+    s_p.far_idx = yes;
+}
+
+void rdp_idx_counts(uint32_t *idx_px, uint32_t *rgb_px)
+{
+    *idx_px = s_p.idx_px;
+    *rgb_px = s_p.rgb_px;
 }
 
 bool rdp_pass_whole(void)
@@ -851,6 +1068,7 @@ void rdp_forget(void)
         return;
     }
     s_p.redraws++;
+    s_p.pal_forget = true;
     lock();
     s_p.snap_is_far = false;
     for (uint32_t y = 0; y < s_p.h; y++) {
@@ -876,6 +1094,12 @@ static bool buffers(uint16_t w, uint16_t h, uint16_t room)
     s_p.dirty = ag_port_alloc((size_t)h * RDP_SPANS * sizeof(span_t), AG_MEM_BYTE);
     s_p.work = ag_port_alloc((size_t)h * RDP_SPANS * sizeof(span_t), AG_MEM_BYTE);
     s_p.msg = ag_port_alloc(room, AG_MEM_BYTE);
+    /* the palette is worth having, not worth failing for */
+    s_p.pal = ag_port_alloc(sizeof(rpal_t) + w, AG_MEM_BYTE);
+    if (s_p.pal != NULL) {
+        memset(s_p.pal, 0, sizeof(rpal_t));
+        pal_reset(s_p.pal);
+    }
     if (s_p.pic == NULL || s_p.known == NULL || s_p.dirty == NULL ||
         s_p.work == NULL || s_p.msg == NULL) {
         ag_port_free(s_p.pic);
@@ -929,11 +1153,15 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
         }
         s_p.said_us = ag_port_us();
     }
+    const int64_t t_dmg = ag_port_us();
     lock();
+    s_p.t_damage_wait_us += ag_port_us() - t_dmg;
     if (b->surf_w != s_p.w || b->surf_h != s_p.h) {
         if ((uint32_t)b->surf_w * b->surf_h > s_p.cap_px ||
             b->surf_h > s_p.cap_rows || room > s_p.room) {
             unlock();
+    s_p.t_damage_us += ag_port_us() - t_dmg;
+    s_p.damages++;
             return false; /* bigger than the picture was made for */
         }
         /* another shape: nothing of the far screen is known any more */
@@ -960,6 +1188,23 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
             memcpy(row + b->x, in, (size_t)(xe - b->x) * 2u);
             row_add(r, b->x, xe);
             marked = true;
+            continue;
+        }
+        /*
+         * ALREADY GOING WHOLE: a copy, and nothing to compare (30 Sep 2026).
+         * While the far screen is behind a picture that changes everywhere,
+         * the row is still marked from the last present, and comparing it
+         * pixel by pixel found what was already known - the program spent
+         * 360 ms of every second doing it, scrolling at 26 frames a second
+         * where noise went at 52.
+         */
+        bool covered = false;
+        for (uint32_t i = 0; i < RDP_SPANS && !covered; i++) {
+            covered = r[i].x0 <= b->x && r[i].x1 >= xe && r[i].x1 > r[i].x0;
+        }
+        if (covered) {
+            memcpy(row + b->x, in, (size_t)(xe - b->x) * 2u);
+            marked = true; /* and the painter woken: it may be waiting */
             continue;
         }
         /* what differs from what the far screen will show, and only that,
@@ -992,6 +1237,8 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
         s_p.frame_end = true;
     }
     unlock();
+    s_p.t_damage_us += ag_port_us() - t_dmg;
+    s_p.damages++;
     if (marked) {
         (void)ag_port_sem_give(s_p.wake);
     }
@@ -1057,6 +1304,7 @@ typedef struct {
     uint8_t                 next;
     uint32_t                t_unpack_us, t_blit_us, blits;
     uint32_t                fl[RDP_FL_N]; /* why a strip went to the glass */
+    uint16_t                pal[256];     /* the painter's palette, as told */
     uint16_t                px[RDP_RECT_PX];
 } rdraw_t;
 static rdraw_t *s_dr;
@@ -1081,6 +1329,8 @@ void rdp_draw_times(uint32_t *unpack_us, uint32_t *blit_us, uint32_t *blits,
 }
 
 bool rdp_draws_rects(void) { return s_dr != NULL; }
+
+bool rdp_draws_idx(void) { return s_dr != NULL; }
 
 static void blit_px(const ag_display_ops_t *d, uint16_t sw, uint16_t sh,
                     const uint16_t *px, uint16_t x, uint16_t y, uint16_t w,
@@ -1266,15 +1516,29 @@ static uint16_t *slot_take(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh)
 
 uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
 {
-    static uint16_t line[RDP_CHUNK];
     if (d == NULL || d->blit_rect == NULL || len < RDP_HDR) {
         return 0u;
     }
     if (s_dr == NULL) {
         s_dr = ag_port_alloc(sizeof(rdraw_t), AG_MEM_BYTE);
-        if (s_dr != NULL) {
-            memset(s_dr, 0, offsetof(rdraw_t, px));
+        if (s_dr == NULL) {
+            /*
+             * No block, no drawing: there used to be a row of 256 pixels in
+             * static memory to fall back on, and the emulated S3 had 64 bytes
+             * too few of it for anything else (30 Sep 2026).  A screen that
+             * cannot find 8 KB is not drawing a neighbour's picture anyway.
+             */
+            s_draw_faults++;
+            static bool said;
+            if (!said) {
+                said = true;
+                ag_log(AG_LOG_WARN, TAG, "no memory to draw a neighbour's "
+                                         "picture (%u bytes)",
+                       (unsigned)sizeof(rdraw_t));
+            }
+            return 0u;
         }
+        memset(s_dr, 0, offsetof(rdraw_t, px));
     }
     rdraw_t *const r = s_dr;
     const uint16_t w = get16(pay);
@@ -1295,14 +1559,33 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
         const uint16_t x = get16(pay + at + 2);
         const uint16_t n = get16(pay + at + 4);
         const uint16_t plen = get16(pay + at + 6);
-        uint16_t       rw = n, rh = 1;
+        if (y == RDP_PAL_ROW) {
+            /* palette entries: x the first, n how many */
+            at += RDP_RUN_HDR;
+            if (r == NULL || n == 0u || (uint32_t)x + n > 256u ||
+                plen != (uint32_t)n * 2u || at + plen > len) {
+                s_draw_faults++;
+                break;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                r->pal[x + i] = get16(pay + at + i * 2u);
+            }
+            at += plen;
+            continue;
+        }
+        const bool     idx = (n & RDP_IDX_BIT) != 0u;
+        uint16_t       rw = (uint16_t)(n & ~RDP_IDX_BIT), rh = 1;
+        if (idx && r == NULL) {
+            s_draw_faults++;
+            break;
+        }
         if ((n & RDP_RECT_BIT) != 0u) {
             /* a rectangle: its width, and its height in a fifth word */
             if (at + RDP_RECT_HDR > len) {
                 s_draw_faults++;
                 break;
             }
-            rw = (uint16_t)(n & ~RDP_RECT_BIT);
+            rw = (uint16_t)(n & ~(RDP_RECT_BIT | RDP_IDX_BIT));
             rh = get16(pay + at + 8);
             at += RDP_RECT_HDR;
             if (r == NULL || rw == 0u || rh == 0u ||
@@ -1313,26 +1596,25 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
             }
         } else {
             at += RDP_RUN_HDR;
-            if (n == 0u || n > RDP_CHUNK || at + plen > len || y >= h ||
-                (uint32_t)x + n > w) {
+            if (rw == 0u || rw > RDP_CHUNK || at + plen > len || y >= h ||
+                (uint32_t)x + rw > w) {
                 s_draw_faults++;
                 break; /* not a run: the rest cannot be trusted either */
             }
         }
         const uint32_t px = (uint32_t)rw * rh;
-        uint16_t      *into = (r != NULL) ? slot_take(x, y, rw, rh) : NULL;
+        uint16_t      *into = slot_take(x, y, rw, rh);
         bool           now = false;
         if (into == NULL) {
-            /* bigger than a slot, or no buffer: drawn at once, alone */
+            /* bigger than a slot: drawn at once, alone */
             rdp_draw_flush(RDP_FL_OTHER);
-            into = (r != NULL) ? r->px : line;
+            into = r->px;
             now = true;
         }
         const int64_t  t0 = ag_port_us();
-        const uint32_t took = rdc_unpack(pay + at, plen, into, px);
-        if (r != NULL) {
-            r->t_unpack_us += (uint32_t)(ag_port_us() - t0);
-        }
+        const uint32_t took = idx ? rdc_unpack8(pay + at, plen, r->pal, into, px)
+                                  : rdc_unpack(pay + at, plen, into, px);
+        r->t_unpack_us += (uint32_t)(ag_port_us() - t0);
         if (took != plen) {
             s_draw_faults++;
             break;

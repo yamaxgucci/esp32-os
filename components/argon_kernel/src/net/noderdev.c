@@ -38,6 +38,7 @@
 #include <argon/log.h>
 #include <argon/nodedev.h>
 #include <argon/nodename.h>
+#include <argon/power.h>
 #include <argon/proc.h>
 #include <argon/textpanel.h>
 
@@ -2168,6 +2169,7 @@ static int64_t s_glass_last_us;
  * leaves the word 0.
  */
 #define RD_CAN_RECTS 1u
+#define RD_CAN_IDX   2u
 static volatile bool s_glass_owed;
 /*
  * AND ANY PIECE OF THE PICTURE NOT DRAWN owes the same: a message dropped
@@ -2275,7 +2277,9 @@ static void paint_answer(int32_t wire, uint16_t from, uint16_t tag,
 {
     const ag_err_t e = send_raw(
         wire, from, (uint8_t)(RD_PAINTED | RD_REPLY), 0, tag, status,
-        rdp_draws_rects() ? RD_CAN_RECTS : 0u, handle, AG_LINK_CONTROL, NULL,
+        (rdp_draws_rects() ? RD_CAN_RECTS : 0u) |
+            (rdp_draws_idx() ? RD_CAN_IDX : 0u),
+        handle, AG_LINK_CONTROL, NULL,
         0);
     if (e != AG_OK) {
         ag_log(AG_LOG_WARN, TAG, "a pass's answer did not go out: %d", (int)e);
@@ -2448,6 +2452,7 @@ static void glass_lend(void)
         ag_dev_lock_hold();
         ag_textpanel_enable(false);
         ag_dev_lock_release();
+        ag_power_kernel_full(true); /* drawn at the full clock, not in cruise */
         ag_log(AG_LOG_INFO, TAG, "a neighbour is drawing on this screen");
     }
 }
@@ -2458,6 +2463,7 @@ static void glass_back(const char *why)
         return;
     }
     s_glass_lent = false;
+    ag_power_kernel_full(false);
     ag_textpanel_enable(true);
     s_glass_owed = true;
     ag_log(AG_LOG_INFO, TAG, "%s; the screen is this board's again", why);
@@ -2753,6 +2759,7 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         s_paint_acked = get16(b + 2);
         s_paint_heard = true; /* this screen answers: wait for it from now */
         rdp_far_rects((get32(b + 8) & RD_CAN_RECTS) != 0u);
+        rdp_far_idx((get32(b + 8) & RD_CAN_IDX) != 0u);
         rdev_t *const dp = s_display_proxy;
         if ((int32_t)get32(b + 4) == RD_PAINTED_GONE && dp != NULL &&
             dp->far_handle >= 0 && (uint32_t)dp->far_handle == get32(b + 12)) {
