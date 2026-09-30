@@ -168,8 +168,10 @@ ag_err_t ag_port_uart_dma_listen_ring(int port, uint32_t bytes);
 uint32_t ag_port_uart_dma_overruns(int port);
 /* A receive by a DMA the port drives itself (the ESP32's UHCI): its
  * interrupts, those that found nothing, descriptors taken as filled whole and
- * as ended by an idle line.  Zeros where there is none. */
-void     ag_port_uart_dma_diag(int port, uint32_t out[4]);
+ * as ended by an idle line; of the first, how many had a length written and
+ * how many none; of the second, how many had the owner bit given and how
+ * many only their end.  Zeros where there is none. */
+void     ag_port_uart_dma_diag(int port, uint32_t out[8]);
 
 #include <argon/port/impl/uart.h>
 

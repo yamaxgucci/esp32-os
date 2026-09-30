@@ -306,14 +306,17 @@ static void print_uartlink(void)
         if (ag_uartlink_stats(port, &u) != AG_OK) {
             continue;
         }
-        uint32_t dd[4];
+        uint32_t dd[8];
         ag_port_uart_dma_diag(port, dd);
         if (dd[0] != 0u) {
             ag_console_printf("uart%d   by DMA: %u interrupts (%u found "
-                              "nothing), %u descriptors filled whole, %u "
-                              "ended by an idle line\n",
+                              "nothing), %u descriptors filled whole (%u "
+                              "with a length, %u none), %u ended by an idle "
+                              "line (%u owner given, %u end only)\n",
                               port, (unsigned)dd[0], (unsigned)dd[1],
-                              (unsigned)dd[2], (unsigned)dd[3]);
+                              (unsigned)dd[2], (unsigned)dd[4],
+                              (unsigned)dd[5], (unsigned)dd[3],
+                              (unsigned)dd[6], (unsigned)dd[7]);
         }
         if (u.short_frames == 0u && u.blocks_unarmed == 0u &&
             u.stalls == 0u && u.timeouts == 0u) {

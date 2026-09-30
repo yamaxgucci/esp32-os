@@ -313,10 +313,12 @@ bool ag_port_uart_dma_can_send(void)
     return true;
 }
 
-void ag_port_uart_dma_diag(int port, uint32_t out[4])
+void ag_port_uart_dma_diag(int port, uint32_t out[8])
 {
     (void)port;
-    out[0] = out[1] = out[2] = out[3] = 0u;
+    for (int i = 0; i < 8; i++) {
+        out[i] = 0u;
+    }
 }
 
 /* One finished transfer, waited for.  A minute of patience is not a timeout
@@ -819,7 +821,12 @@ static struct {
     intr_handle_t      ih;
     e32_piece_t        cur;
     uint32_t           at;
+    volatile uint32_t  pos;        /* where the DMA is: see e32_isr */
+    uint32_t           last_cur;   /* the register's descriptor, last read */
     volatile uint32_t  calls, empty_calls, passed, ended;
+    /* what a closed descriptor held when taken: passed by with a length
+     * written / with none; ended with the owner given / with only its end */
+    volatile uint32_t  passed_len, passed_nolen, ended_owner, ended_eof;
 } s_e32 = {.port = -1};
 
 /* The descriptor the DMA is in, by its buffer; UINT32_MAX if that does not
@@ -835,15 +842,23 @@ static uint32_t IRAM_ATTR e32_current(void)
 }
 
 /*
- * WHERE THE DMA IS, NOT ONLY WHAT IT GAVE BACK (29 Sep 2026).  Taking the
- * descriptors by their owner bit alone, as the C3's are, the wire came up -
- * acknowledgements and short bursts, each ended by an idle line - and died
- * under the first real load: a descriptor the DMA fills whole and goes on
- * from does not come back with its bit given, and the handler stopped at it
- * for good.  So every descriptor from the last one taken up to the one the
- * DMA is in now is closed, whole unless the DMA wrote a length and an end in
- * it; the one it is in is taken only once it says it ended there (an idle
- * line), and nothing past it.
+ * WHERE THE DMA IS, KEPT HERE (29-30 Sep 2026).  What the DMA writes into a
+ * descriptor it has closed, counted on the CYD: one an idle line ended comes
+ * back with its owner bit given and its length (19 534 of 19 534); one it
+ * filled whole and went on from comes back with nothing at all - no bit, no
+ * length (12 of 12).  Taking them by the bit alone stopped at the first full
+ * one for good.  Taking them up to the descriptor its register says it is in
+ * went wrong both ways: after an idle end the register still names the one
+ * just handed over, which read as a lap ahead and sent the reader the whole
+ * ring of old bytes, and the register is not always up to date, which sent
+ * each burst a burst late.
+ *
+ * So the handler keeps where the DMA is itself, `pos`, a count that only
+ * goes forward: by how far the register has moved since it last looked -
+ * never a lap: a lap between two interrupts is lost bytes anyway - and past
+ * any descriptor ahead of it the DMA has given back.  Everything before `pos`
+ * is closed, with its length if given and whole if not; the one at `pos`
+ * only once given; nothing after.
  */
 static void IRAM_ATTR e32_isr(void *arg)
 {
@@ -852,44 +867,49 @@ static void IRAM_ATTR e32_isr(void *arg)
     UHCI0.int_clr.val = st;
     BaseType_t     woken = pdFALSE;
     uint32_t       taken = 0;
+    const uint32_t n = s_e32.nodes;
     const uint32_t cur = e32_current();
     s_e32.calls++;
-    for (; taken < s_e32.nodes; taken++) {
-        const uint32_t  k = s_e32.done % s_e32.nodes;
-        lldesc_t *const d = &s_e32.d[k];
-        const bool      wrote = d->eof != 0u || d->owner == 0u;
-        bool            last = false;
-        if (cur == UINT32_MAX) {
-            if (!wrote) {
-                break; /* where the DMA is cannot be read: its word alone */
-            }
-        } else if (k == cur) {
-            if (!wrote) {
-                break; /* being filled */
-            }
-            last = true; /* ended here by an idle line: nothing after it */
+    if (cur != UINT32_MAX) {
+        s_e32.pos += (cur + n - s_e32.last_cur) % n;
+        s_e32.last_cur = cur;
+    }
+    /* a descriptor given back further on: the DMA has been there */
+    for (uint32_t i = s_e32.pos + 1u; i < s_e32.done + n; i++) {
+        if (s_e32.d[i % n].owner == 0u) {
+            s_e32.pos = i;
         }
-        uint32_t n = d->length;
-        if (!wrote) {
-            n = E32_NODE; /* passed by, filled whole */
+    }
+    while (s_e32.done < s_e32.pos ||
+           (s_e32.done == s_e32.pos && s_e32.d[s_e32.done % n].owner == 0u)) {
+        lldesc_t *const d = &s_e32.d[s_e32.done % n];
+        uint32_t        len = d->length;
+        if (d->owner != 0u) {
+            if (len != 0u) {
+                s_e32.passed_len++;
+            } else {
+                s_e32.passed_nolen++;
+            }
+            len = E32_NODE; /* passed by, filled whole */
             s_e32.passed++;
         } else {
+            if (d->eof != 0u) {
+                s_e32.ended_eof++;
+            }
+            s_e32.ended_owner++;
             s_e32.ended++;
         }
-        const e32_piece_t pc = {(const uint8_t *)d->buf, n, s_e32.done};
+        const e32_piece_t pc = {(const uint8_t *)d->buf, len, s_e32.done};
         d->length = 0;
         d->eof = 0;
         d->owner = 1;
         s_e32.done++;
+        taken++;
         if (pc.n > 0u && xQueueSendFromISR(s_e32.q, &pc, &woken) != pdTRUE) {
             e32_piece_t old;
             (void)xQueueReceiveFromISR(s_e32.q, &old, &woken);
             (void)xQueueSendFromISR(s_e32.q, &pc, &woken);
             s_e32.overrun++;
-        }
-        if (last) {
-            taken++;
-            break;
         }
     }
     if (taken == 0u) {
@@ -900,13 +920,17 @@ static void IRAM_ATTR e32_isr(void *arg)
     }
 }
 
-void ag_port_uart_dma_diag(int port, uint32_t out[4])
+void ag_port_uart_dma_diag(int port, uint32_t out[8])
 {
     const bool mine = (port == s_e32.port);
     out[0] = mine ? s_e32.calls : 0u;
     out[1] = mine ? s_e32.empty_calls : 0u;
     out[2] = mine ? s_e32.passed : 0u;
     out[3] = mine ? s_e32.ended : 0u;
+    out[4] = mine ? s_e32.passed_len : 0u;
+    out[5] = mine ? s_e32.passed_nolen : 0u;
+    out[6] = mine ? s_e32.ended_owner : 0u;
+    out[7] = mine ? s_e32.ended_eof : 0u;
 }
 
 bool ag_port_uart_dma_ready(int port)
@@ -934,9 +958,11 @@ ag_err_t ag_port_uart_dma_listen_ring(int port, uint32_t bytes)
     if (s_e32.port >= 0) {
         return (s_e32.port == port) ? AG_OK : -AG_EBUSY;
     }
+    /* at least 8 KB, 10 ms of 8 Mbaud: 4 KB was 5 ms, and a reader on a
+     * board drawing a full-screen picture is sometimes later than that */
     uint32_t nodes = (bytes != 0u ? bytes : 8192u) / E32_NODE;
-    if (nodes < 4u) {
-        nodes = 4u;
+    if (nodes < 8u) {
+        nodes = 8u;
     }
     s_e32.d = heap_caps_calloc(nodes, sizeof(lldesc_t),
                                MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -956,6 +982,8 @@ ag_err_t ag_port_uart_dma_listen_ring(int port, uint32_t bytes)
     }
     s_e32.nodes = nodes;
     s_e32.done = 0;
+    s_e32.pos = 0;
+    s_e32.last_cur = 0;
     for (uint32_t k = 0; k < nodes; k++) {
         lldesc_t *const d = &s_e32.d[k];
         d->size = E32_NODE;
@@ -1041,9 +1069,15 @@ int32_t ag_port_uart_dma_read(int port, void *buf, size_t len,
             n = len - got;
         }
         memcpy((uint8_t *)buf + got, s_e32.cur.p + s_e32.at, n);
-        /* its descriptor comes round again after `nodes` more: until then
-         * nothing has written over it */
-        if ((uint32_t)(s_e32.done - s_e32.cur.no) >= s_e32.nodes) {
+        /*
+         * ITS DESCRIPTOR COMES ROUND AGAIN AFTER `nodes` MORE - counted from
+         * where the DMA is (e32_isr's `pos`), not from what the handler has
+         * taken (30 Sep 2026): a DMA a lap ahead of a late handler writes
+         * over a piece while it is being copied, and counted from the
+         * handler's count the piece went on as if whole.
+         */
+        const uint32_t pos = s_e32.pos;
+        if ((uint32_t)(pos - s_e32.cur.no) >= s_e32.nodes) {
             s_e32.overrun++;
             s_e32.at = s_e32.cur.n;
             continue;
@@ -1093,10 +1127,12 @@ bool ag_port_uart_dma_ready(int port)
     return false;
 }
 
-void ag_port_uart_dma_diag(int port, uint32_t out[4])
+void ag_port_uart_dma_diag(int port, uint32_t out[8])
 {
     (void)port;
-    out[0] = out[1] = out[2] = out[3] = 0u;
+    for (int i = 0; i < 8; i++) {
+        out[i] = 0u;
+    }
 }
 
 bool ag_port_uart_dma_can_send(void)
