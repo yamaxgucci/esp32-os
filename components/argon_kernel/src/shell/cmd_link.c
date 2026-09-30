@@ -408,14 +408,25 @@ static void print_stats(void)
                           (unsigned)nd, (unsigned)np, (unsigned)mop,
                           (unsigned)mlen, (unsigned)mf);
     }
-    uint32_t fs = 0, fsl = 0, fst = 0, fsms = 0, fmax = 0;
-    ag_noderdev_frames_seen(&fs, &fsl, &fst, &fsms, &fmax);
+    uint32_t fs = 0, fsl = 0, fst = 0, fsms = 0, fmax = 0, fnr = 0;
+    ag_noderdev_frames_seen(&fs, &fsl, &fst, &fsms, &fmax, &fnr);
     if (fs != 0u) {
         ag_console_printf("seen    %u frames drawn whole here; %u waits of "
                           "250 ms or more between two (%u ms together), %u of "
-                          "a second or more, the longest %u ms\n",
+                          "a second or more, the longest %u ms (before "
+                          "frame %u)\n",
                           (unsigned)fs, (unsigned)fsl, (unsigned)fsms,
-                          (unsigned)fst, (unsigned)fmax);
+                          (unsigned)fst, (unsigned)fmax, (unsigned)fnr);
+    }
+    uint32_t tfc = 0, bnp = 0, bno = 0, braw = 0;
+    int32_t  berr = 0;
+    ag_noderdev_blit_counts(&tfc, &bnp, &bno, &berr, &braw);
+    if (tfc != 0u) {
+        ag_console_printf("to far  %u blits for the neighbour's screen: %u with "
+                          "none chosen, %u it would not open (last %d), %u "
+                          "raw\n",
+                          (unsigned)tfc, (unsigned)bnp, (unsigned)bno,
+                          (int)berr, (unsigned)braw);
     }
     uint32_t whole = 0, passes = 0, pass_wait = 0;
     rdp_counts(&whole, &passes, &pass_wait);

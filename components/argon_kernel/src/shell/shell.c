@@ -473,7 +473,7 @@ static int cmd_cpu(int argc, char **argv)
     if (t == NULL) {
         t = ag_port_alloc(sizeof(*t) * MAX_TASKS, AG_MEM_BYTE);
     } else {
-        before = ag_port_task_list(t + MAX_TASKS, MAX_TASKS);
+        before = ag_port_task_names(t + MAX_TASKS, MAX_TASKS);
         if (before > MAX_TASKS) {
             before = MAX_TASKS;
         }
@@ -485,7 +485,7 @@ static int cmd_cpu(int argc, char **argv)
     ag_cpu_sample(true);
     ag_port_task_delay(ag_port_ms_to_ticks(((secs == 0u) ? 1u : secs) * 1000u));
     ag_cpu_sample(false);
-    uint32_t n = ag_port_task_list(t, MAX_TASKS);
+    uint32_t n = ag_port_task_names(t, MAX_TASKS);
     if (n > MAX_TASKS) {
         n = MAX_TASKS;
     }

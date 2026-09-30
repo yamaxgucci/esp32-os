@@ -63,6 +63,16 @@ ag_pid_t ag_display_owner(void);
  */
 void ag_display_force_release(void);
 
+/*
+ * The focus came back to `pid`: if the screen was taken from it by force
+ * (not let go by itself), it has it again, showing the frame it had.  An
+ * application acquires once and draws for ever; without this, one that
+ * had its slot switched away and back drew into a screen it no longer
+ * held, every flush dropped, and the glass kept the shell (30 Sep 2026:
+ * Fallout after Ctrl+\ and Alt+1).
+ */
+void ag_display_focus_back(ag_pid_t pid);
+
 /* Present the last snap with a one-line label (Alt-Tab overlay). */
 void ag_display_show_overlay(const char *label);
 

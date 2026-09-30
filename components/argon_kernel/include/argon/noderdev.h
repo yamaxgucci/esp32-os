@@ -106,12 +106,25 @@ void ag_noderdev_screen_counts(uint32_t *passes, uint32_t *lost,
  * WHAT A PERSON SEES of a neighbour's picture here: frames drawn whole, the
  * waits between two of them of a quarter of a second or more and of a
  * second or more, the time those quarter-second waits took together, and the
- * longest.  An average of frames a second hides a picture that stands still
+ * longest, and which frame ended it.  An average of frames a second hides a picture that stands still
  * for two seconds and then runs (28 Sep 2026: "9.4 a second" where Maxim saw
  * one frame in two seconds most of the time).
  */
+/* The display was released here: a neighbour's screen showing it is told,
+ * behind the last of what was drawn, so it can take its glass back. */
+void ag_noderdev_screen_done(void);
+/* The painting side: blits handed to the neighbour's screen, those with no
+ * screen chosen, those the far end would not open (and its last error),
+ * and those sent raw for want of the painter's memory. */
+void ag_noderdev_blit_counts(uint32_t *calls, uint32_t *noproxy,
+                             uint32_t *noopen, int32_t *open_err,
+                             uint32_t *raw);
+/* ...and taken again: the neighbour's screen gets the whole picture. */
+void ag_noderdev_screen_taken(void);
+
 void ag_noderdev_frames_seen(uint32_t *frames, uint32_t *slow, uint32_t *stalls,
-                             uint32_t *slow_ms, uint32_t *gap_max_ms);
+                             uint32_t *slow_ms, uint32_t *gap_max_ms,
+                             uint32_t *gap_max_nr);
 /* The painting board's side: passes whose wait for the far end ran out
  * (RD_PAINT_WAIT_MS), the longest wait, and markers the wire refused. */
 void ag_noderdev_paint_waits(uint32_t *timeouts, uint32_t *wait_max_ms,

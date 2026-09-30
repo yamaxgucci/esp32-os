@@ -90,5 +90,8 @@ typedef struct {
 } ag_port_task_info_t;
 
 uint32_t ag_port_task_list(ag_port_task_info_t *out, uint32_t max);
+/* The same list without reading the stacks (stack_bytes and stack_unused 0):
+ * cheap enough to take while something is playing. */
+uint32_t ag_port_task_names(ag_port_task_info_t *out, uint32_t max);
 
 #endif /* ARGON_PORT_TASK_H */

@@ -19,6 +19,7 @@
 #include <argon/device.h>
 #include <argon/draw.h>
 #include <argon/log.h>
+#include <argon/noderdev.h>
 #include <argon/path.h>
 #include <argon/proc.h>
 #include <argon/session.h>
@@ -89,6 +90,8 @@ static uint16_t  s_h;
 static uint32_t  s_stride; /* bytes per row */
 static bool      s_ready;
 static bool      s_acquired;
+/* whose screen was taken from it by force, to give back with its focus */
+static ag_pid_t  s_taken_from = AG_PID_KERNEL;
 static ag_pid_t  s_owner = AG_PID_KERNEL;
 static bool      s_have_snap;
 static bool      s_front_owned; /* false when front is QEMU's dedicated FB */
@@ -808,6 +811,7 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
         s_stride = (uint32_t)pw * sizeof(uint16_t);
         s_acquired = true;
         s_owner = ag_proc_self();
+        ag_noderdev_screen_taken();
         s_draw = NULL;
         s_warned_surfaceless = false;
         s_shim_seen = false;
@@ -828,6 +832,7 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
     }
     s_acquired = true;
     s_owner = ag_proc_self();
+    ag_noderdev_screen_taken();
     s_caret_col = -1;
     s_clip_x = 0;
     s_clip_y = 0;
@@ -857,6 +862,9 @@ static void gfx_release(void)
     if (!s_acquired) {
         return;
     }
+    /* a neighbour's screen showing this one has its glass back once the
+     * last frame has reached it (noderdev.c, THE GLASS) */
+    ag_noderdev_screen_done();
     /*
      * Who lost the glass, and to whom.  A release is invisible from outside
      * and there are four roads into it, three of them force_release from the
@@ -866,6 +874,7 @@ static void gfx_release(void)
      */
     ag_log(AG_LOG_INFO, "display", "release: owner pid %u, by pid %u",
            (unsigned)s_owner, (unsigned)ag_proc_self());
+    s_taken_from = AG_PID_KERNEL; /* let go of: nothing to give back */
     if (s_surfaceless) {
         shim_kick(); /* whatever was still pending is this app's last frame */
         s_acquired = false;
@@ -1436,7 +1445,41 @@ bool ag_display_acquired(void) { return s_acquired; }
 
 ag_pid_t ag_display_owner(void) { return s_owner; }
 
-void ag_display_force_release(void) { gfx_release(); }
+void ag_display_force_release(void)
+{
+    /* whoever's context this runs in - Ctrl+\ is read inside the owner's own
+     * poll for input - it is taken, not let go */
+    const ag_pid_t owner = s_acquired ? s_owner : AG_PID_KERNEL;
+    gfx_release();
+    s_taken_from = owner;
+}
+
+void ag_display_focus_back(ag_pid_t pid)
+{
+    if (!s_ready || s_acquired || pid == AG_PID_KERNEL || pid != s_taken_from) {
+        return;
+    }
+    s_taken_from = AG_PID_KERNEL;
+    s_acquired = true;
+    s_owner = pid;
+    ag_noderdev_screen_taken();
+    ag_log(AG_LOG_INFO, "display", "pid %u has the screen back",
+           (unsigned)pid);
+    if (s_surfaceless) {
+        return; /* its next present is the picture */
+    }
+    /* the frame it had, and the buffer it was given to draw in */
+    if (s_have_snap && s_snap != NULL && s_front != NULL) {
+        memcpy(s_front, s_snap, fb_bytes());
+    }
+    if (s_back != NULL) {
+        memcpy(s_back, s_front, fb_bytes());
+        s_draw = s_back;
+    } else {
+        s_draw = s_front;
+    }
+    panel_present();
+}
 
 void ag_display_show_overlay(const char *label)
 {

@@ -80,6 +80,20 @@ void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us);
  * far end counts the frames it has drawn whole, which is what a person sees. */
 bool rdp_pass_whole(void);
 
+/*
+ * The program drawing on the far screen let it go (the display was
+ * released).  The painter says so in a marker behind the last of what it
+ * drew, and the far screen takes its glass back then - not when a picture
+ * has stood still for a while, which a game's menu does for minutes.
+ * rdp_pass_done: for the sync, whether this pass carries it.
+ */
+void rdp_screen_done(void);
+bool rdp_pass_done(void);
+/* A program took the display again: if the far screen was told it was let
+ * go, it shows its own console now, and every row goes again - a picture
+ * that does not change would otherwise never be sent. */
+void rdp_screen_taken(void);
+
 /* The far screen said it draws a rectangle sent as one run; this screen
  * does (it has the buffer to unpack one into).  See rdpaint.c. */
 void rdp_far_rects(bool yes);

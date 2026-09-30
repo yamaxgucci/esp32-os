@@ -22,7 +22,8 @@
  * One walk of the task lists: each task once, however many lists it passed
  * through while being walked.
  */
-static uint32_t walk(ag_port_task_info_t *out, uint32_t max, uint32_t *seen)
+static uint32_t walk(ag_port_task_info_t *out, uint32_t max, uint32_t *seen,
+                     bool stacks)
 {
     uint32_t       n = 0;
     uint32_t       all = 0;
@@ -63,14 +64,16 @@ static uint32_t walk(ag_port_task_info_t *out, uint32_t max, uint32_t *seen)
             memset(o, 0, sizeof(*o));
             strncpy(o->name, pcTaskGetName(t), sizeof(o->name) - 1u);
             TaskSnapshot_t snap;
-            const uint8_t *const base = pxTaskGetStackStart(t);
+            const uint8_t *const base = stacks ? pxTaskGetStackStart(t) : NULL;
             if (base != NULL && vTaskGetSnapshot(t, &snap) == pdTRUE) {
                 const uint8_t *const end = (const uint8_t *)snap.pxEndOfStack;
                 o->stack_bytes = (end > base)
                                      ? (uint32_t)(end - base) + sizeof(StackType_t)
                                      : (uint32_t)(base - end) + sizeof(StackType_t);
             }
-            o->stack_unused = (uint32_t)uxTaskGetStackHighWaterMark(t);
+            if (stacks) {
+                o->stack_unused = (uint32_t)uxTaskGetStackHighWaterMark(t);
+            }
             o->prio = (unsigned)uxTaskPriorityGet(t);
             o->task = t;
             n++;
@@ -90,17 +93,34 @@ static uint32_t walk(ag_port_task_info_t *out, uint32_t max, uint32_t *seen)
  * one run the reader and the next its sender.  So the walk is repeated,
  * up to four times, until it finds as many tasks as the kernel counts.
  */
-uint32_t ag_port_task_list(ag_port_task_info_t *out, uint32_t max)
+static uint32_t task_list(ag_port_task_info_t *out, uint32_t max, bool stacks)
 {
     if (out == NULL || max == 0u) {
         return (uint32_t)uxTaskGetNumberOfTasks();
     }
     uint32_t seen = 0;
     for (int attempt = 0; attempt < 4; attempt++) {
-        (void)walk(out, max, &seen);
+        (void)walk(out, max, &seen, stacks);
         if (seen >= (uint32_t)uxTaskGetNumberOfTasks()) {
             break;
         }
     }
     return seen;
+}
+
+uint32_t ag_port_task_list(ag_port_task_info_t *out, uint32_t max)
+{
+    return task_list(out, max, true);
+}
+
+/*
+ * WITHOUT THE STACKS (30 Sep 2026).  How much of a stack was never touched is
+ * found by reading it from the far end until the fill pattern stops - every
+ * task's, byte by byte, with this core's scheduler held, up to four walks.
+ * `cpu` wants names and priorities only, and on the CYD the scan held the
+ * sound's task off its core for long enough to hear.
+ */
+uint32_t ag_port_task_names(ag_port_task_info_t *out, uint32_t max)
+{
+    return task_list(out, max, false);
 }

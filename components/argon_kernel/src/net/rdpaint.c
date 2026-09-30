@@ -240,6 +240,11 @@ static struct {
      * sends only what differs from it (trim_to_far) */
     bool     snap_is_far;
     uint32_t redraws;       /* times every row had to go again */
+    /* the program let the screen go: said by a marker once what it drew
+     * has gone (rdp_screen_done), and the marker carrying it */
+    volatile bool done_asked;
+    bool          pass_done;
+    volatile bool done_sent; /* ...and the far screen was told */
 } s_p;
 
 static uint16_t get16(const uint8_t *p)
@@ -577,6 +582,8 @@ static void pass(void)
          */
         const bool cont = s_p.cont && s_p.snap != NULL;
         s_p.cont = false;
+        /* asked before this snapshot: it holds the program's last frame */
+        const bool done = s_p.done_asked;
         if (!cont) {
         memcpy(s_p.work, s_p.dirty, (size_t)h * RDP_SPANS * sizeof(span_t));
         memset(s_p.dirty, 0, (size_t)h * RDP_SPANS * sizeof(span_t));
@@ -719,6 +726,11 @@ static void pass(void)
         } else if (any) {
             s_p.passes++;
             s_p.pass_whole = !cut;
+            s_p.pass_done = done && !cut;
+            if (s_p.pass_done) {
+                s_p.done_asked = false;
+                s_p.done_sent = true;
+            }
             if (!cut) {
                 s_p.frames++; /* nothing of it left: a whole frame went */
             }
@@ -739,6 +751,15 @@ static void pass(void)
                 s_p.gap_max_us = now - s_p.last_pass_us;
             }
             s_p.last_pass_us = now;
+            s_p.pass_done = false;
+        } else if (ok && done && s_sync != NULL) {
+            /* nothing left to draw: the marker alone, and it is no frame */
+            s_p.done_asked = false;
+            s_p.done_sent = true;
+            s_p.pass_whole = false;
+            s_p.pass_done = true;
+            s_sync(handle);
+            s_p.pass_done = false;
         }
         report();
     }
@@ -794,6 +815,29 @@ void rdp_far_rects(bool yes)
 bool rdp_pass_whole(void)
 {
     return s_p.pass_whole;
+}
+
+bool rdp_pass_done(void)
+{
+    return s_p.pass_done;
+}
+
+void rdp_screen_done(void)
+{
+    if (s_p.task == NULL || s_p.pic == NULL) {
+        return; /* nothing was ever sent: nothing to say */
+    }
+    s_p.done_asked = true;
+    (void)ag_port_sem_give(s_p.wake);
+}
+
+void rdp_screen_taken(void)
+{
+    s_p.done_asked = false; /* taken again before the marker went: no marker */
+    if (s_p.done_sent) {
+        s_p.done_sent = false;
+        rdp_forget(); /* its console has the glass: all of it again */
+    }
 }
 
 uint32_t rdp_redraws(void)

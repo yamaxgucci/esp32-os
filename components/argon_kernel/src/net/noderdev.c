@@ -907,8 +907,10 @@ static uint32_t msgs_in_flight(uint16_t seq, uint16_t acked)
 }
 
 #define RD_PAINT_WAIT_MS 1000u
-/* in a marker's last word: this pass ended its frame */
+/* in a marker's last word: this pass ended its frame; the program that drew
+ * it let the screen go (older receivers ignore both) */
 #define RD_PASS_WHOLE 1u
+#define RD_PASS_DONE  2u
 #define RD_PAINT_LEGACY  3u
 
 /*
@@ -959,7 +961,8 @@ static void rd_sync_z(uint32_t handle)
     put32(msg + 8, 0);
     /* the last pass of its frame: the far end counts the frames it drew
      * whole (older receivers leave this word alone) */
-    put32(msg + 12, rdp_pass_whole() ? RD_PASS_WHOLE : 0u);
+    put32(msg + 12, (rdp_pass_whole() ? RD_PASS_WHOLE : 0u) |
+                        (rdp_pass_done() ? RD_PASS_DONE : 0u));
     if (link_send(p->wire, p->node, AG_LINK_BULK, msg, RD_HDR) < 0) {
         s_paint_unsent++;
         return;
@@ -1088,18 +1091,49 @@ static void rd_blit_raw(rdev_t *p, const ag_blit_t *b)
  * raw.  Nothing is packed there - noise does not pack - so that number is
  * the floor this has to keep.
  */
+/*
+ * Blits handed to the neighbour's screen, and the ones that went nowhere:
+ * no screen chosen, or the far end would not open it (the last error).  A
+ * game's picture reached nothing and nothing here said so (30 Sep 2026).
+ */
+static uint32_t s_blit_calls, s_blit_noproxy, s_blit_noopen, s_blit_raw;
+static int32_t  s_blit_open_err;
+
+void ag_noderdev_blit_counts(uint32_t *calls, uint32_t *noproxy,
+                             uint32_t *noopen, int32_t *open_err,
+                             uint32_t *raw)
+{
+    *calls = s_blit_calls;
+    *noproxy = s_blit_noproxy;
+    *noopen = s_blit_noopen;
+    *open_err = s_blit_open_err;
+    *raw = s_blit_raw;
+}
+
 static void rd_blit(ag_handle_t h, const ag_blit_t *b)
 {
     rdev_t *p = proxy_of(h);
-    if (p == NULL || b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
+    if (b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
         return;
     }
-    if (ensure_open(p) != AG_OK) {
+    s_blit_calls++;
+    if (p == NULL) {
+        s_blit_noproxy++;
+        return;
+    }
+    const ag_err_t oe = ensure_open(p);
+    if (oe != AG_OK) {
+        if (s_blit_noopen++ == 0u) {
+            ag_log(AG_LOG_WARN, TAG, "%s would not open (%d): the picture "
+                   "goes nowhere until it does", p->name, (int)oe);
+        }
+        s_blit_open_err = (int32_t)oe;
         return;
     }
     rdp_set_sync(rd_sync_z);
     if (!rdp_damage(b, (uint32_t)p->far_handle, rd_pour_payload(p),
                     rd_send_z)) {
+        s_blit_raw++;
         rd_blit_raw(p, b); /* no memory for the painter: every pixel, raw */
     }
 }
@@ -1350,6 +1384,7 @@ static uint32_t s_scr_raw, s_scr_text, s_scr_asked;
 static uint32_t serve_poured_class(ag_device_t *dev,
                                    const rd_period_t *pd);
 static void     glass_back_if_quiet(void);
+static void     glass_back(const char *why);
 static void     screen_report(void);
 static void     screen_lost(void);
 
@@ -1831,11 +1866,14 @@ static void pour_screen_one(void)
 {
     rd_period_t *pd = &s_scr.e[s_scr.r];
     if (pd->op == RD_PAINTED) {
-        if ((pd->off & RD_PASS_WHOLE) != 0u) {
+        if ((pd->off & (RD_PASS_WHOLE | RD_PASS_DONE)) != 0u) {
             /* a frame is on the glass whole when it says so */
             rdp_draw_flush(RDP_FL_FRAME);
         }
         pour_pass_drawn(pd);
+        if ((pd->off & RD_PASS_DONE) != 0u) {
+            glass_back("the neighbour's program let it go");
+        }
         s_scr.r = (s_scr.r + 1u) % s_scr.n;
         return;
     }
@@ -2088,8 +2126,16 @@ static void pour_task(void *arg)
  * painting the rows that changed over the picture, and when the neighbour's
  * program ended the glass kept whatever was last on it - Maxim found the CYD
  * showing a white screen with nothing wrong with it (26 Sep 2026).  So while
- * pictures arrive the console keeps off the panel, and after RD_GLASS_QUIET_US
- * without one it has the glass back and repaints all of it.
+ * pictures arrive the console keeps off the panel, and it has the glass back
+ * and repaints all of it when the neighbour's program lets the screen go
+ * (a marker with RD_PASS_DONE), when the neighbour starts over, or after
+ * RD_GLASS_QUIET_US with neither a picture nor the link.
+ *
+ * NOT WHEN THE PICTURE STANDS STILL (30 Sep 2026).  It went back after
+ * RD_GLASS_QUIET_US without a picture, and Fallout's main menu does not
+ * move: a second and a half after it was drawn the CYD showed its own
+ * console, and the game - drawing nothing, because nothing had changed -
+ * never learned it had to draw again.  Maxim: the game is not running.
  */
 #define RD_GLASS_QUIET_US 1500000
 static bool    s_glass_lent;
@@ -2163,6 +2209,10 @@ static uint32_t s_all_passes, s_all_snd_q_max;
  * turns it on; `link` shows the totals without it.
  */
 static volatile bool s_report;
+
+void ag_noderdev_screen_done(void) { rdp_screen_done(); }
+
+void ag_noderdev_screen_taken(void) { rdp_screen_taken(); }
 
 void ag_noderdev_report(bool on)
 {
@@ -2249,11 +2299,15 @@ static void acker_task(void *arg)
 #define RD_SEEN_SLOW_US  250000
 #define RD_SEEN_STALL_US 1000000
 static uint32_t s_seen_frames, s_seen_slow, s_seen_stalls;
+/* the frame that ended the longest wait: an early one is a program starting */
+static uint32_t s_seen_gap_nr;
 static int64_t  s_seen_at, s_seen_slow_us, s_seen_gap_max;
 
 void ag_noderdev_frames_seen(uint32_t *frames, uint32_t *slow, uint32_t *stalls,
-                             uint32_t *slow_ms, uint32_t *gap_max_ms)
+                             uint32_t *slow_ms, uint32_t *gap_max_ms,
+                             uint32_t *gap_max_nr)
 {
+    *gap_max_nr = s_seen_gap_nr;
     *frames = s_seen_frames;
     *slow = s_seen_slow;
     *stalls = s_seen_stalls;
@@ -2286,6 +2340,7 @@ static void pour_pass_drawn(const rd_period_t *pd)
         }
         if (gap > s_seen_gap_max) {
             s_seen_gap_max = gap;
+            s_seen_gap_nr = s_seen_frames;
         }
         s_seen_at = now;
     }
@@ -2397,14 +2452,30 @@ static void glass_lend(void)
     }
 }
 
+static void glass_back(const char *why)
+{
+    if (!s_glass_lent) {
+        return;
+    }
+    s_glass_lent = false;
+    ag_textpanel_enable(true);
+    s_glass_owed = true;
+    ag_log(AG_LOG_INFO, TAG, "%s; the screen is this board's again", why);
+}
+
+/* the neighbour started over: what it drew is nobody's (pour task's to act on) */
+static volatile bool s_glass_orphaned;
+
 static void glass_back_if_quiet(void)
 {
-    if (s_glass_lent && ag_port_us() - s_glass_last_us > RD_GLASS_QUIET_US) {
-        s_glass_lent = false;
-        ag_textpanel_enable(true);
-        s_glass_owed = true;
-        ag_log(AG_LOG_INFO, TAG, "the neighbour stopped drawing; the screen "
-                                 "is this board's again");
+    if (s_glass_orphaned) {
+        s_glass_orphaned = false;
+        glass_back("the neighbour started over");
+        return;
+    }
+    if (s_glass_lent && ag_port_us() - s_glass_last_us > RD_GLASS_QUIET_US &&
+        !ag_linkprov_up()) {
+        glass_back("the neighbour is not heard");
     }
 }
 
@@ -3204,6 +3275,9 @@ static void want_src(int32_t src);
 
 void ag_noderdev_peer_named(int32_t wire, bool again)
 {
+    if (again) {
+        s_glass_orphaned = true; /* whatever it drew here, it drew before */
+    }
     if (!s_auto || wire < 0 || wire >= (int32_t)AG_LINK_WIRES) {
         return;
     }
