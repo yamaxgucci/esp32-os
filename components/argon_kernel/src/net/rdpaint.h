@@ -84,6 +84,23 @@ bool rdp_pass_whole(void);
  * does (it has the buffer to unpack one into).  See rdpaint.c. */
 void rdp_far_rects(bool yes);
 bool rdp_draws_rects(void);
+/* Whether rdp_draw holds pixels not yet on the glass. */
+bool rdp_draw_holds(void);
+/* Why a strip gathered by rdp_draw went to the glass. */
+enum {
+    RDP_FL_EVICT, /* full, or neither slot took the next piece       */
+    RDP_FL_UNDER, /* a new piece lands on it                         */
+    RDP_FL_FRAME, /* a frame's end                                   */
+    RDP_FL_IDLE,  /* nothing more arrived                            */
+    RDP_FL_OTHER, /* another screen, or a piece bigger than a slot   */
+    RDP_FL_N
+};
+/* Time rdp_draw spent unpacking and blitting, its blits, and why its strips
+ * were drawn, since asked. */
+void rdp_draw_times(uint32_t *unpack_us, uint32_t *blit_us, uint32_t *blits,
+                    uint32_t why[RDP_FL_N]);
+/* Draw what rdp_draw is still gathering, for the reason `why` (RDP_FL_*). */
+void rdp_draw_flush(unsigned why);
 
 /* Times every row went again: the wire refused a pass, or the far screen
  * said it no longer shows what was sent. */

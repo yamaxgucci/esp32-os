@@ -23,7 +23,8 @@ static uint16_t get_px(const uint8_t *p)
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-uint32_t rdc_pack(const uint16_t *px, uint32_t n, uint8_t *out, uint32_t cap)
+static uint32_t pack(const uint16_t *px, uint32_t n, uint8_t *out,
+                     uint32_t cap, uint32_t *taken)
 {
     uint32_t at = 0;
     uint32_t i = 0;
@@ -35,7 +36,7 @@ uint32_t rdc_pack(const uint16_t *px, uint32_t n, uint8_t *out, uint32_t cap)
         }
         if (run >= RDC_RUN_MIN) {
             if (at + 3u > cap) {
-                return 0u;
+                break;
             }
             out[at] = (uint8_t)(run + 125u);
             put_px(out + at + 1u, px[i]);
@@ -53,7 +54,11 @@ uint32_t rdc_pack(const uint16_t *px, uint32_t n, uint8_t *out, uint32_t cap)
             lit++;
         }
         if (at + 1u + 2u * lit > cap) {
-            return 0u;
+            /* as many of them as there is room for, and no more */
+            lit = (at + 3u <= cap) ? (cap - at - 1u) / 2u : 0u;
+            if (lit == 0u) {
+                break;
+            }
         }
         out[at++] = (uint8_t)(lit - 1u);
         for (uint32_t k = 0; k < lit; k++) {
@@ -62,7 +67,21 @@ uint32_t rdc_pack(const uint16_t *px, uint32_t n, uint8_t *out, uint32_t cap)
         }
         i += lit;
     }
+    *taken = i;
     return at;
+}
+
+uint32_t rdc_pack(const uint16_t *px, uint32_t n, uint8_t *out, uint32_t cap)
+{
+    uint32_t       taken = 0;
+    const uint32_t at = pack(px, n, out, cap, &taken);
+    return (taken == n) ? at : 0u;
+}
+
+uint32_t rdc_pack_some(const uint16_t *px, uint32_t n, uint8_t *out,
+                       uint32_t cap, uint32_t *taken)
+{
+    return pack(px, n, out, cap, taken);
 }
 
 uint32_t rdc_unpack(const uint8_t *in, uint32_t len, uint16_t *px, uint32_t n)

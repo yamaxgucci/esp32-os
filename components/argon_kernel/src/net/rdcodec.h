@@ -24,6 +24,11 @@
 /* n pixels into out; the bytes written, or 0 if they do not fit in cap. */
 uint32_t rdc_pack(const uint16_t *px, uint32_t n, uint8_t *out, uint32_t cap);
 
+/* As many of the n pixels as fit in cap, whole ones from the start: the
+ * bytes written, and in *taken how many pixels they are (0 if none fit). */
+uint32_t rdc_pack_some(const uint16_t *px, uint32_t n, uint8_t *out,
+                       uint32_t cap, uint32_t *taken);
+
 /* Exactly n pixels out of in[0..len); the bytes read, or 0 if in is not n
  * pixels' worth of a packing (short, long, or damaged). */
 uint32_t rdc_unpack(const uint8_t *in, uint32_t len, uint16_t *px, uint32_t n);

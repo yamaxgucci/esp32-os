@@ -147,6 +147,7 @@ static void present_frame(void)
 /* Where the glass differs from the frame: the first pixel, and how many. */
 static uint32_t diff(uint32_t *first)
 {
+    rdp_draw_flush(RDP_FL_FRAME); /* as a frame's marker does */
     uint32_t n = 0;
     for (uint32_t i = 0; i < W * H; i++) {
         if (s_glass[i] != s_frame[i]) {
@@ -317,6 +318,7 @@ static void one_instant(void)
         pass();
     }
     CHECK(guard < 64u);
+    rdp_draw_flush(RDP_FL_FRAME);
     uint32_t n = 0;
     for (uint32_t i = 0; i < W * H; i++) {
         n += (s_glass[i] != first[i]) ? 1u : 0u;
@@ -411,6 +413,7 @@ static void switches(void)
         }
         present_frame();
         const uint32_t m0 = s_sends;
+        const uint32_t r0 = s_rects;
         uint32_t       guard = 0;
         do {
             rdpaint_stub_now_us += 16000;
@@ -423,6 +426,12 @@ static void switches(void)
         }
         if (k < 3u) {
             flat_msgs += s_sends - m0;
+        }
+        if (k == 3u) {
+            /* a screen of noise comes in pieces cut anywhere along a row;
+             * gathered in strips it is a few dozen windows, not hundreds */
+            printf("  rdpaint noise: %u windows\n", (unsigned)(s_rects - r0));
+            CHECK(s_rects - r0 <= 60u);
         }
         printf("  rdpaint switch %u: %u messages, %u px wrong\n",
                (unsigned)k, (unsigned)(s_sends - m0), (unsigned)n);

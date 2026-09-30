@@ -19,6 +19,7 @@
 #include "net/rdpaint.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
 
 #include <argon/log.h>
@@ -289,14 +290,19 @@ static bool flush(uint32_t handle, rdp_send_fn send)
 
 /*
  * A row of a rectangle into the payload: onto the rectangle open there when
- * it is the next row of it, else as a new one.  1 if it went, 0 if the wire
- * would not take the payload, -1 if the row does not fit even an empty one
- * (a row of noise the width of the screen): then it goes as runs.
+ * it is the next row of it, else as a new one.  1 if it went, -1 if it
+ * does not fit what is left of the payload: then it goes as runs, which
+ * fill the payload to its end and go on in the next.  Sending the payload
+ * first and trying again in an empty one sent a row of noise as two
+ * messages half full (30 Sep 2026): 643 bytes do not fit in 640, and the
+ * 64 pixels over went alone.
  */
 static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
                         uint16_t room, uint32_t handle, rdp_send_fn send)
 {
-    for (int attempt = 0; attempt < 2; attempt++) {
+    (void)handle;
+    (void)send;
+    {
         if (s_p.rect_at != 0u && s_p.rect_x == x && s_p.rect_w == n &&
             (uint32_t)s_p.rect_y + s_p.rect_h == y &&
             ((uint32_t)s_p.rect_h + 1u) * n <= RDP_RECT_PX) {
@@ -332,40 +338,43 @@ static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
                 return 1;
             }
         }
-        if (s_p.len <= RDP_HDR) {
-            return -1; /* an empty payload does not take it */
-        }
-        if (!flush(handle, send)) {
-            return 0;
-        }
     }
     return -1;
 }
 
-/* A run of the row into the payload, sending the payload first if full. */
+/* A run of the row into the payload: as much of it as there is room for,
+ * and the rest in the next payload after sending this one. */
 static bool put_run(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
                     uint16_t room, uint32_t handle, rdp_send_fn send)
 {
     s_p.rect_at = 0; /* what follows is not the open rectangle's */
-    for (int attempt = 0; attempt < 2; attempt++) {
+    while (n != 0u) {
+        uint32_t taken = 0;
         if (s_p.len + RDP_RUN_HDR < room) {
             uint8_t *const at = s_p.msg + s_p.len;
-            const uint32_t packed =
-                rdc_pack(px, n, at + RDP_RUN_HDR, room - s_p.len - RDP_RUN_HDR);
-            if (packed > 0u) {
+            const uint32_t packed = rdc_pack_some(
+                px, n, at + RDP_RUN_HDR, room - s_p.len - RDP_RUN_HDR, &taken);
+            if (taken != 0u) {
                 put16(at, (uint16_t)y);
                 put16(at + 2, (uint16_t)x);
-                put16(at + 4, (uint16_t)n);
+                put16(at + 4, (uint16_t)taken);
                 put16(at + 6, (uint16_t)packed);
                 s_p.len += RDP_RUN_HDR + packed;
-                return true;
+                px += taken;
+                x += taken;
+                n -= taken;
             }
         }
-        if (!flush(handle, send)) {
-            return false;
+        if (n != 0u) {
+            if (taken == 0u && s_p.len <= RDP_HDR) {
+                return false; /* cannot happen: a pixel fits an empty payload */
+            }
+            if (!flush(handle, send)) {
+                return false;
+            }
         }
     }
-    return false; /* cannot happen: RDP_CHUNK always fits an empty payload */
+    return true;
 }
 
 /*
@@ -963,31 +972,252 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
  * full buffer, draws what is gathered first.  The buffer is taken the first
  * time a board draws a neighbour's picture, not by every board.
  */
-static uint16_t *s_rect;
-static uint16_t  s_rx, s_ry, s_rw, s_rh, s_sw, s_sh;
-static uint32_t  s_draw_faults;
+/*
+ * TWO STRIPS AT ONCE, AND ACROSS MESSAGES (30 Sep 2026).  A row of noise the
+ * width of the screen does not fit one message: each message ends where its
+ * bytes run out, somewhere along a row, and the next begins there.  Drawn a
+ * message at a time that was some 480 windows a frame at about 420 us each,
+ * and the CYD drew noise at 2.3 frames a second off the wire and at 19 from
+ * its own program.  Gathered only where a piece lies exactly under the last,
+ * it was still 386 windows a second of 960 pixels each, because the cuts
+ * move along the row from one message to the next.
+ *
+ * So a slot gathers a strip in reading order: the next piece on the row it
+ * is filling, where the last one ended, or a whole rectangle under it the
+ * strip's width.  Its first row sets the width, and may come in any number
+ * of pieces.  Two slots, because rectangles arrive side by side as well as
+ * one under another.  Kept from one message to the next and drawn when
+ * full, when a piece fits neither, when a piece would land on what one
+ * holds (so nothing is drawn out of turn), and by rdp_draw_flush: at the
+ * end of a frame and when nothing more arrives.  Drawn at the end of
+ * every pass instead, a strip was a pass long - some 2 500 pixels in three
+ * windows - since a pass of noise ends in the middle of a row.
+ */
+#define RDP_SLOTS   2u
+#define RDP_SLOT_PX (RDP_RECT_PX / RDP_SLOTS)
+typedef struct {
+    uint16_t x, y, w; /* where the strip is, and its width                */
+    uint16_t h;       /* whole rows held                                  */
+    uint16_t part;    /* pixels held of row y + h; a first row is all part */
+    bool     live;
+} rslot_t;
+/*
+ * All of it in the one block taken for the pixels, and only the pointer in
+ * static memory: the emulated S3's DRAM had 48 bytes too few for the slots
+ * and their counters as statics (30 Sep 2026).
+ */
+typedef struct {
+    rslot_t                 slot[RDP_SLOTS];
+    const ag_display_ops_t *d;
+    uint16_t                sw, sh;
+    uint8_t                 next;
+    uint32_t                t_unpack_us, t_blit_us, blits;
+    uint32_t                fl[RDP_FL_N]; /* why a strip went to the glass */
+    uint16_t                px[RDP_RECT_PX];
+} rdraw_t;
+static rdraw_t *s_dr;
+static uint32_t s_draw_faults;
 
 uint32_t rdp_draw_faults(void) { return s_draw_faults; }
 
-bool rdp_draws_rects(void) { return s_rect != NULL; }
-
-static void rect_flush(const ag_display_ops_t *d)
+void rdp_draw_times(uint32_t *unpack_us, uint32_t *blit_us, uint32_t *blits,
+                    uint32_t why[RDP_FL_N])
 {
-    if (s_rh == 0u) {
+    rdraw_t *const r = s_dr;
+    *unpack_us = (r != NULL) ? r->t_unpack_us : 0u;
+    *blit_us = (r != NULL) ? r->t_blit_us : 0u;
+    *blits = (r != NULL) ? r->blits : 0u;
+    for (unsigned i = 0; i < RDP_FL_N; i++) {
+        why[i] = (r != NULL) ? r->fl[i] : 0u;
+    }
+    if (r != NULL) {
+        r->t_unpack_us = r->t_blit_us = r->blits = 0u;
+        memset(r->fl, 0, sizeof(r->fl));
+    }
+}
+
+bool rdp_draws_rects(void) { return s_dr != NULL; }
+
+static void blit_px(const ag_display_ops_t *d, uint16_t sw, uint16_t sh,
+                    const uint16_t *px, uint16_t x, uint16_t y, uint16_t w,
+                    uint16_t h)
+{
+    const ag_blit_t bl = {
+        .px = px,
+        .stride = (uint32_t)w * 2u,
+        .surf_w = sw,
+        .surf_h = sh,
+        .x = x,
+        .y = y,
+        .w = w,
+        .h = h,
+    };
+    const int64_t t0 = ag_port_us();
+    d->blit_rect(0, &bl);
+    if (s_dr != NULL) {
+        s_dr->t_blit_us += (uint32_t)(ag_port_us() - t0);
+        s_dr->blits++;
+    }
+}
+
+static uint16_t *slot_px(unsigned i) { return s_dr->px + (size_t)i * RDP_SLOT_PX; }
+
+static void slot_flush(unsigned i, unsigned why)
+{
+    rslot_t *const sl = &s_dr->slot[i];
+    if (sl->live && s_dr->d != NULL) {
+        s_dr->fl[why]++;
+        uint16_t *const base = slot_px(i);
+        if (sl->h != 0u) {
+            blit_px(s_dr->d, s_dr->sw, s_dr->sh, base, sl->x, sl->y, sl->w,
+                    sl->h);
+        }
+        if (sl->part != 0u) {
+            blit_px(s_dr->d, s_dr->sw, s_dr->sh, base + (size_t)sl->h * sl->w,
+                    sl->x, (uint16_t)(sl->y + sl->h), sl->part, 1u);
+        }
+    }
+    sl->live = false;
+    sl->h = sl->part = 0u;
+}
+
+bool rdp_draw_holds(void)
+{
+    if (s_dr == NULL) {
+        return false;
+    }
+    for (unsigned i = 0; i < RDP_SLOTS; i++) {
+        if (s_dr->slot[i].live) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Draws every slot but `keep` the rectangle would land on: what it holds is
+ * older. */
+static void slot_clear_under(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh,
+                             unsigned keep)
+{
+    for (unsigned i = 0; i < RDP_SLOTS; i++) {
+        const rslot_t *const sl = &s_dr->slot[i];
+        if (!sl->live || i == keep) {
+            continue;
+        }
+        /* its bounds, the row being filled whole: at worst a draw early */
+        const uint32_t y1 = (uint32_t)sl->y + sl->h + (sl->part != 0u ? 1u : 0u);
+        if ((uint32_t)x < (uint32_t)sl->x + sl->w && (uint32_t)x + rw > sl->x &&
+            (uint32_t)y < y1 && (uint32_t)y + rh > sl->y) {
+            slot_flush(i, RDP_FL_UNDER);
+        }
+    }
+}
+
+void rdp_draw_flush(unsigned why)
+{
+    if (s_dr == NULL) {
         return;
     }
-    const ag_blit_t bl = {
-        .px = s_rect,
-        .stride = (uint32_t)s_rw * 2u,
-        .surf_w = s_sw,
-        .surf_h = s_sh,
-        .x = s_rx,
-        .y = s_ry,
-        .w = s_rw,
-        .h = s_rh,
-    };
-    d->blit_rect(0, &bl);
-    s_rh = 0;
+    for (unsigned i = 0; i < RDP_SLOTS; i++) {
+        slot_flush(i, why);
+    }
+}
+
+/* Where in slot `sl` the piece goes if it continues the strip, else NULL;
+ * and the strip takes it. */
+static uint16_t *slot_continue(rslot_t *sl, uint16_t *base, uint16_t x,
+                               uint16_t y, uint16_t rw, uint16_t rh)
+{
+    if (!sl->live) {
+        return NULL;
+    }
+    if (sl->h == 0u) {
+        /* the first row: it grows to the right while it lasts */
+        if (rh == 1u && y == sl->y && x == sl->x + sl->part &&
+            (uint32_t)sl->part + rw <= RDP_SLOT_PX) {
+            uint16_t *const into = base + sl->part;
+            sl->part = (uint16_t)(sl->part + rw);
+            sl->w = sl->part;
+            return into;
+        }
+        /* and ends when a piece starts the row under it at its left edge */
+        if (y != sl->y + 1u || x != sl->x || rw > sl->w) {
+            return NULL;
+        }
+        if ((uint32_t)(1u + rh) * sl->w > RDP_SLOT_PX ||
+            (rh > 1u && rw != sl->w)) {
+            return NULL;
+        }
+        sl->h = 1u;
+        sl->part = 0u;
+    }
+    if ((uint32_t)y != (uint32_t)sl->y + sl->h ||
+        (uint32_t)x != (uint32_t)sl->x + sl->part) {
+        return NULL;
+    }
+    if (rh == 1u) {
+        if ((uint32_t)sl->part + rw > sl->w ||
+            (uint32_t)(sl->h + 1u) * sl->w > RDP_SLOT_PX) {
+            return NULL;
+        }
+        uint16_t *const into = base + (size_t)sl->h * sl->w + sl->part;
+        sl->part = (uint16_t)(sl->part + rw);
+        if (sl->part == sl->w) {
+            sl->h++;
+            sl->part = 0u;
+        }
+        return into;
+    }
+    if (sl->part != 0u || rw != sl->w ||
+        (uint32_t)(sl->h + rh) * sl->w > RDP_SLOT_PX) {
+        return NULL;
+    }
+    uint16_t *const into = base + (size_t)sl->h * sl->w;
+    sl->h = (uint16_t)(sl->h + rh);
+    return into;
+}
+
+/* Where `rw` x `rh` at (x, y) goes: on in a strip it continues, else into a
+ * free slot, else into the oldest after drawing it.  NULL if it is bigger
+ * than a slot. */
+static uint16_t *slot_take(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh)
+{
+    if ((uint32_t)rw * rh > RDP_SLOT_PX) {
+        return NULL;
+    }
+    for (unsigned i = 0; i < RDP_SLOTS; i++) {
+        uint16_t *const into =
+            slot_continue(&s_dr->slot[i], slot_px(i), x, y, rw, rh);
+        if (into != NULL) {
+            slot_clear_under(x, y, rw, rh, i);
+            return into;
+        }
+    }
+    slot_clear_under(x, y, rw, rh, RDP_SLOTS);
+    int pick = -1;
+    for (unsigned i = 0; i < RDP_SLOTS && pick < 0; i++) {
+        if (!s_dr->slot[i].live) {
+            pick = (int)i;
+        }
+    }
+    if (pick < 0) {
+        pick = s_dr->next;
+        s_dr->next = (uint8_t)((s_dr->next + 1u) % RDP_SLOTS);
+        slot_flush((unsigned)pick, RDP_FL_EVICT);
+    }
+    rslot_t *const sl = &s_dr->slot[pick];
+    sl->live = true;
+    sl->x = x;
+    sl->y = y;
+    sl->w = rw;
+    if (rh == 1u) {
+        sl->h = 0u; /* a first row, open to the right */
+        sl->part = rw;
+    } else {
+        sl->h = rh;
+        sl->part = 0u;
+    }
+    return slot_px((unsigned)pick);
 }
 
 uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
@@ -996,94 +1226,78 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
     if (d == NULL || d->blit_rect == NULL || len < RDP_HDR) {
         return 0u;
     }
-    if (s_rect == NULL) {
-        s_rect = ag_port_alloc(RDP_RECT_PX * 2u, AG_MEM_BYTE);
+    if (s_dr == NULL) {
+        s_dr = ag_port_alloc(sizeof(rdraw_t), AG_MEM_BYTE);
+        if (s_dr != NULL) {
+            memset(s_dr, 0, offsetof(rdraw_t, px));
+        }
     }
+    rdraw_t *const r = s_dr;
     const uint16_t w = get16(pay);
     const uint16_t h = get16(pay + 2);
-    uint32_t       at = RDP_HDR;
-    uint32_t       drawn = 0;
-    s_rh = 0;
-    s_sw = w;
-    s_sh = h;
+    if (r != NULL) {
+        if (r->d != d || w != r->sw || h != r->sh) {
+            /* another screen or shape: what is held is its own */
+            rdp_draw_flush(RDP_FL_OTHER);
+        }
+        r->d = d;
+        r->sw = w;
+        r->sh = h;
+    }
+    uint32_t at = RDP_HDR;
+    uint32_t drawn = 0;
     while (at + RDP_RUN_HDR <= len) {
         const uint16_t y = get16(pay + at);
         const uint16_t x = get16(pay + at + 2);
         const uint16_t n = get16(pay + at + 4);
         const uint16_t plen = get16(pay + at + 6);
+        uint16_t       rw = n, rh = 1;
         if ((n & RDP_RECT_BIT) != 0u) {
             /* a rectangle: its width, and its height in a fifth word */
             if (at + RDP_RECT_HDR > len) {
                 s_draw_faults++;
                 break;
             }
-            const uint16_t rw = (uint16_t)(n & ~RDP_RECT_BIT);
-            const uint16_t rh = get16(pay + at + 8);
+            rw = (uint16_t)(n & ~RDP_RECT_BIT);
+            rh = get16(pay + at + 8);
             at += RDP_RECT_HDR;
-            if (s_rect == NULL || rw == 0u || rh == 0u ||
+            if (r == NULL || rw == 0u || rh == 0u ||
                 (uint32_t)rw * rh > RDP_RECT_PX || at + plen > len ||
                 (uint32_t)y + rh > h || (uint32_t)x + rw > w) {
                 s_draw_faults++;
                 break;
             }
-            const bool joins = s_rh != 0u && x == s_rx && rw == s_rw &&
-                               y == (uint16_t)(s_ry + s_rh) &&
-                               ((uint32_t)s_rh + rh) * rw <= RDP_RECT_PX;
-            if (!joins) {
-                rect_flush(d);
-            }
-            if (rdc_unpack(pay + at, plen, s_rect + (size_t)s_rh * rw,
-                           (uint32_t)rw * rh) != plen) {
+        } else {
+            at += RDP_RUN_HDR;
+            if (n == 0u || n > RDP_CHUNK || at + plen > len || y >= h ||
+                (uint32_t)x + n > w) {
                 s_draw_faults++;
-                break;
+                break; /* not a run: the rest cannot be trusted either */
             }
-            at += plen;
-            drawn += (uint32_t)rw * rh;
-            if (s_rh == 0u) {
-                s_rx = x;
-                s_ry = y;
-                s_rw = rw;
-            }
-            s_rh = (uint16_t)(s_rh + rh);
-            continue;
         }
-        at += RDP_RUN_HDR;
-        if (n == 0u || n > RDP_CHUNK || at + plen > len || y >= h ||
-            (uint32_t)x + n > w) {
-            s_draw_faults++;
-            break; /* not a run: the rest cannot be trusted either */
+        const uint32_t px = (uint32_t)rw * rh;
+        uint16_t      *into = (r != NULL) ? slot_take(x, y, rw, rh) : NULL;
+        bool           now = false;
+        if (into == NULL) {
+            /* bigger than a slot, or no buffer: drawn at once, alone */
+            rdp_draw_flush(RDP_FL_OTHER);
+            into = (r != NULL) ? r->px : line;
+            now = true;
         }
-        const bool joins = s_rect != NULL && s_rh != 0u && x == s_rx &&
-                           n == s_rw && y == (uint16_t)(s_ry + s_rh) &&
-                           (uint32_t)(s_rh + 1u) * n <= RDP_RECT_PX;
-        if (!joins) {
-            rect_flush(d);
+        const int64_t  t0 = ag_port_us();
+        const uint32_t took = rdc_unpack(pay + at, plen, into, px);
+        if (r != NULL) {
+            r->t_unpack_us += (uint32_t)(ag_port_us() - t0);
         }
-        uint16_t *const into = (s_rect != NULL && (uint32_t)n <= RDP_RECT_PX)
-                                   ? s_rect + (size_t)s_rh * n
-                                   : line;
-        if (rdc_unpack(pay + at, plen, into, n) != plen) {
+        if (took != plen) {
             s_draw_faults++;
             break;
         }
         at += plen;
-        drawn += n;
-        if (into == line) {
-            /* no buffer: one row at a time, as before */
-            const ag_blit_t bl = {
-                .px = line, .stride = (uint32_t)n * 2u, .surf_w = w,
-                .surf_h = h, .x = x, .y = y, .w = n, .h = 1,
-            };
-            d->blit_rect(0, &bl);
-            continue;
+        drawn += px;
+        if (now) {
+            blit_px(d, w, h, into, x, y, rw, rh);
         }
-        if (s_rh == 0u) {
-            s_rx = x;
-            s_ry = y;
-            s_rw = n;
-        }
-        s_rh++;
     }
-    rect_flush(d);
     return drawn;
 }

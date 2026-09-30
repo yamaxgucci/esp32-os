@@ -1810,6 +1810,10 @@ static uint32_t s_snd_waited;
 static bool     s_snd_begun;
 
 static void pour_pass_drawn(const rd_period_t *pd);
+/* since when (ms, 0 for not) the pour task has had nothing to draw while
+ * pixels were held */
+static uint32_t s_idle_since;
+#define RD_IDLE_DRAW_MS 20u
 /*
  * 1: a pass is answered once drawn; 0: on arrival.  Measured both ways on 27
  * Sep 2026, a minute of sound and picture on the CYD: 1.7% of its sound
@@ -1827,6 +1831,10 @@ static void pour_screen_one(void)
 {
     rd_period_t *pd = &s_scr.e[s_scr.r];
     if (pd->op == RD_PAINTED) {
+        if ((pd->off & RD_PASS_WHOLE) != 0u) {
+            /* a frame is on the glass whole when it says so */
+            rdp_draw_flush(RDP_FL_FRAME);
+        }
         pour_pass_drawn(pd);
         s_scr.r = (s_scr.r + 1u) % s_scr.n;
         return;
@@ -2000,6 +2008,7 @@ static void pour_task(void *arg)
         if (s_scr.r != s_scr.w) {
             pour_screen_one();
             busy = true;
+            s_idle_since = 0u;
         }
         bool full = false;
         if (s_snd_task == NULL && s_snd.r != s_snd.w) {
@@ -2027,6 +2036,27 @@ static void pour_task(void *arg)
             full = true;
         }
         if (busy) {
+            continue;
+        }
+        /*
+         * Pixels gathered and nothing more arriving: on the glass with them,
+         * once RD_IDLE_DRAW_MS has passed with nothing to go on with.  A
+         * frame's end draws them anyway, by its marker; this is for a frame
+         * that never ends.  After 2 ms it drew the tail of every pass - the
+         * next one is a wire's time away - 165 times a second, and noise went
+         * to the glass in windows a pass long instead of six rows (30 Sep).
+         */
+        if (rdp_draw_holds()) {
+            const uint32_t now = (uint32_t)(ag_port_us() / 1000);
+            if (s_idle_since == 0u) {
+                s_idle_since = now | 1u;
+            }
+            if (now - s_idle_since >= RD_IDLE_DRAW_MS) {
+                rdp_draw_flush(RDP_FL_IDLE);
+                s_idle_since = 0u;
+                continue;
+            }
+            ag_port_notify_take(true, full ? 1 : 2);
             continue;
         }
         if (full) {
@@ -2308,6 +2338,16 @@ static void screen_report(void)
                          s_scr_asked != 0u);
     if (screen) {
         const uint32_t ms = (uint32_t)((now - s_scr_said_us) / 1000);
+        uint32_t       un_us, bl_us, blits, why[RDP_FL_N];
+        rdp_draw_times(&un_us, &bl_us, &blits, why);
+        ag_log(AG_LOG_INFO, TAG,
+               "drawing: %u ms unpacking, %u ms in %u blits; strips drawn "
+               "%u full, %u under a new piece, %u at a frame's end, %u idle, "
+               "%u other",
+               (unsigned)(un_us / 1000u), (unsigned)(bl_us / 1000u),
+               (unsigned)blits, (unsigned)why[RDP_FL_EVICT],
+               (unsigned)why[RDP_FL_UNDER], (unsigned)why[RDP_FL_FRAME],
+               (unsigned)why[RDP_FL_IDLE], (unsigned)why[RDP_FL_OTHER]);
         ag_log(AG_LOG_INFO, TAG,
                "screen: %u passes in %u ms, %u messages, %u px, %u ms of it "
                "drawing, queue up to %u of %u, %u not drawn so far",
