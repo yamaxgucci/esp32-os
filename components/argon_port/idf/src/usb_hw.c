@@ -762,14 +762,33 @@ static void client_cb(const usb_host_client_event_msg_t *msg, void *arg)
     }
 }
 
+/*
+ * ARGON: the library's own task runs on past the stop until the library has
+ * let every device go (1 Oct 2026).  It left as soon as s_running fell, and
+ * nothing handled the events that freeing the devices needs: the uninstall
+ * refused (ESP_ERR_INVALID_STATE) for good, every start after it failed, and
+ * a host that tried again once with nothing plugged in stayed off - the mouse
+ * plugged in later was never seen.  IDF's order: the last client gone
+ * (NO_CLIENTS), free_all, the library says ALL_FREE, then uninstall.
+ */
+static volatile bool s_lib_free;
+
 static void lib_task(void *arg)
 {
     (void)arg;
-    while (s_running) {
+    s_lib_free = false;
+    uint32_t after = 0; /* events handled since the stop, a bound on it */
+    while (s_running || (!s_lib_free && after++ < 30u)) {
         uint32_t flags = 0;
-        usb_host_lib_handle_events(portMAX_DELAY, &flags);
+        /* not for ever: with nothing plugged in no event comes */
+        (void)usb_host_lib_handle_events(pdMS_TO_TICKS(100), &flags);
         if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
-            (void)usb_host_device_free_all();
+            if (usb_host_device_free_all() == ESP_OK) {
+                s_lib_free = true; /* nothing was allocated */
+            }
+        }
+        if (flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
+            s_lib_free = true;
         }
     }
     s_lib_task = NULL;
@@ -905,8 +924,16 @@ static void cli_task(void *arg)
 static void restart_task(void *arg)
 {
     (void)arg;
-    (void)ag_port_usb_stop();
-    const ag_err_t rc = ag_port_usb_start();
+    ag_err_t rc = -AG_EIO;
+    for (int i = 0; i < 3 && rc != AG_OK; i++) {
+        if (i > 0) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        rc = ag_port_usb_stop();
+        if (rc == AG_OK) {
+            rc = ag_port_usb_start();
+        }
+    }
     if (rc != AG_OK) {
         ESP_LOGE(TAG, "the host would not come back up (%d)", (int)rc);
     } else {
@@ -973,14 +1000,36 @@ ag_err_t ag_port_usb_stop(void)
     }
     /* The tasks wake from their handle_events within a tick or two and delete
      * themselves; give them that before tearing the host down under them. */
-    for (int i = 0; i < 25 && (s_lib_task != NULL || s_cli_task != NULL); i++) {
-        vTaskDelay(pdMS_TO_TICKS(20));
+    for (int i = 0; i < 25 && s_cli_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20)); /* the client's task goes first */
     }
     if (s_client != NULL) {
         (void)usb_host_client_deregister(s_client);
         s_client = NULL;
     }
-    (void)usb_host_uninstall();
+    for (int i = 0; i < 200 && s_lib_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20)); /* it frees the devices, then goes */
+    }
+    /*
+     * ARGON: and only OFF once the library has really gone (1 Oct 2026).  It
+     * was torn down while its task was still inside handle_events, the
+     * uninstall refused, the state said OFF anyway - and every start after
+     * it failed to install (-5): a host that tried again once with nothing
+     * plugged in stayed off for good, and the mouse plugged in later was
+     * never seen.
+     */
+    esp_err_t un = ESP_FAIL;
+    for (int i = 0; i < 20; i++) {
+        un = usb_host_uninstall();
+        if (un == ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (un != ESP_OK) {
+        ESP_LOGE(TAG, "the host library would not uninstall (%d)", (int)un);
+        return -AG_EBUSY;
+    }
 
     s_state = AG_USB_OFF;
     s_reports = 0;
