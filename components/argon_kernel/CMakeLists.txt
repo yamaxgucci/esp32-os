@@ -73,6 +73,7 @@ set(ARGON_KERNEL_SRCS
     "src/net/netio.c"
     "src/net/spilink.c"
     "src/net/wlink.c"
+    "src/net/wtrace.c"
     "src/net/uartlink.c"
     "src/net/rdcodec.c"
     "src/net/rdpaint.c"

@@ -39,6 +39,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "esp_timer.h"
 
 /*
  * The receive that is never stopped (ag_port_uart_dma_listen_ring): where
@@ -86,6 +87,19 @@ typedef struct {
     SemaphoreHandle_t        done;   /* counts finished transfers */
     uint32_t                 out;    /* handed over, not yet finished */
     bool                     tried;
+    /* the wire between transfers (`link probe`, 1 Oct 2026): transfers
+     * ended (counted in the interrupt) and when the last did; transfers
+     * handed over, those handed to a DMA with nothing left, and how long
+     * it had had nothing */
+    volatile uint32_t        tx_ended;
+    volatile int64_t         tx_end_us;
+    uint32_t                 tx_subs, tx_idle_subs;
+    int64_t                  tx_idle_us;
+    uint32_t                 tx_last_quiet_us; /* before the latest transfer */
+    /* each transfer's own time: when the one on the wire began, and those
+     * slower than a byte a microsecond (16 Mbaud is 1.6) - count, worst */
+    volatile int64_t         tx_cur_start;
+    volatile uint32_t        tx_slow, tx_slow_max_us, tx_slow_max_len;
     /* receiving: one ring the DMA writes round and round, and the pieces
      * of it that are full, in order, for the reader */
     QueueHandle_t            rx_q;
@@ -116,7 +130,21 @@ typedef struct {
 #endif
 } dma_port_t;
 
-static dma_port_t s_dma[AG_PORT_UART_MAX];
+/*
+ * Made at the first question, in internal memory (its interrupts read it):
+ * as a static it was DRAM the S3's emulator build has not got - 208 bytes
+ * over once the probe's counters were in (1 Oct 2026).
+ */
+static dma_port_t *s_dma;
+
+static bool dma_table(void)
+{
+    if (s_dma == NULL) {
+        s_dma = heap_caps_calloc(AG_PORT_UART_MAX, sizeof(dma_port_t),
+                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return s_dma != NULL;
+}
 
 static bool IRAM_ATTR on_tx_done(uhci_controller_handle_t ctrl,
                                  const uhci_tx_done_event_data_t *edata,
@@ -124,8 +152,21 @@ static bool IRAM_ATTR on_tx_done(uhci_controller_handle_t ctrl,
 {
     (void)ctrl;
     (void)edata;
-    BaseType_t woken = pdFALSE;
-    xSemaphoreGiveFromISR(((dma_port_t *)user_ctx)->done, &woken);
+    BaseType_t        woken = pdFALSE;
+    dma_port_t *const d = (dma_port_t *)user_ctx;
+    const int64_t     now = esp_timer_get_time();
+    const uint32_t    took = (uint32_t)(now - d->tx_cur_start);
+    if (edata != NULL && took > edata->sent_size) {
+        d->tx_slow++;
+        if (took > d->tx_slow_max_us) {
+            d->tx_slow_max_us = took;
+            d->tx_slow_max_len = (uint32_t)edata->sent_size;
+        }
+    }
+    d->tx_cur_start = now; /* the next, if there is one, starts now */
+    d->tx_end_us = now;
+    d->tx_ended++;
+    xSemaphoreGiveFromISR(d->done, &woken);
     return woken == pdTRUE;
 }
 
@@ -222,7 +263,7 @@ static bool IRAM_ATTR on_rx(uhci_controller_handle_t ctrl,
 
 static dma_port_t *dma_for(int port)
 {
-    if (port < 0 || port >= AG_PORT_UART_MAX) {
+    if (port < 0 || port >= AG_PORT_UART_MAX || !dma_table()) {
         return NULL;
     }
     dma_port_t *d = &s_dma[port];
@@ -313,12 +354,60 @@ bool ag_port_uart_dma_can_send(void)
     return true;
 }
 
+bool ag_port_uart_dma_can_receive(void)
+{
+    return AG_UART_DMA_RING != 0;
+}
+
 void ag_port_uart_dma_diag(int port, uint32_t out[8])
 {
     (void)port;
     for (int i = 0; i < 8; i++) {
         out[i] = 0u;
     }
+}
+
+void ag_port_uart_dma_tx_gaps(int port, uint32_t *subs, uint32_t *idle,
+                              uint32_t *idle_us)
+{
+    *subs = *idle = *idle_us = 0u;
+    dma_port_t *const d =
+        (port >= 0 && port < AG_PORT_UART_MAX && s_dma != NULL) ? &s_dma[port]
+                                                           : NULL;
+    if (d == NULL || d->ctrl == NULL) {
+        return;
+    }
+    /* the gaps since the last look, then started again; the transfers
+     * handed over since the start (the interrupt counts against them) */
+    *subs = d->tx_subs;
+    *idle = d->tx_idle_subs;
+    *idle_us = (uint32_t)d->tx_idle_us;
+    d->tx_idle_subs = 0u;
+    d->tx_idle_us = 0;
+}
+
+uint32_t ag_port_uart_dma_last_quiet(int port)
+{
+    const dma_port_t *const d =
+        (port >= 0 && port < AG_PORT_UART_MAX && s_dma != NULL) ? &s_dma[port]
+                                                           : NULL;
+    return (d != NULL && d->ctrl != NULL) ? d->tx_last_quiet_us : 0u;
+}
+
+void ag_port_uart_dma_tx_slow(int port, uint32_t *slow, uint32_t *max_us,
+                              uint32_t *max_len)
+{
+    *slow = *max_us = *max_len = 0u;
+    dma_port_t *const d =
+        (port >= 0 && port < AG_PORT_UART_MAX && s_dma != NULL) ? &s_dma[port]
+                                                           : NULL;
+    if (d == NULL || d->ctrl == NULL) {
+        return;
+    }
+    *slow = d->tx_slow;
+    *max_us = d->tx_slow_max_us;
+    *max_len = d->tx_slow_max_len;
+    d->tx_slow = d->tx_slow_max_us = d->tx_slow_max_len = 0u;
 }
 
 /* One finished transfer, waited for.  A minute of patience is not a timeout
@@ -351,6 +440,16 @@ int32_t ag_port_uart_dma_submit(int port, const void *buf, size_t len)
         }
     }
 
+    d->tx_last_quiet_us = 0u;
+    if (d->tx_subs == d->tx_ended) {
+        d->tx_cur_start = esp_timer_get_time(); /* it goes out at once */
+    }
+    if (d->tx_subs == d->tx_ended && d->tx_subs != 0u) {
+        const int64_t q = esp_timer_get_time() - d->tx_end_us;
+        d->tx_idle_subs++; /* everything handed over has ended: a gap */
+        d->tx_idle_us += q;
+        d->tx_last_quiet_us = (uint32_t)q;
+    }
     const esp_err_t rc = uhci_transmit(d->ctrl, (uint8_t *)buf, len);
     if (rc != ESP_OK) {
         /* Alignment is the usual reason, and the caller can do something about
@@ -358,6 +457,7 @@ int32_t ag_port_uart_dma_submit(int port, const void *buf, size_t len)
         return (rc == ESP_ERR_INVALID_ARG) ? -AG_EINVAL : -AG_EIO;
     }
     d->out++;
+    d->tx_subs++;
     return (int32_t)len;
 }
 
@@ -920,6 +1020,26 @@ static void IRAM_ATTR e32_isr(void *arg)
     }
 }
 
+void ag_port_uart_dma_tx_gaps(int port, uint32_t *subs, uint32_t *idle,
+                              uint32_t *idle_us)
+{
+    (void)port;
+    *subs = *idle = *idle_us = 0u;
+}
+
+uint32_t ag_port_uart_dma_last_quiet(int port)
+{
+    (void)port;
+    return 0u;
+}
+
+void ag_port_uart_dma_tx_slow(int port, uint32_t *slow, uint32_t *max_us,
+                              uint32_t *max_len)
+{
+    (void)port;
+    *slow = *max_us = *max_len = 0u;
+}
+
 void ag_port_uart_dma_diag(int port, uint32_t out[8])
 {
     const bool mine = (port == s_e32.port);
@@ -942,6 +1062,11 @@ bool ag_port_uart_dma_ready(int port)
 bool ag_port_uart_dma_can_send(void)
 {
     return false;
+}
+
+bool ag_port_uart_dma_can_receive(void)
+{
+    return true; /* the ring of descriptors the DMA goes round */
 }
 
 ag_err_t ag_port_uart_dma_listen(int port)
@@ -1127,6 +1252,26 @@ bool ag_port_uart_dma_ready(int port)
     return false;
 }
 
+void ag_port_uart_dma_tx_gaps(int port, uint32_t *subs, uint32_t *idle,
+                              uint32_t *idle_us)
+{
+    (void)port;
+    *subs = *idle = *idle_us = 0u;
+}
+
+uint32_t ag_port_uart_dma_last_quiet(int port)
+{
+    (void)port;
+    return 0u;
+}
+
+void ag_port_uart_dma_tx_slow(int port, uint32_t *slow, uint32_t *max_us,
+                              uint32_t *max_len)
+{
+    (void)port;
+    *slow = *max_us = *max_len = 0u;
+}
+
 void ag_port_uart_dma_diag(int port, uint32_t out[8])
 {
     (void)port;
@@ -1136,6 +1281,11 @@ void ag_port_uart_dma_diag(int port, uint32_t out[8])
 }
 
 bool ag_port_uart_dma_can_send(void)
+{
+    return false;
+}
+
+bool ag_port_uart_dma_can_receive(void)
 {
     return false;
 }

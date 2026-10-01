@@ -27,6 +27,7 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "net/rdpaint.h"
+#include "net/wtrace.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -302,6 +303,16 @@ static struct {
     /* this second's time: taking a pass's snapshot, packing and sending
      * it, and the program's own presents marking what changed */
     int64_t t_snap_us, t_send_us, t_damage_us, t_damage_wait_us;
+    int64_t t_wire_us;  /* of t_send_us: inside send(), its sleeps included */
+    uint32_t eagains;   /* sends the wire refused for want of room */
+    /* since the board started, for `link`: passes, send() inside them, sends */
+    int64_t  tot_pass_us, tot_wire_us;
+    uint32_t tot_sends;
+    /* ...and between passes: for the program's frame, for the least pass */
+    int64_t  tot_frame_wait_us, tot_min_wait_us;
+    /* ...for anything to be marked at all, and the presents that marked */
+    int64_t  tot_wake_wait_us;
+    uint32_t tot_presents;
     uint32_t damages;
 } s_p;
 
@@ -330,15 +341,20 @@ static bool flush(uint32_t handle, rdp_send_fn send)
     if (s_p.len <= RDP_HDR) {
         return true;
     }
-    const int64_t until = ag_port_us() + (int64_t)RDP_SEND_PATIENCE_MS * 1000;
+    const int64_t t0 = ag_port_us();
+    const int64_t until = t0 + (int64_t)RDP_SEND_PATIENCE_MS * 1000;
     ag_err_t      r;
     for (;;) {
         r = send(handle, s_p.msg, (uint16_t)s_p.len);
         if (r != -AG_EAGAIN || ag_port_us() >= until) {
             break;
         }
+        s_p.eagains++;
         ag_port_task_delay(1);
     }
+    s_p.t_wire_us += ag_port_us() - t0;
+    s_p.tot_wire_us += ag_port_us() - t0;
+    s_p.tot_sends++;
     if (r == AG_OK) {
         s_p.bytes_out += s_p.len;
         s_p.pass_msgs++;
@@ -575,12 +591,16 @@ static void report(void)
            (unsigned)(s_p.sync_max_us / 1000), (unsigned)(s_p.gap_max_us / 1000));
     /* apart: a journal line has a length, and the end of one line was lost */
     ag_log(AG_LOG_INFO, TAG,
-           "the painter's second: %u ms snapshots, %u ms packing and sending; "
-           "the program's: %u ms in %u presents, %u of it waiting for the lock",
+           "the painter's second: %u ms snapshots, %u ms packing and sending "
+           "(%u in send, %u refused); the program's: %u ms in %u presents, %u "
+           "of it waiting for the lock",
            (unsigned)(s_p.t_snap_us / 1000), (unsigned)(s_p.t_send_us / 1000),
+           (unsigned)(s_p.t_wire_us / 1000), (unsigned)s_p.eagains,
            (unsigned)(s_p.t_damage_us / 1000), (unsigned)s_p.damages,
            (unsigned)(s_p.t_damage_wait_us / 1000));
     s_p.t_damage_wait_us = 0;
+    s_p.t_wire_us = 0;
+    s_p.eagains = 0;
     s_p.t_snap_us = s_p.t_send_us = s_p.t_damage_us = 0;
     s_p.damages = 0;
     s_p.sync_us = 0;
@@ -773,6 +793,7 @@ static void pass(void)
 {
     {
         const int64_t t_in = ag_port_us();
+        wt_note(WT_PASS_IN, s_p.passes);
         lock();
         const uint16_t w = s_p.w;
         const uint16_t h = s_p.h;
@@ -846,6 +867,7 @@ static void pass(void)
         const rdp_send_fn send = s_p.send;
         unlock();
         const int64_t t_snapped = ag_port_us();
+        wt_note(WT_SNAP_OUT, (uint32_t)(t_snapped - t_in));
         s_p.t_snap_us += t_snapped - t_in;
 
         bool     any = false;
@@ -1013,6 +1035,8 @@ static void pass(void)
             s_p.pass_done = false;
         }
         report();
+        wt_note(WT_PASS_OUT, s_p.pass_msgs);
+        s_p.tot_pass_us += ag_port_us() - t_in;
     }
 }
 
@@ -1021,7 +1045,11 @@ static void painter(void *arg)
     (void)arg;
     int64_t began = 0;
     for (;;) {
+        const int64_t ww0 = ag_port_us();
+        wt_note(WT_WAKE_IN, 0u);
         (void)ag_port_sem_take(s_p.wake, ag_port_ms_to_ticks(1000));
+        wt_note(WT_WAKE_OUT, 0u);
+        s_p.tot_wake_wait_us += ag_port_us() - ww0;
         /*
          * A WHOLE FRAME, then a pass: a program presents a frame in bands
          * from the top, and a pass taken while it is half way down is half
@@ -1038,10 +1066,12 @@ static void painter(void *arg)
          * while the map scrolled, 45 passes and a third of the wire a second,
          * a picture Maxim saw at two frames a second.
          */
+        const int64_t fw0 = ag_port_us();
         while (!s_p.cont && !s_p.more && !s_p.frame_end &&
                ag_port_us() - s_p.present_us < RDP_FRAME_QUIET_US) {
             (void)ag_port_sem_take(s_p.wake, ag_port_ms_to_ticks(2));
         }
+        s_p.tot_frame_wait_us += ag_port_us() - fw0;
         /* the rest of a frame goes at once: it is the same frame */
         const bool rest = s_p.cont || s_p.more;
         if (!rest) {
@@ -1049,12 +1079,32 @@ static void painter(void *arg)
         }
         const int64_t since = ag_port_us() - began;
         if (!rest && began != 0 && since < RDP_MIN_PASS_US) {
+            const int64_t mw0 = ag_port_us();
             ag_port_task_delay(ag_port_ms_to_ticks(
                 (uint32_t)((RDP_MIN_PASS_US - since) / 1000) + 1u));
+            s_p.tot_min_wait_us += ag_port_us() - mw0;
         }
         began = ag_port_us();
         pass();
     }
+}
+
+void rdp_times(uint32_t *pass_ms, uint32_t *send_ms, uint32_t *sync_ms,
+               uint32_t *sends)
+{
+    *pass_ms = (uint32_t)(s_p.tot_pass_us / 1000);
+    *send_ms = (uint32_t)(s_p.tot_wire_us / 1000);
+    *sync_ms = (uint32_t)(s_p.sync_total_us / 1000);
+    *sends = s_p.tot_sends;
+}
+
+void rdp_waits(uint32_t *frame_ms, uint32_t *min_ms, uint32_t *wake_ms,
+               uint32_t *presents)
+{
+    *frame_ms = (uint32_t)(s_p.tot_frame_wait_us / 1000);
+    *min_ms = (uint32_t)(s_p.tot_min_wait_us / 1000);
+    *wake_ms = (uint32_t)(s_p.tot_wake_wait_us / 1000);
+    *presents = s_p.tot_presents;
 }
 
 void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us)
@@ -1228,8 +1278,9 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
         if ((uint32_t)b->surf_w * b->surf_h > s_p.cap_px ||
             b->surf_h > s_p.cap_rows || room > s_p.room) {
             unlock();
-    s_p.t_damage_us += ag_port_us() - t_dmg;
-    s_p.damages++;
+            s_p.t_damage_us += ag_port_us() - t_dmg;
+            s_p.damages++;
+            s_p.tot_presents++;
             return false; /* bigger than the picture was made for */
         }
         /* another shape: nothing of the far screen is known any more */
@@ -1333,6 +1384,7 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
     unlock();
     s_p.t_damage_us += ag_port_us() - t_dmg;
     s_p.damages++;
+    s_p.tot_presents++;
     if (marked) {
         (void)ag_port_sem_give(s_p.wake);
     }

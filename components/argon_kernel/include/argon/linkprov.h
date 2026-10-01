@@ -241,6 +241,10 @@ ag_err_t ag_linkprov_info_on(int32_t wire, ag_link_info_t *out);
 /* Windows in which the reader spent its 2 ms and was dropped below
  * applications for the rest (see READER_PRIO_HIGH in linkprov.c). */
 uint32_t ag_linkprov_reader_overruns(void);
+/* The reader's slow messages since the last call (the probe, 1 Oct 2026): the
+ * longest one took to route and its channel, and those of 1 ms or more. */
+void     ag_linkprov_reader_slow(uint32_t *max_us, uint8_t *max_chan,
+                                 uint32_t *slow, uint32_t *slow_us);
 /* The same for the relay's task, which is on the same terms. */
 uint32_t ag_linkprov_relay_overruns(void);
 /* `link report on|off`: the link's second-by-second meters in the journal. */
@@ -276,7 +280,9 @@ typedef struct {
     uint32_t got_wrong;   /* frames with a byte other than the one sent    */
 } ag_linkprov_flood_t;
 
+/* cls: AG_LINK_BACKGROUND (the default) or AG_LINK_BULK - the second without
+ * the background's end-to-end window, to measure the wire itself */
 ag_err_t ag_linkprov_flood(uint32_t ms, uint32_t size, unsigned prio,
-                           ag_linkprov_flood_t *out);
+                           uint8_t cls, ag_linkprov_flood_t *out);
 
 #endif /* ARGON_LINKPROV_H */

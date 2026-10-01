@@ -113,6 +113,9 @@ void ag_noderdev_screen_counts(uint32_t *passes, uint32_t *lost,
 /* The display was released here: a neighbour's screen showing it is told,
  * behind the last of what was drawn, so it can take its glass back. */
 void ag_noderdev_screen_done(void);
+/* The painter's window: passes ahead of the far end's answers, and messages
+ * unanswered.  Read, or set when `set`. */
+void ag_noderdev_paint_window(uint8_t *ahead, uint8_t *msgs, bool set);
 /* The painting side: blits handed to the neighbour's screen, those with no
  * screen chosen, those the far end would not open (and its last error),
  * and those sent raw for want of the painter's memory. */

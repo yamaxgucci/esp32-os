@@ -925,9 +925,28 @@ static uint32_t msgs_in_flight(uint16_t seq, uint16_t acked)
  * picture queue (RD_SCR slots) takes without its reader waiting for room.
  * (Four and twenty filled it: the reader waited 33 times, and the sound
  * behind the picture came 218 ms late.)
+ *
+ * NOT WIDER WHILE SOUND SHARES THE RING (1 Oct 2026).  8/64 with a send ring
+ * of 16 ms of the wire took a 16 Mbaud wire from 84% to 91-94% under noise -
+ * and the sound behind the picture in the same ring came in bursts: 83
+ * periods dropped at the CYD in 40 s against 9 at 2/12.  Wider only once
+ * sound has a way past the picture.
  */
 #define RD_PAINT_AHEAD 2u
 #define RD_PAINT_MSGS  12u
+/* the window as it is now: `link window <passes> <messages>` measures others */
+static uint8_t s_paint_ahead = RD_PAINT_AHEAD, s_paint_msgs = RD_PAINT_MSGS;
+
+void ag_noderdev_paint_window(uint8_t *ahead, uint8_t *msgs, bool set)
+{
+    if (set) {
+        /* at least one, and fewer than the passes counted (s_pass_msgs) */
+        s_paint_ahead = (*ahead < 1u) ? 1u : (*ahead > 15u) ? 15u : *ahead;
+        s_paint_msgs = (*msgs >= 4u) ? *msgs : 4u;
+    }
+    *ahead = s_paint_ahead;
+    *msgs = s_paint_msgs;
+}
 
 static void rd_sync_z(uint32_t handle)
 {
@@ -984,9 +1003,9 @@ static void rd_sync_z(uint32_t handle)
     const int64_t t0 = ag_port_us();
     const int64_t until = t0 + (int64_t)RD_PAINT_WAIT_MS * 1000;
     bool          out = false;
-    while ((uint16_t)(seq - s_paint_acked) > RD_PAINT_AHEAD ||
+    while ((uint16_t)(seq - s_paint_acked) > s_paint_ahead ||
            ((uint16_t)(seq - s_paint_acked) > 1u &&
-            msgs_in_flight(seq, s_paint_acked) > RD_PAINT_MSGS)) {
+            msgs_in_flight(seq, s_paint_acked) > s_paint_msgs)) {
         if (ag_port_us() >= until) {
             out = true;
             break;
@@ -1000,7 +1019,7 @@ static void rd_sync_z(uint32_t handle)
         s_paint_wait_max = ag_port_us() - t0;
     }
     if (s_paint_acked != 0u &&
-        (uint16_t)(seq - s_paint_acked) <= RD_PAINT_AHEAD) {
+        (uint16_t)(seq - s_paint_acked) <= s_paint_ahead) {
         s_paint_heard = true;
         s_paint_silent = 0;
     } else if (s_paint_silent < 255u) {

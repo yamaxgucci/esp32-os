@@ -80,6 +80,16 @@ void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us);
  * far end counts the frames it has drawn whole, which is what a person sees. */
 bool rdp_pass_whole(void);
 
+/* Since the board started: time in passes, of it inside send() and waiting
+ * for the far end, and the payloads sent. */
+void rdp_times(uint32_t *pass_ms, uint32_t *send_ms, uint32_t *sync_ms,
+               uint32_t *sends);
+/* the painter's time between passes: waiting for the program's frame, for
+ * the least time a pass may take (RDP_MIN_PASS_US), and for anything marked
+ * at all; and the presents that marked something */
+void rdp_waits(uint32_t *frame_ms, uint32_t *min_ms, uint32_t *wake_ms,
+               uint32_t *presents);
+
 /*
  * The program drawing on the far screen let it go (the display was
  * released).  The painter says so in a marker behind the last of what it

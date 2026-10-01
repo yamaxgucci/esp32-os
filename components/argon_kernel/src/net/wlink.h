@@ -116,7 +116,8 @@
 #define WL_F_SEG  4u
 #define WL_SEG_SKIP 0x8000u
 /* frames a sender may have out and unacknowledged, and the out-of-order
- * frames a receiver will hold beyond its hole */
+ * frames a receiver will hold beyond its hole (24 tried 1 Oct 2026 for the
+ * S3's 530-byte picture frames: no change - the window was never full) */
 #define WL_WIN 8u
 /* no acknowledgement for this long with frames out: send the first again */
 #define WL_RTO_US 50000
@@ -255,6 +256,7 @@ typedef struct {
         uint32_t off;
         uint32_t blk; /* block mode: its first record header, >= off */
         uint16_t n;
+        int64_t  at;  /* when it was built, for the probe's round trip */
     } infl[WL_WIN];
     uint32_t infl_n;
     bool     resend;
@@ -311,6 +313,21 @@ typedef struct {
     uint32_t peer_restarts;
     uint32_t starve_data;
     uint32_t starve_credit;
+    /* the probe (`link probe`, 1 Oct 2026): a writer's waits for room, the
+     * sending task's reasons to stop, its waits for a transmit buffer */
+    uint32_t pr_sends, pr_space_waits;
+    int64_t  pr_send_us, pr_space_us;
+    uint32_t pr_stop_credit, pr_stop_win, pr_stop_empty;
+    uint32_t pr_settles;
+    int64_t  pr_settle_us;
+    uint64_t pr_wire_bytes;
+    /* frames acknowledged, the time they took in all and the longest, and
+     * the far end's room at each acknowledgement, in all and the least */
+    uint32_t pr_acked, pr_rtt_max_us, pr_room_n, pr_room_min;
+    /* room told under a frame: frames held past a hole, a hole, a full ring */
+    uint32_t pr_small_ooo, pr_small_hole, pr_small_full;
+    int64_t  pr_rtt_us;
+    uint64_t pr_room_sum;
     uint32_t frames_bad;
     uint32_t seq_gaps;
     uint32_t bytes_dropped;

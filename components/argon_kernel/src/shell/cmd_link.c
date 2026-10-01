@@ -12,6 +12,7 @@
  */
 #include "shell/cmd_link.h"
 #include "net/rdpaint.h"
+#include "net/wtrace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,7 @@
 /* For the SPI slave service's own counters - see print_spilink below. */
 #include <argon/spilink.h>
 #include <argon/uartlink.h>
+#include <argon/port/task.h>
 #include <argon/port/uart.h>
 #include <argon/nodeproc.h>
 #include <argon/path.h>
@@ -437,6 +439,19 @@ static void print_stats(void)
                           "end took %u ms a pass\n",
                           (unsigned)whole, (unsigned)passes,
                           (unsigned)(pass_wait / 1000u));
+        uint32_t tpm = 0, tsm = 0, tym = 0, tsn = 0;
+        rdp_times(&tpm, &tsm, &tym, &tsn);
+        ag_console_printf("        passes took %u ms: %u in sending %u payloads, "
+                          "%u waiting for the far end\n",
+                          (unsigned)tpm, (unsigned)tsm, (unsigned)tsn,
+                          (unsigned)tym);
+        uint32_t tfw = 0, tmw = 0, tww = 0, tpr = 0;
+        rdp_waits(&tfw, &tmw, &tww, &tpr);
+        ag_console_printf("        between passes: %u ms waiting for the "
+                          "program's frame, %u for the least pass, %u for "
+                          "anything; %u presents\n",
+                          (unsigned)tfw, (unsigned)tmw, (unsigned)tww,
+                          (unsigned)tpr);
         ag_console_printf("        %u times all of it again, %u waits ran "
                           "out, the longest %u ms, %u markers refused\n",
                           (unsigned)rdp_redraws(), (unsigned)pto,
@@ -815,7 +830,7 @@ static int link_ping(uint32_t count, uint8_t cls)
 }
 
 /*
- * `link flood <secs> [size] [prio]`: the wire filled with bytes that mean
+ * `link flood <secs> [size] [prio] [bulk]`: the wire filled with bytes that mean
  * nothing, to measure it beside whatever else is running.  See the sink in
  * linkprov.c.  Priority 2 by default: an application's LOW class, so a real
  * program on this board comes first for the processor.
@@ -825,11 +840,14 @@ static int link_flood(int argc, char **argv)
     const uint32_t secs = (argc > 2) ? (uint32_t)atoi(argv[2]) : 10u;
     const uint32_t size = (argc > 3) ? (uint32_t)atoi(argv[3]) : 0u;
     const unsigned prio = (argc > 4) ? (unsigned)atoi(argv[4]) : 2u;
-    ag_console_printf("flood: %u s at priority %u to %s\n", (unsigned)secs,
-                      prio, ag_linkprov_active());
+    const bool     bulk = argc > 5 && ag_path_icmp(argv[5], "bulk") == 0;
+    ag_console_printf("flood: %u s at priority %u, %s, to %s\n",
+                      (unsigned)secs, prio, bulk ? "bulk" : "background",
+                      ag_linkprov_active());
     ag_linkprov_flood_t f;
-    const ag_err_t e = ag_linkprov_flood(((secs == 0u) ? 1u : secs) * 1000u,
-                                         size, prio, &f);
+    const ag_err_t e = ag_linkprov_flood(
+        ((secs == 0u) ? 1u : secs) * 1000u, size, prio,
+        bulk ? (uint8_t)AG_LINK_BULK : (uint8_t)AG_LINK_BACKGROUND, &f);
     if (e != AG_OK) {
         ag_console_printf("flood: %d\n", (int)e);
         return 1;
@@ -1265,6 +1283,107 @@ int ag_cmd_link(int argc, char **argv)
     if (ag_path_icmp(argv[1], "echo") == 0) {
         const uint32_t s = (argc > 2) ? (uint32_t)atoi(argv[2]) : 20u;
         return link_echo((s == 0) ? 1u : s);
+    }
+    if (ag_path_icmp(argv[1], "window") == 0) {
+        uint8_t a = 0, m = 0;
+        const bool set = argc > 3;
+        if (set) {
+            a = (uint8_t)atoi(argv[2]);
+            m = (uint8_t)atoi(argv[3]);
+        }
+        ag_noderdev_paint_window(&a, &m, set);
+        ag_console_printf("the painter's window: %u passes ahead, %u messages "
+                          "unanswered\n", (unsigned)a, (unsigned)m);
+        return 0;
+    }
+    if (ag_path_icmp(argv[1], "trace") == 0) {
+        /* `link trace <ms>`: the wire's events in time (net/wtrace.h) */
+        const uint32_t ms = (argc > 2) ? (uint32_t)atoi(argv[2]) : 100u;
+        if (!wt_start(ms)) {
+            ag_console_puts("trace: no memory\n");
+            return 1;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(ms + 20u));
+        wt_stop();
+        const uint32_t n = wt_count();
+        ag_console_printf("trace: %u events in %u ms\n", (unsigned)n,
+                          (unsigned)ms);
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t us = 0, a = 0;
+            uint8_t  ev = 0;
+            if (wt_get(i, &us, &ev, &a)) {
+                ag_console_printf("T %u %s %u\n", (unsigned)us, wt_name(ev),
+                                  (unsigned)a);
+            }
+        }
+        ag_console_puts("trace: end\n");
+        return 0;
+    }
+    if (ag_path_icmp(argv[1], "probe") == 0) {
+        /* where a UART link's sender spends its time, since the last look */
+        for (int port = 0; port < 3; port++) {
+            ag_uartlink_probe_t p;
+            if (ag_uartlink_probe(port, &p) != AG_OK) {
+                continue;
+            }
+            const uint32_t ms = p.elapsed_us / 1000u;
+            ag_console_printf(
+                "uart%d over %u ms: %u frames out (%u KB, %u B each), %u in\n",
+                port, (unsigned)ms, (unsigned)p.frames,
+                (unsigned)(p.wire_bytes / 1024u),
+                (unsigned)(p.frames ? p.wire_bytes / p.frames : 0u),
+                (unsigned)p.frames_rx);
+            ag_console_printf(
+                "  %u writes, %u us in them; %u waited for room, %u us\n",
+                (unsigned)p.sends, (unsigned)p.send_us,
+                (unsigned)p.space_waits, (unsigned)p.space_us);
+            ag_console_printf(
+                "  sender stopped: %u nothing to send, %u no credit, %u "
+                "window full; %u buffer waits, %u us\n",
+                (unsigned)p.stop_empty, (unsigned)p.stop_credit,
+                (unsigned)p.stop_win, (unsigned)p.settles,
+                (unsigned)p.settle_us);
+            if (p.acked != 0u) {
+                ag_console_printf("  %u frames answered: round trip %u us on "
+                                  "average, %u at most; the far end's room "
+                                  "%u B on average, %u at least (this end "
+                                  "keeps %u)\n",
+                                  (unsigned)p.acked, (unsigned)p.rtt_avg_us,
+                                  (unsigned)p.rtt_max_us,
+                                  (unsigned)p.room_avg, (unsigned)p.room_min,
+                                  (unsigned)p.rxcap_peer);
+            }
+            if (p.small_ooo + p.small_hole + p.small_full != 0u) {
+                ag_console_printf("  told under a frame of room: %u for "
+                                  "frames past a hole, %u for a hole, %u "
+                                  "for a full ring\n",
+                                  (unsigned)p.small_ooo,
+                                  (unsigned)p.small_hole,
+                                  (unsigned)p.small_full);
+            }
+            uint32_t slow = 0, slow_us = 0, slow_len = 0;
+            ag_port_uart_dma_tx_slow(port, &slow, &slow_us, &slow_len);
+            if (slow != 0u) {
+                ag_console_printf("  DMA transfers slower than 1 B/us: %u, "
+                                  "the slowest %u us for %u B\n",
+                                  (unsigned)slow, (unsigned)slow_us,
+                                  (unsigned)slow_len);
+            }
+            if (p.dma_subs != 0u) {
+                ag_console_printf("  by DMA: %u transfers, %u found the wire "
+                                  "quiet, %u us of quiet\n",
+                                  (unsigned)p.dma_subs, (unsigned)p.dma_idle,
+                                  (unsigned)p.dma_idle_us);
+            }
+        }
+        uint32_t rmax = 0, rslow = 0, rslow_us = 0;
+        uint8_t  rchan = 0;
+        ag_linkprov_reader_slow(&rmax, &rchan, &rslow, &rslow_us);
+        ag_console_printf("reader: the longest message %u us (channel %u); "
+                          "%u of 1 ms or more, %u us in all\n",
+                          (unsigned)rmax, (unsigned)rchan, (unsigned)rslow,
+                          (unsigned)rslow_us);
+        return 0;
     }
     if (ag_path_icmp(argv[1], "report") == 0) {
         const bool on = argc > 2 && ag_path_icmp(argv[2], "on") == 0;

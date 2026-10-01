@@ -121,6 +121,12 @@ bool     ag_port_uart_dma_ready(int port);
  * and without making anything: the ESP32 receives by its UHCI and sends
  * through the driver, which then needs a transmit ring. */
 bool     ag_port_uart_dma_can_send(void);
+/* Whether this chip RECEIVES by DMA without losing anything - by the receive
+ * that is never stopped (ag_port_uart_dma_listen_ring).  Asked the same way.
+ * The S3 cannot have that ring, and IDF's own receive there lost whole frames
+ * (883 of 123 365 at 8 Mbaud, 27 Sep 2026): it receives through the driver and
+ * still sends by DMA.  The chip decides this, not a board's configuration. */
+bool     ag_port_uart_dma_can_receive(void);
 int32_t  ag_port_uart_dma_write(int port, const void *buf, size_t len);
 
 /*
@@ -172,6 +178,19 @@ uint32_t ag_port_uart_dma_overruns(int port);
  * how many none; of the second, how many had the owner bit given and how
  * many only their end.  Zeros where there is none. */
 void     ag_port_uart_dma_diag(int port, uint32_t out[8]);
+/* The transmit's gaps (1 Oct 2026, `link probe`): transfers handed over since
+ * the start, and since the last call those handed to a DMA that had finished
+ * everything before - a wire gone quiet - and for how long in all.  Zero where
+ * nothing goes out by DMA. */
+void     ag_port_uart_dma_tx_gaps(int port, uint32_t *subs, uint32_t *idle,
+                                  uint32_t *idle_us);
+/* How long the wire had been quiet before the latest transfer, 0 if it had not
+ * (for `link trace`). */
+uint32_t ag_port_uart_dma_last_quiet(int port);
+/* Transfers since the last call slower than a byte a microsecond, and the
+ * slowest of them: its time and its length (for `link probe`). */
+void     ag_port_uart_dma_tx_slow(int port, uint32_t *slow, uint32_t *max_us,
+                                  uint32_t *max_len);
 
 #include <argon/port/impl/uart.h>
 

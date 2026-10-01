@@ -1186,6 +1186,10 @@ static volatile int64_t s_rd_window;  /* when the current window began   */
 static volatile int64_t s_rd_used;    /* spent in it                     */
 static volatile bool    s_rd_low;     /* dropped for the rest of it      */
 static uint32_t         s_rd_drops;   /* how many windows it overran     */
+/* the probe (1 Oct 2026): the longest one message took to route, and on
+ * which channel; how many took a millisecond or more, and how long in all */
+static uint32_t         s_rd_route_max_us, s_rd_route_slow, s_rd_route_slow_us;
+static uint8_t          s_rd_route_max_chan;
 
 static void reader_charge(int64_t began)
 {
@@ -1205,6 +1209,18 @@ static void reader_charge(int64_t began)
 uint32_t ag_linkprov_reader_overruns(void)
 {
     return s_rd_drops;
+}
+
+void ag_linkprov_reader_slow(uint32_t *max_us, uint8_t *max_chan,
+                             uint32_t *slow, uint32_t *slow_us)
+{
+    *max_us = s_rd_route_max_us;
+    *max_chan = s_rd_route_max_chan;
+    *slow = s_rd_route_slow;
+    *slow_us = s_rd_route_slow_us;
+    s_rd_route_max_us = 0;
+    s_rd_route_slow = 0;
+    s_rd_route_slow_us = 0;
 }
 
 
@@ -1333,6 +1349,15 @@ static void reader_task(void *arg)
                 const int64_t began = ag_port_us();
                 route(w, chan, &from, buf, (uint16_t)n);
                 reader_charge(began);
+                const int64_t took = ag_port_us() - began;
+                if (took > (int64_t)s_rd_route_max_us) {
+                    s_rd_route_max_us = (uint32_t)took;
+                    s_rd_route_max_chan = chan;
+                }
+                if (took >= 1000) {
+                    s_rd_route_slow++;
+                    s_rd_route_slow_us += (uint32_t)took;
+                }
             }
         }
         bg_answer(s_rd_low, s_rd_window);
@@ -1470,6 +1495,7 @@ typedef struct {
     uint32_t              ms;
     uint32_t              size;
     uint8_t              *frame;
+    uint8_t               cls;
     ag_linkprov_flood_t  *out;
     ag_port_sem_t         done;
 } flood_job_t;
@@ -1503,8 +1529,8 @@ static void flood_task(void *arg)
         for (uint32_t k = 5; k < j->size; k++) {
             j->frame[k] = sink_byte(seq, k);
         }
-        const int32_t r = ag_linkprov_send(LINK_CHAN_SINK, AG_LINK_BACKGROUND,
-                                           j->frame, j->size);
+        const int32_t r =
+            ag_linkprov_send(LINK_CHAN_SINK, j->cls, j->frame, j->size);
         if (r >= 0) {
             o->sent_bytes += j->size;
             o->sent_frames++;
@@ -1522,7 +1548,7 @@ static void flood_task(void *arg)
 }
 
 ag_err_t ag_linkprov_flood(uint32_t ms, uint32_t size, unsigned prio,
-                           ag_linkprov_flood_t *out)
+                           uint8_t cls, ag_linkprov_flood_t *out)
 {
     memset(out, 0, sizeof(*out));
     if (!ag_linkprov_bound()) {
@@ -1536,7 +1562,9 @@ ag_err_t ag_linkprov_flood(uint32_t ms, uint32_t size, unsigned prio,
     if (size == 0u || size > info.mtu) {
         size = info.mtu;
     }
-    flood_job_t j = {ms, size, NULL, out, NULL};
+    flood_job_t j = {ms, size, NULL,
+                     (cls == AG_LINK_BULK) ? cls : (uint8_t)AG_LINK_BACKGROUND,
+                     out, NULL};
     j.frame = (uint8_t *)ag_port_alloc(size, AG_MEM_BYTE);
     j.done = ag_port_sem_new_binary();
     ag_port_task_t t = NULL;
