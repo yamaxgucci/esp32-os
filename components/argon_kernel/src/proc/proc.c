@@ -575,7 +575,14 @@ static bool holds_kernel_lock(ag_port_task_t task)
      * the CYD with it, and the shell that had asked for the kill never came
      * back (26 Sep 2026).
      */
+    /*
+     * AND INSIDE THE JOURNAL.  Every word a background application prints goes
+     * through it (ag_log_app_write), and it was the one lock left off this
+     * list: SPIN, killed in the middle of its dots, took it with it and the
+     * board said nothing more but the lock watch (1 Oct 2026).
+     */
     return ag_console_lock_holder() == (void *)task ||
+           ag_log_lock_holder() == (const void *)task ||
            ag_storage_vfs_lock_holder() == (void *)task ||
            ag_hostfs_rpc_holder() == (void *)task ||
            ag_dev_task_in_driver((const void *)task);
@@ -584,6 +591,65 @@ static bool holds_kernel_lock(ag_port_task_t task)
 bool ag_proc_task_in_kernel(ag_port_task_t task)
 {
     return holds_kernel_lock(task);
+}
+
+/*
+ * How long a task told to stop is given to actually leave its processor.  The
+ * stop is an interrupt to the other core and lands in microseconds; what can
+ * hold it off is a critical section or a scheduler suspended over there, and
+ * neither honestly lasts a millisecond.
+ */
+#define AG_PROC_STOP_SPIN_US 2000
+
+/*
+ * Stops `task` where it stands, and keeps it stopped only if it holds none of
+ * the kernel's locks there: true means it is suspended, off every processor,
+ * holding nothing, and may be deleted; false means it has been let go again,
+ * exactly as it was.  One attempt - the caller decides how long to keep trying.
+ *
+ * WHY STOP IT FIRST.  "Is it in the kernel?" and the delete used to be two
+ * steps, and the task they were about is an application on the OTHER core,
+ * running the whole time between them.  SPIN, killed while it wrote its dots
+ * through the journal (1 Oct 2026, proctest), was asked, answered "no", walked
+ * into the journal's lock in the next microseconds and was deleted holding it -
+ * and FreeRTOS lets only the owner give a mutex back, so from then on nothing
+ * on the board could log or print: "[lockwatch] the journal lock held 30 s by
+ * ''", the empty name being a task that no longer existed.  A suspended task
+ * runs no further, so the answer asked of one is still true at the delete.
+ *
+ * ASKED BEFORE IT IS STOPPED, AND AGAIN AFTER.  A task stopped inside a
+ * blocking call is taken off whatever it was waiting for, and when it is let
+ * go it returns as if the wait had run out.  A task already seen holding a lock
+ * is therefore never stopped at all - it is left to come out by itself - and
+ * only one that took a lock in the microseconds between the first look and the
+ * stop is let go again, early from whatever it was blocked on.  It is being
+ * killed; the cost of that rare early return is its own.
+ */
+static bool stop_outside_kernel(ag_port_task_t task)
+{
+    /* never itself: a task that suspends itself is not coming back */
+    if (task == NULL || task == ag_port_task_self() ||
+        holds_kernel_lock(task)) {
+        return false;
+    }
+    ag_port_task_suspend(task);
+    const int64_t until = ag_port_us() + AG_PROC_STOP_SPIN_US;
+    while (ag_port_task_on_cpu(task)) {
+        if (ag_port_us() > until) {
+            ag_port_task_resume(task);
+            return false;
+        }
+    }
+    if (holds_kernel_lock(task)) {
+        ag_port_task_resume(task);
+        return false;
+    }
+    return true;
+}
+
+bool ag_proc_task_stop_outside_kernel(ag_port_task_t task)
+{
+    return stop_outside_kernel(task);
 }
 
 /*
@@ -1718,31 +1784,34 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
     unlock();
 
     /*
-     * Wait for it to be outside the kernel.  A task deleted while it holds a
-     * kernel lock leaves that lock held forever, and the two locks that matter -
-     * the console and the filesystem - are how anything else gets done.
+     * Stopped outside the kernel, or not at all.  A task deleted while it holds
+     * a kernel lock leaves that lock held forever, and the locks that matter -
+     * the console, the journal, the filesystem - are how anything else gets
+     * done.  See stop_outside_kernel for why it is stopped before it is asked.
+     *
+     * Tried under the table lock, so that it cannot be finishing by itself in
+     * the meantime; let go between tries, because the way out of whatever it
+     * holds may lead through the table.  A millisecond at a time: a program
+     * that writes sound is outside the driver for moments, not for tens of
+     * milliseconds.
      */
-    /* a millisecond at a time: a program that writes sound is outside the
-     * driver for moments, not for tens of milliseconds */
-    for (uint32_t waited = 0; waited < AG_PROC_KILL_GRACE_MS; waited++) {
-        if (!holds_kernel_lock(task)) {
-            break;
+    bool stopped = false;
+    for (uint32_t waited = 0;; waited++) {
+        lock();
+        p = by_pid(pid);
+        if (p == NULL || p->state == AG_PS_ZOMBIE) {
+            unlock();
+            return AG_OK; /* it finished by itself while we waited */
         }
+        stopped = stop_outside_kernel(task);
+        if (stopped || waited >= AG_PROC_KILL_GRACE_MS) {
+            break; /* with the table locked */
+        }
+        unlock();
         ag_port_task_delay(1);
     }
 
-    lock();
-    p = by_pid(pid);
-    if (p == NULL) {
-        unlock();
-        return AG_OK; /* it finished by itself while we waited */
-    }
-    if (p->state == AG_PS_ZOMBIE) {
-        unlock();
-        return AG_OK;
-    }
-
-    if (holds_kernel_lock(task)) {
+    if (!stopped) {
         /*
          * Refusing rather than pretending.  Killing it here would trade a hung
          * application for a hung system, and saying so gives the operator

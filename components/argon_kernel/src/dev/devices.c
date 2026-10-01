@@ -233,8 +233,6 @@ void ag_dev_note_done(void)
  * (26 Sep 2026).  Seen held by the same task three watches running - three
  * seconds - it is said, once per spell.
  */
-const void *ag_log_lock_holder(void); /* core/log.c */
-
 static const void *console_holder(void)
 {
     return ag_console_lock_holder(); /* argon/console.h */

@@ -98,9 +98,16 @@ if(NOT CMAKE_SCRIPT_MODE_FILE AND ARGON_PORT STREQUAL "idf")
     endforeach()
 endif()
 
+set(ARGON_PORT_LDFRAGMENTS "")
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/${ARGON_PORT}/linker.lf")
+    set(ARGON_PORT_LDFRAGMENTS "${ARGON_PORT}/linker.lf")
+endif()
+
 idf_component_register(
     SRCS ${ARGON_PORT_SRCS}
     INCLUDE_DIRS "include" "${ARGON_PORT}"
+    # Where some of IDF's own functions are placed - see idf/linker.lf.
+    LDFRAGMENTS ${ARGON_PORT_LDFRAGMENTS}
     # Public, not private: the port headers are inline and pull these in
     # wherever the kernel includes them.
     REQUIRES argon_abi heap esp_timer freertos log esp_system esp_hw_support

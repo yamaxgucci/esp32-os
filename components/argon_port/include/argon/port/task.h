@@ -30,6 +30,9 @@
  *                            uint32_t stack_bytes, void *arg, unsigned prio,
  *                            int core, unsigned stack_caps, ag_port_task_t *out)
  *   void ag_port_task_delete(ag_port_task_t t)      NULL means "this task"
+ *   void ag_port_task_suspend(ag_port_task_t t)     another task, never NULL
+ *   void ag_port_task_resume(ag_port_task_t t)
+ *   bool ag_port_task_on_cpu(ag_port_task_t t)      executing on some core now
  *   void ag_port_task_delay(ag_port_ticks_t ticks)
  *   ag_port_task_t ag_port_task_self(void)
  *   void ag_port_task_prio_set(ag_port_task_t t, unsigned prio)
@@ -61,6 +64,10 @@
  *   AG_PORT_TASK_STACK_CAPS is 0 the kernel does not ask twice, so a port that
  *   ignores the mask must say 0 rather than accept and disregard it.
  * - ag_port_task_delete(NULL) does not return.
+ * - ag_port_task_suspend may return while the task is still executing on
+ *   another core; it runs no further once ag_port_task_on_cpu says false.  A
+ *   task suspended inside a blocking call is taken off what it waited for, and
+ *   resumed it returns from that call as if the wait had run out.
  * - ag_port_sched_lock stops the scheduler; it is not a critical section and
  *   does not disable interrupts.  It must nest or the kernel must not nest it -
  *   today the kernel does not.
