@@ -120,6 +120,10 @@ const char *ag_port_audio_name(void) { return "dac"; }
 #define DAC_PRIME 1536u            /* 35 ms */
 
 static dac_continuous_handle_t s_dac;
+/* playing: enabled and going round (s_dac alone is only "made") */
+static bool                    s_dac_on;
+/* the rate s_dac was made at, as played (after s_up) */
+static uint32_t                s_dac_hz;
 static uint8_t                 s_channels = 2;
 /* each input sample is given this many times (see ag_port_audio_open) */
 static uint8_t                 s_up = 1;
@@ -175,8 +179,18 @@ static bool IRAM_ATTR on_dac_done(dac_continuous_handle_t h,
  * neighbour's picture and the link had the rest - so its DMA buffers could
  * not be had: "failed to allocate dma buffer", sound arriving and nothing
  * played.  So a block the size of what the driver takes is held from the
- * first question about the converter, let go just before the driver asks for
- * its buffers, and held again once it has given them back.
+ * first question about the converter until the driver asks for its buffers.
+ *
+ * AND NOT GIVEN BACK AFTER THAT (2 Oct 2026).  Held again at every close, the
+ * block came back somewhere else: the heap's best fit for 3 KB was the CYD's
+ * last 5 KB piece, not the hole the driver had left, and one `beep` took the
+ * largest block of byte memory from 5 KB to 2 KB.  The neighbour's next
+ * request then had no 4 KB for the task it is served in - its open of
+ * cyd.pcm0 answered -12, the S3's mixer had "nowhere to send sound", and the
+ * CYD played nothing more of it.  So the driver keeps its channels from the
+ * first open on, stopped while the device is closed, and the memory never
+ * moves; only a different rate makes them anew - and 22 050 and 44 100, the
+ * two that reach here, are both played at 44 100 (see the open).
  */
 #define DAC_RESERVE (DAC_DESCS * DAC_BUF + 1024u)
 static void *s_reserve;
@@ -195,17 +209,21 @@ bool ag_port_audio_present(void)
     return true;
 }
 
-bool ag_port_audio_open(uint32_t rate, uint8_t channels)
+static void dac_drop(void)
 {
     if (s_dac != NULL) {
+        (void)dac_continuous_del_channels(s_dac);
+        s_dac = NULL;
+    }
+    dac_reserve();
+}
+
+bool ag_port_audio_open(uint32_t rate, uint8_t channels)
+{
+    if (s_dac_on) {
         return true;
     }
-    if (s_reserve != NULL) {
-        heap_caps_free(s_reserve); /* for the driver's own buffers, now */
-        s_reserve = NULL;
-    }
     if (channels != 1u && channels != 2u) {
-        dac_reserve();
         return false;
     }
     /*
@@ -229,6 +247,11 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
     s_up = (rate < 32000u) ? 2u : 1u;
     rate *= s_up;
 
+    if (s_dac != NULL && s_dac_hz != rate) {
+        /* another clock: the one thing that needs the channels made anew */
+        (void)dac_continuous_del_channels(s_dac);
+        s_dac = NULL;
+    }
     const dac_continuous_config_t cfg = {
         /* Channel 1 is GPIO 26: the pin the amplifier is on. */
         .chan_mask = DAC_CHANNEL_MASK_CH1,
@@ -240,31 +263,42 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
         .chan_mode = DAC_CHANNEL_MODE_SIMUL,
     };
 
+    esp_err_t err = ESP_OK;
+    if (s_dac == NULL) {
+        if (s_reserve != NULL) {
+            heap_caps_free(s_reserve); /* for the driver's own buffers, now */
+            s_reserve = NULL;
+        }
+        err = dac_continuous_new_channels(&cfg, &s_dac);
+        if (err == ESP_OK) {
+            const dac_event_callbacks_t cbs = {.on_convert_done = on_dac_done,
+                                               .on_stop = NULL};
+            err = dac_continuous_register_event_callback(s_dac, &cbs, NULL);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "dac: %s", esp_err_to_name(err));
+            dac_drop();
+            return false;
+        }
+        s_dac_hz = rate;
+    }
+
     s_w = s_r = 0;
     s_priming = true;
     s_last = 128;
-    esp_err_t err = dac_continuous_new_channels(&cfg, &s_dac);
-    if (err == ESP_OK) {
-        const dac_event_callbacks_t cbs = {.on_convert_done = on_dac_done,
-                                           .on_stop = NULL};
-        err = dac_continuous_register_event_callback(s_dac, &cbs, NULL);
-    }
-    if (err == ESP_OK) {
-        err = dac_continuous_enable(s_dac);
-    }
+    err = dac_continuous_enable(s_dac);
     if (err == ESP_OK) {
         err = dac_continuous_start_async_writing(s_dac);
+        if (err != ESP_OK) {
+            (void)dac_continuous_disable(s_dac);
+        }
     }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "dac: %s", esp_err_to_name(err));
-        if (s_dac != NULL) {
-            (void)dac_continuous_disable(s_dac);
-            (void)dac_continuous_del_channels(s_dac);
-        }
-        s_dac = NULL;
-        dac_reserve();
+        dac_drop();
         return false;
     }
+    s_dac_on = true;
     s_channels = channels;
     ESP_LOGI(TAG, "dac out on gpio26, %u Hz, %u ch in", (unsigned)rate,
              (unsigned)channels);
@@ -287,7 +321,7 @@ static void ring_put(uint8_t v)
 
 void ag_port_audio_close(void)
 {
-    if (s_dac == NULL) {
+    if (!s_dac_on) {
         return;
     }
     ring_drain(DAC_WAIT_MS);
@@ -307,14 +341,12 @@ void ag_port_audio_close(void)
     ring_drain(DAC_WAIT_MS);
     (void)dac_continuous_stop_async_writing(s_dac);
     (void)dac_continuous_disable(s_dac);
-    (void)dac_continuous_del_channels(s_dac);
-    s_dac = NULL;
-    dac_reserve(); /* its memory held for the next sound */
+    s_dac_on = false; /* the channels and their memory stay, for the next */
 }
 
 int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
 {
-    if (s_dac == NULL || pcm == NULL || frames <= 0) {
+    if (!s_dac_on || pcm == NULL || frames <= 0) {
         return 0;
     }
     int32_t  done = 0;
@@ -360,7 +392,7 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
 
 int32_t ag_port_audio_space(void)
 {
-    return s_dac != NULL ? (int32_t)((DAC_RING - (s_w - s_r)) / s_up) : 0;
+    return s_dac_on ? (int32_t)((DAC_RING - (s_w - s_r)) / s_up) : 0;
 }
 
 #elif SOC_I2S_SUPPORTED
