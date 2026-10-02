@@ -141,7 +141,7 @@ static bool nd_up(ag_device_t *dev)
 
 static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
                            const void *buf, size_t len, uint16_t dst,
-                           uint16_t src)
+                           uint16_t src, uint16_t budget_ms)
 {
     node_t *nd = (node_t *)ag_dev_priv(dev);
     if (nd == NULL) {
@@ -165,11 +165,13 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
     TASK->mutex_lock(nd->txlock, UINT32_MAX);
     const int32_t w = IO->spi_link_send2(
         nd->bus, head, LSPI_HEAD, buf, len,
-        stream ? 0u
-               : (cls == AG_LINK_BACKGROUND)
-                   ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_YIELD |
-                      AG_SPILINK_IDLE)
-                   : AG_SPILINK_RELIABLE,
+        /* what goes first is the wire's, by the sender's budget (2 Oct
+         * 2026); the class says only how it is delivered */
+        (stream ? 0u
+                : (cls == AG_LINK_BACKGROUND)
+                    ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_IDLE)
+                    : AG_SPILINK_RELIABLE) |
+            AG_SPILINK_BUDGET(budget_ms),
         stream ? 1u : LSPI_SEND_MS);
     int32_t r;
     if (w > 0) {
@@ -195,7 +197,7 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
 static int32_t nd_send(ag_device_t *dev, uint8_t chan, uint8_t cls,
                        const void *buf, size_t len)
 {
-    return send_common(dev, chan, cls, buf, len, 0u, 0u);
+    return send_common(dev, chan, cls, buf, len, 0u, 0u, 0u);
 }
 
 static int32_t nd_send_a(ag_device_t *dev, uint8_t chan, const void *buf,
@@ -204,7 +206,8 @@ static int32_t nd_send_a(ag_device_t *dev, uint8_t chan, const void *buf,
     if (to == NULL) {
         return -AG_EINVAL;
     }
-    return send_common(dev, chan, to->cls, buf, len, to->dst, to->src);
+    return send_common(dev, chan, to->cls, buf, len, to->dst, to->src,
+                       to->budget_ms);
 }
 
 static int32_t recv_common(ag_device_t *dev, uint8_t *chan, void *buf,

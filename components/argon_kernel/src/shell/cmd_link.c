@@ -38,6 +38,7 @@
 /* For the SPI slave service's own counters - see print_spilink below. */
 #include <argon/spilink.h>
 #include <argon/uartlink.h>
+#include <argon/port/audio.h>
 #include <argon/port/task.h>
 #include <argon/port/uart.h>
 #include <argon/nodeproc.h>
@@ -481,6 +482,22 @@ static void print_stats(void)
                           "for want of time\n",
                           (unsigned)bw, (unsigned)bc, (unsigned)br,
                           (unsigned)bh);
+    }
+    uint64_t pin = 0, pout = 0;
+    uint32_t prate = 0;
+    ag_pcmhw_counts(&pin, &pout, &prate);
+    if (pin != 0u) {
+        /* the proof of sound on this board: what its converter took */
+        uint32_t pch = 0;
+        const uint32_t peak = ag_pcmhw_peak(&pch);
+        ag_console_printf("played  this board's converter was given %u frames "
+                          "and took %u (%u ms at %u Hz, %u ch); the loudest "
+                          "sample since the last look %u of 32767; it ran out "
+                          "and stopped %u times\n",
+                          (unsigned)pin, (unsigned)pout,
+                          (unsigned)(prate ? pout * 1000u / prate : 0u),
+                          (unsigned)prate, (unsigned)pch, (unsigned)peak,
+                          (unsigned)ag_port_audio_stops());
     }
     uint32_t dry = 0, dry_us = 0;
     ag_pcmhw_dry(&dry, &dry_us);

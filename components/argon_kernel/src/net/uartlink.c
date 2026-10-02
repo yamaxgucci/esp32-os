@@ -85,12 +85,18 @@
  */
 #define UL_TX_MIN_BYTES 6144u
 /*
- * Not by time (1 Oct 2026, tried): a ring of 16 ms of a 16 Mbaud wire kept the
- * wire full while the S3's painter took a frame's snapshot - 84% -> 91% - and
- * the sound behind the picture in the same ring waited as long: 83 periods
- * dropped at the CYD in 40 s against 9.  One ring is one queue; a deeper one
- * waits for sound to have its own way past the picture.
+ * THE DEPTH IS IN THE LANES, BY TIME (2 Oct 2026).  A ring of 16 ms of a
+ * 16 Mbaud wire kept it full while the S3's painter took a frame's snapshot
+ * - 84% -> 91% - and the sound behind the picture in that one queue waited as
+ * long: 83 periods dropped at the CYD in 40 s against 9.  So the stream stays
+ * shallow and what may wait waits in its lane (wlink.c, by its budget): the
+ * middle lane holds UL_LANE_MS of the wire, the others UL_LANE_SMALL each,
+ * and only with UL_LANE_SPARE beside them - the CYD has not, and sends in
+ * order as before.
  */
+#define UL_LANE_MS    16u
+#define UL_LANE_SMALL 4096u
+#define UL_LANE_SPARE (64u * 1024u)
 /* what one DMA read takes at most; the frame finder holds a frame and this */
 #define UL_READ      1024u
 #define UL_READ_MS   20u
@@ -152,6 +158,7 @@ typedef struct {
      * of internal memory it did not fit beside the port's receive rings */
     uint8_t *dmem;
     uint8_t *mem;
+    uint8_t *lmem; /* the lanes of blocks waiting to go (wlink_t.lane) */
     uint8_t *txf[UL_TXBUF];
     unsigned txk;
     uint8_t *pbuf;
@@ -401,6 +408,7 @@ static void tx_task(void *arg)
         (void)ag_port_sem_take(w->tx_sem, ticks_at_least(wait_ms));
         while (!u->stop) {
             wl_rto_check(w);
+            (void)wl_feed(w); /* the lanes into the stream, what fits */
             const int64_t now = ag_port_us();
             lock(u);
             uint32_t allow = 0;
@@ -598,11 +606,27 @@ ag_err_t ag_uartlink_open(int port, uint32_t baud, uint32_t frame,
      * more of them, never bigger frames; x4 gave 78.2% and left the CYD 6 KB.
      */
     const uint32_t more = (frame < UL_SMALL_FRAME) ? 2u : 1u;
-    w->txcap = (UL_TX_FRAMES * more * pay < UL_TX_MIN_BYTES)
+    /* the receive room doubled, not the send ring (2 Oct 2026): what may be
+     * on the way is the far end's room, and what waits to go waits in the
+     * lanes now - eight frames to send cost the CYD, which sends answers of
+     * thirty bytes, 2 KB it had not got */
+    w->txcap = (UL_TX_FRAMES * pay < UL_TX_MIN_BYTES)
                    ? UL_TX_MIN_BYTES
-                   : ((UL_TX_FRAMES * more * pay + 3u) & ~3u);
+                   : ((UL_TX_FRAMES * pay + 3u) & ~3u);
     w->rxcap = (UL_RX_FRAMES * more * pay + 3u) & ~3u;
     u->pcap = frame + UL_READ;
+    /* lanes only with memory to spare beside them (UL_LANE_SPARE), and then
+     * a send ring that holds all the far end's room - which is this end's,
+     * the same rule both ways - a frame not yet sent, and the room left for a
+     * block that goes at once */
+    const uint32_t lane_deep =
+        (uint32_t)(((uint64_t)baud / 10u * UL_LANE_MS / 1000u + 3u) & ~3u);
+    const uint32_t lane_bytes = UL_LANE_SMALL + lane_deep + UL_LANE_SMALL;
+    const bool     plenty =
+        ag_port_mem_free(AG_MEM_BYTE) >= lane_bytes + UL_LANE_SPARE;
+    if (plenty && w->txcap < w->rxcap + pay + 1280u) {
+        w->txcap = (w->rxcap + pay + 1280u + 3u) & ~3u;
+    }
     const bool   dma_tx = want && ag_port_uart_dma_can_send() &&
                         ag_port_uart_dma_ready(port);
     const size_t dbytes = (size_t)(dma_tx ? UL_TXBUF : 1u) * frame;
@@ -623,14 +647,32 @@ ag_err_t ag_uartlink_open(int port, uint32_t baud, uint32_t frame,
                port, (unsigned)dbytes, (void *)u->dmem);
     }
     u->mem = (u->dmem != NULL) ? ag_port_alloc(bytes, AG_MEM_BYTE) : NULL;
+    uint32_t lanes[WL_LANES] = {0u, 0u, 0u};
+    {
+        const uint32_t deep = lane_deep;
+        const uint32_t want = lane_bytes;
+        if (u->mem != NULL && u->lmem == NULL && plenty) {
+            /* in the slow memory where there is one: the S3's internal
+             * memory is the game's and the radio's */
+            u->lmem = ag_port_alloc(want, AG_MEM_SLOW | AG_MEM_BYTE);
+            if (u->lmem == NULL) {
+                u->lmem = ag_port_alloc(want, AG_MEM_BYTE);
+            }
+        }
+        if (u->lmem != NULL) {
+            lanes[0] = UL_LANE_SMALL;
+            lanes[1] = deep;
+            lanes[2] = UL_LANE_SMALL;
+        }
+    }
     if (u->mem != NULL) {
         ag_log(AG_LOG_INFO, "uartlink",
-               "uart%d: rings at %p, %u B to send (%u ms of the wire), %u B "
-               "to receive",
-               port, (void *)u->mem, (unsigned)w->txcap,
-               (unsigned)(baud >= 10u ? (uint64_t)w->txcap * 10000u / baud
-                                      : 0u),
-               (unsigned)w->rxcap);
+               "uart%d: rings at %p, %u B to send, %u B to receive; lanes "
+               "%u/%u/%u B (%u ms of the wire in the middle one)",
+               port, (void *)u->mem, (unsigned)w->txcap, (unsigned)w->rxcap,
+               (unsigned)lanes[0], (unsigned)lanes[1], (unsigned)lanes[2],
+               (unsigned)(baud >= 10u ? (uint64_t)lanes[1] * 10000u / baud
+                                      : 0u));
     }
     if (u->mem == NULL) {
         ag_port_free(u->dmem);
@@ -650,6 +692,7 @@ ag_err_t ag_uartlink_open(int port, uint32_t baud, uint32_t frame,
     w->tx = (ring_t){.mem = p, .cap = w->txcap};
     p += w->txcap;
     w->rx = (ring_t){.mem = p, .cap = w->rxcap};
+    wl_lanes(w, u->lmem, lanes);
 
     w->framed = true;
     w->master = false;
@@ -824,8 +867,14 @@ ag_err_t ag_uartlink_close(int port, ag_spilink_stats_t *out)
     lock(u);
     ag_port_free(u->mem);
     ag_port_free(u->dmem);
+    ag_port_free(u->lmem);
     u->mem = NULL;
     u->dmem = NULL;
+    u->lmem = NULL;
+    {
+        const uint32_t none[WL_LANES] = {0u, 0u, 0u};
+        wl_lanes(&u->w, NULL, none);
+    }
     memset(&u->w.tx, 0, sizeof(u->w.tx));
     memset(&u->w.rx, 0, sizeof(u->w.rx));
     unlock(u);

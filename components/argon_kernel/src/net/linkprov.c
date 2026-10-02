@@ -309,6 +309,7 @@ typedef struct {
 } relay_q_t;
 
 static void reader_wake(void);
+static uint16_t budget_of(uint8_t cls);
 static bool credit_hold(int32_t to, uint8_t chan, const ag_link_addr_t *a,
                         const uint8_t *buf, uint16_t len);
 
@@ -424,6 +425,10 @@ static bool bg_pend_try(int i)
         relay_drop(2, p->a.dst, "the wire out of here has gone");
         p->on = false;
         return true;
+    }
+    if (p->a.budget_ms == 0u) {
+        /* the far end's budget does not cross the wire; its class does */
+        p->a.budget_ms = budget_of(p->a.cls);
     }
     const int32_t r = h.ops->send_a(h.dev, p->chan, p->buf, p->len, &p->a);
     let_go(&h);
@@ -1799,6 +1804,28 @@ int32_t ag_linkprov_index_of(const char *name)
  * The relay does NOT come through this function - it must keep the source it
  * received, and it calls send_a directly for that reason (see relay()).
  */
+/*
+ * HOW LONG A MESSAGE MAY WAIT, BY ITS CLASS, FOR A SENDER THAT SAID NOTHING
+ * (2 Oct 2026).  The wire sends the soonest due first (AG_SPILINK_BUDGET) and
+ * knows nothing about the bytes; the class is what the sender said about
+ * them, so this is where it becomes a number: an answer or a command at once,
+ * a stream (sound) within a period, bulk (a picture, a device's data) within
+ * a frame, background (a file) within a second.
+ */
+static uint16_t budget_of(uint8_t cls)
+{
+    switch (cls) {
+    case AG_LINK_STREAM:
+        return 10u;
+    case AG_LINK_BULK:
+        return 50u;
+    case AG_LINK_BACKGROUND:
+        return 1000u;
+    default:
+        return 0u;
+    }
+}
+
 static int32_t send_addressed(int32_t wire, uint16_t dst, uint8_t chan,
                               uint8_t cls, const void *buf, size_t len)
 {
@@ -1835,7 +1862,8 @@ static int32_t send_addressed(int32_t wire, uint16_t dst, uint8_t chan,
     if (bo != NULL) {
         bo->sent += (uint32_t)len;
     }
-    const ag_link_addr_t to = {dst, ag_linkprov_here(), cls};
+    const ag_link_addr_t to = {dst, ag_linkprov_here(), cls, 0,
+                               budget_of(cls)};
     const int32_t r = h.ops->send_a(h.dev, chan, buf, len, &to);
     let_go(&h);
     if (r < 0 && bo != NULL) {

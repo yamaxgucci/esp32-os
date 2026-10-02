@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/log.h>
 #include <argon/path.h>
 
 #include <argon/port/config.h>
@@ -376,10 +377,27 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
             snprintf(s_board.audio.driver, sizeof(s_board.audio.driver), "%s",
                      adrv);
         }
-        s_board.audio.bclk = cfg_pin(cfg, "audio.bclk", s_board.audio.bclk);
-        s_board.audio.ws = cfg_pin(cfg, "audio.ws", s_board.audio.ws);
-        s_board.audio.dout = cfg_pin(cfg, "audio.dout", s_board.audio.dout);
-        s_board.audio.mclk = cfg_pin(cfg, "audio.mclk", s_board.audio.mclk);
+        /*
+         * `fitted = no`: the wiring is written down and nothing is on the end
+         * of it (2 Oct 2026).  The S3-CAM's amplifier was taken off its I2S
+         * pins, its /dev/pcm0 kept coming up and playing into the air, and
+         * as a real converter it beat the CYD's speaker next door: no sound
+         * on the pair, ever, Fallout's included.  Unfitted, there is no
+         * converter here, and the neighbour's is the one (devdefault.c).
+         */
+        const char *fitted = ag_cfg_get(cfg, "audio.fitted", "yes");
+        if (fitted != NULL && strcmp(fitted, "no") == 0) {
+            ag_log(AG_LOG_INFO, "board",
+                   "audio: nothing fitted on its pins - no converter here");
+        } else {
+            s_board.audio.bclk =
+                cfg_pin(cfg, "audio.bclk", s_board.audio.bclk);
+            s_board.audio.ws = cfg_pin(cfg, "audio.ws", s_board.audio.ws);
+            s_board.audio.dout =
+                cfg_pin(cfg, "audio.dout", s_board.audio.dout);
+            s_board.audio.mclk =
+                cfg_pin(cfg, "audio.mclk", s_board.audio.mclk);
+        }
         const int32_t ar = ag_cfg_get_int(cfg, "audio.rate",
                                           (int32_t)s_board.audio.rate);
         if (ar >= 8000 && ar <= 48000) {

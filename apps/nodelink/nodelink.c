@@ -132,7 +132,7 @@ static bool nd_up(ag_device_t *dev)
 
 static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
                            const void *buf, size_t len, uint16_t dst,
-                           uint16_t src)
+                           uint16_t src, uint16_t budget_ms)
 {
     node_t *nd = (node_t *)ag_dev_priv(dev);
     if (nd == NULL) {
@@ -157,18 +157,19 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
      * WHOLE, AND WAITED FOR WITHOUT THE LOCK.  The lock is held only while a
      * message is copied in, never while room is awaited, so a sender of
      * sound is not stood behind a picture that is waiting for the wire to
-     * drain (see AG_SPILINK_WHOLE).  Bulk yields: it goes only when room for
-     * somebody else's message is left behind it.  Stream is one attempt, as
-     * it always was: late sound is worse than none.
+     * drain (see AG_SPILINK_WHOLE).  What goes first is not decided here
+     * (2 Oct 2026): the message's budget, said by its sender, goes to the
+     * wire, and the wire sends the soonest due first.  Here only what the
+     * class says about delivery: a stream is not sent again and is one
+     * attempt - late sound is worse than none - and background waits for an
+     * idle wire.
      */
     const uint32_t how =
-        stream ? AG_SPILINK_WHOLE
-        : (cls == AG_LINK_BACKGROUND)
-            ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_YIELD |
-               AG_SPILINK_IDLE)
-        : (cls == AG_LINK_BULK)
-            ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_YIELD)
-            : (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE);
+        (stream ? AG_SPILINK_WHOLE
+         : (cls == AG_LINK_BACKGROUND)
+             ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_IDLE)
+             : (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE)) |
+        AG_SPILINK_BUDGET(budget_ms);
     /* background is one attempt too: its caller has other things to send
      * while the wire is busy, and waiting here would be waiting in front of
      * them */
@@ -212,7 +213,7 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
 static int32_t nd_send(ag_device_t *dev, uint8_t chan, uint8_t cls,
                        const void *buf, size_t len)
 {
-    return send_common(dev, chan, cls, buf, len, 0u, 0u);
+    return send_common(dev, chan, cls, buf, len, 0u, 0u, 0u);
 }
 
 static int32_t nd_send_a(ag_device_t *dev, uint8_t chan, const void *buf,
@@ -221,7 +222,8 @@ static int32_t nd_send_a(ag_device_t *dev, uint8_t chan, const void *buf,
     if (to == NULL) {
         return -AG_EINVAL;
     }
-    return send_common(dev, chan, to->cls, buf, len, to->dst, to->src);
+    return send_common(dev, chan, to->cls, buf, len, to->dst, to->src,
+                       to->budget_ms);
 }
 
 static int32_t recv_common(ag_device_t *dev, uint8_t *chan, void *buf,

@@ -431,7 +431,9 @@ static void switches(void)
             /* a screen of noise comes in pieces cut anywhere along a row;
              * gathered in strips it is a few dozen windows, not hundreds */
             printf("  rdpaint noise: %u windows\n", (unsigned)(s_rects - r0));
-            CHECK(s_rects - r0 <= 60u);
+            /* at most three times the fewest windows of RDP_RECT_PX (2048
+             * since 2 Oct 2026) that could carry it */
+            CHECK(s_rects - r0 <= 3u * (W * H / RDP_RECT_PX));
         }
         printf("  rdpaint switch %u: %u messages, %u px wrong\n",
                (unsigned)k, (unsigned)(s_sends - m0), (unsigned)n);

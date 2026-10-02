@@ -364,8 +364,10 @@ static bool flush(uint32_t handle, rdp_send_fn send)
     return r == AG_OK;
 }
 
-/* The rectangle rdp_draw can hold: its pixels are unpacked there whole. */
-#define RDP_RECT_PX 4096u
+/* The rectangle rdp_draw can hold: its pixels are unpacked there whole.
+ * 2048, not 4096 (2 Oct 2026): the CYD, a neighbour's screen and its
+ * speaker at once with no PSRAM, had not the 8 KB in one piece for it. */
+#define RDP_RECT_PX 2048u
 
 static void pal_reset(rpal_t *pl)
 {
@@ -1658,6 +1660,27 @@ static uint16_t *slot_take(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh)
         sl->part = 0u;
     }
     return slot_px((unsigned)pick);
+}
+
+/*
+ * The strips, made at start-up on a board with a screen (2 Oct 2026): 9 KB in
+ * one piece, and on the CYD, once sound had its places, the largest piece
+ * left was 4 KB - the neighbour's picture could not be drawn at all.  In the
+ * slow memory where there is one.
+ */
+bool rdp_draw_prepare(void)
+{
+    if (s_dr != NULL) {
+        return true;
+    }
+    s_dr = ag_port_alloc(sizeof(rdraw_t), AG_MEM_SLOW | AG_MEM_BYTE);
+    if (s_dr == NULL) {
+        s_dr = ag_port_alloc(sizeof(rdraw_t), AG_MEM_BYTE);
+    }
+    if (s_dr != NULL) {
+        memset(s_dr, 0, offsetof(rdraw_t, px));
+    }
+    return s_dr != NULL;
 }
 
 uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)

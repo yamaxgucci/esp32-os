@@ -115,6 +115,14 @@
 #define WL_F_MASTER 16u
 #define WL_F_SEG  4u
 #define WL_SEG_SKIP 0x8000u
+/* the lanes of blocks waiting to go (see wlink_t.lane), by budget in ms; a
+ * budget under WL_NOW_MS goes in at once, and with no lanes a budget over
+ * WL_YIELD_BUDGET_MS leaves room behind it as AG_SPILINK_YIELD does */
+#define WL_LANES           3u
+#define WL_LANE0_MS        20u
+#define WL_LANE1_MS        200u
+#define WL_NOW_MS          2u
+#define WL_YIELD_BUDGET_MS 20u
 /* frames a sender may have out and unacknowledged, and the out-of-order
  * frames a receiver will hold beyond its hole (24 tried 1 Oct 2026 for the
  * S3's 530-byte picture frames: no change - the window was never full) */
@@ -241,6 +249,16 @@ typedef struct {
     uint32_t rxcap;
     ring_t   tx;
     ring_t   rx;
+    /*
+     * Blocks waiting to go into the stream, by how long they may wait (2 Oct
+     * 2026, AG_SPILINK_BUDGET): a lane each for budgets up to WL_LANE0_MS,
+     * up to WL_LANE1_MS and beyond.  The stream (tx) is kept to less than a
+     * frame not yet sent, and fed from the lanes, the soonest due first - so
+     * what may not wait goes past what may, and the wire knows nothing of
+     * what either is.  Capacity 0: no lanes, blocks go straight in (a board
+     * with no memory for them).
+     */
+    ring_t   lane[WL_LANES];
 
     /* the other end's room as its last frame said, and its ack in that frame */
     bool     peer_known;
@@ -347,6 +365,11 @@ uint32_t wl_allowance(const wlink_t *w, uint32_t in_flight);
 /* The next frame into `f`: a frame to send again first, then new data up to
  * `allow`.  Returns its data bytes; *wire_len (if asked) is the length of
  * the frame, header included. */
+/* The lanes' memory, caps[k] bytes each in turn from mem (0: no lane). */
+void wl_lanes(wlink_t *w, uint8_t *mem, const uint32_t caps[WL_LANES]);
+/* Into the stream from the lanes what fits; whether the stream has bytes to
+ * send.  For the sending task, before it looks for something to send. */
+bool wl_feed(wlink_t *w);
 uint32_t wl_build(wlink_t *w, uint8_t *f, uint32_t allow, uint32_t room_less,
                   bool *nak_was, uint32_t *wire_len);
 /* Take back what wl_build did, for a frame that never went out. */

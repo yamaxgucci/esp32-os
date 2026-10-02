@@ -46,6 +46,7 @@ static ag_audio_fmt_t  s_fmt;
 static bool            s_hw_open;
 static uint64_t        s_frames_in;
 static uint64_t        s_frames_out;
+static uint32_t        s_peak; /* the loudest sample since the last look */
 
 static void default_fmt(ag_audio_fmt_t *out)
 {
@@ -252,6 +253,21 @@ void ag_pcmhw_dry(uint32_t *times, uint32_t *longest_us)
     *longest_us = s_dry_max_us;
 }
 
+void ag_pcmhw_counts(uint64_t *frames_in, uint64_t *frames_out, uint32_t *rate)
+{
+    *frames_in = s_frames_in;
+    *frames_out = s_frames_out;
+    *rate = s_fmt.rate;
+}
+
+uint32_t ag_pcmhw_peak(uint32_t *channels)
+{
+    const uint32_t p = s_peak;
+    s_peak = 0;
+    *channels = s_fmt.channels;
+    return p;
+}
+
 uint32_t ag_pcmhw_dry_at(uint32_t *at_ms, uint32_t cap, uint32_t *pauses)
 {
     const uint32_t n = (s_dry_at_n < cap) ? s_dry_at_n : cap;
@@ -291,6 +307,19 @@ static int32_t pcm_write(ag_device_t *dev, const void *buf, size_t len,
     s_frames_in += frames;
     s_frames_out += (uint64_t)done;
     count_dry((uint32_t)done);
+    /* the loudest sample given to the converter: proof there was a sound in
+     * what it took, not just samples (2 Oct 2026, "the speaker hisses and
+     * nothing plays") */
+    {
+        const int16_t *const pcm = (const int16_t *)buf;
+        const size_t         n = frames * s_fmt.channels;
+        for (size_t i = 0; i < n; i++) {
+            const int32_t v = (pcm[i] < 0) ? -(int32_t)pcm[i] : pcm[i];
+            if ((uint32_t)v > s_peak) {
+                s_peak = (uint32_t)v;
+            }
+        }
+    }
 
     /*
      * Bytes accepted, which is what a caller checks against what it asked for.
@@ -375,6 +404,19 @@ void ag_pcmhw_dry(uint32_t *times, uint32_t *longest_us)
 {
     *times = 0;
     *longest_us = 0;
+}
+
+void ag_pcmhw_counts(uint64_t *frames_in, uint64_t *frames_out, uint32_t *rate)
+{
+    *frames_in = 0;
+    *frames_out = 0;
+    *rate = 0;
+}
+
+uint32_t ag_pcmhw_peak(uint32_t *channels)
+{
+    *channels = 0;
+    return 0;
 }
 
 uint32_t ag_pcmhw_dry_at(uint32_t *at_ms, uint32_t cap, uint32_t *pauses)

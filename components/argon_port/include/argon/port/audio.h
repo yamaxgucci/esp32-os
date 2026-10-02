@@ -82,5 +82,8 @@ bool    ag_port_audio_open(uint32_t rate, uint8_t channels);
 void    ag_port_audio_close(void);
 int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames);
 int32_t ag_port_audio_space(void);
+/* How many times the converter ran out and stopped since the start: each is a
+ * click.  0 where it is not counted. */
+uint32_t ag_port_audio_stops(void);
 
 #endif /* ARGON_PORT_AUDIO_H */

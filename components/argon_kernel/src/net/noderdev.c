@@ -28,6 +28,8 @@
 #include <string.h>
 
 #include <argon/device.h>
+#include <argon/display.h>
+#include <argon/port/audio.h>
 #include <argon/port/mem.h>
 
 #include "proc/proc_internal.h"
@@ -926,14 +928,15 @@ static uint32_t msgs_in_flight(uint16_t seq, uint16_t acked)
  * (Four and twenty filled it: the reader waited 33 times, and the sound
  * behind the picture came 218 ms late.)
  *
- * NOT WIDER WHILE SOUND SHARES THE RING (1 Oct 2026).  8/64 with a send ring
- * of 16 ms of the wire took a 16 Mbaud wire from 84% to 91-94% under noise -
- * and the sound behind the picture in the same ring came in bursts: 83
- * periods dropped at the CYD in 40 s against 9 at 2/12.  Wider only once
- * sound has a way past the picture.
+ * EIGHT AND SIXTY-FOUR NOW THAT THE WIRE ORDERS BY BUDGET (2 Oct 2026).
+ * 8/64 with a send ring of 16 ms of the wire took a 16 Mbaud wire from 84% to
+ * 91-94% under noise - and the sound behind the picture in that one queue
+ * came in bursts: 83 periods dropped at the CYD in 40 s against 9 at 2/12.
+ * The picture now waits in its own lane and sound (a shorter budget) goes
+ * past it (wlink.c); this window is what lets the picture fill that lane.
  */
-#define RD_PAINT_AHEAD 2u
-#define RD_PAINT_MSGS  12u
+#define RD_PAINT_AHEAD 8u
+#define RD_PAINT_MSGS  64u
 /* the window as it is now: `link window <passes> <messages>` measures others */
 static uint8_t s_paint_ahead = RD_PAINT_AHEAD, s_paint_msgs = RD_PAINT_MSGS;
 
@@ -1357,8 +1360,18 @@ static ag_port_task_t s_worker;
  * sound.  Now each has its own queue out of the same slots, and the task
  * draws whatever picture there is whenever the converter has no room.
  */
-#define RD_SND  18
-#define RD_SCR  28
+/* 14 periods of sound, 40 ms at 44.1 kHz - the sender keeps 30 ms ahead -
+ * not 18: the CYD, which has no PSRAM, had no room left for its picture
+ * once sound had its places (2 Oct 2026) */
+#define RD_SND  14
+/*
+ * 8 pieces of picture, not 28 (2 Oct 2026): 28 of 640 bytes on the CYD,
+ * which has no PSRAM, left it no room for its own picture's strips nor for
+ * the worker a request from the S3 is served in ("lcd0 would not open (-12)")
+ * once sound had its places too.  The CYD draws faster than the wire brings
+ * a picture: its reader waited for room 0-2 times in 16 s with 28.
+ */
+#define RD_SCR  8
 #define RD_RING (RD_SND + RD_SCR)
 
 typedef struct {
@@ -2323,6 +2336,15 @@ static void acker_task(void *arg)
     }
 }
 
+/* The task the painter's answers go out from: at start-up on a board with a
+ * screen (2 Oct 2026), for the same reason as pour_tasks_make. */
+static bool acker_make(void)
+{
+    return s_acker != NULL ||
+           ag_proc_task_create(acker_task, "rdevack", 2048, NULL, 6,
+                               AG_PORT_ANY_CORE, &s_acker);
+}
+
 /* frames drawn whole here, and the waits between them (ag_noderdev_frames_seen) */
 #define RD_SEEN_SLOW_US  250000
 #define RD_SEEN_STALL_US 1000000
@@ -2386,9 +2408,7 @@ static void pour_pass_drawn(const rd_period_t *pd)
                       s_session[pd->handle] == NULL;
     const uint8_t status = gone ? RD_PAINTED_GONE
                                 : (lost ? RD_PAINTED_LOST : 0u);
-    if (s_acker == NULL &&
-        !ag_proc_task_create(acker_task, "rdevack", 2048, NULL, 6,
-                             AG_PORT_ANY_CORE, &s_acker)) {
+    if (s_acker == NULL && !acker_make()) {
         /* no task: answered here, as it was, rather than not at all */
         paint_answer(pd->wire, pd->from, pd->tag, status, pd->handle);
         return;
@@ -2584,55 +2604,93 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
     }
 }
 
+/*
+ * The places sound and picture are poured into, made once.  At start-up on a
+ * board with a converter of its own (ag_noderdev_serve, 2 Oct 2026): made on
+ * the first period instead, the CYD found its 27 KB taken by the neighbour's
+ * picture by then, and every period of sound was lost for want of it ("no
+ * memory") while the picture went on.  Still made late where it was not made
+ * at the start.
+ */
+static bool ring_make(void)
+{
+    if (s_ring_mem != NULL) {
+        return true;
+    }
+    /*
+     * Twenty kilobytes, out of PSRAM where there is any.  Taken from
+     * internal memory on the Zero it was the last of it, and the
+     * converter these periods are for could then not have the 4 KB its
+     * DMA descriptors need: sound arrived and nothing played (26 Sep
+     * 2026).  A period is copied out of here once; PSRAM is fast enough.
+     */
+    const size_t bytes = (size_t)RD_SND * RD_SND_CAP +
+                         (size_t)RD_SCR * RD_SCR_CAP;
+    s_ring_mem = (uint8_t *)ag_port_alloc(bytes,
+                                          AG_MEM_SLOW | AG_MEM_BYTE);
+    if (s_ring_mem == NULL) {
+        s_ring_mem = (uint8_t *)ag_port_alloc(bytes, AG_MEM_BYTE);
+    }
+    if (s_ring_mem == NULL) {
+        return false;
+    }
+    /* and its places beside it: 46 of them are 1.3 KB, and on an
+     * emulated S3 that was the internal memory the next request's
+     * worker could not then be made in - the far end answered -12 and
+     * the mixer had nowhere to send sound (nodetest, 29 Sep 2026) */
+    s_ring = (rd_period_t *)ag_port_alloc(RD_RING * sizeof(rd_period_t),
+                                          AG_MEM_SLOW | AG_MEM_BYTE);
+    if (s_ring == NULL) {
+        s_ring = (rd_period_t *)ag_port_alloc(
+            RD_RING * sizeof(rd_period_t), AG_MEM_BYTE);
+    }
+    if (s_ring == NULL) {
+        ag_port_free(s_ring_mem);
+        s_ring_mem = NULL;
+        return false;
+    }
+    memset(s_ring, 0, RD_RING * sizeof(rd_period_t));
+    s_snd.e = s_ring;
+    s_scr.e = s_ring + RD_SND;
+    for (uint32_t i = 0; i < RD_RING; i++) {
+        s_ring[i].data =
+            (i < RD_SND) ? s_ring_mem + (size_t)i * RD_SND_CAP
+                         : s_ring_mem + (size_t)RD_SND * RD_SND_CAP +
+                               (size_t)(i - RD_SND) * RD_SCR_CAP;
+    }
+    return true;
+}
+
+static void pour_task(void *arg);
+static void sound_task(void *arg);
+
+/* The tasks that draw and play what is poured here (2 Oct 2026: at start-up
+ * on a board with a converter, as ring_make - made on the first period, the
+ * CYD had no 3 KB left for the converter's one once a picture was drawing). */
+static bool pour_tasks_make(void)
+{
+    if (s_pour_task == NULL &&
+        !ag_proc_task_create(pour_task, "rdevpour", 4096, NULL, 1,
+                             AG_PORT_ANY_CORE, &s_pour_task)) {
+        return false;
+    }
+    /* the converter's task, above the drawing: without it the pour task
+     * feeds the converter as before */
+    if (s_snd_task == NULL) {
+        (void)ag_proc_task_create(sound_task, "rdevsnd", 3072, NULL, 7,
+                                  AG_PORT_ANY_CORE, &s_snd_task);
+    }
+    return true;
+}
+
 static void take_period(const uint8_t *b, uint16_t n)
 {
     if (s_pour_first_us == 0) {
         s_pour_first_us = ag_port_us();
     }
-    if (s_ring_mem == NULL) {
-        /*
-         * Twenty kilobytes, out of PSRAM where there is any.  Taken from
-         * internal memory on the Zero it was the last of it, and the
-         * converter these periods are for could then not have the 4 KB its
-         * DMA descriptors need: sound arrived and nothing played (26 Sep
-         * 2026).  A period is copied out of here once; PSRAM is fast enough.
-         */
-        const size_t bytes = (size_t)RD_SND * RD_SND_CAP +
-                             (size_t)RD_SCR * RD_SCR_CAP;
-        s_ring_mem = (uint8_t *)ag_port_alloc(bytes,
-                                              AG_MEM_SLOW | AG_MEM_BYTE);
-        if (s_ring_mem == NULL) {
-            s_ring_mem = (uint8_t *)ag_port_alloc(bytes, AG_MEM_BYTE);
-        }
-        if (s_ring_mem == NULL) {
-            pour_lost(RD_LOST_NOMEM);
-            return;
-        }
-        /* and its places beside it: 46 of them are 1.3 KB, and on an
-         * emulated S3 that was the internal memory the next request's
-         * worker could not then be made in - the far end answered -12 and
-         * the mixer had nowhere to send sound (nodetest, 29 Sep 2026) */
-        s_ring = (rd_period_t *)ag_port_alloc(RD_RING * sizeof(rd_period_t),
-                                              AG_MEM_SLOW | AG_MEM_BYTE);
-        if (s_ring == NULL) {
-            s_ring = (rd_period_t *)ag_port_alloc(
-                RD_RING * sizeof(rd_period_t), AG_MEM_BYTE);
-        }
-        if (s_ring == NULL) {
-            ag_port_free(s_ring_mem);
-            s_ring_mem = NULL;
-            pour_lost(RD_LOST_NOMEM);
-            return;
-        }
-        memset(s_ring, 0, RD_RING * sizeof(rd_period_t));
-        s_snd.e = s_ring;
-        s_scr.e = s_ring + RD_SND;
-        for (uint32_t i = 0; i < RD_RING; i++) {
-            s_ring[i].data =
-                (i < RD_SND) ? s_ring_mem + (size_t)i * RD_SND_CAP
-                             : s_ring_mem + (size_t)RD_SND * RD_SND_CAP +
-                                   (size_t)(i - RD_SND) * RD_SCR_CAP;
-        }
+    if (!ring_make()) {
+        pour_lost(RD_LOST_NOMEM);
+        return;
     }
     if (s_pour_task == NULL) {
         /*
@@ -2645,15 +2703,10 @@ static void take_period(const uint8_t *b, uint16_t n)
         /* internal memory, else PSRAM, as the server's workers: on an
          * emulated S3 there were not 4 KB inside, the task was never made,
          * and every period poured at it was lost (nodetest, 27 Sep 2026) */
-        if (!ag_proc_task_create(pour_task, "rdevpour", 4096, NULL, 1,
-                                 AG_PORT_ANY_CORE, &s_pour_task)) {
+        if (!pour_tasks_make()) {
             pour_lost(RD_LOST_NOMEM);
             return;
         }
-        /* the converter's task, above the drawing: without it the pour
-         * task feeds the converter as before */
-        (void)ag_proc_task_create(sound_task, "rdevsnd", 3072, NULL, 7,
-                                  AG_PORT_ANY_CORE, &s_snd_task);
         ag_log(AG_LOG_INFO, TAG, "sound is being poured at us from %s",
                ag_node_peer_name() != NULL ? ag_node_peer_name() : "the wire");
     }
@@ -2868,6 +2921,16 @@ ag_err_t ag_noderdev_serve(void)
         return e;
     }
     s_serving = true;
+    /* the screen first, the sound after: a board that is a neighbour's
+     * screen needs its 9 KB in one piece, and once sound has taken its
+     * places there is no such piece left on the CYD */
+    if (ag_display_ready()) {
+        (void)rdp_draw_prepare();
+        (void)acker_make();
+    }
+    if (ag_port_audio_present() && ring_make()) {
+        (void)pour_tasks_make(); /* now, while there is memory for them */
+    }
     return AG_OK;
 }
 

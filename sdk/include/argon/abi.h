@@ -448,12 +448,15 @@ extern "C" {
  *      with it.
  *
  * 0.66 AG_SPILINK_IDLE: a block only into a wire with nothing waiting to go.
+ * 0.67 ag_link_addr_t.budget_ms and AG_SPILINK_BUDGET: how long a message
+ *      may wait to go, said by whoever sends it; the link sends the soonest
+ *      due first and knows nothing of what the bytes are.
  *      Background written this way takes the wire's idle time and nothing
  *      else, so a picture behind it waits for one block of it, not a window.
  *      A flag an older driver never sets; nothing moves.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 66u
+#define AG_ABI_MINOR 67u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1671,6 +1674,12 @@ typedef struct ag_link_addr {
     uint16_t dst; /* node it is for, 0 = whoever is reading it             */
     uint16_t src; /* node that sent it, same encoding, 0 = not stated      */
     uint8_t  cls; /* ag_link_class it travels in                          */
+    uint8_t  rsv;
+    /* ABI 0.67: how long it may wait to go out, in ms, said by its sender (0:
+     * at once).  A driver passes it to its wire (AG_SPILINK_BUDGET) and does
+     * not look at it otherwise: what goes first is the wire's business, and
+     * what the bytes are is nobody's below the sender. */
+    uint16_t budget_ms;
 } ag_link_addr_t;
 
 typedef struct ag_link_ops {
@@ -1905,6 +1914,15 @@ typedef struct {
  * of it at most.
  */
 #define AG_SPILINK_IDLE     8u
+/*
+ * With WHOLE (ABI 0.67): how long this block may wait to go out, in ms.  A
+ * wire that has room to hold blocks back sends the one due soonest first -
+ * a block of 10 ms goes ahead of a block of 100 queued before it - and one
+ * that has not sends in order, a block of more than WL_YIELD_BUDGET_MS
+ * leaving room behind it as YIELD does.  0 is at once.
+ */
+#define AG_SPILINK_BUDGET(ms)     (((uint32_t)((ms) > 0xFFFFu ? 0xFFFFu : (ms))) << 16)
+#define AG_SPILINK_BUDGET_OF(flags) ((uint32_t)(flags) >> 16)
 /* ag_spilink_block_t.flags: blocks no..last were lost and not sent again */
 #define AG_SPILINK_LOST 0x80u
 
