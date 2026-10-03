@@ -119,8 +119,10 @@ param(
     # Both exist for the same reason and neither is optional for a pair.  The
     # flash drive is writable: two guests on one file corrupt each other's C:,
     # and the damage shows up later as a file that reads back -91.  And this
-    # script kills every qemu-system-xtensa it finds before starting, which is
-    # right for one guest and fatal for two - the second would shoot the first.
+    # script stops the previous emulator of the same image before starting -
+    # only one this tree registered (qemu-common.ps1, Stop-Emulators), never
+    # another tree's - which for a pair sharing one image would still be the
+    # second shooting the first.
     [string]$Flash = '',
     # The image in -Flash is FINISHED: do not rebuild build\qemu_flash.bin and
     # do not copy over it.  For a pair of guests that are two different
@@ -347,28 +349,24 @@ if (-not $KeepOtherEmulators) {
     # What identifies a leftover is the image it is running: two emulators of the
     # same flash file are the same board twice, and the older one is the one that
     # has to go.
-    $ourFlash = ($qemuArgs | Where-Object { $_ -like 'file=*.bin,if=mtd,*' } |
-                 Select-Object -First 1)
-    $ourImage = ''
-    if ($ourFlash) {
-        $ourImage = [regex]::Match($ourFlash, '[^\\/=]+\.bin(?=,if=mtd)').Value
-    }
-    if ($ourImage) {
-        Get-CimInstance Win32_Process `
-            -Filter "Name='qemu-system-xtensa.exe' OR Name='qemu-system-riscv32.exe'" `
-            -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($ourImage) } |
-            ForEach-Object {
-                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-            }
-    } else {
-        # The image could not be read out of our own arguments, which should not
-        # happen; fall back to the old sledgehammer rather than to leaving a
-        # leftover in place, and say so, because it is the sledgehammer that once
-        # killed somebody else's board.
-        Write-Host 'qemu: cannot name this run''s flash image; stopping every emulator'
-        Stop-Emulators
-    }
+    #
+    # And the same FILE, not the same file NAME.  This compared the name alone -
+    # `qemu_flash.bin` - which nearly every run in every worktree shares, so a run
+    # here still killed a run in another tree whenever both used the default
+    # image.  The image is now taken from this tree's own record of what it
+    # started (qemu-common.ps1, Register-Emulator), with its full path: an
+    # emulator another tree started is not in that record at all.
+    Stop-Emulators -Flash $flashPath
+}
+
+# Somebody else's emulator on our console port is not ours to stop - but it is
+# ours to name.  Without this the run waits a minute for a prompt and then says
+# "could not connect", which reads as a firmware that did not boot.
+$holder = Get-PortHolder -Port $Port
+if ($holder) {
+    throw ("port $Port is already held by $($holder.ProcessName) (pid $($holder.Id)), " +
+           'which this tree did not start.  Pick another -Port, or stop that ' +
+           'process if it is a leftover of yours from before 3 Oct 2026.')
 }
 
 # QEMU's own chatter goes to a file: it is not part of what the board said,
@@ -383,6 +381,7 @@ if ($env:ARGON_QEMU_EXTRA) {
 
 $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
     -PassThru -RedirectStandardOutput $qemuOut -RedirectStandardError "$qemuOut.err"
+Register-Emulator -Process $proc -Flash $flashPath
 
 # A forward that could not be set up is said once, quietly, to that file.
 #
@@ -1078,6 +1077,7 @@ try {
     if ($proc -and -not $proc.HasExited) {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
+    Unregister-Emulator -Process $proc
     if ($hostfsProc -and -not $hostfsProc.HasExited) {
         Stop-Process -Id $hostfsProc.Id -Force -ErrorAction SilentlyContinue
     }

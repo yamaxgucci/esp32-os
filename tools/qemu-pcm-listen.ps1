@@ -26,8 +26,8 @@ $efuse = Initialize-EfuseFile
 $Port = 5556
 $HostFsPort = 5557
 
-Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+# This tree's own leftover, not every emulator on the PC (qemu-common.ps1).
+Stop-Emulators -Flash 'build\qemu_flash.bin'
 try {
     Get-NetTCPConnection -LocalPort $HostFsPort -State Listen -ErrorAction SilentlyContinue |
         ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
@@ -55,6 +55,7 @@ $qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse) + @(
 $qemuOut = 'build\qemu-emulator.log'
 $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
     -PassThru -RedirectStandardOutput $qemuOut -RedirectStandardError "$qemuOut.err"
+Register-Emulator -Process $proc -Flash 'build\qemu_flash.bin'
 
 $client = $null
 $stream = $null
@@ -154,6 +155,7 @@ try {
     if ($proc -and -not $proc.HasExited) {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
+    Unregister-Emulator -Process $proc
     if ($hostfsProc -and -not $hostfsProc.HasExited) {
         Stop-Process -Id $hostfsProc.Id -Force -ErrorAction SilentlyContinue
     }

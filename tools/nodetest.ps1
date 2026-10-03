@@ -29,9 +29,11 @@
 # WHAT HAD TO CHANGE for it, all in qemu-boot.ps1, and each was a way for this
 # to fail confusingly rather than cleanly:
 #
-#   * that script kills every qemu-system-xtensa before it starts, which is
-#     right for one guest and fatal for two - the second shoots the first.
-#     -KeepOtherEmulators, and this script does the one kill at the top.
+#   * that script stops the previous emulator of its image before it starts,
+#     which is right for one guest and fatal for two sharing an image - the
+#     second shoots the first.  -KeepOtherEmulators, and this script does the
+#     one stop at the top - of the emulators THIS tree started, which since
+#     3 Oct 2026 is all Stop-Emulators ever touches (qemu-common.ps1).
 #   * the flash drive is writable raw MTD.  Two emulators on one file corrupt
 #     each other's C:, and the damage is not seen here - it is seen weeks later
 #     as a file that reads back -91 on an unrelated run.  -Flash gives B its own
