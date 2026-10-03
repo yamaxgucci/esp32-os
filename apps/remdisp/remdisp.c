@@ -76,7 +76,7 @@ AG_DRV("REMDISP", "2.0", "argon");
  * Four megabaud, measured rather than chosen: 400 067 B/s over 4 MB with zero
  * corrupt and zero lost blocks, where five megabaud corrupts 0.12% (apps/link,
  * and the table in docs/09-esp32-cyd.md).  Both ends must agree, so the same
- * number appears in monitor/main/monitor.c.
+ * number appears in remterm.c.
  */
 #ifndef LINK_BAUD
 #define LINK_BAUD 4000000u
@@ -895,6 +895,18 @@ static uint64_t s_sweep_asked_at;           /* when the far end last complained 
 
 #define FR_HELLO 'H'
 /*
+ * And what the far end says about itself: 'S' then four little-endian
+ * counters - frames closed, bands presented, times the display was refused,
+ * times there was no memory for a band.
+ *
+ * It exists because the far end's own console is unreadable while it is
+ * drawing (it holds the display) and taking that console back stops it drawing
+ * for good.  So "it is drawing" and "it is wedged" were the same observation
+ * from over there, and the only way to tell them apart was to restart it.  Now
+ * it says so, here, into a console nobody is holding.
+ */
+#define FR_STAT  'S'
+/*
  * And 'R' - "send slice N of frame M again".  Four bytes after it, little
  * endian.  This is the whole of the recovery scheme for whole-frame mode: the
  * far end knows which slices it has because they are numbered, so it can name
@@ -904,12 +916,20 @@ static uint64_t s_sweep_asked_at;           /* when the far end last complained 
 static void raw_resend(uint32_t frame, uint32_t slice);
 
 /*
- * What the far end says back, collected a byte at a time: a four-byte
- * "send slice N of frame M again".  (A status frame of sixteen bytes came
- * from REMTERM, which is gone: the monitor firmware prints its own.)
+ * What the far end says back, collected a byte at a time: a status frame of
+ * sixteen bytes, and a four-byte "send slice N of frame M again".
  */
+static uint8_t  s_stat[16];
+static uint32_t s_stat_have = 0xffffffffu; /* not collecting */
 static uint8_t  s_req[4];
 static uint32_t s_req_have = 0xffffffffu;
+
+static uint32_t stat32(uint32_t at)
+{
+    return (uint32_t)s_stat[at] | ((uint32_t)s_stat[at + 1u] << 8) |
+           ((uint32_t)s_stat[at + 2u] << 16) |
+           ((uint32_t)s_stat[at + 3u] << 24);
+}
 
 /* Defined with the palette, far below; wanted here, by the far end's "again". */
 static void pal_owe(void);
@@ -931,6 +951,18 @@ static void poll_far_end(void)
          */
         s_rx_bytes += (uint32_t)n;
         for (int32_t i = 0; i < n; i++) {
+            if (s_stat_have != 0xffffffffu) {
+                s_stat[s_stat_have++] = buf[i];
+                if (s_stat_have < sizeof(s_stat)) {
+                    continue;
+                }
+                s_stat_have = 0xffffffffu;
+                ag_printf("REMTERM: %u frames whole, %u slices in, "
+                          "%u buffer pieces, %u resends asked\n",
+                          (unsigned)stat32(0), (unsigned)stat32(4),
+                          (unsigned)stat32(8), (unsigned)stat32(12));
+                continue;
+            }
             if (s_req_have != 0xffffffffu) {
                 s_req[s_req_have++] = buf[i];
                 if (s_req_have < sizeof(s_req)) {
@@ -939,6 +971,10 @@ static void poll_far_end(void)
                 s_req_have = 0xffffffffu;
                 raw_resend((uint32_t)s_req[0] | ((uint32_t)s_req[1] << 8),
                            (uint32_t)s_req[2] | ((uint32_t)s_req[3] << 8));
+                continue;
+            }
+            if (buf[i] == (uint8_t)FR_STAT) {
+                s_stat_have = 0;
                 continue;
             }
             if (buf[i] == (uint8_t)FR_RESEND) {
