@@ -63,6 +63,7 @@ void ag_port_audio_pins(const ag_port_audio_pins_t *pins)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 const char *ag_port_audio_name(void) { return "dac"; }
 
@@ -139,6 +140,32 @@ uint32_t ag_port_audio_stops(void)
     return s_dac_stops;
 }
 
+/* What the DMA has played, held samples and all, and when it started: the
+ * converter's own clock, against which the neighbour's sound arrives
+ * (2 Oct 2026, for the gaps the S3's tone had now and then). */
+static volatile uint32_t s_dma_samples;
+static volatile int64_t  s_dma_t0_us;
+static uint32_t          s_rate_seen_samples;
+static int64_t           s_rate_seen_us;
+
+uint32_t ag_port_audio_rate_mhz(void)
+{
+    const uint32_t n = s_dma_samples;
+    const int64_t  now = esp_timer_get_time();
+    if (s_rate_seen_us == 0 || s_dma_t0_us == 0) {
+        s_rate_seen_us = (s_dma_t0_us != 0) ? s_dma_t0_us : now;
+        s_rate_seen_samples = 0u;
+    }
+    const uint32_t dn = n - s_rate_seen_samples;
+    const int64_t  dt = now - s_rate_seen_us;
+    s_rate_seen_samples = n;
+    s_rate_seen_us = now;
+    if (dn == 0u || dt <= 0 || s_up == 0u) {
+        return 0u;
+    }
+    return (uint32_t)((uint64_t)dn * 1000000000ull / (uint64_t)dt / s_up);
+}
+
 static bool IRAM_ATTR on_dac_done(dac_continuous_handle_t h,
                                   const dac_event_data_t *e, void *arg)
 {
@@ -148,6 +175,10 @@ static bool IRAM_ATTR on_dac_done(dac_continuous_handle_t h,
         (e->buf_size / 2u < DAC_BUF) ? e->buf_size / 2u : DAC_BUF;
     const uint32_t have = s_w - s_r;
     uint32_t       n = 0;
+    if (s_dma_t0_us == 0) {
+        s_dma_t0_us = esp_timer_get_time();
+    }
+    s_dma_samples += want;
     if (s_priming && have >= DAC_PRIME) {
         s_priming = false;
     }
@@ -555,6 +586,7 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
  * size a ring, and a ring the size of the chain is the right size.
  */
 uint32_t ag_port_audio_stops(void) { return 0; }
+uint32_t ag_port_audio_rate_mhz(void) { return 0; }
 
 int32_t ag_port_audio_space(void)
 {
@@ -584,6 +616,7 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
 }
 
 uint32_t ag_port_audio_stops(void) { return 0; }
+uint32_t ag_port_audio_rate_mhz(void) { return 0; }
 
 int32_t ag_port_audio_space(void) { return 0; }
 
@@ -617,6 +650,7 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
 }
 
 uint32_t ag_port_audio_stops(void) { return 0; }
+uint32_t ag_port_audio_rate_mhz(void) { return 0; }
 
 int32_t ag_port_audio_space(void)
 {

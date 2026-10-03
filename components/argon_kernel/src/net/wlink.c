@@ -169,8 +169,23 @@ static bool lanes_feed(wlink_t *s)
                 best_rel = h[6];
             }
         }
-        if (best < 0 || ring_space(&s->tx) < WL_REC + best_len + keep) {
+        if (best < 0) {
             break;
+        }
+        if (ring_space(&s->tx) < WL_REC + best_len + keep) {
+            s->pr_lane_blocked++;
+            break;
+        }
+        {
+            const int32_t late =
+                (int32_t)((uint32_t)(ag_port_us() / 1000) - best_due);
+            s->pr_lane_fed[best]++;
+            if (late > 0) {
+                s->pr_lane_late[best]++;
+                if ((uint32_t)late > s->pr_lane_late_ms[best]) {
+                    s->pr_lane_late_ms[best] = (uint32_t)late;
+                }
+            }
         }
         ring_t *const L = &s->lane[best];
         ring_commit(L, WL_REC);
@@ -1095,6 +1110,7 @@ int32_t wl_send2(wlink_t *s, const void *head, size_t hlen, const void *body,
                         s->space_sem, ticks_at_least(timeout_ms));
                     wt_note(WT_ROOM_OUT, 0u);
                     s->pr_space_waits++;
+                    s->pr_lane_waits[lane_of(budget)]++;
                     s->pr_space_us += ag_port_us() - w0;
                     if (!got) {
                         return -AG_EAGAIN;

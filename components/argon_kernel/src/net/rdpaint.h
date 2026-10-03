@@ -50,6 +50,8 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
 uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len);
 /* The receiving side's strips, made now rather than at the first piece. */
 bool rdp_draw_prepare(void);
+/* The most pixels one rectangle may carry to this screen: 0 if it draws none. */
+uint32_t rdp_draw_rect_px(void);
 /* Payloads rdp_draw could not draw to the end: a run it could not read.  The
  * rest of such a payload is lost, and the screen with it until repainted. */
 uint32_t rdp_draw_faults(void);
@@ -109,6 +111,8 @@ void rdp_screen_taken(void);
 /* The far screen said it draws a rectangle sent as one run; this screen
  * does (it has the buffer to unpack one into).  See rdpaint.c. */
 void rdp_far_rects(bool yes);
+/* ... and the most pixels it holds in one rectangle (0: it never said). */
+void rdp_far_rect_px(uint32_t px);
 bool rdp_draws_rects(void);
 /* The same for indices into a palette (see rdpaint.c, OR INDICES), and the
  * pixels the painter sent each way since it began. */

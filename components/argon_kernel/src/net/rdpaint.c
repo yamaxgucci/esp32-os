@@ -279,6 +279,7 @@ static struct {
     bool     pass_whole;    /* the pass just sent ended a frame */
     uint32_t pass_msgs;     /* messages this pass has sent so far */
     bool     rects;         /* the far screen draws a rectangle as one run */
+    uint16_t rect_px;       /* the most it holds in one, 0 if never said */
     uint32_t rect_at;       /* where the open rectangle's header is, or 0 */
     uint16_t rect_x, rect_y, rect_w, rect_h, rect_plen;
     uint32_t cuts_inside;   /* passes cut inside a rectangle, for tests */
@@ -365,9 +366,13 @@ static bool flush(uint32_t handle, rdp_send_fn send)
 }
 
 /* The rectangle rdp_draw can hold: its pixels are unpacked there whole.
- * 2048, not 4096 (2 Oct 2026): the CYD, a neighbour's screen and its
- * speaker at once with no PSRAM, had not the 8 KB in one piece for it. */
-#define RDP_RECT_PX 2048u
+ * RDP_RECT_MAX where there is slow memory for it and RDP_RECT_MIN where there
+ * is not - the CYD, a neighbour's screen and its speaker at once with no
+ * PSRAM, had not 8 KB in one piece (2 Oct 2026) - and the painter cuts to
+ * what the far screen says it holds (rdp_far_rect_px): a fixed 2048 for
+ * everyone made a screen of noise 80 windows where 37 had done. */
+#define RDP_RECT_MAX 4096u
+#define RDP_RECT_MIN 2048u
 
 static void pal_reset(rpal_t *pl)
 {
@@ -463,6 +468,13 @@ static uint32_t pack_whole(const uint16_t *px, const uint8_t *ix, uint32_t n,
  * messages half full (30 Sep 2026): 643 bytes do not fit in 640, and the
  * 64 pixels over went alone.
  */
+/* The largest rectangle the far screen holds; an image that never said holds
+ * the smaller size. */
+static uint32_t far_rect_px(void)
+{
+    return (s_p.rect_px != 0u) ? s_p.rect_px : RDP_RECT_MIN;
+}
+
 static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px,
                         const uint8_t *ix, uint32_t n, uint16_t room,
                         uint32_t handle, rdp_send_fn send)
@@ -473,7 +485,7 @@ static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px,
         if (s_p.rect_at != 0u && s_p.rect_x == x && s_p.rect_w == n &&
             s_p.rect_idx == (ix != NULL) &&
             (uint32_t)s_p.rect_y + s_p.rect_h == y &&
-            ((uint32_t)s_p.rect_h + 1u) * n <= RDP_RECT_PX) {
+            ((uint32_t)s_p.rect_h + 1u) * n <= far_rect_px()) {
             const uint32_t packed =
                 pack_whole(px, ix, n, s_p.msg + s_p.len, room - s_p.len);
             if (packed > 0u) {
@@ -933,7 +945,7 @@ static void pass(void)
                         s_p.rgb_px += (uint32_t)(x1 - x0);
                     }
                     const int rr =
-                        (s_p.rects && (uint32_t)(x1 - x0) <= RDP_RECT_PX)
+                        (s_p.rects && (uint32_t)(x1 - x0) <= far_rect_px())
                             ? put_rect_row(yy, x0, row + x0, ix,
                                            (uint32_t)(x1 - x0), room, handle,
                                            send)
@@ -1121,6 +1133,11 @@ void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us)
 void rdp_far_rects(bool yes)
 {
     s_p.rects = yes;
+}
+
+void rdp_far_rect_px(uint32_t px)
+{
+    s_p.rect_px = (uint16_t)((px > RDP_RECT_MAX) ? RDP_RECT_MAX : px);
 }
 
 void rdp_stable_surface(const uint16_t *px, uint16_t w, uint16_t h)
@@ -1433,7 +1450,7 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
  * windows - since a pass of noise ends in the middle of a row.
  */
 #define RDP_SLOTS   2u
-#define RDP_SLOT_PX (RDP_RECT_PX / RDP_SLOTS)
+#define RDP_SLOT_PX ((uint32_t)s_dr->cap / RDP_SLOTS)
 typedef struct {
     uint16_t x, y, w; /* where the strip is, and its width                */
     uint16_t h;       /* whole rows held                                  */
@@ -1453,7 +1470,8 @@ typedef struct {
     uint32_t                t_unpack_us, t_blit_us, blits;
     uint32_t                fl[RDP_FL_N]; /* why a strip went to the glass */
     uint16_t                pal[256];     /* the painter's palette, as told */
-    uint16_t                px[RDP_RECT_PX];
+    uint16_t                cap; /* pixels px holds */
+    uint16_t                px[];
 } rdraw_t;
 static rdraw_t *s_dr;
 static uint32_t s_draw_faults;
@@ -1477,6 +1495,7 @@ void rdp_draw_times(uint32_t *unpack_us, uint32_t *blit_us, uint32_t *blits,
 }
 
 bool rdp_draws_rects(void) { return s_dr != NULL; }
+uint32_t rdp_draw_rect_px(void) { return (s_dr != NULL) ? s_dr->cap : 0u; }
 
 bool rdp_draws_idx(void) { return s_dr != NULL; }
 
@@ -1668,18 +1687,29 @@ static uint16_t *slot_take(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh)
  * left was 4 KB - the neighbour's picture could not be drawn at all.  In the
  * slow memory where there is one.
  */
+static rdraw_t *rdraw_make(void)
+{
+    uint32_t cap = RDP_RECT_MAX;
+    rdraw_t *r = ag_port_alloc(sizeof(rdraw_t) + cap * sizeof(uint16_t),
+                               AG_MEM_SLOW | AG_MEM_BYTE);
+    if (r == NULL) {
+        cap = RDP_RECT_MIN;
+        r = ag_port_alloc(sizeof(rdraw_t) + cap * sizeof(uint16_t),
+                          AG_MEM_BYTE);
+    }
+    if (r != NULL) {
+        memset(r, 0, sizeof(rdraw_t));
+        r->cap = (uint16_t)cap;
+    }
+    return r;
+}
+
 bool rdp_draw_prepare(void)
 {
     if (s_dr != NULL) {
         return true;
     }
-    s_dr = ag_port_alloc(sizeof(rdraw_t), AG_MEM_SLOW | AG_MEM_BYTE);
-    if (s_dr == NULL) {
-        s_dr = ag_port_alloc(sizeof(rdraw_t), AG_MEM_BYTE);
-    }
-    if (s_dr != NULL) {
-        memset(s_dr, 0, offsetof(rdraw_t, px));
-    }
+    s_dr = rdraw_make();
     return s_dr != NULL;
 }
 
@@ -1689,7 +1719,7 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
         return 0u;
     }
     if (s_dr == NULL) {
-        s_dr = ag_port_alloc(sizeof(rdraw_t), AG_MEM_BYTE);
+        s_dr = rdraw_make();
         if (s_dr == NULL) {
             /*
              * No block, no drawing: there used to be a row of 256 pixels in
@@ -1703,11 +1733,11 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
                 said = true;
                 ag_log(AG_LOG_WARN, TAG, "no memory to draw a neighbour's "
                                          "picture (%u bytes)",
-                       (unsigned)sizeof(rdraw_t));
+                       (unsigned)(sizeof(rdraw_t) +
+                                  RDP_RECT_MIN * sizeof(uint16_t)));
             }
             return 0u;
         }
-        memset(s_dr, 0, offsetof(rdraw_t, px));
     }
     rdraw_t *const r = s_dr;
     const uint16_t w = get16(pay);
@@ -1758,7 +1788,7 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
             rh = get16(pay + at + 8);
             at += RDP_RECT_HDR;
             if (r == NULL || rw == 0u || rh == 0u ||
-                (uint32_t)rw * rh > RDP_RECT_PX || at + plen > len ||
+                (uint32_t)rw * rh > r->cap || at + plen > len ||
                 (uint32_t)y + rh > h || (uint32_t)x + rw > w) {
                 s_draw_faults++;
                 break;

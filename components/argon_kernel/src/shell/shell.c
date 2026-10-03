@@ -1863,17 +1863,18 @@ static int cmd_ps(int argc, char **argv)
     for (uint32_t i = 0;; i++) {
         const char *name = NULL;
         uint32_t    used = 0, budget = 0;
-        bool        demoted = false;
-        if (!ag_budget_report(i, &name, &used, &budget, &demoted)) {
+        int         standing = 0;
+        if (!ag_budget_report(i, &name, &used, &budget, &standing)) {
             break;
         }
         if (i == 0) {
-            ag_console_puts(
-                "  driver tasks above applications, per 100 ms window:\n");
+            ag_console_puts("  tasks on a budget, per 100 ms window:\n");
         }
         ag_console_printf("  %-17s used %3u ms of %3u%s\n", name,
                           (unsigned)used, (unsigned)budget,
-                          demoted ? "  (held down)" : "");
+                          (standing < 0)   ? "  (held down)"
+                          : (standing > 0) ? "  (raised: light)"
+                                           : "");
     }
 
     return 0;

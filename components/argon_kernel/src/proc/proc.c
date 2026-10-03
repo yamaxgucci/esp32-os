@@ -8,6 +8,7 @@
 #include <setjmp.h>
 #include <string.h>
 
+#include <argon/budget.h>
 #include <argon/clu.h>
 #include <argon/console.h>
 #include <argon/device.h>
@@ -892,7 +893,13 @@ static void apply_task_priority(proc_t *p)
     if (p == NULL || p->task == NULL) {
         return;
     }
+    /* watched for fairness at the ordinary priority only: low asked to be
+     * last, high asked by name to be first (ag_budget_fair) */
+    ag_budget_forget(p->task);
     ag_port_task_prio_set(p->task, prio_for(p->sched_class));
+    if (prio_for(p->sched_class) == AG_BUDGET_FAIR_PRIO) {
+        (void)ag_budget_fair(p->task, p->name);
+    }
 }
 
 static void name_from_path(char *dst, size_t dst_len, const char *path)
@@ -1088,6 +1095,7 @@ static void proc_finished(proc_t *p)
     p->state = AG_PS_ZOMBIE;
     ag_port_sem_give(p->done);
     unlock();
+    ag_budget_forget(ag_port_task_self());
     ag_port_task_delete(NULL);
 }
 
@@ -1758,6 +1766,7 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
 
     crash_record(p, reason, true);
 
+    ag_budget_forget(task);
     ag_port_task_delete(task);
     p->task = NULL;
     p->exit_code = -AG_EKILLED;
@@ -2170,6 +2179,7 @@ void ag_proc_fault_exit(void)
      */
     ag_thread_mark_self_finished();
     ag_supervisor_kill_request(p->pid);
+    ag_budget_forget(ag_port_task_self());
     ag_port_task_delete(NULL);
 }
 

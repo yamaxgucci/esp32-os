@@ -622,8 +622,16 @@ ag_err_t ag_uartlink_open(int port, uint32_t baud, uint32_t frame,
     const uint32_t lane_deep =
         (uint32_t)(((uint64_t)baud / 10u * UL_LANE_MS / 1000u + 3u) & ~3u);
     const uint32_t lane_bytes = UL_LANE_SMALL + lane_deep + UL_LANE_SMALL;
+    /*
+     * IN SLOW MEMORY, OR NOT AT ALL (2 Oct 2026).  Counted against all the
+     * memory there is, the CYD - no PSRAM, and at start-up still most of its
+     * 270 KB free - took 34 KB of lanes and a larger send ring for a link on
+     * which it sends acknowledgements, and then had 1 KB left: no task to
+     * attach its neighbour's devices, no 4 KB worker for a request.  A board
+     * without slow memory sends as it did before the lanes.
+     */
     const bool     plenty =
-        ag_port_mem_free(AG_MEM_BYTE) >= lane_bytes + UL_LANE_SPARE;
+        ag_port_mem_free(AG_MEM_SLOW) >= lane_bytes + UL_LANE_SPARE;
     if (plenty && w->txcap < w->rxcap + pay + 1280u) {
         w->txcap = (w->rxcap + pay + 1280u + 3u) & ~3u;
     }
@@ -646,7 +654,17 @@ ag_err_t ag_uartlink_open(int port, uint32_t baud, uint32_t frame,
         ag_log(AG_LOG_INFO, "uartlink", "uart%d: %u B of transmit buffers at %p",
                port, (unsigned)dbytes, (void *)u->dmem);
     }
-    u->mem = (u->dmem != NULL) ? ag_port_alloc(bytes, AG_MEM_BYTE) : NULL;
+    /* the rings are the processor's, never the DMA's: with memory to spare
+     * (and so the larger send ring) in the slow memory where there is one -
+     * in internal memory the larger ring left the emulated S3 2.5 KB short
+     * of a program's thread stacks (nodetest, 2 Oct 2026) */
+    u->mem = NULL;
+    if (u->dmem != NULL && plenty) {
+        u->mem = ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+    }
+    if (u->dmem != NULL && u->mem == NULL) {
+        u->mem = ag_port_alloc(bytes, AG_MEM_BYTE);
+    }
     uint32_t lanes[WL_LANES] = {0u, 0u, 0u};
     {
         const uint32_t deep = lane_deep;
@@ -796,6 +814,16 @@ ag_err_t ag_uartlink_probe(int port, ag_uartlink_probe_t *out)
     out->small_hole = w->pr_small_hole;
     out->small_full = w->pr_small_full;
     w->pr_small_ooo = w->pr_small_hole = w->pr_small_full = 0;
+    for (unsigned k = 0; k < 3u; k++) {
+        out->lane_fed[k] = w->pr_lane_fed[k];
+        out->lane_late[k] = w->pr_lane_late[k];
+        out->lane_late_ms[k] = w->pr_lane_late_ms[k];
+        out->lane_waits[k] = w->pr_lane_waits[k];
+        w->pr_lane_fed[k] = w->pr_lane_late[k] = 0;
+        w->pr_lane_late_ms[k] = w->pr_lane_waits[k] = 0;
+    }
+    out->lane_blocked = w->pr_lane_blocked;
+    w->pr_lane_blocked = 0;
     w->pr_acked = w->pr_rtt_max_us = w->pr_room_n = w->pr_room_min = 0;
     w->pr_rtt_us = 0;
     w->pr_room_sum = 0;

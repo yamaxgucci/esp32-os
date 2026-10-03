@@ -531,10 +531,20 @@ try {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     $seen = 0
+    $bootFault = $false
     while ((Get-Date) -lt $deadline) {
         $seen = Read-Available
         if ($seen -gt 0) { $found = $true; break }
+        # A guest that faulted before its prompt never shows one: say so now
+        # instead of waiting out the timeout - a pair's partner waited on it
+        # for over ten minutes (2 Oct 2026: build\ held the C3 BOARD build,
+        # not esp32c3-qemu, and its bootloader faults in the emulator).
+        if ($text.ToString().Contains('Guru Meditation')) { $bootFault = $true; break }
         Start-Sleep -Milliseconds 100
+    }
+    if ($bootFault) {
+        Write-Host ("--- the guest faulted before '$Marker': is build\ the " +
+                    "board build of this chip instead of its -qemu target? ---")
     }
 
     # A terminal sends CR for Enter; CRLF would look like two keys.

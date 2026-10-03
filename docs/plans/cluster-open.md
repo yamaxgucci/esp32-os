@@ -1,0 +1,42 @@
+# The S3-CAM + CYD cluster: what is open
+
+Started 2 Oct 2026 after 3ab83c0 (budget lanes, `fitted = no`, the CYD's DAC
+from a ring). The goal is every row closed. Anything new found on the way is
+added here, not kept in a head.
+
+| # | Item | State | What closes it |
+|---|------|-------|----------------|
+| 1 | The S3 lost its sound, or hung, when its sound's far end failed | fixed 2 Oct, on the boards: (a) the mixer dropped a revoked sink without closing it, so /dev/cyd.pcm0 stayed taken and the CYD's converter came back -17 - now closed on the next period, and an attach waits up to 1 s for such a name; (b) a refused far open was asked again on every write - now 250 ms doubling to 8 s; (c) a period with no sink, or a refused write, took no time and the writer spun - it now lasts its length. CYD rebooted mid-tone: 15 devices back, sound back on the CYD, the tone played its 40 s, console fine. A forced -12 not reproduced since row 16 | gates |
+| 2 | A `beep` on the CYD broke the S3's sound | done b1efd12 (other session): the DAC close moved its 3 KB reserve into the last 5 KB block, so the 4 KB worker for the next RD_OPEN failed -12; the DAC keeps its channels now. Pair: tone, beep, tone x3, 0 lost | gates on b1efd12 (with the next run) |
+| 3 | Sound by ear with the picture running | done 3 Oct: Maxim, 440/660 Hz through the mixer over a full-screen picture at 8M: first "no clicks, but gaps now and then, more with time" - the tone through the mixer took 9-12 ms of 100, over the 10 ms light line, and lost its step; with the line at the drivers' 20 ms: "no gaps, no clicks", the converter dry 0 in 8 tones twice (and 0 in 12) | - |
+| 4 | Wire use at 4/8/16 Mbaud with lanes and sound | done on the boards 2 Oct, noise + tone S3 -> CYD on one firmware: 4M 99.9% of the line (2 periods lost, dry twice in 15 s), 8M 99.7% (0 lost, dry once), 16M 96.8% (0 lost, dry once) | gates |
+| 5 | The other pairs (CYD-C3, Zero-C3) on ABI 0.67 | open | NODELINK/LINKSPI reflashed, clustertest passes on each pair, no per-pair setting |
+| 6 | The QEMU cluster scenarios | open | `argon xclutest` and the QEMU pair pass |
+| 7 | The CYD runs out of the S3's sound now and then | 2 Oct: NOT the clock - the converter plays at 44101.1 Hz by its own (25 ppm, `link` clock line); the gaps were row 19 | the same counter ~0 over a minute at each baud |
+| 8 | Sizes hard-coded for the CYD (RDP_RECT_PX 2048, RD_SCR 8, RD_SND 14, DAC_RING 3072) | done 2 Oct: the drawing window 4096 px in PSRAM or 2048 without, told in the RD_PAINTED caps (bits 16..31) and cut to by the painter; the receive queues 18/28 in PSRAM, 14/8 without (the CYD reports 13 and 7); DAC_RING stays - it is 70 ms of the one converter that has it, a time, not a board | gates |
+| 9 | ~275 us inside `send()` per message, unexplained | gone 2 Oct: a write costs 29-30 us of its own under noise (and noise + tone); the rest of its 171-178 us is waiting for room in its lane, which is the wire's back-pressure (the painter is faster than the wire): 16.8 MB in 11.5 s at 16M | - |
+| 10 | Fallout on the cluster screen against REMDISP | measured 2 Oct (below): the game is faster than under REMDISP in both scenes; the glass shows ~7 whole frames/s standing, 5.5-6 scrolled; the animated menu no longer exists (the 2 Sep fix made it static) | row 20 |
+| 11 | Merge into main (main at 10ef28d; 21d7ef1, a8ba6dc, 3ab83c0 and on) | open | `--ff-only` once the rows above are closed and Maxim agrees |
+| 12 | Docs: budgets (ABI 0.67), lanes, `fitted = no`, the DAC ring | done 2 Oct (wire-blocks.md item 12, 05-status.md) | - |
+| 13 | Clutter in the worktree (`bash.exe.stackdump`, loose logs) | done 2 Oct: logs/*.txt and logs/*/ ignored (kept on disk), stackdump removed | - |
+| 14 | `argon check` builds for whatever target build/ holds; today that was the C3 BOARD build (not esp32c3-qemu), so the 3ab83c0 gate covered the C3 only, and nodetest/`argon test` booted it in QEMU: bootloader fault, then a wait of minutes | fixed 2 Oct: qemu-boot stops at a fault before the prompt and says why; the real gate is gates2.ps1 (c3 check, s3 check, nodetest, proctest, xclutest) | gates2.ps1 green |
+| 15 | A beep and the neighbour's sound at the same moment: pcm0 is exclusive, the second opener gets -16 | open | both heard at once; through the CYD's pcmmix needs a 16 KB ring a client against ~6 KB free - pcmmix reworked (per-client conversion, zero-padded partial periods) |
+| 16 | The CYD made a 4 KB worker for each request from the S3 (-12 on a tight boot) | fixed 2 Oct: one standing worker made at start-up - 3 Oct: only on a board that is a screen or a speaker to its neighbours (the emulated C3 held the 4 KB for nothing and xclutest's 32 KB arena did not fit: 8 of 22 failed; 22 of 22 after) | gates |
+| 17 | The CYD's byte memory after boot: 2 KB free, 1 KB the largest piece | fixed 2 Oct: the cause was 34 KB of lanes and a larger send ring the CYD took at boot ("plenty" counted all memory) - lanes now only with PSRAM; after: 33 KB free, 26 KB the largest piece | gates |
+| 18 | nodetest `job` (GRIND threads on both nodes) failed after 3ab83c0: the emulated S3 had 3.5 KB internal free against 6 KB on 1 Oct, no 8 KB thread stack | cause: the acker and pour tasks made at start-up for the CYD's sake took internal stacks on every board; now made at start-up only on a board without PSRAM, when first wanted elsewhere | nodetest green |
+| 19 | The S3's sound starved under a picture: tone.axe and gfxnoise.axe on the same core at the same priority, the tone got 2% and the CYD's converter ran dry 127 times in 10 s with the wire, the lanes (0 late) and the CYD's reader all on time | fixed 2 Oct by fairness, which knows nothing about sound (Maxim: the OS must not know who writes sound): an application's ordinary task is judged by its last 100 ms window - over 50 ms of the core runs a step lower, under 10 ms a step higher until it uses more than that; a thread that asks above applications pays a budget like a driver. `ps`: TONE 5 ms (raised: light), GFXNOISE 78 ms (held down); dry 1-2 a run, the tone's own start and end. A first version raised whoever wrote to a sound device - removed | gates |
+| 20 | The CYD's glass under Fallout: ~7 whole frames/s standing (the game 63.5 fps), 5.5-6 scrolled (the game 15-17) | diagnosed 2 Oct: wire-bound, not the CYD (its reader waited 0 times while scrolling, its cores 28% and 75% idle): ~80 KB of palette indices a presented frame, 6089 presents for 2749 whole frames, the painter ~0.9 MB/s | better packing: LZ over the indices and a palette a frame instead of a band (argonos-two-frame-rates) |
+
+## Row 10: the numbers to compare against
+
+REMDISP over 4 Mbaud UART, 2 Sep 2026 (`argonos-two-frame-rates`, `argon-cyd-link`):
+
+| Scene | REMDISP, 2 Sep | Cluster, 1 Oct | Cluster, now |
+|-------|----------------|----------------|--------------|
+| Temple, standing still | 44.8 fps, wire 1 ms | - | game 63.5 fps, wire 245 KB/s; CYD ~7 whole frames/s |
+| Main menu (animated) | 3.35 fps, wire 285 ms | - | static now: 0 KB/s after the fade, 62-65 fps (the 2 Sep fix stopped the whole-screen redraw) |
+| Temple scroll | 3.5-5 fps, all wire | game 12-17 fps, CYD 5-6.5 screens/s | game 15-17 fps, 840-950 KB/s; CYD 5.4-5.9 whole frames/s |
+| Full flush / dirty rects (bench) | 15 / 154 fps | - | |
+
+REMDISP and REMTERM are deleted; the old numbers stand unless they are disputed,
+then the old build is checked out and measured again.

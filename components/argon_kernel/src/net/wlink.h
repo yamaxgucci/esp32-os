@@ -344,6 +344,11 @@ typedef struct {
     uint32_t pr_acked, pr_rtt_max_us, pr_room_n, pr_room_min;
     /* room told under a frame: frames held past a hole, a hole, a full ring */
     uint32_t pr_small_ooo, pr_small_hole, pr_small_full;
+    /* the lanes (2 Oct 2026): records fed to the stream from each, those fed
+     * after they were due and by how much at most, writers that waited for
+     * a lane's room; and feeds stopped by a full stream with a lane waiting */
+    uint32_t pr_lane_fed[3], pr_lane_late[3], pr_lane_late_ms[3];
+    uint32_t pr_lane_waits[3], pr_lane_blocked;
     int64_t  pr_rtt_us;
     uint64_t pr_room_sum;
     uint32_t frames_bad;

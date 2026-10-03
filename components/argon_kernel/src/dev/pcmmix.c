@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include <argon/port/mem.h>
+#include <argon/port/task.h>
 
 #include "argon/board.h"
 #include "argon/device.h"
@@ -67,6 +68,10 @@ typedef struct {
     /* the other members of a chosen group (multiroom), open beside `sink` */
     ag_device_t     *also[PCMMIX_ALSO];
     int              also_n;
+    /* revoked under us and not yet closed (on_revoke): closed by the mixer's
+     * own task, outside the registry lock */
+    ag_device_t     *stale[PCMMIX_ALSO + 1];
+    volatile uint32_t stale_w, stale_r;
 
     uint64_t         bytes_out;
     uint64_t         bytes_drop_nosink;
@@ -248,9 +253,34 @@ static ag_device_t *pick_sink(void)
  * belongs anyway - "the sound moved to the other board" should not need anyone
  * to notice and act.
  */
+/* A revoked handle still open keeps its device's slot AND ITS NAME until it is
+ * closed - so dropping the pointer without closing it kept /dev/cyd.pcm0
+ * taken for good: the CYD restarted, came back, and its converter "could not
+ * be registered here: -17" while the sound went to pcmnull (2 Oct 2026). */
+static void stale_add(ag_device_t *dev)
+{
+    const uint32_t n = PCMMIX_ALSO + 1u;
+    if (s_st->stale_w - s_st->stale_r < n) {
+        s_st->stale[s_st->stale_w % n] = dev;
+        s_st->stale_w++;
+    }
+}
+
+static void stale_close(pcmmix_state_t *st)
+{
+    const uint32_t n = PCMMIX_ALSO + 1u;
+    while (st->stale_r != st->stale_w) {
+        (void)ag_dev_close(st->stale[st->stale_r % n]);
+        st->stale_r++;
+    }
+}
+
 static void on_revoke(ag_device_t *dev)
 {
     if (s_st != NULL && s_st->sink == dev) {
+        if (s_st->sink_held) {
+            stale_add(dev);
+        }
         s_st->sink = NULL;
         s_st->sink_held = 0;
         s_st->sink_name[0] = '\0';
@@ -258,6 +288,7 @@ static void on_revoke(ag_device_t *dev)
     /* a room of a group left: the others play on */
     for (int i = 0; s_st != NULL && i < s_st->also_n; i++) {
         if (s_st->also[i] == dev) {
+            stale_add(dev);
             s_st->also[i] = s_st->also[--s_st->also_n];
             i--;
         }
@@ -312,6 +343,7 @@ static void ensure_also(pcmmix_state_t *st)
 
 static void release_sink(pcmmix_state_t *st)
 {
+    stale_close(st);
     release_also(st);
     if (st->sink_held && st->sink != NULL) {
         (void)ag_dev_close(st->sink);
@@ -376,6 +408,21 @@ static int client_has_period(const pcmmix_client_t *c, size_t fb)
     return c->used && c->fmt_set && c->ring_used >= fb * PCMMIX_PERIOD;
 }
 
+/*
+ * A PERIOD NOT PLAYED STILL TAKES ITS TIME (2 Oct 2026).  A sink paces its
+ * writers; without one, or with one that refuses, a period was gone in
+ * microseconds and a tone, writing as fast as it was taken, spun the board
+ * with the mixer's lock in its hand - beside a neighbour answering -12 the S3
+ * had no console left.  Dropped, it lasts as long as it would have played.
+ */
+static void period_pause(const pcmmix_state_t *st)
+{
+    if (st->mix_fmt.rate != 0u) {
+        const uint32_t ms = PCMMIX_PERIOD * 1000u / st->mix_fmt.rate;
+        ag_port_task_delay(ag_port_ms_to_ticks(ms > 0u ? ms : 1u));
+    }
+}
+
 static void mix_one_period(pcmmix_state_t *st)
 {
     const size_t fb = frame_bytes(&st->mix_fmt);
@@ -388,6 +435,7 @@ static void mix_one_period(pcmmix_state_t *st)
     int          any_data = 0;
     int32_t      n;
 
+    stale_close(st);
     memset(st->mix_scratch, 0, period_bytes);
 
     for (i = 0; i < PCMMIX_CLIENTS; i++) {
@@ -444,6 +492,7 @@ static void mix_one_period(pcmmix_state_t *st)
                 ag_log(AG_LOG_WARN, TAG, "nowhere to send sound: %d",
                        (int)serr);
             }
+            period_pause(st);
             return;
         }
         st->nosink_said = 0;
@@ -453,6 +502,7 @@ static void mix_one_period(pcmmix_state_t *st)
         st->bytes_out += (uint64_t)n;
     } else {
         st->bytes_drop_nosink += (uint64_t)period_bytes;
+        period_pause(st);
     }
     ensure_also(st);
     for (i = 0; i < (size_t)st->also_n; i++) {

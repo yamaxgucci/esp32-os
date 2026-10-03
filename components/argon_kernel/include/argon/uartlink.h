@@ -55,6 +55,10 @@ typedef struct {
     /* this end told under a frame of room: for frames held past a hole, for
      * a hole, for a ring full of what its reader has not taken */
     uint32_t small_ooo, small_hole, small_full;
+    /* each lane: records fed, fed late, the latest by (ms), writers that
+     * waited for its room; feeds a full stream stopped */
+    uint32_t lane_fed[3], lane_late[3], lane_late_ms[3], lane_waits[3];
+    uint32_t lane_blocked;
 } ag_uartlink_probe_t;
 ag_err_t ag_uartlink_probe(int port, ag_uartlink_probe_t *out);
 int32_t  ag_uartlink_write(int port, const void *buf, size_t len);

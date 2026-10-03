@@ -25,8 +25,18 @@ static volatile uint32_t   s_next;
 static int64_t             s_t0;
 static int64_t             s_until;
 
+static uint32_t s_mask;
+
+void wt_only(uint32_t mask)
+{
+    s_mask = mask;
+}
+
 void wt_note_(uint8_t ev, uint32_t a)
 {
+    if (s_mask != 0u && (ev >= 32u || (s_mask & (1u << ev)) == 0u)) {
+        return;
+    }
     const int64_t now = ag_port_us();
     if (now > s_until) {
         wt_on = false;
@@ -90,6 +100,7 @@ const char *wt_name(uint8_t ev)
                                     "submit", "quiet",  "ack",    "wake",
                                     "wake.",  "nothing", "rx",     "take",
                                     "txwake", "settled", "built",  "locking",
-                                    "locked"};
+                                    "locked", "scrfull", "scrroom", "draw",
+                                    "draw.",  "sndq"};
     return (ev < sizeof(k) / sizeof(k[0])) ? k[ev] : "?";
 }

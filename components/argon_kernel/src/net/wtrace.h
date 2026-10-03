@@ -43,6 +43,12 @@ enum {
     WT_BUILT,       /* ...has built the frame: its payload */
     WT_LOCKING,     /* a frame's build asks for the link's lock */
     WT_LOCKED,      /* ...and has it */
+    /* the receiving screen (2 Oct 2026) */
+    WT_SCR_FULL,    /* the reader found the picture queue full: places used */
+    WT_SCR_ROOM,    /* ...and has room again: ms it waited */
+    WT_DRAW_IN,     /* the pour task draws a piece: its bytes */
+    WT_DRAW_OUT,    /* ...drawn: pixels */
+    WT_SND_Q,       /* a period of sound queued: periods waiting */
 };
 
 #ifdef ARGON_NO_WTRACE
@@ -67,6 +73,10 @@ static inline void wt_note(uint8_t ev, uint32_t a)
 
 /* Recording from now, for `ms` at most; false with no memory for it. */
 bool     wt_start(uint32_t ms);
+/* Only these events (a bit each, 1u << WT_...), from the next start on; 0 is
+ * all of them.  A board with room for 256 events fills them in 16 ms with
+ * the wire's own (2 Oct 2026). */
+void     wt_only(uint32_t mask);
 void     wt_stop(void);
 uint32_t wt_count(void);
 /* Event i of those kept: microseconds from the start, the event, its value. */

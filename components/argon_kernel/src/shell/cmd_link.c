@@ -496,6 +496,12 @@ static void print_stats(void)
                           (unsigned)pin, (unsigned)pout, (unsigned)pms,
                           (unsigned)prate, (unsigned)pch, (unsigned)peak,
                           (unsigned)ag_port_audio_stops());
+        const uint32_t mhz = ag_port_audio_rate_mhz();
+        if (mhz != 0u) {
+            ag_console_printf("clock   since the last look it played %u.%03u "
+                              "samples a second by its own clock\n",
+                              (unsigned)(mhz / 1000u), (unsigned)(mhz % 1000u));
+        }
     }
     uint32_t dry = 0, dry_us = 0;
     ag_pcmhw_dry(&dry, &dry_us);
@@ -1314,6 +1320,18 @@ int ag_cmd_link(int argc, char **argv)
     if (ag_path_icmp(argv[1], "trace") == 0) {
         /* `link trace <ms>`: the wire's events in time (net/wtrace.h) */
         const uint32_t ms = (argc > 2) ? (uint32_t)atoi(argv[2]) : 100u;
+        /* `link trace <ms> rd`: the receiving screen's events only, and the
+         * reader's takes between them */
+        /* ... and `snd`: only sound arriving and the reader's waits for
+         * picture room, so a few hundred events cover a second */
+        const bool rd = argc > 3 && ag_path_icmp(argv[3], "rd") == 0;
+        const bool snd = argc > 3 && ag_path_icmp(argv[3], "snd") == 0;
+        wt_only(rd ? ((1u << WT_SCR_FULL) | (1u << WT_SCR_ROOM) |
+                      (1u << WT_DRAW_IN) | (1u << WT_DRAW_OUT) |
+                      (1u << WT_SND_Q) | (1u << WT_TAKE))
+                : snd ? ((1u << WT_SCR_FULL) | (1u << WT_SCR_ROOM) |
+                         (1u << WT_SND_Q))
+                      : 0u);
         if (!wt_start(ms)) {
             ag_console_puts("trace: no memory\n");
             return 1;
@@ -1389,6 +1407,23 @@ int ag_cmd_link(int argc, char **argv)
                                   "quiet, %u us of quiet\n",
                                   (unsigned)p.dma_subs, (unsigned)p.dma_idle,
                                   (unsigned)p.dma_idle_us);
+            }
+            for (unsigned k = 0; k < 3u; k++) {
+                if (p.lane_fed[k] == 0u && p.lane_waits[k] == 0u) {
+                    continue;
+                }
+                ag_console_printf("  lane %u: %u fed, %u of them late (the "
+                                  "latest by %u ms); %u writers waited for "
+                                  "its room\n",
+                                  k, (unsigned)p.lane_fed[k],
+                                  (unsigned)p.lane_late[k],
+                                  (unsigned)p.lane_late_ms[k],
+                                  (unsigned)p.lane_waits[k]);
+            }
+            if (p.lane_blocked != 0u) {
+                ag_console_printf("  the stream was full with a lane "
+                                  "waiting: %u times\n",
+                                  (unsigned)p.lane_blocked);
             }
         }
         uint32_t rmax = 0, rslow = 0, rslow_us = 0;

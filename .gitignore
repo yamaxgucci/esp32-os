@@ -73,5 +73,8 @@ assets/pwd
 # `argon target` deletes.  Evidence lives in logs/, and its readable part lives
 # in git.
 logs/*.log
+logs/*.txt
+# the emulator harnesses' per-run folders: raw logs too
+logs/*/
 logs/SYSTEM-*.CFG
 logs/BOARD-*.CFG

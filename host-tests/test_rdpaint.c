@@ -431,9 +431,9 @@ static void switches(void)
             /* a screen of noise comes in pieces cut anywhere along a row;
              * gathered in strips it is a few dozen windows, not hundreds */
             printf("  rdpaint noise: %u windows\n", (unsigned)(s_rects - r0));
-            /* at most three times the fewest windows of RDP_RECT_PX (2048
-             * since 2 Oct 2026) that could carry it */
-            CHECK(s_rects - r0 <= 3u * (W * H / RDP_RECT_PX));
+            /* at most three times the fewest windows of the receiver's
+             * strips that could carry it (rdp_draw_rect_px, 2 Oct 2026) */
+            CHECK(s_rects - r0 <= 3u * (W * H / rdp_draw_rect_px()));
         }
         printf("  rdpaint switch %u: %u messages, %u px wrong\n",
                (unsigned)k, (unsigned)(s_sends - m0), (unsigned)n);
@@ -585,6 +585,12 @@ int main(void)
     s_all_new = false;
     balls();
     long_way();
+    switches();
+    /* a far screen with the memory for the larger window says so, and the
+     * same picture goes in fewer of them */
+    rdp_far_rect_px(rdp_draw_rect_px());
+    printf("  rdpaint far window: %u px\n", (unsigned)far_rect_px());
+    CHECK(far_rect_px() == RDP_RECT_MAX);
     switches();
     palette_scroll();
     stable_surface();
