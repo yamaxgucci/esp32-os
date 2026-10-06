@@ -6088,6 +6088,16 @@ static void pan_follow_pointer(void)
 static void pump(void)
 {
     /*
+     * ARGON: asking for input is a heartbeat too (6 Oct 2026).  The heartbeat
+     * was only the frame handed over (SDL_RenderPresent), and a screen that
+     * waits for a key hands over none: the game was killed after ten minutes
+     * of "no frame for 597026 ms, still asking for input" - "no heartbeat,
+     * 4 ms past its own deadline".  A program that asks for input is not
+     * stopped; one that stops asking and stops drawing still misses the
+     * deadline.
+     */
+    ag_heartbeat();
+    /*
      * Also from SDL_RenderPresent, and that is the one that matters: the
      * engine does not poll for events while a movie is running, and a driver
      * that goes unread for five minutes has had its connection dropped long
