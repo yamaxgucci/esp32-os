@@ -313,11 +313,20 @@ static struct {
     rdc_zstate_t *z;           /* its hash, made when first wanted */
     uint8_t      *zhist;       /* its indices so far, RDC_Z_WIN */
     uint32_t      zn;
+    /* what copies saved this frame, and frames to go without them */
+    uint32_t      z_px, z_bytes, z_rest, z_rest_len;
     uint32_t      idx_px, rgb_px; /* pixels sent each way, for tests */
     /* this second's time: taking a pass's snapshot, packing and sending
      * it, and the program's own presents marking what changed */
     int64_t t_snap_us, t_send_us, t_damage_us, t_damage_wait_us;
     int64_t t_wire_us;  /* of t_send_us: inside send(), its sleeps included */
+    /* of t_send_us: colours to indices, and the search for copies (6 Oct
+     * 2026, to see where a scrolled frame's 46 ms of packing go) */
+    int64_t t_pal_us, t_z_us;
+    /* how many colours a frame really has (6 Oct 2026: the palette was off
+     * under Fallout's scroll and nobody could say why) - a bit a colour */
+    uint8_t *cbits;
+    uint32_t colours, colours_max;
     uint32_t eagains;   /* sends the wire refused for want of room */
     /* since the board started, for `link`: passes, send() inside them, sends */
     int64_t  tot_pass_us, tot_wire_us;
@@ -429,6 +438,15 @@ static const uint8_t *pal_index(rpal_t *pl, const uint16_t *px, uint32_t n)
     return pl->ix;
 }
 
+static const uint8_t *pal_index_timed(rpal_t *pl, const uint16_t *px,
+                                      uint32_t n)
+{
+    const int64_t        t0 = ag_port_us();
+    const uint8_t *const r = pal_index(pl, px, n);
+    s_p.t_pal_us += ag_port_us() - t0;
+    return r;
+}
+
 /* The entries the far screen has not been told, ahead of what uses them. */
 static bool pal_tell(rpal_t *pl, uint16_t room, uint32_t handle,
                      rdp_send_fn send)
@@ -466,24 +484,39 @@ static bool pal_tell(rpal_t *pl, uint16_t room, uint32_t handle,
  * The history and its hash are made the first time; with no memory for them
  * a rectangle goes as before.
  */
+/*
+ * COPIES ONLY WHILE THEY PAY (6 Oct 2026).  On Fallout's scrolled map they
+ * saved nothing over the bare indices - the picture went at half its RGB565
+ * size either way - and the search cost the S3 a third of every second.  A
+ * frame whose copies saved under a tenth turns them off for RDP_Z_REST
+ * frames; then they are tried again, since another picture may want them.
+ * A try that fails again doubles the rest, up to RDP_Z_REST_MAX: the try
+ * itself cost 134 ms of a second on the scroll; one that pays starts over.
+ */
+#define RDP_Z_REST     30u
+#define RDP_Z_REST_MAX 960u
+
 static bool z_ready(void)
 {
-    if (!s_p.far_z) {
+    if (!s_p.far_z || s_p.z_rest != 0u) {
         return false;
     }
     if (s_p.z == NULL) {
+        /* internal memory first: the hash is read at random, and from
+         * PSRAM the search cost the S3 294 ms of every second (6 Oct 2026) */
         s_p.z = (rdc_zstate_t *)ag_port_alloc(sizeof(rdc_zstate_t),
-                                              AG_MEM_SLOW | AG_MEM_BYTE);
+                                              AG_MEM_FAST | AG_MEM_BYTE);
         if (s_p.z == NULL) {
             s_p.z = (rdc_zstate_t *)ag_port_alloc(sizeof(rdc_zstate_t),
-                                                  AG_MEM_BYTE);
+                                                  AG_MEM_SLOW | AG_MEM_BYTE);
         }
     }
     if (s_p.zhist == NULL) {
         s_p.zhist = (uint8_t *)ag_port_alloc(RDC_Z_WIN,
-                                             AG_MEM_SLOW | AG_MEM_BYTE);
+                                             AG_MEM_FAST | AG_MEM_BYTE);
         if (s_p.zhist == NULL) {
-            s_p.zhist = (uint8_t *)ag_port_alloc(RDC_Z_WIN, AG_MEM_BYTE);
+            s_p.zhist = (uint8_t *)ag_port_alloc(RDC_Z_WIN,
+                                                 AG_MEM_SLOW | AG_MEM_BYTE);
         }
     }
     return s_p.z != NULL && s_p.zhist != NULL;
@@ -501,12 +534,16 @@ static uint32_t pack_whole_z(const uint8_t *ix, uint32_t n, uint8_t *out,
     }
     memcpy(s_p.zhist + s_p.zn, ix, n);
     uint32_t       taken = 0;
+    const int64_t  t0 = ag_port_us();
     const uint32_t at =
         rdc_pack8z_some(s_p.z, s_p.zhist, s_p.zn, n, out, cap, &taken);
+    s_p.t_z_us += ag_port_us() - t0;
     if (taken != n) {
         return 0u;
     }
     s_p.zn += n;
+    s_p.z_px += n;
+    s_p.z_bytes += at;
     return at;
 }
 
@@ -678,14 +715,19 @@ static void report(void)
     /* apart: a journal line has a length, and the end of one line was lost */
     ag_log(AG_LOG_INFO, TAG,
            "the painter's second: %u ms snapshots, %u ms packing and sending "
-           "(%u in send, %u refused); the program's: %u ms in %u presents, %u "
-           "of it waiting for the lock",
+           "(%u in send, %u colours to indices, %u copies, %u refused; a "
+           "frame had up to %u colours); the program's: %u ms in %u presents, "
+           "%u of it waiting for the lock",
            (unsigned)(s_p.t_snap_us / 1000), (unsigned)(s_p.t_send_us / 1000),
-           (unsigned)(s_p.t_wire_us / 1000), (unsigned)s_p.eagains,
+           (unsigned)(s_p.t_wire_us / 1000), (unsigned)(s_p.t_pal_us / 1000),
+           (unsigned)(s_p.t_z_us / 1000), (unsigned)s_p.eagains,
+           (unsigned)s_p.colours_max,
            (unsigned)(s_p.t_damage_us / 1000), (unsigned)s_p.damages,
            (unsigned)(s_p.t_damage_wait_us / 1000));
     s_p.t_damage_wait_us = 0;
     s_p.t_wire_us = 0;
+    s_p.t_pal_us = s_p.t_z_us = 0;
+    s_p.colours_max = 0;
     s_p.eagains = 0;
     s_p.t_snap_us = s_p.t_send_us = s_p.t_damage_us = 0;
     s_p.damages = 0;
@@ -901,6 +943,29 @@ static void pass(void)
             s_p.pal_forget = false;
             pal_reset(s_p.pal);
         }
+        if (!cont && !s_p.more) {
+            if (s_p.z_rest != 0u) {
+                s_p.z_rest--;
+            } else if (s_p.z_px >= 4096u && s_p.z_bytes * 10u > s_p.z_px * 9u) {
+                if (s_p.z_rest_len < RDP_Z_REST) {
+                    s_p.z_rest_len = RDP_Z_REST;
+                }
+                s_p.z_rest = s_p.z_rest_len;
+                if (s_p.z_rest_len < RDP_Z_REST_MAX) {
+                    s_p.z_rest_len *= 2u;
+                }
+            } else if (s_p.z_px >= 4096u) {
+                s_p.z_rest_len = RDP_Z_REST; /* they paid */
+            }
+            s_p.z_px = s_p.z_bytes = 0;
+        }
+        if (!cont && !s_p.more && s_p.cbits != NULL && s_p.colours != 0u) {
+            if (s_p.colours > s_p.colours_max) {
+                s_p.colours_max = s_p.colours;
+            }
+            s_p.colours = 0;
+            memset(s_p.cbits, 0, 8192u);
+        }
         if (pl != NULL && !cont && !s_p.more && pl->missed) {
             /* a new frame: the colours that did not fit, a table again -
              * and after two frames that missed, a rest from indices */
@@ -1001,9 +1066,28 @@ static void pass(void)
                     const uint16_t *row =
                         ((s_p.snap != NULL) ? s_p.snap : s_p.src) +
                         (size_t)yy * w;
+                    /* counted only while the report is asked for: a pass
+                     * over every pixel is not free */
+                    if (s_report && s_p.cbits == NULL) {
+                        s_p.cbits = (uint8_t *)ag_port_alloc(
+                            8192u, AG_MEM_SLOW | AG_MEM_BYTE);
+                        if (s_p.cbits != NULL) {
+                            memset(s_p.cbits, 0, 8192u);
+                        }
+                    }
+                    if (s_report && s_p.cbits != NULL) {
+                        for (uint32_t k = x0; k < x1; k++) {
+                            const uint16_t c = row[k];
+                            const uint8_t  bit = (uint8_t)(1u << (c & 7u));
+                            if ((s_p.cbits[c >> 3] & bit) == 0u) {
+                                s_p.cbits[c >> 3] |= bit;
+                                s_p.colours++;
+                            }
+                        }
+                    }
                     const uint8_t *ix =
                         (pl != NULL && pl->rest == 0u)
-                            ? pal_index(pl, row + x0, (uint32_t)(x1 - x0))
+                            ? pal_index_timed(pl, row + x0, (uint32_t)(x1 - x0))
                             : NULL;
                     if (ix != NULL && pl->told < pl->n) {
                         ok = pal_tell(pl, room, handle, send);

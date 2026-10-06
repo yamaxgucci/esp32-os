@@ -196,7 +196,9 @@ uint32_t rdc_unpack(const uint8_t *in, uint32_t len, uint16_t *px, uint32_t n)
 
 #define RDC_Z_RUN_MAX  66u
 #define RDC_Z_COPY_MAX 66u
-#define RDC_Z_DEPTH    8u /* candidates looked at a place: speed against size */
+/* candidates looked at a place: speed against size.  8 cost the S3 339 ms
+ * of every second under Fallout's scroll (6 Oct 2026) */
+#define RDC_Z_DEPTH    2u
 
 void rdc_z_reset(rdc_zstate_t *z)
 {
