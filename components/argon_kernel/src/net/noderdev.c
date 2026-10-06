@@ -1357,10 +1357,11 @@ static ag_port_task_t s_worker;
  * places, the largest piece left was 4 KB or less: every open from the S3
  * answered -12, sound and screen alike, until a restart.  Made once while
  * there is memory, it waits on s_req_sem; a board where it could not be made
- * falls back to one a request.  Only on a board with no slow memory: where
- * there is PSRAM a worker a request always finds a stack, and a standing one
- * would hold 4 KB of internal memory for good - the emulated S3 then had too
- * little left for a program's threads.
+ * falls back to one a request.  Its stack is in PSRAM where there is any
+ * (ag_proc_task_create_slow): in internal memory it held 4 KB for good and
+ * the emulated S3 then had too little left for a program's threads.  Where
+ * there is no PSRAM, only on a board that is a screen or a speaker to its
+ * neighbours (the emulated C3 held the 4 KB for nothing).
  */
 static ag_port_sem_t  s_req_sem;
 static bool           s_standing;
@@ -1788,7 +1789,7 @@ static void standing_worker(void *arg)
 
 static void worker_make(void)
 {
-    if (s_standing || ag_port_mem_free(AG_MEM_SLOW) > 0u) {
+    if (s_standing) {
         return;
     }
     if (s_req_sem == NULL) {
@@ -1797,9 +1798,10 @@ static void worker_make(void)
     if (s_req_sem == NULL) {
         return;
     }
-    /* As nodeproc's worker: internal stack, else PSRAM (see there). */
-    s_standing = ag_proc_task_create(standing_worker, "rdevsrv", 4096, NULL, 1,
-                                     AG_PORT_ANY_CORE, &s_worker);
+    /* PSRAM first where there is any: it lives as long as the board */
+    s_standing = ag_proc_task_create_slow(standing_worker, "rdevsrv", 4096,
+                                          NULL, 1, AG_PORT_ANY_CORE,
+                                          &s_worker);
 }
 
 /*
@@ -3038,6 +3040,16 @@ ag_err_t ag_noderdev_serve(void)
      * internal memory that a program's threads then did not find (nodetest).
      */
     if (ag_port_mem_free(AG_MEM_SLOW) > 0u) {
+        /*
+         * ONE REQUEST WORKER HERE TOO, ITS STACK IN PSRAM (6 Oct 2026).  A
+         * worker made for each request and deleted after it gives its stack
+         * back only when the idle task gets round to it; a busy emulated S3
+         * serving its sound while a neighbour drew on it had the next
+         * request's 4 KB refused (-12) while the last one's was still
+         * waiting to be freed - nodetest's far sound failed twice in three
+         * runs.  Standing, in PSRAM, it costs no internal memory.
+         */
+        worker_make();
         return AG_OK;
     }
     if (ag_display_ready()) {

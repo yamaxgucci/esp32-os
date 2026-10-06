@@ -921,6 +921,28 @@ bool ag_proc_task_create(ag_port_task_fn fn, const char *name,
 #endif
 }
 
+/*
+ * The other way round, for a task that lives as long as the board and is
+ * not in a hurry: PSRAM first, internal SRAM only where there is none
+ * (6 Oct 2026, the standing request worker - a 4 KB internal stack held for
+ * good cost the emulated S3 a program's thread stacks).
+ */
+bool ag_proc_task_create_slow(ag_port_task_fn fn, const char *name,
+                              uint32_t stack_bytes, void *arg, unsigned prio,
+                              int core, ag_port_task_t *out)
+{
+#if AG_PORT_TASK_STACK_CAPS
+    if (ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                            AG_MEM_SLOW | AG_MEM_BYTE, out)) {
+        return true;
+    }
+    return ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                               AG_MEM_FAST | AG_MEM_BYTE, out);
+#else
+    return ag_port_task_create(fn, name, stack_bytes, arg, prio, core, 0, out);
+#endif
+}
+
 static uint32_t clamp_stack_bytes(uint32_t want)
 {
     if (want == 0) {
