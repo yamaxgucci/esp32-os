@@ -50,6 +50,14 @@ bool ag_log_echo(void);
 void ag_log_app_write(ag_pid_t pid, const char *name, const char *data,
                       size_t len);
 
+/*
+ * Which task holds the journal's lock right now, or NULL.  Asked before a task
+ * is deleted (proc/proc.c) and by the lock watch (dev/devices.c): an
+ * application writing to its log holds it, and a holder deleted holds it for
+ * ever - after which nothing on the board can log, or print.
+ */
+const void *ag_log_lock_holder(void);
+
 const ag_journal_t *ag_log_journal(void);
 void                ag_log_clear(void);
 

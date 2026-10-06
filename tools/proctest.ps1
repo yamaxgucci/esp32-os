@@ -19,6 +19,17 @@
 # and after the first two a second wait must say -2: the first one collected
 # the child, and nothing else may have.
 #
+# The one check that is a loop, because it is a race:
+#
+#   storm  spawn SPIN log, kill a moment later, wait - forty times
+#                                          -> 40 of 40 killed, no [lockwatch]
+#
+# SPIN log is inside the journal's lock or the console's nearly all the time.
+# A kill used to ask "is it in the kernel?" and then delete it, with the child
+# running on the other core in between; on 1 Oct 2026 it was deleted holding
+# the journal and the board printed nothing more.  Before the fix this storm
+# hung on its first kill.
+#
 # Exit code 0 means every check passed.
 [CmdletBinding()]
 param(
@@ -74,7 +85,9 @@ $log = 'build\proctest.log'
             'run t:\reapwait.axe kill t:\spin.axe', '=reapwait kill:',
             'run t:\reapwait.axe leave t:\hello.axe', '=reapwait leave:',
             '!powershell -NoProfile -Command Start-Sleep -Seconds 3',
-            'ps') | Out-Host
+            'ps',
+            'run t:\reapwait.axe storm t:\spin.axe log', '=reapwait storm:') |
+    Out-Host
 
 $t = Transcript $log
 Check $t 'reapwait late: wait 0, code 0, again -2' 'late-wait-gets-the-code'
@@ -90,6 +103,29 @@ Check $t 'reapwait leave: not waiting' 'parent-left-without-waiting'
 $ps = $t.LastIndexOf('C:\>ps')
 Note ($ps -ge 0 -and $t.IndexOf('no applications loaded', $ps) -gt $ps) `
     'orphan-swept-up' $(if ($ps -lt 0) { 'ps never ran' })
+# Forty kills of a child that is inside the journal's lock or the console's
+# nearly all the time.  A kill that deleted it there left the lock held for
+# ever (1 Oct 2026: "[lockwatch] the journal lock held 30 s by ''") and the
+# board printed nothing more; now the kill stops the child first and deletes
+# it only outside every kernel lock.
+Check $t 'reapwait storm: 40 of 40 killed, 0 refused' 'killed-mid-log-leaves-no-lock'
+# From the ps before the storm on: recv holds the console for as long as a
+# file takes to arrive, and the watch says so while the images go onto t:.
+# Not from the storm's own command line - the screen is sent as differences,
+# and a line that scrolls away before the next paint never reaches the
+# transcript at all.  The watch itself is raw output and always does.
+#
+# Less one report.  The watch samples once a second and says "held 3 s" when
+# three samples running found the same holder, held through or not; the
+# console task painting SPIN's flood takes the console lock hundreds of times
+# a second and is found holding it three samples running in about every second
+# run, while the kills go on around it.  A console really stopped is said
+# again at 30 s - the storm's wait outlasts that - and the hang this is about
+# was the journal, held by the deleted child, which nothing here forgives.
+$watch = [regex]::Match($(if ($ps -ge 0) { $t.Substring($ps) } else { '' }),
+                        "\[lockwatch\](?! the console lock held 3 s by 'ag_con')[^\n]*")
+Note ($ps -ge 0 -and -not $watch.Success) 'no-lock-held-for-seconds' `
+    $(if ($ps -lt 0) { 'ps never ran' } elseif ($watch.Success) { $watch.Value })
 
 $failed = @($results | Where-Object { $_ -like 'FAIL*' }).Count
 Write-Host ''

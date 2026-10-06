@@ -102,14 +102,21 @@ void ag_thread_release(void *record)
          * journal; a lost console is a board that has to be power-cycled, and
          * Maxim had to do exactly that.
          */
+        /*
+         * And stopped before it is asked, not asked and then deleted: the
+         * thread runs on in between, and can walk into a lock in the moment
+         * after the answer (see stop_outside_kernel in proc.c).
+         */
+        bool stopped = false;
         for (unsigned i = 0; i < AG_THREAD_UNLOCK_TRIES; i++) {
-            if (!ag_proc_task_in_kernel(rec->task)) {
+            stopped = ag_proc_task_stop_outside_kernel(rec->task);
+            if (stopped) {
                 break;
             }
             ag_port_task_delay(AG_THREAD_UNLOCK_WAIT_MS);
         }
 
-        if (ag_proc_task_in_kernel(rec->task)) {
+        if (!stopped) {
             ag_log(AG_LOG_ERROR, "thread",
                    "a thread (task %p) is inside the kernel holding a lock "
                    "after 2 s; left running rather than killed - deleting it "

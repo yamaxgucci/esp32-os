@@ -1,0 +1,22 @@
+# ArgonOS port: ESP-IDF - functions of IDF's that this port takes out of IRAM.
+#
+# IDF puts all of FreeRTOS in IRAM (FREERTOS_IN_IRAM), whether a function can
+# ever be called with the flash cache off or not.  On the ESP32-S3 that is not
+# free: internal SRAM is one pool seen through two windows, and every byte of
+# IRAM code pushes the start of DRAM up by one.  The S3 image links with
+# almost nothing to spare (25 Sep 2026, s_procs in proc.c).
+#
+# The kill (ag_proc_kill, ag_thread_release) stops a task before it decides
+# whether it may be deleted, and the three calls that takes - 685 bytes of
+# IRAM between them, never linked before - overflowed dram0_0_seg by 744 bytes
+# on 1 Oct 2026.  None of them is called from an interrupt or with the cache
+# off; IDF's own fragment lists all three as safe in flash, under
+# FREERTOS_PLACE_FUNCTIONS_INTO_FLASH.  A symbol here is more specific than
+# IDF's `* (noflash_text)` and wins over it.
+
+[mapping:argon_port_freertos]
+archive: libfreertos.a
+entries:
+    tasks:vTaskSuspend (default)
+    tasks:vTaskResume (default)
+    tasks:eTaskGetState (default)

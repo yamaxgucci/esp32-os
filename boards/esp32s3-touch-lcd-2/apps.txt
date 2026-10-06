@@ -41,5 +41,12 @@ GRINDRV.AXE
 # be measured with.  A fetch of it from the neighbour is the one-way throughput
 # test this pair had no file for.
 DESKTOP.AXE
+#
+# REMTERM.AXE - THE OTHER HALF OF THE CABLE'S SCREEN.
+#
+# `run c:\remterm.axe` and this board's panel becomes the Zero's display: the
+# pixels arrive as bands and go straight to the glass, and the far console
+# arrives as characters.  A monitor at the end of a cable.
+REMTERM.AXE
 # Blocks across the wire, counted: tools/wireblk.py.
 WIREBLK.AXE

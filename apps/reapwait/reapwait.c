@@ -4,6 +4,8 @@
  *   run t:\reapwait.axe late t:\hello.axe    spawn, sleep 1 s, then wait
  *   run t:\reapwait.axe kill t:\spin.axe     spawn, kill it, sleep 1 s, wait
  *   run t:\reapwait.axe leave t:\hello.axe   spawn, sleep 1 s, never wait
+ *   run t:\reapwait.axe storm t:\spin.axe log
+ *                                            spawn, kill, wait - forty times
  *
  * An application's spawn and its wait are two calls.  The supervisor collects
  * a finished process nobody is waiting for every 250 ms, so a child that ends
@@ -31,11 +33,65 @@
 
 AG_APP("REAPWAIT", "1.0", "argon", 0);
 
+/*
+ * The storm: spawn, kill a moment later, collect - STORM_ROUNDS times, with
+ * the moment different every round so the kill lands at a different point of
+ * whatever the child is doing.  For SPIN log, which is inside the kernel's
+ * output path nearly all the time, that is a kill inside the journal's lock
+ * or the console's, over and over.
+ *
+ * A child deleted holding one of those holds it for ever (FreeRTOS lets only
+ * the owner give a mutex back), and from then on nothing that logs gets
+ * anywhere - this program included, so the line below never comes and that
+ * absence is the failure.  It hung proctest once in four runs on 1 Oct 2026
+ * with one kill.  Before the fix this storm hung on its very first kill.
+ */
+#define STORM_ROUNDS 40
+
+static int storm(const char *program, const char *arg)
+{
+    const char *child_argv[] = {program, arg};
+    unsigned    killed = 0, refused = 0;
+
+    for (unsigned round = 0; round < STORM_ROUNDS; round++) {
+        const ag_pid_t child =
+            ag_spawn(program, (arg != NULL) ? 2 : 1, child_argv,
+                     AG_SPAWN_BACKGROUND | AG_SPAWN_NO_SESSION);
+        if (child < 0) {
+            ag_printf("reapwait: spawn %s failed %d\n", program, (int)child);
+            return 1;
+        }
+        ag_delay(1u + (round * 7u) % 23u);
+
+        const ag_err_t k = ag_kill(child);
+        int32_t        code = 12345;
+        const ag_err_t w = ag_wait(child, &code, 5000u);
+        if (k == AG_OK && (w == -AG_EKILLED || w == AG_OK)) {
+            killed++;
+        } else if (k == -AG_EBUSY) {
+            refused++; /* the kernel left it running and said so */
+            ag_printf("reapwait: round %u kill refused, wait %d\n", round,
+                      (int)w);
+        } else {
+            ag_printf("reapwait: round %u kill %d wait %d code %d\n", round,
+                      (int)k, (int)w, (int)code);
+        }
+    }
+    /* Short: in the journal it is behind "I (16998) app/REAPWAIT:7: ", and a
+     * line past 80 columns reaches the transcript in two pieces. */
+    ag_printf("reapwait storm: %u of %u killed, %u refused\n", killed,
+              (unsigned)STORM_ROUNDS, refused);
+    return 0;
+}
+
 int ag_main(int argc, char **argv)
 {
     if (argc < 3) {
-        ag_print("usage: reapwait late|kill <program>\n");
+        ag_print("usage: reapwait late|kill|leave|storm <program> [arg]\n");
         return 1;
+    }
+    if (argv[1][0] == 's') {
+        return storm(argv[2], (argc > 3) ? argv[3] : NULL);
     }
     const bool kill = argv[1][0] == 'k';
 

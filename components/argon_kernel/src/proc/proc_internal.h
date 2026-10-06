@@ -211,6 +211,15 @@ void ag_thread_mark_self_finished(void);
 bool ag_proc_task_in_kernel(ag_port_task_t task);
 
 /*
+ * Suspends another task where it stands and keeps it suspended only if it
+ * holds none of those locks there: true means it may now be deleted, false
+ * that it has been let go again.  One attempt; asking ag_proc_task_in_kernel
+ * and then deleting is two steps with the task running between them on the
+ * other core, which is how SPIN was deleted holding the journal (1 Oct 2026).
+ */
+bool ag_proc_task_stop_outside_kernel(ag_port_task_t task);
+
+/*
  * Called from an exception context: writes down what happened and nothing else.
  * Returns false when this process cannot be recovered, in which case the caller
  * must let the fault take its normal course.

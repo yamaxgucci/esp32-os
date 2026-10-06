@@ -301,14 +301,18 @@ if ($hostfsSerial) {
 #
 function Start-Qemu {
     param([string]$Exe, [string[]]$Arguments)
-    return Start-Process -FilePath $Exe -ArgumentList $Arguments `
+    $p = Start-Process -FilePath $Exe -ArgumentList $Arguments `
         -NoNewWindow -PassThru
+    # So that this tree's own tests may stop it, and nobody else's will.
+    Register-Emulator -Process $p -Flash 'build\qemu_flash.bin'
+    return $p
 }
 
 try {
     $proc = Start-Qemu -Exe $qemu -Arguments $qemuArgs
     $proc.WaitForExit()
 } finally {
+    Unregister-Emulator -Process $proc
     if ($virtProc) {
         Stop-ProcessTree -Id $virtProc.Id
         Stop-ArgonVirtHelpers

@@ -16,20 +16,111 @@ function Get-QemuTarget {
     return $line.Matches[0].Groups[1].Value
 }
 
-# Every emulator, not just the Xtensa one.
+# The emulators THIS TREE started - and only those.
 #
 # WHY THIS IS A FUNCTION.  Six places in these scripts killed
 # `qemu-system-xtensa` by name, which was the whole list until 18 Sep 2026.  A
-# stray qemu-system-riscv32 now survives all of them, keeps a core busy, and
-# the next run does not fail - it goes SLOW, which came out as node B needing a
+# stray qemu-system-riscv32 then survived all of them, kept a core busy, and
+# the next run did not fail - it went SLOW, which came out as node B needing a
 # second attempt at a file transfer and arriving a hundred and fifty seconds
-# after the sender had finished.  Two checks then reported a dead wire, which
-# was true and was about the wrong thing.
+# after the sender had finished.  So it became every emulator of both kinds.
+#
+# WHY IT IS NO LONGER EVERY EMULATOR (3 Oct 2026).  "Every emulator" meant every
+# emulator ON THE PC, and this PC runs several sessions in several worktrees at
+# once.  A cluster test starting in one worktree killed a Fallout measurement
+# running in another, twice in one morning, and both at the same second - with
+# nothing anywhere saying who had done it, because from the victim's side the
+# console port simply stops answering.  The same afternoon had already been lost
+# the other way round once (see the note in qemu-boot.ps1).
+#
+# So every launcher registers what it started, in this tree's own build folder:
+# one file per emulator, holding its pid, the moment it started (a pid alone is
+# reused by Windows, and stopping a stranger who inherited it would be the same
+# bug again) and the flash image it runs.  This stops the registered ones that
+# are still the same process, and forgets the rest.  `-Flash` narrows it to the
+# emulators of one image - a leftover of the board about to be booted again.
+# `-All` is the old sledgehammer, kept for a person who asks for it by name and
+# used by nothing in this folder.
+function Get-EmulatorRegistry {
+    return (Join-Path (Get-Location) 'build\qemu-pids')
+}
+
+function Get-FullFlashPath {
+    param([string]$Flash)
+    if (-not $Flash) { return '' }
+    return [IO.Path]::GetFullPath((Join-Path (Get-Location) $Flash))
+}
+
+function Register-Emulator {
+    param([System.Diagnostics.Process]$Process, [string]$Flash = '')
+    if (-not $Process) { return }
+    $dir = Get-EmulatorRegistry
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $started = 0
+    try { $started = $Process.StartTime.ToFileTimeUtc() } catch {}
+    Set-Content -Encoding ascii -Path (Join-Path $dir "$($Process.Id).pid") `
+        -Value @("$($Process.Id)", "$started", (Get-FullFlashPath $Flash))
+}
+
+function Unregister-Emulator {
+    param([System.Diagnostics.Process]$Process)
+    if (-not $Process) { return }
+    Remove-Item -LiteralPath (Join-Path (Get-EmulatorRegistry) "$($Process.Id).pid") `
+        -Force -ErrorAction SilentlyContinue
+}
+
 function Stop-Emulators {
-    foreach ($name in @('qemu-system-xtensa', 'qemu-system-riscv32')) {
-        Get-Process $name -ErrorAction SilentlyContinue |
-            Stop-Process -Force -ErrorAction SilentlyContinue
+    param([string]$Flash = '', [switch]$All)
+    if ($All) {
+        foreach ($name in @('qemu-system-xtensa', 'qemu-system-riscv32')) {
+            Get-Process $name -ErrorAction SilentlyContinue |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+        }
+        return
     }
+    $dir = Get-EmulatorRegistry
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    $want = Get-FullFlashPath $Flash
+    $stopped = 0
+    foreach ($f in Get-ChildItem -LiteralPath $dir -Filter '*.pid' -ErrorAction SilentlyContinue) {
+        $rec = @(Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue)
+        if ($rec.Count -lt 2) {
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+            continue
+        }
+        $image = if ($rec.Count -ge 3) { $rec[2] } else { '' }
+        if ($want -and ($image -ne $want)) {
+            continue    # another board of this tree: not the leftover asked about
+        }
+        $p = Get-Process -Id ([int]$rec[0]) -ErrorAction SilentlyContinue
+        $same = $false
+        if ($p) {
+            try {
+                $same = ([int64]$rec[1] -eq 0) -or
+                        ($p.StartTime.ToFileTimeUtc() -eq [int64]$rec[1])
+            } catch {}
+        }
+        if ($same) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $stopped++
+        }
+        Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+    }
+    if ($stopped -gt 0) {
+        Start-Sleep -Milliseconds 300    # let the ports it held go
+    }
+}
+
+# Who is listening on a port, if anyone - for the one message that says
+# "somebody else's emulator has your port" instead of a minute of silence.
+function Get-PortHolder {
+    param([int]$Port)
+    try {
+        $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+        if ($c) { return (Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue) }
+    } catch {}
+    return $null
 }
 
 function Resolve-Qemu {
