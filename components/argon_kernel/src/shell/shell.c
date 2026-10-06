@@ -5027,6 +5027,7 @@ static int cmd_usb(int argc, char **argv)
     if (argc >= 2 && ag_path_icmp(argv[1], "off") == 0) {
         const size_t before = ag_port_mem_free(AG_MEM_FAST);
         (void)ag_port_usb_stop();
+        ag_usbinput_off();
         const size_t after = ag_port_mem_free(AG_MEM_FAST);
         ag_console_printf("usb host off, %u KB back\n",
                           (unsigned)((after - before) / 1024u));

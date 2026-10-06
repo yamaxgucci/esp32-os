@@ -17,6 +17,8 @@ extern "C" {
 /* Registers the report handler.  The host is started separately: a board can
  * have USB host up and nothing plugged into it. */
 ag_err_t ag_usbinput_init(void);
+/* The host went down: what was kept for an arriving device is given back. */
+void     ag_usbinput_off(void);
 #endif
 
 #ifdef __cplusplus

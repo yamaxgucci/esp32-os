@@ -243,8 +243,8 @@ static ag_thread_t thread_create_in(proc_t *p, void (*fn)(void *), void *arg,
     snprintf(label, sizeof(label), "%.11s/t", (name != NULL) ? name : p->name);
 
     ag_port_task_t task = NULL;
-    if (!ag_proc_task_create(thread_entry, label, (uint32_t)want, rec,
-                             (unsigned)prio, core, &task)) {
+    if (!ag_proc_task_create_app(thread_entry, label, (uint32_t)want, rec,
+                                 (unsigned)prio, core, &task)) {
         (void)ag_reslist_remove(&p->res, AG_RES_THREAD, rec, NULL);
         ag_port_free(rec);
         ag_proc_table_unlock();

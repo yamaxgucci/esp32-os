@@ -38,6 +38,7 @@
 
 #include <argon/port/usb.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -795,6 +796,35 @@ static void lib_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/*
+ * ARGON: what a device's arrival costs in internal memory (6 Oct 2026).  The
+ * mouse plugged in during Fallout was noticed and never opened - "HCD Pipe
+ * alloc error: ESP_ERR_NO_MEM" with 2 KB of internal memory left - so the
+ * cost of an arrival is measured from the host's coming up to the device's
+ * being open: the lowest internal free in between, against what was free at
+ * the start.  That difference is what the host has to have kept for it.
+ */
+static size_t s_free_at_up;
+
+static void arrival_watch_start(void)
+{
+    (void)heap_caps_monitor_local_minimum_free_size_stop();
+    s_free_at_up = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    (void)heap_caps_monitor_local_minimum_free_size_start();
+}
+
+static void arrival_said(void)
+{
+    const size_t low = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    const size_t now = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG, "the arrival took internal memory from %u bytes free down "
+                  "to %u at its lowest (%u), %u held now",
+             (unsigned)s_free_at_up, (unsigned)low,
+             (unsigned)(s_free_at_up > low ? s_free_at_up - low : 0u),
+             (unsigned)(s_free_at_up > now ? s_free_at_up - now : 0u));
+    arrival_watch_start();
+}
+
 static void cli_task(void *arg)
 {
     (void)arg;
@@ -813,11 +843,13 @@ static void cli_task(void *arg)
              */
             ESP_LOGI(TAG, "connect on address %u", addr);
             attach(addr);
+            arrival_said();
         }
         usb_device_handle_t gone = s_pending_gone;
         if (gone != NULL) {
             s_pending_gone = NULL;
             detach(gone);
+            arrival_watch_start(); /* the next arrival counted from here */
         }
 
         /* ARGON: and any endpoint that stopped answering.  See pipe_recover. */
@@ -946,6 +978,21 @@ static void restart_task(void *arg)
 
 void ag_port_usb_on_report(ag_port_usb_report_fn fn) { s_on_report = fn; }
 
+/*
+ * What an arrival costs, measured on the S3 on 6 Oct 2026 by arrival_said():
+ * a mouse (046d:c542) plugged into a waiting host took internal free memory
+ * 11600 bytes down at its lowest, three times out of three, and held 11340
+ * of it while open.  Kept with room for what the measurement cannot see: the
+ * pipes' descriptor lists are 512-byte aligned, and a free total of 11600 in
+ * scattered pieces would not give them a block.
+ */
+#define USB_ARRIVAL_BYTES (16u * 1024u)
+
+size_t ag_port_usb_arrival_bytes(void)
+{
+    return USB_ARRIVAL_BYTES;
+}
+
 ag_err_t ag_port_usb_start(void)
 {
     if (s_state != AG_USB_OFF) {
@@ -973,6 +1020,7 @@ ag_err_t ag_port_usb_start(void)
         return -AG_EIO;
     }
 
+    arrival_watch_start();
     s_running = true;
     s_state = AG_USB_IDLE;
     s_up_at_ms = (uint32_t)(esp_timer_get_time() / 1000);

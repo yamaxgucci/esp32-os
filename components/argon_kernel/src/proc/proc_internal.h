@@ -150,6 +150,11 @@ void ag_proc_table_unlock(void);
 bool ag_proc_task_create(ag_port_task_fn fn, const char *name,
                          uint32_t stack_bytes, void *arg, unsigned prio,
                          int core, ag_port_task_t *out);
+/* The same for an application's own task or thread: internal SRAM only above
+ * what is kept for arriving devices (ag_proc_keep_internal), else PSRAM. */
+bool ag_proc_task_create_app(ag_port_task_fn fn, const char *name,
+                             uint32_t stack_bytes, void *arg, unsigned prio,
+                             int core, ag_port_task_t *out);
 /* The same with the stack in PSRAM first: for a task that lives as long as
  * the board and must not hold internal memory for it. */
 bool ag_proc_task_create_slow(ag_port_task_fn fn, const char *name,

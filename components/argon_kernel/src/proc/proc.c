@@ -921,6 +921,74 @@ bool ag_proc_task_create(ag_port_task_fn fn, const char *name,
 #endif
 }
 
+/* ---- internal memory kept for what may arrive (see proc.h) ---- */
+
+#define KEEP_SLOTS 4u
+static const void *s_keep_who[KEEP_SLOTS];
+static size_t      s_keep_bytes[KEEP_SLOTS];
+
+void ag_proc_keep_internal(const void *who, size_t bytes)
+{
+    int free_slot = -1;
+    for (uint32_t i = 0; i < KEEP_SLOTS; i++) {
+        if (s_keep_who[i] == who) {
+            s_keep_bytes[i] = bytes;
+            if (bytes == 0u) {
+                s_keep_who[i] = NULL;
+            }
+            return;
+        }
+        if (s_keep_who[i] == NULL && free_slot < 0) {
+            free_slot = (int)i;
+        }
+    }
+    if (bytes != 0u && free_slot >= 0) {
+        s_keep_bytes[free_slot] = bytes;
+        s_keep_who[free_slot] = who;
+    }
+}
+
+size_t ag_proc_kept_internal(void)
+{
+    size_t sum = 0;
+    for (uint32_t i = 0; i < KEEP_SLOTS; i++) {
+        if (s_keep_who[i] != NULL) {
+            sum += s_keep_bytes[i];
+        }
+    }
+    return sum;
+}
+
+/* Whether an application may take `bytes` of internal memory and still leave
+ * what is kept. */
+static bool app_internal_room(size_t bytes)
+{
+    return ag_port_mem_free(AG_MEM_FAST) >= bytes + ag_proc_kept_internal();
+}
+
+bool ag_proc_task_create_app(ag_port_task_fn fn, const char *name,
+                             uint32_t stack_bytes, void *arg, unsigned prio,
+                             int core, ag_port_task_t *out)
+{
+#if AG_PORT_TASK_STACK_CAPS
+    if (app_internal_room(stack_bytes)) {
+        return ag_proc_task_create(fn, name, stack_bytes, arg, prio, core, out);
+    }
+    if (ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                            AG_MEM_SLOW | AG_MEM_BYTE, out)) {
+        ag_log(AG_LOG_INFO, "proc",
+               "%s: task stack in PSRAM (%u bytes; internal SRAM is kept for "
+               "devices, %u bytes)",
+               name != NULL ? name : "?", (unsigned)stack_bytes,
+               (unsigned)ag_proc_kept_internal());
+        return true;
+    }
+    return false;
+#else
+    return ag_proc_task_create(fn, name, stack_bytes, arg, prio, core, out);
+#endif
+}
+
 /*
  * The other way round, for a task that lives as long as the board and is
  * not in a hurry: PSRAM first, internal SRAM only where there is none
@@ -947,6 +1015,20 @@ static uint32_t clamp_stack_bytes(uint32_t want)
 {
     if (want == 0) {
         want = (uint32_t)CONFIG_ARGON_APP_STACK_KB * 1024u;
+        /*
+         * A DEFAULT SIZED BY THE KIND OF MACHINE (6 Oct 2026).  On a board
+         * with no PSRAM every stack is the internal memory everything else
+         * lives in, and 16 KB of it for a program that named no size was the
+         * C3's undoing: a 440 Hz tone held 16 KB of stack with 12 KB never
+         * touched, and the next program on that board was refused an 8 KB
+         * one.  The CYD's sdkconfig already said 8 for the same reason; the
+         * kind of memory says it for every such board.  A program that needs
+         * more names it (AG_APP_SIZED) and gets it.
+         */
+        if (ag_port_mem_free(AG_MEM_SLOW) == 0u &&
+            want > AG_PROC_LOAD_STACK_MIN) {
+            want = AG_PROC_LOAD_STACK_MIN;
+        }
     }
     if (want < AG_PROC_STACK_MIN) {
         want = AG_PROC_STACK_MIN;
@@ -1330,8 +1412,8 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
     const int      core = background ? 0 : (int)ag_sysinfo()->app_core;
     const unsigned prio = prio_for(p->sched_class);
 
-    if (!ag_proc_task_create(proc_task, p->name, p->stack_bytes, p, prio, core,
-                             NULL)) {
+    if (!ag_proc_task_create_app(proc_task, p->name, p->stack_bytes, p, prio,
+                                 core, NULL)) {
         /*
          * Tried internal SRAM, then PSRAM (when enabled).  Failure here means
          * both are exhausted or the TCB (always internal) could not be taken.
@@ -2065,6 +2147,17 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
             want |= AG_MEM_SLOW;
         }
 
+        /* an application's internal memory stops above what is kept for
+         * arriving devices (see ag_proc_keep_internal) */
+        if (p != NULL && (want & AG_MEM_SLOW) == 0u &&
+            (want & AG_MEM_EXEC) == 0u && !app_internal_room(bytes)) {
+            ag_log(AG_LOG_INFO, "proc",
+                   "%s: %u bytes of internal memory refused - %u are kept for "
+                   "devices",
+                   p->name, (unsigned)bytes,
+                   (unsigned)ag_proc_kept_internal());
+            return NULL;
+        }
         void *ptr = ag_port_alloc(bytes, want);
         if (ptr == NULL && (want & AG_MEM_SLOW)) {
             ptr = ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);

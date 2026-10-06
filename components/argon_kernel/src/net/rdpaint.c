@@ -502,21 +502,22 @@ static bool z_ready(void)
         return false;
     }
     if (s_p.z == NULL) {
-        /* internal memory first: the hash is read at random, and from
-         * PSRAM the search cost the S3 294 ms of every second (6 Oct 2026) */
+        /* PSRAM first: 14 KB of internal memory held for good was what a
+         * mouse plugged in during Fallout did not have (6 Oct 2026), and
+         * copies rest most of the time now (RDP_Z_REST) */
         s_p.z = (rdc_zstate_t *)ag_port_alloc(sizeof(rdc_zstate_t),
-                                              AG_MEM_FAST | AG_MEM_BYTE);
+                                              AG_MEM_SLOW | AG_MEM_BYTE);
         if (s_p.z == NULL) {
             s_p.z = (rdc_zstate_t *)ag_port_alloc(sizeof(rdc_zstate_t),
-                                                  AG_MEM_SLOW | AG_MEM_BYTE);
+                                                  AG_MEM_FAST | AG_MEM_BYTE);
         }
     }
     if (s_p.zhist == NULL) {
         s_p.zhist = (uint8_t *)ag_port_alloc(RDC_Z_WIN,
-                                             AG_MEM_FAST | AG_MEM_BYTE);
+                                             AG_MEM_SLOW | AG_MEM_BYTE);
         if (s_p.zhist == NULL) {
             s_p.zhist = (uint8_t *)ag_port_alloc(RDC_Z_WIN,
-                                                 AG_MEM_SLOW | AG_MEM_BYTE);
+                                                 AG_MEM_FAST | AG_MEM_BYTE);
         }
     }
     return s_p.z != NULL && s_p.zhist != NULL;
