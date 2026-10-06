@@ -1557,8 +1557,41 @@ static uint32_t s_scr_nodev, s_scr_nopx;
 static uint8_t  s_scr_last_op;
 static uint16_t s_scr_last_len;
 
+/*
+ * A NEIGHBOUR THAT RESTARTED LEAVES ITS SESSIONS HERE (6 Oct 2026).  Every
+ * handle it held died with it, and nothing closed them on this side: three
+ * restarts of the S3 against a CYD left up for 79 minutes filled all eight
+ * slots, and the S3's screen open came back -ENFILE 2575 times - Fallout ran
+ * blind.  Only an exclusive device opened again by the same node was caught
+ * (A SESSION ITS ASKER HAS LOST, below).  Now a neighbour saying its name anew
+ * marks its node here, and the worker closes all it had before its next
+ * request - on the worker, as RD_CLOSE does, not on the reader that heard it.
+ */
+static volatile uint16_t s_reborn[AG_LINK_WIRES];
+static volatile uint32_t s_reborn_bits;
+
+static void close_reborn(void)
+{
+    while (s_reborn_bits != 0u) {
+        const uint32_t w = (uint32_t)__builtin_ctz(s_reborn_bits);
+        const uint16_t node = s_reborn[w];
+        s_reborn_bits &= ~(1u << w);
+        for (int i = 0; i < RD_MAX_SESSIONS; i++) {
+            ag_device_t *const dev = s_session[i];
+            if (dev != NULL && s_session_from[i] == node) {
+                ag_log(AG_LOG_INFO, TAG,
+                       "%s: its asker restarted - closing the session it had",
+                       dev->name);
+                s_session[i] = NULL;
+                (void)ag_dev_close(dev);
+            }
+        }
+    }
+}
+
 static void serve_one(const uint8_t *b, uint16_t n)
 {
+    close_reborn();
     const uint8_t  op = b[0];
     const uint16_t tag = get16(b + 2);
     const uint32_t h = get32(b + 4);
@@ -3516,6 +3549,13 @@ void ag_noderdev_peer_named(int32_t wire, bool again)
 {
     if (again) {
         s_glass_orphaned = true; /* whatever it drew here, it drew before */
+        const char *const pn = (wire >= 0 && wire < (int32_t)AG_LINK_WIRES)
+                                   ? ag_node_peer_name_at(wire)
+                                   : NULL;
+        if (pn != NULL) {
+            s_reborn[wire] = ag_node_hash(pn);
+            s_reborn_bits |= 1u << wire;
+        }
     }
     if (!s_auto || wire < 0 || wire >= (int32_t)AG_LINK_WIRES) {
         return;
