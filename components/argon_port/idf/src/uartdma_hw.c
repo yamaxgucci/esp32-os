@@ -349,6 +349,25 @@ bool ag_port_uart_dma_ready(int port)
     return dma_for(port) != NULL;
 }
 
+bool ag_port_uart_dma_available(int port)
+{
+    if (port < 0 || port >= AG_PORT_UART_MAX || !dma_table()) {
+        return false;
+    }
+    if (s_dma[port].ctrl != NULL) {
+        return true;
+    }
+#if defined(SOC_UHCI_NUM)
+    uint32_t in_use = 0;
+    for (int i = 0; i < AG_PORT_UART_MAX; i++) {
+        in_use += (s_dma[i].ctrl != NULL) ? 1u : 0u;
+    }
+    return in_use < (uint32_t)SOC_UHCI_NUM;
+#else
+    return true;
+#endif
+}
+
 bool ag_port_uart_dma_can_send(void)
 {
     return true;
@@ -1059,6 +1078,12 @@ bool ag_port_uart_dma_ready(int port)
     return false; /* nothing goes out by DMA here: the driver sends */
 }
 
+bool ag_port_uart_dma_available(int port)
+{
+    /* one receive ring on the chip, and whichever port has it keeps it */
+    return port >= 0 && port <= 2 && (s_e32.port < 0 || s_e32.port == port);
+}
+
 bool ag_port_uart_dma_can_send(void)
 {
     return false;
@@ -1247,6 +1272,12 @@ ag_err_t ag_port_uart_dma_settle(int port, uint32_t max_out)
 #else /* !SOC_UHCI_SUPPORTED */
 
 bool ag_port_uart_dma_ready(int port)
+{
+    (void)port;
+    return false;
+}
+
+bool ag_port_uart_dma_available(int port)
 {
     (void)port;
     return false;

@@ -1567,8 +1567,19 @@ static uint16_t s_scr_last_len;
  * marks its node here, and the worker closes all it had before its next
  * request - on the worker, as RD_CLOSE does, not on the reader that heard it.
  */
-static volatile uint16_t s_reborn[AG_LINK_WIRES];
+/* one slot a wire, then one a node beyond a neighbour (far_heard) */
+#define RD_REBORN_SLOTS 32
+static volatile uint16_t s_reborn[RD_REBORN_SLOTS];
 static volatile uint32_t s_reborn_bits;
+
+static void reborn_mark(int32_t slot, uint16_t node)
+{
+    if (slot < 0 || slot >= RD_REBORN_SLOTS) {
+        return;
+    }
+    s_reborn[slot] = node;
+    s_reborn_bits |= 1u << (uint32_t)slot;
+}
 
 static void close_reborn(void)
 {
@@ -3553,8 +3564,7 @@ void ag_noderdev_peer_named(int32_t wire, bool again)
                                    ? ag_node_peer_name_at(wire)
                                    : NULL;
         if (pn != NULL) {
-            s_reborn[wire] = ag_node_hash(pn);
-            s_reborn_bits |= 1u << wire;
+            reborn_mark(wire, ag_node_hash(pn));
         }
     }
     if (!s_auto || wire < 0 || wire >= (int32_t)AG_LINK_WIRES) {
@@ -3589,8 +3599,43 @@ static void want_src(int32_t src)
     }
 }
 
+/*
+ * AND A NODE BEYOND A NEIGHBOUR THAT RESTARTED (6 Oct 2026).  Its hello does
+ * not reach this board, but its count of starts does, relayed with its name:
+ * a count that changed is a restart, and its sessions here go the way a
+ * neighbour's do (A NEIGHBOUR THAT RESTARTED, above).  Kept apart from the
+ * attach slots below, which only exist when docking is on - sessions are
+ * served either way.
+ */
+static char    s_heard_name[RD_FAR][AG_NODE_NAME_MAX];
+static uint8_t s_heard_starts[RD_FAR];
+
+static void far_heard(const char *name, uint8_t starts)
+{
+    int free_slot = -1;
+    for (int k = 0; k < RD_FAR; k++) {
+        if (strcmp(s_heard_name[k], name) == 0) {
+            if (s_heard_starts[k] != starts) {
+                s_heard_starts[k] = starts;
+                reborn_mark((int32_t)AG_LINK_WIRES + k, ag_node_hash(name));
+            }
+            return;
+        }
+        if (free_slot < 0 && s_heard_name[k][0] == '\0') {
+            free_slot = k;
+        }
+    }
+    if (free_slot >= 0) {
+        ag_strlcpy(s_heard_name[free_slot], name, sizeof(s_heard_name[0]));
+        s_heard_starts[free_slot] = starts;
+    }
+}
+
 void ag_noderdev_far_named(int32_t via, const char *name, uint8_t starts)
 {
+    if (name != NULL && name[0] != '\0' && strlen(name) < AG_NODE_NAME_MAX) {
+        far_heard(name, starts);
+    }
     if (!s_auto || via < 0 || via >= (int32_t)AG_LINK_WIRES || name == NULL ||
         name[0] == '\0' || strlen(name) >= AG_NODE_NAME_MAX) {
         return;

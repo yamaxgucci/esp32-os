@@ -117,6 +117,11 @@ int32_t  ag_port_uart_pending(int port);
 ag_err_t ag_port_uart_tx_wait(int port, uint32_t timeout_ms);
 
 bool     ag_port_uart_dma_ready(int port);
+/* Whether this port could have the chip's DMA now - it holds it, or a
+ * controller is free - asked before the port is brought up and without
+ * taking anything.  The C3 has one UHCI: the second wire of the board in
+ * the middle goes through the driver instead of failing (6 Oct 2026). */
+bool     ag_port_uart_dma_available(int port);
 /* Whether this chip sends by DMA at all, asked before a port is brought up
  * and without making anything: the ESP32 receives by its UHCI and sends
  * through the driver, which then needs a transmit ring. */

@@ -913,7 +913,24 @@ static ag_err_t io_uart_link_open(int port, uint32_t baud, uint32_t frame,
      * in flight - this end's room, three frames - and not the 8 KB a reader
      * with no flow control needs: the link's own task empties it at once.
      */
-    const bool     dma = (flags & AG_UARTLINK_DMA) != 0u;
+    bool dma = (flags & AG_UARTLINK_DMA) != 0u;
+    /*
+     * AND ONLY WHERE THE DMA IS THIS PORT'S TO HAVE (6 Oct 2026).  The C3 in
+     * the middle of three boards has one UHCI and two wires: the wire to the
+     * CYD took it, the wire to the Zero asked for it as well and was refused
+     * outright - "uart0 would not open as a link at 8000000 baud by DMA: -45"
+     * - so the Zero was never in the cluster.  `dma = auto` means by DMA
+     * where the chip can, and through the driver where it cannot; a channel
+     * that is another wire's is a "cannot".
+     */
+    if (dma && !ag_port_uart_dma_available(port)) {
+        ag_log(AG_LOG_INFO, "io",
+               "uart%d: the chip's DMA is another wire's; this one goes "
+               "through the driver",
+               port);
+        dma = false;
+        flags &= ~(uint32_t)AG_UARTLINK_DMA;
+    }
     /*
      * EACH WAY AS THE CHIP DOES IT BEST, not as a board's file says (1 Oct
      * 2026).  The ESP32 receives by DMA and sends through the driver; the S3

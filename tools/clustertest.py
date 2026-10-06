@@ -77,9 +77,19 @@ class Node:
         self.board = Board(port, 115200, log, echo)
         self.log = log
 
-    def restart(self, seconds=6.0):
+    def restart(self, seconds=20.0):
         self.log.write(b"\n=== reset %s ===\n" % self.name.encode())
+        # The RTS pulse, and `reboot` only where it did nothing: a board on its
+        # own USB-Serial-JTAG (the C3) ignores the pulse, and without the
+        # command the C3 went into a run still playing the last run's tone,
+        # with its memory and its wire state (6 Oct 2026).  Not both on every
+        # board: the CYD rebooted twice in a row and missed the first checks.
+        self.board.buf = bytearray()
         self.board.reset()
+        self.board.pump(2.0)
+        if not re.search(rb"rst:|ESP-ROM|boot:", bytes(self.board.buf)):
+            self.log.write(b"(the pulse did nothing; `reboot`)\n")
+            self.board.send(b"reboot\r")
         self.board.wait_prompt(seconds)
 
     def say(self, line, wait=4.0):
@@ -256,6 +266,8 @@ def scen_restart(a, b):
     print("\n== one end restarts ==", flush=True)
     a.restart()
     time.sleep(1.0)
+    # a board that holds two wires comes up on whichever bound last
+    bind_to(a, b)
     ta = a.ask("link")
     note("the other is " + b.name in ta,
          "restart-%s-found-%s-again" % (a.name, b.name))
@@ -604,7 +616,11 @@ def main():
     # sound scenario, since the C3 has no DAC of its own.
     rounds = []
     if args.main in ("cyd", "both"):
-        rounds.append((cyd, c3, "tonerv.axe 440 20 200", "tone:"))
+        # two seconds, not 200: since 25 Sep a far board's sound is paced to
+        # real time, so "200" is a 200 s run, and this check waits 30 for its
+        # prompt - the CYD's shell then stayed busy through every check after
+        # it (6 Oct 2026)
+        rounds.append((cyd, c3, "tonerv.axe 440 20 2", "tone:"))
     if args.main in ("c3", "both"):
         rounds.append((c3, cyd, "link32.axe", "usage: link"))
 

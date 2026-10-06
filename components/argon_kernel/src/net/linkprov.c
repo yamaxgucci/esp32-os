@@ -1878,12 +1878,45 @@ int32_t ag_linkprov_send_on(int32_t wire, uint8_t chan, uint8_t cls,
     return send_addressed(wire, ag_linkprov_target(), chan, cls, buf, len);
 }
 
+/*
+ * THE WIRE THAT REACHES dst, not the one that happens to be selected (6 Oct
+ * 2026).  On the reader an answer goes back the way the question came, which
+ * current() already knew.  Off it - a remote run's output and its EXIT, sent
+ * from the task the program runs on - the answer went down the SELECTED wire,
+ * and on the board in the middle that is whichever its shell last used: with
+ * the C3 pointed at the Zero, a run the CYD asked of it was never answered and
+ * the CYD reported -60 a minute later.  So: the wire this node last wrote to
+ * us on, or the wire it is the neighbour on, and the selected one only when
+ * neither says.
+ */
+static int32_t wire_toward(uint16_t dst)
+{
+    if (s_reader != NULL && ag_port_task_self() == s_reader &&
+        s_reading != NULL && s_reading->ops != NULL) {
+        return wire_slot(s_reading);
+    }
+    if (dst != 0u) {
+        for (unsigned i = 0; i < LINK_WIRES; i++) {
+            if (s_wire[i].dev != NULL && s_from[i] == dst) {
+                return (int32_t)i;
+            }
+        }
+        for (unsigned i = 0; i < LINK_WIRES; i++) {
+            const char *peer = ag_node_peer_name_at((int32_t)i);
+            if (s_wire[i].dev != NULL && peer != NULL &&
+                ag_node_hash(peer) == dst) {
+                return (int32_t)i;
+            }
+        }
+    }
+    const wire_t *w = current();
+    return (w != NULL) ? wire_slot(w) : -1;
+}
+
 int32_t ag_linkprov_send_to(uint16_t dst, uint8_t chan, uint8_t cls,
                             const void *buf, size_t len)
 {
-    const wire_t *w = current();
-    return send_addressed((w != NULL) ? wire_slot(w) : -1, dst, chan, cls, buf,
-                          len);
+    return send_addressed(wire_toward(dst), dst, chan, cls, buf, len);
 }
 
 int32_t ag_linkprov_send_to_on(int32_t wire, uint16_t dst, uint8_t chan,

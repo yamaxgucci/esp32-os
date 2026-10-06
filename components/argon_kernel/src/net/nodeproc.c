@@ -75,7 +75,19 @@ enum {
      * board's number for something it no longer holds.
      */
     NP_OP_RETURN = 7,
+    /*
+     * "It is still running here."  Every NP_ALIVE_MS while a guest runs
+     * (6 Oct 2026).  The asking node waited a fixed minute for the EXIT, and a
+     * program that runs longer - a 200 s tone from the CYD on the C3 - was
+     * reported -60 after it, while it went on playing, and the asking shell
+     * then tried to run it locally.  It waits now as long as the far node says
+     * the program lives; a far node that goes quiet still ends the wait.
+     */
+    NP_OP_ALIVE = 8,
 };
+
+#define NP_ALIVE_MS      5000u
+#define NP_ALIVE_LOST_MS (3u * NP_ALIVE_MS)
 
 #define NP_HDR 8u
 /* One message, less the header.  The link's quantum is what caps this. */
@@ -225,6 +237,8 @@ static ag_port_task_t s_run_task;
 
 /* Set by the far node's STARTED; only a handover ever waits on it. */
 static volatile bool s_started;
+/* when the far node last said its guest is running (NP_OP_ALIVE), 0 never */
+static volatile int64_t s_alive_us;
 
 /*
  * State arriving with a migrating program, collected before its RUN.
@@ -265,7 +279,10 @@ static uint32_t s_in_state_len;
 static ag_err_t serve_guest(ag_pid_t pid, int32_t *code)
 {
     s_guest_pid = pid;
-    const ag_err_t e = ag_proc_wait(pid, code, UINT32_MAX);
+    ag_err_t e;
+    while ((e = ag_proc_wait(pid, code, NP_ALIVE_MS)) == -AG_ETIMEDOUT) {
+        (void)send_msg(s_run_from, NP_OP_ALIVE, 0, NULL, 0);
+    }
     /*
      * Cleared BEFORE the check, so that a request that arrived while the guest
      * was ending is not lost: an ask that lands after this line finds no guest
@@ -555,6 +572,9 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
                 ag_console_write((const char *)(buf + NP_HDR), have);
             }
             break;
+        case NP_OP_ALIVE:
+            s_alive_us = ag_port_us();
+            break;
         case NP_OP_EXIT:
             s_code = code;
             s_done = true;
@@ -677,6 +697,7 @@ ag_err_t ag_nodeproc_run_state(const char *cmdline, const void *state,
     s_done = false;
     s_busy_reply = false;
     s_started = false;
+    s_alive_us = 0;
     s_code = 0;
     s_awaiting = true;
     /*
@@ -728,7 +749,13 @@ ag_err_t ag_nodeproc_run_state(const char *cmdline, const void *state,
      */
     const int64_t deadline = ag_port_us() + (int64_t)timeout_ms * 1000;
     while (!s_done && !(want_started && s_started)) {
-        if (ag_port_us() >= deadline) {
+        /* the deadline is for starting; a program the far node says is
+         * running is waited for as long as it says so (NP_OP_ALIVE) */
+        const int64_t now = ag_port_us();
+        const bool    alive =
+            s_alive_us != 0 &&
+            now - s_alive_us < (int64_t)NP_ALIVE_LOST_MS * 1000;
+        if (now >= deadline && !alive) {
             s_awaiting = false;
             return -AG_ETIMEDOUT;
         }
