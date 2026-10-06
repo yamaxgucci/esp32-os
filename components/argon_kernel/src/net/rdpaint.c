@@ -24,6 +24,13 @@
  * of itself: the byte halves what crosses.  Sent only to a screen that
  * says it takes them (rdp_far_idx).
  *
+ * OR COPIES (3 Oct 2026): with RDP_Z_BIT besides RDP_RECT_BIT and
+ * RDP_IDX_BIT, a rectangle of indices is packed with copies of what the
+ * rectangle already holds (rdc_pack8z): a row above, a tile to the left.
+ * The far screen undoes it from the pixels it has just unpacked, so it
+ * needs no memory of the last frame.  Sent only to a screen that says it
+ * takes them (rdp_far_z).
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "net/rdpaint.h"
@@ -50,6 +57,7 @@
 #define RDP_RECT_HDR 10u
 #define RDP_RECT_BIT 0x8000u
 #define RDP_IDX_BIT  0x4000u
+#define RDP_Z_BIT    0x2000u
 #define RDP_PAL_ROW  0xFFFFu
 #define RDP_HDR 4u
 /* how long a pass waits for the wire before it gives the screen up as
@@ -300,6 +308,11 @@ static struct {
     rpal_t       *pal;         /* or NULL: no memory for it */
     volatile bool pal_forget;  /* start the palette again */
     bool          rect_idx;    /* the open rectangle is of indices */
+    bool          far_z;       /* the far screen undoes copies */
+    bool          rect_z;      /* the open rectangle is packed with copies */
+    rdc_zstate_t *z;           /* its hash, made when first wanted */
+    uint8_t      *zhist;       /* its indices so far, RDC_Z_WIN */
+    uint32_t      zn;
     uint32_t      idx_px, rgb_px; /* pixels sent each way, for tests */
     /* this second's time: taking a pass's snapshot, packing and sending
      * it, and the program's own presents marking what changed */
@@ -447,6 +460,56 @@ static bool pal_tell(rpal_t *pl, uint16_t room, uint32_t handle,
     return true;
 }
 
+/*
+ * A row of indices onto the rectangle's own history and packed with copies of
+ * it, whole or not at all (0).  `fresh` starts the rectangle's history again.
+ * The history and its hash are made the first time; with no memory for them
+ * a rectangle goes as before.
+ */
+static bool z_ready(void)
+{
+    if (!s_p.far_z) {
+        return false;
+    }
+    if (s_p.z == NULL) {
+        s_p.z = (rdc_zstate_t *)ag_port_alloc(sizeof(rdc_zstate_t),
+                                              AG_MEM_SLOW | AG_MEM_BYTE);
+        if (s_p.z == NULL) {
+            s_p.z = (rdc_zstate_t *)ag_port_alloc(sizeof(rdc_zstate_t),
+                                                  AG_MEM_BYTE);
+        }
+    }
+    if (s_p.zhist == NULL) {
+        s_p.zhist = (uint8_t *)ag_port_alloc(RDC_Z_WIN,
+                                             AG_MEM_SLOW | AG_MEM_BYTE);
+        if (s_p.zhist == NULL) {
+            s_p.zhist = (uint8_t *)ag_port_alloc(RDC_Z_WIN, AG_MEM_BYTE);
+        }
+    }
+    return s_p.z != NULL && s_p.zhist != NULL;
+}
+
+static uint32_t pack_whole_z(const uint8_t *ix, uint32_t n, uint8_t *out,
+                             uint32_t cap, bool fresh)
+{
+    if (fresh) {
+        rdc_z_reset(s_p.z);
+        s_p.zn = 0;
+    }
+    if (s_p.zn + n > RDC_Z_WIN) {
+        return 0u;
+    }
+    memcpy(s_p.zhist + s_p.zn, ix, n);
+    uint32_t       taken = 0;
+    const uint32_t at =
+        rdc_pack8z_some(s_p.z, s_p.zhist, s_p.zn, n, out, cap, &taken);
+    if (taken != n) {
+        return 0u;
+    }
+    s_p.zn += n;
+    return at;
+}
+
 /* n pixels packed whole, as indices when ix is given: 0 if they do not fit. */
 static uint32_t pack_whole(const uint16_t *px, const uint8_t *ix, uint32_t n,
                            uint8_t *out, uint32_t cap)
@@ -487,7 +550,10 @@ static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px,
             (uint32_t)s_p.rect_y + s_p.rect_h == y &&
             ((uint32_t)s_p.rect_h + 1u) * n <= far_rect_px()) {
             const uint32_t packed =
-                pack_whole(px, ix, n, s_p.msg + s_p.len, room - s_p.len);
+                s_p.rect_z
+                    ? pack_whole_z(ix, n, s_p.msg + s_p.len, room - s_p.len,
+                                   false)
+                    : pack_whole(px, ix, n, s_p.msg + s_p.len, room - s_p.len);
             if (packed > 0u) {
                 s_p.len += packed;
                 s_p.rect_h++;
@@ -500,13 +566,19 @@ static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px,
         s_p.rect_at = 0;
         if (s_p.len + RDP_RECT_HDR < room) {
             uint8_t *const at = s_p.msg + s_p.len;
-            const uint32_t packed = pack_whole(px, ix, n, at + RDP_RECT_HDR,
-                                               room - s_p.len - RDP_RECT_HDR);
+            const bool     zz = ix != NULL && z_ready();
+            const uint32_t packed =
+                zz ? pack_whole_z(ix, n, at + RDP_RECT_HDR,
+                                  room - s_p.len - RDP_RECT_HDR, true)
+                   : pack_whole(px, ix, n, at + RDP_RECT_HDR,
+                                room - s_p.len - RDP_RECT_HDR);
             if (packed > 0u) {
+                s_p.rect_z = zz;
                 put16(at, (uint16_t)y);
                 put16(at + 2, (uint16_t)x);
                 put16(at + 4, (uint16_t)(n | RDP_RECT_BIT |
-                                         ((ix != NULL) ? RDP_IDX_BIT : 0u)));
+                                         ((ix != NULL) ? RDP_IDX_BIT : 0u) |
+                                         (zz ? RDP_Z_BIT : 0u)));
                 put16(at + 6, (uint16_t)packed);
                 put16(at + 8, 1u);
                 s_p.rect_at = s_p.len;
@@ -1147,6 +1219,11 @@ void rdp_stable_surface(const uint16_t *px, uint16_t w, uint16_t h)
     s_p.st_h = h;
 }
 
+void rdp_far_z(bool yes)
+{
+    s_p.far_z = yes;
+}
+
 void rdp_far_idx(bool yes)
 {
     if (yes && !s_p.far_idx) {
@@ -1784,7 +1861,7 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
                 s_draw_faults++;
                 break;
             }
-            rw = (uint16_t)(n & ~(RDP_RECT_BIT | RDP_IDX_BIT));
+            rw = (uint16_t)(n & ~(RDP_RECT_BIT | RDP_IDX_BIT | RDP_Z_BIT));
             rh = get16(pay + at + 8);
             at += RDP_RECT_HDR;
             if (r == NULL || rw == 0u || rh == 0u ||
@@ -1811,8 +1888,12 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
             now = true;
         }
         const int64_t  t0 = ag_port_us();
-        const uint32_t took = idx ? rdc_unpack8(pay + at, plen, r->pal, into, px)
-                                  : rdc_unpack(pay + at, plen, into, px);
+        const uint32_t took =
+            !idx                     ? rdc_unpack(pay + at, plen, into, px)
+            : ((n & RDP_Z_BIT) != 0u) ? rdc_unpack8z(pay + at, plen, r->pal,
+                                                     into, px)
+                                      : rdc_unpack8(pay + at, plen, r->pal,
+                                                    into, px);
         r->t_unpack_us += (uint32_t)(ag_port_us() - t0);
         if (took != plen) {
             s_draw_faults++;

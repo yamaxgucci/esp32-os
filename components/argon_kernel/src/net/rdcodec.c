@@ -191,3 +191,176 @@ uint32_t rdc_unpack(const uint8_t *in, uint32_t len, uint16_t *px, uint32_t n)
     }
     return at;
 }
+
+/* ---- copies (rdc_pack8z) ------------------------------------------------ */
+
+#define RDC_Z_RUN_MAX  66u
+#define RDC_Z_COPY_MAX 66u
+#define RDC_Z_DEPTH    8u /* candidates looked at a place: speed against size */
+
+void rdc_z_reset(rdc_zstate_t *z)
+{
+    memset(z->head, 0, sizeof(z->head));
+    z->known = 0;
+}
+
+static uint32_t z_hash(const uint8_t *p)
+{
+    return (((uint32_t)p[0] << 6) ^ ((uint32_t)p[1] << 3) ^ p[2]) &
+           (RDC_Z_HASH - 1u);
+}
+
+/* Every place up to `upto` (exclusive) with three indices after it known. */
+static void z_insert(rdc_zstate_t *z, const uint8_t *ix, uint32_t upto,
+                     uint32_t end)
+{
+    while (z->known < upto && z->known + 2u < end && z->known < RDC_Z_WIN) {
+        const uint32_t h = z_hash(ix + z->known);
+        z->prev[z->known] = z->head[h];
+        z->head[h] = (uint16_t)(z->known + 1u);
+        z->known++;
+    }
+}
+
+/* Literals ix[from, from + lit) as one or more groups, as many as fit in
+ * cap from `at`; how many were written. */
+static uint32_t z_lits(const uint8_t *ix, uint32_t from, uint32_t lit,
+                       uint8_t *out, uint32_t *at, uint32_t cap)
+{
+    uint32_t done = 0;
+    while (done < lit && *at + 2u <= cap) {
+        uint32_t k = lit - done;
+        if (k > RDC_LIT_MAX) {
+            k = RDC_LIT_MAX;
+        }
+        if (*at + 1u + k > cap) {
+            k = cap - *at - 1u;
+        }
+        out[(*at)++] = (uint8_t)(k - 1u);
+        memcpy(out + *at, ix + from + done, k);
+        *at += k;
+        done += k;
+    }
+    return done;
+}
+
+uint32_t rdc_pack8z_some(rdc_zstate_t *z, const uint8_t *ix, uint32_t from,
+                         uint32_t n, uint8_t *out, uint32_t cap,
+                         uint32_t *taken)
+{
+    const uint32_t end = from + n;
+    uint32_t       at = 0;
+    uint32_t       i = from;
+    uint32_t       lit_at = from; /* literals [lit_at, i) not yet written */
+
+    z_insert(z, ix, from, end);
+    while (i < end) {
+        /* a run here */
+        uint32_t run = 1u;
+        while (i + run < end && run < RDC_Z_RUN_MAX && ix[i + run] == ix[i]) {
+            run++;
+        }
+        /* the longest copy here; four at least - three cost what three
+         * literals do and break their group */
+        uint32_t best = 0u, best_off = 0u;
+        if (i + 3u < end) {
+            z_insert(z, ix, i, end);
+            uint32_t cand = z->head[z_hash(ix + i)];
+            for (uint32_t d = 0; cand != 0u && d < RDC_Z_DEPTH; d++) {
+                const uint32_t q = cand - 1u;
+                if (q >= i || i - q >= RDC_Z_WIN) {
+                    break;
+                }
+                uint32_t len = 0u;
+                while (i + len < end && len < RDC_Z_COPY_MAX &&
+                       ix[q + len] == ix[i + len]) {
+                    len++;
+                }
+                if (len > best) {
+                    best = len;
+                    best_off = i - q;
+                }
+                cand = z->prev[q];
+            }
+        }
+        uint8_t  tok[3];
+        uint32_t tok_n = 0u, step = 0u;
+        if (best >= 4u && best > run) {
+            tok[0] = (uint8_t)(0xC0u | (best - 3u));
+            tok[1] = (uint8_t)best_off;
+            tok[2] = (uint8_t)(best_off >> 8);
+            tok_n = 3u;
+            step = best;
+        } else if (run >= 3u) {
+            tok[0] = (uint8_t)(0x80u | (run - 3u));
+            tok[1] = ix[i];
+            tok_n = 2u;
+            step = run;
+        }
+        if (tok_n == 0u) {
+            i++; /* a literal, written with its neighbours */
+            continue;
+        }
+        /* the literals before it, then it - or stop where the room ends */
+        const uint32_t lit = i - lit_at;
+        const uint32_t put = z_lits(ix, lit_at, lit, out, &at, cap);
+        lit_at += put;
+        if (put < lit || at + tok_n > cap) {
+            i = lit_at;
+            *taken = i - from;
+            return at;
+        }
+        memcpy(out + at, tok, tok_n);
+        at += tok_n;
+        i += step;
+        lit_at = i;
+    }
+    lit_at += z_lits(ix, lit_at, i - lit_at, out, &at, cap);
+    *taken = lit_at - from;
+    return at;
+}
+
+uint32_t rdc_unpack8z(const uint8_t *in, uint32_t len, const uint16_t *pal,
+                      uint16_t *px, uint32_t n)
+{
+    uint32_t at = 0;
+    uint32_t i = 0;
+    while (i < n) {
+        if (at >= len) {
+            return 0u;
+        }
+        const uint32_t c = in[at++];
+        if (c < 0x80u) {
+            const uint32_t lit = c + 1u;
+            if (i + lit > n || at + lit > len) {
+                return 0u;
+            }
+            for (uint32_t k = 0; k < lit; k++) {
+                px[i++] = pal[in[at++]];
+            }
+        } else if (c < 0xC0u) {
+            const uint32_t run = (c & 0x3Fu) + 3u;
+            if (i + run > n || at + 1u > len) {
+                return 0u;
+            }
+            const uint16_t v = pal[in[at++]];
+            for (uint32_t k = 0; k < run; k++) {
+                px[i++] = v;
+            }
+        } else {
+            const uint32_t cnt = (c & 0x3Fu) + 3u;
+            if (i + cnt > n || at + 2u > len) {
+                return 0u;
+            }
+            const uint32_t off = (uint32_t)in[at] | ((uint32_t)in[at + 1u] << 8);
+            at += 2u;
+            if (off == 0u || off > i) {
+                return 0u;
+            }
+            for (uint32_t k = 0; k < cnt; k++, i++) {
+                px[i] = px[i - off];
+            }
+        }
+    }
+    return at;
+}

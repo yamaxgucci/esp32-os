@@ -490,10 +490,12 @@ static void palette_scroll(void)
         }
         s_mtex[i] = v;
     }
-    uint32_t msgs[2] = {0, 0};
+    uint32_t msgs[3] = {0, 0, 0};
     uint32_t bad = 0;
-    for (int with = 0; with < 2; with++) {
+    /* RGB565, indices, indices with copies (rdc_pack8z) */
+    for (int with = 0; with < 3; with++) {
         rdp_far_idx(with != 0);
+        rdp_far_z(with == 2);
         for (uint32_t f = 0; f < 6u; f++) {
             map_frame(f * 4u + (uint32_t)with * 1000u);
             msgs[with] += frame_out();
@@ -515,13 +517,15 @@ static void palette_scroll(void)
     }
     uint32_t ipx = 0, rpx = 0;
     rdp_idx_counts(&ipx, &rpx);
-    printf("  rdpaint palette map: %u messages in RGB565, %u as indices; %u "
-           "frames wrong; %u px as indices, %u as RGB565\n",
-           (unsigned)msgs[0], (unsigned)msgs[1], (unsigned)bad, (unsigned)ipx,
-           (unsigned)rpx);
+    printf("  rdpaint palette map: %u messages in RGB565, %u as indices, %u "
+           "with copies; %u frames wrong; %u px as indices, %u as RGB565\n",
+           (unsigned)msgs[0], (unsigned)msgs[1], (unsigned)msgs[2],
+           (unsigned)bad, (unsigned)ipx, (unsigned)rpx);
     CHECK(bad == 0u);
     CHECK(msgs[1] * 10u < msgs[0] * 7u); /* at least 30% fewer */
+    CHECK(msgs[2] < msgs[1]);            /* and copies fewer again */
     rdp_far_idx(false);
+    rdp_far_z(false);
 }
 
 /*

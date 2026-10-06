@@ -2279,6 +2279,8 @@ static int64_t s_glass_last_us;
  */
 #define RD_CAN_RECTS 1u
 #define RD_CAN_IDX   2u
+/* undoes copies in a rectangle of indices (rdc_pack8z, 3 Oct 2026) */
+#define RD_CAN_Z     4u
 /* bits 16..31: the most pixels one rectangle may carry, in 256s (2 Oct
  * 2026); 0 from an image before that, which holds the smaller size */
 #define RD_CAN_RECT_SHIFT 16u
@@ -2395,7 +2397,7 @@ static void paint_answer(int32_t wire, uint16_t from, uint16_t tag,
     const ag_err_t e = send_raw(
         wire, from, (uint8_t)(RD_PAINTED | RD_REPLY), 0, tag, status,
         (rdp_draws_rects() ? RD_CAN_RECTS : 0u) |
-            (rdp_draws_idx() ? RD_CAN_IDX : 0u) |
+            (rdp_draws_idx() ? (RD_CAN_IDX | RD_CAN_Z) : 0u) |
             ((rdp_draw_rect_px() / 256u) << RD_CAN_RECT_SHIFT),
         handle, AG_LINK_CONTROL, NULL,
         0);
@@ -2937,6 +2939,7 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         rdp_far_rects((get32(b + 8) & RD_CAN_RECTS) != 0u);
         rdp_far_rect_px((get32(b + 8) >> RD_CAN_RECT_SHIFT) * 256u);
         rdp_far_idx((get32(b + 8) & RD_CAN_IDX) != 0u);
+        rdp_far_z((get32(b + 8) & RD_CAN_Z) != 0u);
         rdev_t *const dp = s_display_proxy;
         if ((int32_t)get32(b + 4) == RD_PAINTED_GONE && dp != NULL &&
             dp->far_handle >= 0 && (uint32_t)dp->far_handle == get32(b + 12)) {
