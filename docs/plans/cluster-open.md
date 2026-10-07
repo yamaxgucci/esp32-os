@@ -37,6 +37,22 @@ added here, not kept in a head.
 | 29 | The C3 gave a program that named no stack 16 KB of it (TONE: 12 KB never touched) - the CYD's sdkconfig said 8, the C3's said nothing - and the next program was refused an 8 KB one | fixed 6 Oct: 8 KB default stack where there is no PSRAM; a tone on the C3 costs 29 KB (was 38) and clustertest passes with the C3 holding two wires | - |
 | 30 | The board in the middle answered a remote run down its SELECTED wire: with the C3's shell pointed at the Zero (`link use node1`), a run the CYD asked of the C3 got no output and no EXIT, and the CYD said -60 a minute later | fixed 6 Oct (wire_toward): with the C3 pointed at the Zero, a 75 s run from the CYD on it returned 0 (before: no output, -60) | - |
 
+## Found on the way, not cluster work (later, at Maxim's word)
+
+1. **Fallout wedges when a board has no sound device at all.** The audio
+   thread blocks writing to an absent sink and the main loop waits on it
+   ("[watch] the sound thread is at writing to the device"). The workaround,
+   `sounds=0 music=0 speech=0` in a:allout2.cfg, was left on the S3-CAM's
+   card and silenced the game on the cluster until 6 Oct (row 25). Fix in the
+   OS: an absent sink must not block a writer (accept and drop, or fail the
+   open cleanly) - see the pcmmix/audio open path and `ag_port_audio_present()`.
+   Prove with apps/tone or Fallout on a board without audio.
+2. **Two amp host tests are flaky.** `argon check` failed once on 6 Oct with
+   host-tests/test_tube.c:1530 `big_peak < small_peak * 50.0` and :1882
+   `comp[AG_AMP_MODEL_BOGNER] > 14.0 && < 21.0`, then passed on rerun with no
+   change; the PC was heavily loaded. Find the nondeterminism (timing,
+   threads, uninitialised state, order) - do not widen the tolerances.
+
 ## Row 10: the numbers to compare against
 
 REMDISP over 4 Mbaud UART, 2 Sep 2026 (`argonos-two-frame-rates`, `argon-cyd-link`):
