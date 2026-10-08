@@ -17,6 +17,7 @@
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
+#include <argon/port/place.h>
 
 #define TAG "cfg"
 
@@ -33,7 +34,7 @@
  */
 #define AG_CFG_TEXT_BYTES 4096
 
-static ag_cfg_t s_cfg;
+static ag_cfg_t s_cfg AG_PORT_SLOW_BSS;
 static char    *s_text;
 static size_t   s_text_used;
 static char     s_sources[64];

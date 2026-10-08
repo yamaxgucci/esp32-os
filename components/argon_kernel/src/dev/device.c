@@ -8,8 +8,9 @@
 #include <string.h>
 
 #include <argon/path.h>
+#include <argon/port/place.h>
 
-static ag_device_t  s_devices[AG_DEV_MAX];
+static ag_device_t  s_devices[AG_DEV_MAX] AG_PORT_SLOW_BSS;
 static ag_dev_lock_t s_lock;
 static bool          s_initialised;
 

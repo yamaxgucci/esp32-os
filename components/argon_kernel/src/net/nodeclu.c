@@ -19,6 +19,9 @@
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/place.h>
+
+#include "proc/proc_internal.h"
 
 #define NC_CHAN 8u
 
@@ -69,7 +72,7 @@ typedef struct {
 
 static bool            s_listening;
 static ag_port_task_t  s_task;
-static nc_req_t        s_req[NC_REQS];
+static nc_req_t        s_req[NC_REQS] AG_PORT_SLOW_BSS;
 static ag_port_mutex_t s_reqlock;
 static ag_cluf_rx_t    s_rx;
 
@@ -147,7 +150,7 @@ static uint32_t        s_peers_at; /* when the list last went out */
  * quarter of a kilobyte each saying the same thing.  Held under s_reqlock like
  * the slots themselves.
  */
-static char s_image[AG_CLU_IMAGE_MAX];
+static char s_image[AG_CLU_IMAGE_MAX] AG_PORT_SLOW_BSS;
 
 /* The one spawn this node is waiting on an answer for.  One, because only the
  * master spawns and it does so from its own task, one call at a time. */
@@ -170,7 +173,7 @@ static volatile int32_t s_answer;
  */
 #define NC_TXBUF 256u
 static ag_port_mutex_t s_tx;
-static uint8_t         s_txbuf[NC_TXBUF + AG_CLUF_HDR];
+static uint8_t         s_txbuf[NC_TXBUF + AG_CLUF_HDR] AG_PORT_SLOW_BSS;
 
 /* ---------------------------------------------------------------------- */
 
@@ -1156,9 +1159,11 @@ ag_err_t ag_nodeclu_start(void)
     if (s_task == NULL) {
         /* Below applications, like every other task this file's neighbours
          * create: a board serving somebody else's job must not stop answering
-         * its own user. */
-        if (!ag_port_task_create(serve_task, "nodeclu", 4096, NULL, 1,
-                                 AG_PORT_ANY_CORE, 0, &s_task)) {
+         * its own user.  And in PSRAM where there is some, like the
+         * standing request worker: it waits for jobs for the life of the
+         * board and is in no hurry when one comes (8 Oct 2026). */
+        if (!ag_proc_task_create_slow(serve_task, "nodeclu", 4096, NULL, 1,
+                                      AG_PORT_ANY_CORE, &s_task)) {
             ag_linkprov_unlisten(NC_CHAN);
             return -AG_ENOMEM;
         }

@@ -93,6 +93,7 @@ typedef struct {
     uint32_t stack_bytes;  /* the whole stack */
     uint32_t stack_unused; /* never touched yet */
     unsigned prio;
+    bool     stack_slow;   /* the stack is in PSRAM, not internal SRAM */
     ag_port_task_t task;   /* the handle, to match against a tick sample */
 } ag_port_task_info_t;
 

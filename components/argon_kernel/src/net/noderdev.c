@@ -48,6 +48,7 @@
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/place.h>
 
 #define TAG "rdev"
 
@@ -172,7 +173,7 @@ static volatile bool     s_busy;
 static volatile uint16_t s_tag;
 static volatile bool     s_have;
 static volatile int32_t  s_status;
-static uint8_t           s_rbuf[RD_MAX_PAYLOAD];
+static uint8_t           s_rbuf[RD_MAX_PAYLOAD] AG_PORT_SLOW_BSS;
 static volatile uint16_t s_rlen;
 
 /*
@@ -482,7 +483,7 @@ static uint32_t s_sent_said_n, s_sent_said_drop;
  */
 static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
 {
-    static uint8_t buf2[RD_HDR + RD_POUR_CAP];
+    static uint8_t buf2[RD_HDR + RD_POUR_CAP] AG_PORT_SLOW_BSS;
     if (len > RD_POUR_CAP) {
         len = RD_POUR_CAP;
     }
@@ -543,7 +544,7 @@ static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
  * caller writes what it always wrote; on a wire that can carry it, nothing is
  * changed at all.
  */
-static uint8_t s_fit_buf[RD_SND_CAP];
+static uint8_t s_fit_buf[RD_SND_CAP] AG_PORT_SLOW_BSS;
 
 /*
  * THE WRITE IS THE CLOCK, and a proxy had none.
@@ -1346,7 +1347,7 @@ static uint16_t s_session_from[RD_MAX_SESSIONS];
 static uint8_t s_session_ch[RD_MAX_SESSIONS];
 
 /* The request being served, and the worker serving it. */
-static uint8_t        s_req[RD_HDR + RD_MAX_PAYLOAD];
+static uint8_t        s_req[RD_HDR + RD_MAX_PAYLOAD] AG_PORT_SLOW_BSS;
 static volatile uint16_t s_req_len;
 static volatile bool  s_working;
 static ag_port_task_t s_worker;

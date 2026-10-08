@@ -19,6 +19,7 @@
 #include <argon/port/mem.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/place.h>
 
 #include "core/sysconfig.h"
 
@@ -50,7 +51,7 @@ struct module_s {
     modtask_t        tasks[AG_MODULE_TASKS];
 };
 
-static module_t               s_modules[AG_MODULE_MAX];
+static module_t               s_modules[AG_MODULE_MAX] AG_PORT_SLOW_BSS;
 static module_t              *s_loading;
 static const ag_probe_hint_t *s_hint;
 

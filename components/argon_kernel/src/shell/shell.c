@@ -59,6 +59,7 @@
 #include <argon/port/sys.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/place.h>
 
 #include "boot/platform.h"
 #include "core/sysconfig.h"
@@ -121,7 +122,24 @@ typedef struct {
     int           slot;
 } shell_ctx_t;
 
-static shell_ctx_t s_ctx0 = { .cwd = "/", .slot = AG_SESSION_FOLLOW };
+/*
+ * The first prompt's context: 3 KB, in PSRAM where there is some (8 Oct
+ * 2026).  PSRAM statics start as zeroes, not as an initialiser, so the two
+ * fields that are not zero are set the first time anybody asks for it.
+ */
+static shell_ctx_t s_ctx0 AG_PORT_SLOW_BSS;
+static volatile bool s_ctx0_ready;
+
+static shell_ctx_t *ctx0(void)
+{
+    if (!s_ctx0_ready) {
+        s_ctx0.cwd[0] = '/';
+        s_ctx0.cwd[1] = '\0';
+        s_ctx0.slot = AG_SESSION_FOLLOW;
+        s_ctx0_ready = true;
+    }
+    return &s_ctx0;
+}
 
 /*
  * Which prompt is speaking, keyed by task.
@@ -146,7 +164,7 @@ static shell_ctx_t *sh(void)
             return s_ctxs[i].ctx;
         }
     }
-    return &s_ctx0;
+    return ctx0();
 }
 
 #define s_cwd          (sh()->cwd)
@@ -434,18 +452,28 @@ static int mem_tasks(void)
         }
         t[k] = x;
     }
-    uint32_t sum = 0, unused = 0;
-    ag_console_puts("  task              stack   unused  prio\n");
+    /*
+     * Where each stack lives, too (8 Oct 2026): a stack in PSRAM costs the
+     * internal memory nothing, and without the column the list read as if
+     * every kilobyte in it came out of the 512.
+     */
+    uint32_t sum = 0, unused = 0, internal = 0;
+    ag_console_puts(" task             stack unused prio in\n");
     for (uint32_t i = 0; i < n; i++) {
-        ag_console_printf("  %-16s %6u  %6u  %4u\n", t[i].name,
+        ag_console_printf(" %-15s %6u %6u %4u %s\n", t[i].name,
                           (unsigned)t[i].stack_bytes,
-                          (unsigned)t[i].stack_unused, t[i].prio);
+                          (unsigned)t[i].stack_unused, t[i].prio,
+                          t[i].stack_slow ? "ext" : "int");
         sum += t[i].stack_bytes;
         unused += t[i].stack_unused;
+        if (!t[i].stack_slow) {
+            internal += t[i].stack_bytes;
+        }
     }
-    ag_console_printf("  %u tasks, %u KB of stacks, %u KB of it never used\n",
+    ag_console_printf("  %u tasks, %u KB of stacks (%u KB internal), %u KB of "
+                      "it never used\n",
                       (unsigned)all, (unsigned)(sum / 1024),
-                      (unsigned)(unused / 1024));
+                      (unsigned)(internal / 1024), (unsigned)(unused / 1024));
     ag_port_free(t);
     return 0;
 }
@@ -5848,8 +5876,8 @@ static int cmd_uartbridge(int argc, char **argv)
      * 256 bytes is far more than a 2 ms window holds at these rates, so nothing
      * is dropped for want of buffer here.
      */
-    static uint8_t from_pc[256];
-    static uint8_t from_chip[256];
+    static uint8_t from_pc[256] AG_PORT_SLOW_BSS;
+    static uint8_t from_chip[256] AG_PORT_SLOW_BSS;
     for (;;) {
         const int32_t n =
             ag_port_uart_read(AG_PORT_UART_CONSOLE, from_pc, sizeof(from_pc), 2);

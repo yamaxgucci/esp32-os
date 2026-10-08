@@ -20,6 +20,9 @@
 #include <argon/port/time.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
+#include <argon/port/place.h>
+
+#include "proc/proc_internal.h"
 
 /*
  * A lone ESC only becomes the Escape key once nothing follows it.  30 ms is
@@ -155,7 +158,7 @@ static bool (*s_hotkeys)(ag_event_t *ev);
 /* HID usage page 0x07 keycodes fit in a byte; sticky TTL covers auto-repeat. */
 #define AG_KEY_STICKY_MS 150u
 static uint8_t  s_key_down[32];
-static uint32_t s_key_stamp[256];
+static uint32_t s_key_stamp[256] AG_PORT_SLOW_BSS;
 
 /* ---------------------------------------------------------------------- */
 
@@ -221,6 +224,19 @@ const ag_screen_t *ag_console_screen_of_slot(int slot)
 }
 
 /*
+ * A screen's cells, in PSRAM where there is some (8 Oct 2026).  Eighty by
+ * twenty-five is 8 KB of internal memory per slot otherwise, held for the life
+ * of the board by a headless S3-Zero that nobody ever looks at.  Only tasks
+ * read it - the painter, the prompt, a program's output - never an interrupt
+ * or a flash write, so the slower memory costs nothing that matters.
+ */
+static void *screen_alloc(size_t need)
+{
+    void *mem = ag_port_alloc(need, AG_MEM_SLOW | AG_MEM_BYTE);
+    return (mem != NULL) ? mem : ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+}
+
+/*
  * Give a slot its own screen if it has not got one, at the size the console
  * is now.
  *
@@ -236,7 +252,7 @@ static ag_err_t ensure_screen(int want)
 
     const size_t need = ag_screen_memsize(s_screens[s_active].cols,
                                           s_screens[s_active].rows);
-    void        *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+    void        *mem = screen_alloc(need);
     if (mem == NULL) {
         ag_log(AG_LOG_WARN, "console", "no memory for screen %d; sharing",
                want);
@@ -979,7 +995,7 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
     }
 
     const size_t need = ag_screen_memsize(cols, rows);
-    void *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+    void *mem = screen_alloc(need);
     if (mem == NULL) {
         return -AG_ENOMEM;
     }
@@ -1003,10 +1019,12 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
 
     /*
      * The console task lives on the system core: the application core is
-     * meant to stay free for the application.
+     * meant to stay free for the application.  Its stack goes to PSRAM where
+     * there is some (8 Oct 2026): it paints text, and nothing it does wants
+     * internal memory held for the life of the board.
      */
-    if (!ag_port_task_create(console_task, "ag_con", 3072, NULL, 10, 0, 0,
-                             &s_task)) {
+    if (!ag_proc_task_create_slow(console_task, "ag_con", 3072, NULL, 10, 0,
+                                  &s_task)) {
         s_ready = false;
         ag_port_free(mem);
         return -AG_ENOMEM;
@@ -1059,7 +1077,7 @@ ag_err_t ag_console_resize(uint16_t cols, uint16_t rows)
             continue;
         }
         const size_t need = ag_screen_memsize(cols, rows);
-        void *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+        void *mem = screen_alloc(need);
         if (mem == NULL) {
             ag_console_unlock();
             return -AG_ENOMEM;

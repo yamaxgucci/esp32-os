@@ -349,6 +349,19 @@ static void print_summary(void)
     }
 }
 
+#if AG_PORT_TASK_STACK_CAPS
+/* The prompt's own task: the main task's stack and priority (sdkconfig.defaults,
+ * CONFIG_ESP_MAIN_TASK_STACK_SIZE; IDF's main task runs at 1). */
+#define AG_SHELL_STACK    12288u
+#define AG_SHELL_PRIORITY 1u
+
+static void shell_task(void *arg)
+{
+    (void)arg;
+    ag_shell_run();
+}
+#endif
+
 void ag_kernel_main(void)
 {
     AG_TRACE("kernel entry\n");
@@ -433,6 +446,23 @@ void ag_kernel_main(void)
         }
     }
 
+#if AG_PORT_TASK_STACK_CAPS
+    /*
+     * THE PROMPT LEAVES THE MAIN TASK WHERE THERE IS PSRAM (8 Oct 2026).
+     * The boot needs the main task's 12 KB of internal stack - every stage
+     * runs on it - and the prompt that followed kept them for the life of the
+     * board, 7.5 KB of it never touched on the S3-Zero.  The prompt is not in
+     * a hurry, so it goes to a task of its own with the same stack in PSRAM,
+     * and returning from here ends the main task: IDF frees its stack.  Flash
+     * from a PSRAM stack goes through the port's relay (flashop_hw.c).
+     * Without PSRAM, or with none to spare, it stays where it was.
+     */
+    if (ag_port_task_create(shell_task, "shell", AG_SHELL_STACK, NULL,
+                            AG_SHELL_PRIORITY, 0, AG_MEM_SLOW | AG_MEM_BYTE,
+                            NULL)) {
+        return;
+    }
+#endif
     ag_shell_run();
 }
 

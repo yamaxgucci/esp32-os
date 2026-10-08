@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include <argon/path.h>
+#include <argon/port/place.h>
 
 typedef struct {
     char               point[32];
@@ -37,8 +38,8 @@ typedef struct {
     uint32_t root_index;
 } ag_vfs_handle_slot_t;
 
-static ag_mount_t           s_mounts[AG_VFS_MAX_MOUNTS];
-static ag_vfs_handle_slot_t s_handles[AG_VFS_MAX_HANDLES];
+static ag_mount_t           s_mounts[AG_VFS_MAX_MOUNTS] AG_PORT_SLOW_BSS;
+static ag_vfs_handle_slot_t s_handles[AG_VFS_MAX_HANDLES] AG_PORT_SLOW_BSS;
 static ag_vfs_lock_t        s_lock;
 static ag_pid_t (*s_owner_fn)(void);
 static bool s_initialised;
@@ -60,7 +61,7 @@ typedef struct {
     char     path[AG_VFS_NEG_PATH];
 } ag_neg_t;
 
-static ag_neg_t s_neg[AG_VFS_NEG_ENTRIES];
+static ag_neg_t s_neg[AG_VFS_NEG_ENTRIES] AG_PORT_SLOW_BSS;
 static uint32_t s_neg_hits;
 static uint32_t s_neg_count;
 

@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
 #include "esp_private/freertos_debug.h"
+#include "esp_memory_utils.h"
 
 /*
  * One walk of the task lists: each task once, however many lists it passed
@@ -74,6 +75,7 @@ static uint32_t walk(ag_port_task_info_t *out, uint32_t max, uint32_t *seen,
             if (stacks) {
                 o->stack_unused = (uint32_t)uxTaskGetStackHighWaterMark(t);
             }
+            o->stack_slow = base != NULL && esp_ptr_external_ram(base);
             o->prio = (unsigned)uxTaskPriorityGet(t);
             o->task = t;
             n++;

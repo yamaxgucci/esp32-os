@@ -51,6 +51,7 @@
 
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/place.h>
 
 #define ND_CHAN 5u
 #define ND_HDR 12u
@@ -210,7 +211,7 @@ static volatile bool     s_busy;
 static volatile uint16_t s_tag;
 static volatile bool     s_have;
 static volatile int32_t  s_status;
-static uint8_t           s_rbuf[ND_CHUNK_MAX];
+static uint8_t           s_rbuf[ND_CHUNK_MAX] AG_PORT_SLOW_BSS;
 static volatile uint16_t s_rlen;
 
 /*

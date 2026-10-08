@@ -25,6 +25,7 @@
 
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/place.h>
 
 #define NF_CHAN 4u
 
@@ -187,7 +188,7 @@ static struct {
     int32_t       wire;
     uint16_t      len;
     uint8_t       path[AG_PATH_MAX];
-} s_req;
+} s_req AG_PORT_SLOW_BSS;
 
 /* Read the file and push it, in order, on the background class. */
 static void serve_get(uint16_t from, int32_t wire, uint8_t cls,

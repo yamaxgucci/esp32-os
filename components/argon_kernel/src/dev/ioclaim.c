@@ -10,6 +10,7 @@
 /* For AG_PID_KERNEL only: the table itself knows nothing about processes
  * beyond the fact that an owner has a pid. */
 #include <argon/proc.h>
+#include <argon/port/place.h>
 
 typedef struct {
     uint8_t  state;
@@ -18,7 +19,7 @@ typedef struct {
     char     why[AG_IO_REASON_MAX];
 } pin_t;
 
-static pin_t s_pins[AG_IO_MAX_PINS];
+static pin_t s_pins[AG_IO_MAX_PINS] AG_PORT_SLOW_BSS;
 static int   s_count;
 
 /*

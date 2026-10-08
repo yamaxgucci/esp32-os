@@ -22,6 +22,7 @@
 #include "proc/proc_internal.h"
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/place.h>
 
 /*
  * The channel this conversation lives on.  Channels are independent, so a file
@@ -232,7 +233,7 @@ static int32_t out_sink(void *ctx, const char *data, size_t len)
  * program to finish.  Nothing times out and nothing crashes; both nodes simply
  * stop, which is the worst shape a bug can have.
  */
-static char           s_run_line[AG_PATH_MAX + 64];
+static char           s_run_line[AG_PATH_MAX + 64] AG_PORT_SLOW_BSS;
 static ag_port_task_t s_run_task;
 
 /* Set by the far node's STARTED; only a handover ever waits on it. */
