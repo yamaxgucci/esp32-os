@@ -24,13 +24,23 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+/*
+ * The running task, read straight from the kernel's own array.  The accessor,
+ * xTaskGetCurrentTaskHandleForCore, goes to flash with
+ * CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH, and this hook runs while a flash
+ * write has the cache off - the exact death described in budget.c.  The array
+ * is what the port's own context switch reads (portasm.S), so it is not going
+ * anywhere.
+ */
+extern void *volatile pxCurrentTCBs[];
+
 static ag_port_tick_fn s_tick_fn;
 
 static void AG_PORT_IRAM tick_on_core0(void)
 {
     ag_port_tick_fn fn = s_tick_fn;
     if (fn != NULL) {
-        fn(0, xTaskGetCurrentTaskHandleForCore(0));
+        fn(0, (ag_port_task_t)pxCurrentTCBs[0]);
     }
 }
 
@@ -38,7 +48,7 @@ static void AG_PORT_IRAM tick_on_core1(void)
 {
     ag_port_tick_fn fn = s_tick_fn;
     if (fn != NULL) {
-        fn(1, xTaskGetCurrentTaskHandleForCore(1));
+        fn(1, (ag_port_task_t)pxCurrentTCBs[1]);
     }
 }
 
