@@ -23,6 +23,7 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/core/cfg.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cmdline.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/codepage.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/dev/hidrep.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/screen.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtout.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtin.c"
@@ -125,6 +126,7 @@ add_executable(argon_tests
     test_axeload.c
     test_axesig.c
     test_codepage.c
+    test_hidrep.c
     test_probe.c
     test_cc.c
     test_draw.c

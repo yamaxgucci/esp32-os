@@ -147,15 +147,23 @@ void ag_hidptr_report(const uint8_t *data, uint32_t len)
     if (data == NULL || len < 3u) {
         return;
     }
+    ag_hidptr_move(data[0], (int32_t)(int8_t)data[1], (int32_t)(int8_t)data[2],
+                   (len >= 4u) ? (int32_t)(int8_t)data[3] : 0);
+}
+
+static int16_t to16(int32_t v)
+{
+    return (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+}
+
+void ag_hidptr_move(uint8_t buttons_in, int32_t dx, int32_t dy, int32_t wheel)
+{
     if (!s_placed) {
         ag_hidptr_reset();
     }
     s_reports++;
-
-    const uint8_t buttons = (uint8_t)(data[0] & (BTN_LEFT | BTN_RIGHT | BTN_MIDDLE));
-    const int32_t dx = (int32_t)(int8_t)data[1];
-    const int32_t dy = (int32_t)(int8_t)data[2];
-    const int32_t wheel = (len >= 4u) ? (int32_t)(int8_t)data[3] : 0;
+    const uint8_t buttons =
+        (uint8_t)(buttons_in & (BTN_LEFT | BTN_RIGHT | BTN_MIDDLE));
 
     int32_t w, h;
     bounds(&w, &h);
@@ -163,7 +171,7 @@ void ag_hidptr_report(const uint8_t *data, uint32_t len)
     if (dx != 0 || dy != 0) {
         s_x = clamp(s_x + dx, w);
         s_y = clamp(s_y + dy, h);
-        emit(AG_EV_POINTER_MOVE, (int16_t)dx, (int16_t)dy, buttons);
+        emit(AG_EV_POINTER_MOVE, to16(dx), to16(dy), buttons);
     }
 
     /*
@@ -185,7 +193,7 @@ void ag_hidptr_report(const uint8_t *data, uint32_t len)
 
     if (wheel != 0) {
         /* dy carries the notches, the way the terminal's wheel report does. */
-        emit(AG_EV_WHEEL, 0, (int16_t)wheel, buttons);
+        emit(AG_EV_WHEEL, 0, to16(wheel), buttons);
     }
 }
 

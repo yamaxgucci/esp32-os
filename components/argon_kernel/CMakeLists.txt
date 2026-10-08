@@ -29,6 +29,7 @@ set(ARGON_KERNEL_SRCS
     "src/dev/textpanel.c"
     "src/dev/hidkbd.c"
     "src/dev/hidptr.c"
+    "src/dev/hidrep.c"
     "src/dev/btinput.c"
     "src/dev/usbinput.c"
     "src/dev/audio.c"

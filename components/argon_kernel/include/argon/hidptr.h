@@ -50,6 +50,12 @@ void ag_hidptr_reset(void);
  */
 void ag_hidptr_report(const uint8_t *data, uint32_t len);
 
+/*
+ * The same, already decoded - for a device whose report is not the boot
+ * layout and was read through its descriptor (argon/hidrep.h).
+ */
+void ag_hidptr_move(uint8_t buttons, int32_t dx, int32_t dy, int32_t wheel);
+
 /* Where the pointer is, in surface pixels.  For a cursor somebody has to draw
  * and for tests; the events carry their own coordinates. */
 void ag_hidptr_pos(int32_t *x, int32_t *y);
