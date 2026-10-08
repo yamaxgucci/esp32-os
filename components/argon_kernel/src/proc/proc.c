@@ -239,6 +239,51 @@ const char *ag_proc_state_name(ag_proc_state_t state)
  * an application cannot fragment the kernel's heap, and the numbers an
  * application sees in ag_meminfo are about itself rather than about the machine.
  */
+
+/*
+ * And where it went, when the largest block is smaller than what is free.
+ *
+ * The gap between the two is something lying in the middle, and on 8 Oct 2026
+ * it was the whole question: Fallout's 6000 KB arena refused next to 6041 KB
+ * free.  Every block of 32 KB or more goes to the journal in address order,
+ * so the refusal names its own obstacle - `mem /x` afterwards is too late,
+ * the image's data is already given back.  Recorded first, logged after: the
+ * walk holds the heap, and nothing may allocate under it.
+ */
+#define ARENA_MAP_BIG   (32u * 1024u)
+#define ARENA_MAP_LINES 24
+
+typedef struct {
+    uintptr_t addr[ARENA_MAP_LINES];
+    uint32_t  kb[ARENA_MAP_LINES];
+    uint8_t   used[ARENA_MAP_LINES];
+    unsigned  n;
+} arena_map_t;
+
+static void arena_map_block(void *ctx, const void *addr, size_t bytes, int used)
+{
+    arena_map_t *m = (arena_map_t *)ctx;
+    if (bytes < ARENA_MAP_BIG || m->n == ARENA_MAP_LINES) {
+        return;
+    }
+    m->addr[m->n] = (uintptr_t)addr;
+    m->kb[m->n] = (uint32_t)(bytes / 1024u);
+    m->used[m->n] = (uint8_t)(used != 0);
+    m->n++;
+}
+
+static void arena_refused_map(void)
+{
+    static arena_map_t m;
+    memset(&m, 0, sizeof(m));
+    ag_port_mem_walk(AG_MEM_SLOW, arena_map_block, &m);
+    for (unsigned i = 0; i < m.n; i++) {
+        ag_log(AG_LOG_ERROR, "proc", "  extended %08x %5u KB %s",
+               (unsigned)m.addr[i], (unsigned)m.kb[i],
+               m.used[i] ? "used" : "free");
+    }
+}
+
 static ag_err_t heap_create(proc_t *p, uint32_t requested)
 {
     const bool required = requested != 0;
@@ -349,6 +394,7 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
                p->name, (unsigned)(requested / 1024u),
                (unsigned)(ag_port_mem_largest(AG_MEM_SLOW) / 1024u),
                (unsigned)(ag_port_mem_free(AG_MEM_SLOW) / 1024u));
+        arena_refused_map();
         return -AG_ENOMEM;
     }
 

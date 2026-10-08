@@ -550,8 +550,97 @@ static int cmd_cpu(int argc, char **argv)
     return 0;
 }
 
+/*
+ * mem /x: extended memory in address order.
+ *
+ * `mem` says the largest block is smaller than what is free, and stops there.
+ * On 8 Oct 2026 that gap was 102 KB on the S3-CAM under REMDISP, and it was
+ * exactly what kept Fallout's 6000 KB arena from starting next to its own
+ * 1651 KB of data - with 7654 KB free.  The question is what sits in the
+ * middle, and only a walk answers it.
+ *
+ * Blocks of MEM_MAP_BIG and over get a line each; the small ones between two
+ * big ones are one line, counted.  The walk only records: printing allocates,
+ * and the heap must not change under it.
+ */
+#define MEM_MAP_BIG   (16u * 1024u)
+#define MEM_MAP_LINES 64
+
+typedef struct {
+    uintptr_t addr;
+    size_t    used, free_bytes;
+    unsigned  count;
+    bool      big;
+} mem_map_line_t;
+
+typedef struct {
+    mem_map_line_t line[MEM_MAP_LINES];
+    unsigned       n;
+    bool           cut;
+} mem_map_t;
+
+static void mem_map_block(void *ctx, const void *addr, size_t bytes, int used)
+{
+    mem_map_t *m = (mem_map_t *)ctx;
+    const bool big = bytes >= MEM_MAP_BIG;
+    mem_map_line_t *last = (m->n > 0) ? &m->line[m->n - 1] : NULL;
+
+    if (!big && last != NULL && !last->big) {
+        last->count++;
+        if (used) {
+            last->used += bytes;
+        } else {
+            last->free_bytes += bytes;
+        }
+        return;
+    }
+    if (m->n == MEM_MAP_LINES) {
+        m->cut = true;
+        return;
+    }
+    mem_map_line_t *l = &m->line[m->n++];
+    l->addr = (uintptr_t)addr;
+    l->used = used ? bytes : 0;
+    l->free_bytes = used ? 0 : bytes;
+    l->count = 1;
+    l->big = big;
+}
+
+static int mem_map(void)
+{
+    static mem_map_t m;   /* 1.5 KB: not on the shell's stack */
+    memset(&m, 0, sizeof(m));
+    ag_port_mem_walk(AG_MEM_SLOW, mem_map_block, &m);
+    if (m.n == 0) {
+        ag_console_puts("  extended memory: none, or this port cannot walk it\n");
+        return 0;
+    }
+    ag_console_puts("  address      used KB   free KB\n");
+    for (unsigned i = 0; i < m.n; i++) {
+        const mem_map_line_t *l = &m.line[i];
+        if (l->big) {
+            ag_console_printf("  %08x  %8u  %8u\n", (unsigned)l->addr,
+                              (unsigned)(l->used / 1024),
+                              (unsigned)(l->free_bytes / 1024));
+        } else {
+            ag_console_printf("  %08x  %8u  %8u   %u small blocks\n",
+                              (unsigned)l->addr, (unsigned)(l->used / 1024),
+                              (unsigned)(l->free_bytes / 1024), l->count);
+        }
+    }
+    if (m.cut) {
+        ag_console_printf("  (more: only the first %u lines kept)\n",
+                          (unsigned)MEM_MAP_LINES);
+    }
+    return 0;
+}
+
 static int cmd_mem(int argc, char **argv)
 {
+    if (argc > 1 && (strcmp(argv[1], "/x") == 0 ||
+                     strcmp(argv[1], "map") == 0)) {
+        return mem_map();
+    }
     if (argc > 1 && (strcmp(argv[1], "/t") == 0 ||
                      strcmp(argv[1], "tasks") == 0)) {
         return mem_tasks();
@@ -5903,7 +5992,7 @@ static int cmd_guard(int argc, char **argv)
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
-    {"mem", "[/t]", "memory usage; /t: every task and its stack", cmd_mem},
+    {"mem", "[/t|/x]", "memory usage; /t: every task and its stack; /x: extended memory block by block", cmd_mem},
     {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
     {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",

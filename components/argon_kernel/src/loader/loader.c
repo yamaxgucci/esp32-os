@@ -805,8 +805,16 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
      * PSRAM execution is slower than internal SRAM but far faster than flash for
      * a working set that does not fit the cache, and it leaves the internal
      * memory to the radios - which is the whole reason the arena moved.
+     *
+     * And the arena is mapped only for code that can go into it.  It maps
+     * once for the life of the system, 64 KB-aligned, so it lands low in
+     * PSRAM with a hole under it - and on 8 Oct 2026 Fallout, whose 788 KB of
+     * code never goes there, lost it anyway: its 6000 KB arena was refused
+     * next to a free block of 6003, because the heap rounds a request that
+     * large up to 6016.  The 102 KB of arena and hole was the difference.
      */
-    if (!want_xip && !contiguous && psram_ready() &&
+    if (!want_xip && !contiguous &&
+        (size_t)header->code.size <= AG_PSRAM_ARENA_BYTES && psram_ready() &&
         ag_arena_largest_free(&s_psram, 16) >= (size_t)header->code.size) {
         const ag_err_t perr = place_psram(header, out);
         if (perr == AG_OK) {
