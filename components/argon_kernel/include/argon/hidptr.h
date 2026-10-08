@@ -56,6 +56,15 @@ void ag_hidptr_report(const uint8_t *data, uint32_t len);
  */
 void ag_hidptr_move(uint8_t buttons, int32_t dx, int32_t dy, int32_t wheel);
 
+/*
+ * Pointer speed in per cent of a pixel per count: SYSTEM.CFG `[mouse] speed`
+ * until set, 10 to 1000.  Setting it takes effect at the next report and does
+ * not touch the file - the `mouse` command writes that.  Returns what was
+ * applied after clamping.
+ */
+int32_t ag_hidptr_speed(void);
+int32_t ag_hidptr_set_speed(int32_t percent);
+
 /* Where the pointer is, in surface pixels.  For a cursor somebody has to draw
  * and for tests; the events carry their own coordinates. */
 void ag_hidptr_pos(int32_t *x, int32_t *y);

@@ -998,6 +998,41 @@ static int cmd_ptr(int argc, char **argv)
     }
     return 0;
 }
+
+/* Defined further down with the other SYSTEM.CFG writers. */
+static ag_err_t cfg_replace_section(const char *section, const char *body);
+
+/*
+ * `mouse speed N`: how far the pointer goes, in per cent, now and after the
+ * next boot.  The file is what makes it last - a setting that is gone after a
+ * reset is a setting nobody trusts - so it is written at once, the [mouse]
+ * section replaced and the rest of SYSTEM.CFG left as it stands.
+ */
+static int cmd_mouse(int argc, char **argv)
+{
+    if (argc >= 3 && ag_path_icmp(argv[1], "speed") == 0) {
+        char *end = NULL;
+        const long want = strtol(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0') {
+            ag_console_puts("usage: mouse speed <10..1000>  (per cent)\n");
+            return 1;
+        }
+        const int32_t got = ag_hidptr_set_speed((int32_t)want);
+        char body[32];
+        snprintf(body, sizeof(body), "speed = %d\n", (int)got);
+        const ag_err_t err = cfg_replace_section("mouse", body);
+        ag_console_printf("mouse speed %d%%%s\n", (int)got,
+                          (err == AG_OK) ? ", saved to SYSTEM.CFG"
+                                         : ", NOT saved (SYSTEM.CFG not written)");
+        return (err == AG_OK) ? 0 : 1;
+    }
+    if (argc >= 2) {
+        ag_console_puts("usage: mouse [speed <10..1000>]\n");
+        return 1;
+    }
+    ag_console_printf("mouse speed %d%%\n", (int)ag_hidptr_speed());
+    return 0;
+}
 #endif
 
 static int cmd_uptime(int argc, char **argv)
@@ -2289,7 +2324,7 @@ static int cfg_has_device_line(const char *text, const char *dos_path)
  */
 #define ARGON_SHELL_HAS_WIFI (AG_PORT_HAS_WIFI || AG_HAS_NET)
 
-#if ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || \
+#if ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID || \
     (defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH)
 
 /* Case-insensitive compare of a fixed length; the section name in the file may
@@ -2435,7 +2470,7 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
     return (w < 0) ? (ag_err_t)w : AG_OK;
 }
 
-#endif /* ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || CONFIG_ARGON_NET_SSH */
+#endif /* ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID || CONFIG_ARGON_NET_SSH */
 
 #if ARGON_SHELL_HAS_WIFI
 static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass,
@@ -6000,6 +6035,7 @@ static const ag_command_t k_commands[] = {
     {"log", "[-n N|clear]", "system journal", cmd_log},
 #if AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID
     {"ptr", "", "where the pointer is, and how much it has said", cmd_ptr},
+    {"mouse", "[speed N]", "pointer speed in per cent, kept in SYSTEM.CFG", cmd_mouse},
 #endif
     {"uptime", "", "time since reset", cmd_uptime},
     {"date", "[set D T | sync [srv]]", "show the clock, or set it", cmd_date},
