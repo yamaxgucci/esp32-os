@@ -177,7 +177,10 @@ static void share_the_way_out(void)
     memset(&dns, 0, sizeof(dns));
     if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
         dns.ip.u_addr.ip4.addr != 0) {
-        uint8_t offer = 1; /* DHCP option 6, the resolver, to the clients */
+        /* OFFER_DNS, not 1: 1 is OFFER_ROUTER, and asking for the router
+         * again leaves the clients with a gateway and no resolver - which is
+         * exactly what a phone reads as a network that does not work. */
+        uint8_t offer = 0x02;
         (void)esp_netif_dhcps_stop(s_ap_netif);
         (void)esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
         (void)esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
