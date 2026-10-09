@@ -93,6 +93,9 @@ AG_APP_SIZED("STOMP", "1.0", "argon", 0, 12 * 1024, 1024 * 1024);
 #define LIST_MAX  64 /* entries a chooser holds; more are counted, not shown */
 #define LIST_ROW  18
 
+/* How long an open slider waits for a hand that has gone back to the guitar. */
+#define SLIDER_IDLE_MS 5000u
+
 /* What a line in the chooser is.  A header is drawn and skipped over, so that
  * "built in" and "on the card" can separate two kinds of preset in one list. */
 enum {
@@ -217,6 +220,17 @@ static ag_amp_cfg_t s_fit;
 static int          s_model = AG_AMP_MODEL_JCM800;
 static int          s_sel;     /* knobs, then cabinet, switch, preset */
 static int          s_editing; /* the slider is open on s_sel */
+/*
+ * A finger on the slider, and when it was last felt.
+ *
+ * The slider is drawn *over* the knobs, and until now nothing tested it: a tap
+ * on it fell through to the knob underneath, so trying to move it picked a
+ * different knob instead.  It has to take the tap itself, follow the finger
+ * while it is down, and put itself away - a control that can only be opened is
+ * a control in the way.
+ */
+static int          s_drag;      /* the finger is on the slider now */
+static uint32_t     s_touch_ms;  /* when it was last touched or typed at */
 static int          s_cab_on = 1;
 static char         s_cab[AG_PATH_MAX] = "";
 static char         s_preset[AG_PATH_MAX] = "jcm800";
@@ -602,6 +616,37 @@ static void draw_slider(int sw, int sh)
         ag_gfx_fill_rect((int16_t)(28 + w * i / 10), (int16_t)(y + 34), 1, 4,
                          rgb(90, 96, 116));
     }
+}
+
+/*
+ * Where the finger is on the track, as one of the ten marks.
+ *
+ * The track is the same 28..28+(sw-48) draw_slider paints, and it is written
+ * out here rather than shared with a constant because the painter is the
+ * definition: a number here that disagreed with the picture would be a slider
+ * that moves to somewhere other than where it was touched, which is worse than
+ * one that does not move at all.
+ *
+ * Half a mark is added before the division so that the mark nearest the finger
+ * wins rather than the one below it - a tap in the middle of 7 and 8 that
+ * always chose 7 reads as a slider that lags behind the hand.
+ */
+static int slider_mark_at(int px, int sw)
+{
+    const int w = sw - 48;
+    int       v;
+
+    if (w <= 0) {
+        return 0;
+    }
+    v = ((px - 28) * 10 + w / 2) / w;
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 10) {
+        v = 10;
+    }
+    return v;
 }
 
 static void draw_browser(int sw, int sh)
@@ -1854,6 +1899,30 @@ static void set_model(int m)
     }
 }
 
+/* Put the selected knob on a mark, if that is a move at all. */
+static void slider_set(int v)
+{
+    const int id = ag_amp_pot_id(s_model, s_sel);
+
+    if (s_sel >= knob_n() || marks(s_cfg.pot[id]) == v) {
+        return;
+    }
+    s_cfg.pot[id] = (float)v / 10.0f;
+    apply_knobs();
+    dirty_item(s_sel);
+    dirty_slider();
+    /*
+     * Which knob moved and where to, in the same words `pot drive=8` uses.
+     *
+     * One line per mark actually passed - the early return above means a
+     * finger sliding within one mark says nothing - and it goes to the
+     * console, which is not the screen the panel is painted on.  It is what
+     * answers "the slider moved a different knob from the one I grabbed"
+     * without anybody having to photograph a phone.
+     */
+    ag_printf("stomp: %s = %d\n", ag_amp_pot_name(s_model, s_sel), v);
+}
+
 static void nudge(int d)
 {
     const int id = ag_amp_pot_id(s_model, s_sel);
@@ -2163,6 +2232,31 @@ static void on_tap(int px, int py)
         }
         return;
     }
+
+    /*
+     * The open slider takes the tap before anything under it does.
+     *
+     * It is painted over the knobs, and without this the touch went straight
+     * through to whichever knob was behind it: reaching for the slider picked
+     * a different control instead, which is the one thing a slider must never
+     * do.  Inside, the tap sets the mark and the finger keeps it (see
+     * AG_EV_POINTER_MOVE); outside, it closes - a tap on the background is how
+     * a panel like this is dismissed, and it must not also count as a pick.
+     */
+    if (s_editing) {
+        int sx, sy, sw2, sh2;
+        slider_box(&sx, &sy, &sw2, &sh2, sw, sh);
+        if (px >= sx && px < sx + sw2 && py >= sy && py < sy + sh2) {
+            s_drag = 1;
+            slider_set(slider_mark_at(px, sw));
+            return;
+        }
+        s_editing = 0;
+        s_drag = 0;
+        dirty_all();
+        return;
+    }
+
     for (i = 0; i < n; i++) {
         knob_box(i, &x, &y, &w, &h, sw, sh);
         if (px >= x && px < x + w && py >= y && py < y + h) {
@@ -2562,10 +2656,26 @@ int ag_main(int argc, char **argv)
                 draw(); /* somebody else had the panel: none of it is ours */
                 break;
             case AG_EV_KEY_DOWN:
+                s_touch_ms = ag_millis();
                 on_key(ev.key.keycode, &quit);
                 break;
             case AG_EV_POINTER_DOWN:
+                s_touch_ms = ag_millis();
                 on_tap(ev.ptr.x, ev.ptr.y);
+                break;
+            /*
+             * The finger that is already on the slider keeps it.  Without
+             * this it could only be tapped, one mark at a time, which is not
+             * what a slider is for.
+             */
+            case AG_EV_POINTER_MOVE:
+                if (s_drag && s_editing) {
+                    s_touch_ms = ag_millis();
+                    slider_set(slider_mark_at(ev.ptr.x, (int)s_info.width));
+                }
+                break;
+            case AG_EV_POINTER_UP:
+                s_drag = 0;
                 break;
             default:
                 break;
@@ -2589,6 +2699,18 @@ int ag_main(int argc, char **argv)
                 /* The meter and the load are only worth four times a
                  * second, and marking the strip is what makes them move. */
                 const uint32_t ms = ag_millis();
+                /*
+                 * And it puts itself away.  A slider left open sits over the
+                 * knobs, and the hand that opened it has usually gone back to
+                 * the guitar: a tap on the background closes it (see on_tap)
+                 * and so does five seconds of nothing, so neither leaves the
+                 * panel covered.  Not while a finger is still on it.
+                 */
+                if (s_editing && !s_drag && s_touch_ms != 0u &&
+                    ms - s_touch_ms >= SLIDER_IDLE_MS) {
+                    s_editing = 0;
+                    dirty_all();
+                }
                 if (ms - s_hdr_ms >= 250u) {
                     s_hdr_ms = ms;
                     dirty(0, 0, (int)s_info.width, TOP_H);
