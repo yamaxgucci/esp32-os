@@ -80,6 +80,30 @@ uint32_t ag_pixband_encode(ag_pixband_ctx_t *ctx, const uint16_t *px,
                            uint32_t n, uint8_t *out, uint32_t cap, uint8_t *op);
 
 /*
+ * The same band with no context at all: RAW or PACK, never IDX.
+ *
+ * For a sender that has no memory to give the codec.  The context above is
+ * thirteen kilobytes with its buffers on a 320-wide panel, and a board that
+ * cannot spare that still has a picture to send: this one reads the pixels
+ * where they lie - `h` rows of `w`, `stride` bytes apart, the caller's own
+ * surface - and writes straight into `out`.  It loses the palette encoding
+ * (the hash table is most of the context), so game art goes several times
+ * larger than it would; flat areas still pack.
+ *
+ * PackBits is run a row at a time and the rows are laid end to end.  That is
+ * still one valid PACK payload of w*h pixels - a run simply never crosses the
+ * end of a row - so the receiver decodes it exactly as it decodes the other
+ * encoder's, and the wire does not know which side sent it.
+ *
+ * Returns the payload length and sets *op, or 0 when even RAW does not fit in
+ * `cap`, or when the pixels or the stride are not 16-bit aligned (the pixels
+ * are read as uint16_t, and a misaligned one is a fault on Xtensa).
+ */
+uint32_t ag_pixband_encode_rows(const void *px, uint32_t stride, uint32_t w,
+                                uint32_t h, uint8_t *out, uint32_t cap,
+                                uint8_t *op);
+
+/*
  * Undo it: `n` pixels out of `len` bytes of `in`.  False when the payload is
  * malformed or does not contain exactly n pixels - a short or long stream is a
  * corrupt one, and half a band drawn is worse than a band not drawn.

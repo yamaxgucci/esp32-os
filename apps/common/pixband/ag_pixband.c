@@ -432,6 +432,52 @@ uint32_t ag_pixband_encode(ag_pixband_ctx_t *c, const uint16_t *px, uint32_t n,
     return best_len;
 }
 
+uint32_t ag_pixband_encode_rows(const void *px, uint32_t stride, uint32_t w,
+                                uint32_t h, uint8_t *out, uint32_t cap,
+                                uint8_t *op)
+{
+    if (px == NULL || out == NULL || op == NULL || w == 0u || h == 0u ||
+        stride < w * 2u || (((uintptr_t)px | stride) & 1u) != 0u) {
+        return 0;
+    }
+    const uint8_t *base = (const uint8_t *)px;
+    const uint32_t raw = w * h * 2u;
+
+    /*
+     * PACK first, straight into `out`, given up the moment it stops paying:
+     * at the size RAW would be, nothing PackBits could still do is worth it.
+     * A half-written attempt costs nothing - RAW below writes over it.
+     */
+    const uint32_t room = (raw < cap) ? raw : cap;
+    uint32_t       at = 0;
+    bool           packed = true;
+    for (uint32_t r = 0; r < h && packed; r++) {
+        const uint16_t *row = (const uint16_t *)(base + (size_t)r * stride);
+        const uint32_t  p = pack16(row, w, out + at, room - at);
+        if (p == 0u) {
+            packed = false;
+        }
+        at += p;
+    }
+    if (packed && at < raw) {
+        *op = AG_PIXBAND_PACK;
+        return at;
+    }
+
+    if (raw > cap) {
+        return 0;
+    }
+    for (uint32_t r = 0; r < h; r++) {
+        const uint16_t *row = (const uint16_t *)(base + (size_t)r * stride);
+        uint8_t        *o = out + (size_t)r * w * 2u;
+        for (uint32_t i = 0; i < w; i++) {
+            put16(o + i * 2u, row[i]);
+        }
+    }
+    *op = AG_PIXBAND_RAW;
+    return raw;
+}
+
 bool ag_pixband_decode(uint8_t op, const uint8_t *in, uint32_t len,
                        uint16_t *px, uint32_t n)
 {

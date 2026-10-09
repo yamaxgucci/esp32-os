@@ -48,6 +48,29 @@ def read_partition(csv_path, name):
     raise SystemExit(f"mksysfs: no '{name}' partition in {csv_path}")
 
 
+def read_ini(path, key):
+    """One `key = value` out of a BOARD.CFG, which is an INI and not sdkconfig.
+
+    Written separately from read_config on purpose: that one matches
+    `KEY=value` with no spaces, because that is sdkconfig's shape.  Pointed at
+    a BOARD.CFG it silently finds nothing - and a guard that silently finds
+    nothing is a guard that is not there.  This was exactly that bug, caught by
+    the guard failing to fire on a case built to make it fire.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.split(";", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() == key:
+                    return v.strip()
+    except OSError:
+        pass
+    return ""
+
+
 def read_config(sdkconfig, key, default):
     """One CONFIG_ value out of sdkconfig, which is where littlefs's own are."""
     try:
@@ -81,6 +104,40 @@ def stage(board_dir, apps_dir, out_dir, display=None, extra=(),
                 raise SystemExit(f"mksysfs: {src} is missing")
             shutil.copy2(src, os.path.join(out_dir, name))
             staged.append(name)
+
+        # Applications this board is supposed to carry, listed in apps.txt
+        # beside modules.txt.
+        #
+        # They used to be named on the command line with --add, every time, by
+        # whoever happened to be flashing the board.  That is a card whose
+        # contents live in somebody's shell history: the cluster pair needs
+        # five images on one board and seven on the other, chosen so that each
+        # carries what its NEIGHBOUR can execute, and getting one wrong shows
+        # up as a test failing for a reason that looks like the cluster.
+        # --add still works, for one-off files that are nobody's board.
+        appsfile = os.path.join(board_dir, "apps.txt")
+        if os.path.isfile(appsfile):
+            with open(appsfile, "r", encoding="utf-8") as f:
+                for line in f:
+                    image = line.strip()
+                    if not image or image.startswith("#"):
+                        continue
+                    src = os.path.join(apps_dir, image)
+                    if not os.path.isfile(src):
+                        raise SystemExit(
+                            f"mksysfs: {src} is missing - run "
+                            f"`argon apps --group board`")
+                    shutil.copy2(src, os.path.join(out_dir, image))
+                    staged.append(image)
+
+        # AUTOEXEC.BAT if the pack has one - what this board does for itself at
+        # boot, as against what it IS, which is the two files above.  Optional,
+        # and most boards do nothing: binding a wire used to be here and is now
+        # [link] bind in SYSTEM.CFG, which is read before this file runs.
+        auto = os.path.join(board_dir, "AUTOEXEC.BAT")
+        if os.path.isfile(auto):
+            shutil.copy2(auto, os.path.join(out_dir, "AUTOEXEC.BAT"))
+            staged.append("AUTOEXEC.BAT")
 
         # Drivers, under the names SYSTEM.CFG spells: lower case, because that
         # is what `drv install` writes and littlefs does not fold case.
@@ -146,9 +203,9 @@ def main():
     ap.add_argument("--apps", default=os.path.join(ROOT, "build", "apps"),
                     help="where the built .SYS images are")
     ap.add_argument("--partitions", default=None,
-                    help="the layout to read the sysfs offset from.  By "
-                         "default the one sdkconfig names, which is the one "
-                         "the firmware on the board was built against")
+                    help="partition table CSV; by default the one the current "
+                         "sdkconfig names, which is the one the board was "
+                         "actually built with")
     ap.add_argument("--sdkconfig", default=os.path.join(ROOT, "sdkconfig"))
     ap.add_argument("--out", default=os.path.join(ROOT, "build", "sysfs.bin"))
     ap.add_argument("--display", choices=("soft", "panel", "none"),
@@ -178,25 +235,24 @@ def main():
     ap.add_argument("--baud", type=int, default=921600)
     args = ap.parse_args()
 
+    # WHICH TABLE, and it has to be the board's own.
     #
-    # Which layout, and getting this wrong is silent and expensive.
+    # This defaulted to partitions_4mb.csv whatever the target was, while the
+    # docstring above said the layout comes from the partition table and
+    # sdkconfig.  For the two boards with a table of their own that is half a
+    # partition thrown away, silently: the C3 and the C6 give sysfs 1 MB, the
+    # 4 MB table gives it 512 KB, and both put it at the same offset - so the
+    # image lands in the right place, mounts, works, and has half the room it
+    # was designed to have.  Measured on the C3: 466 KB free where there should
+    # have been nearly a megabyte.
     #
-    # The default used to be partitions_4mb.csv, which puts sysfs at 0x200000.
-    # On an 8 MB board the real layout has it at 0x310000 and 0x200000 is
-    # inside the *application* partition - so `--flash` wrote half a megabyte
-    # over the tail of the firmware, esptool said "Hash of data verified", the
-    # board booted (the image ends before there), and C: came back with none
-    # of the files that had just been written to it.  Nothing anywhere said
-    # the offset was wrong.
-    #
-    # sdkconfig names the layout the firmware was actually built against, and
-    # this script already reads sdkconfig for two other things, so ask it.
-    #
+    # It matters most where it is least visible: the C6's table exists SO THAT
+    # C: can hold a cartridge, and a cartridge is up to a megabyte.
     if args.partitions is None:
         named = read_config(args.sdkconfig,
                             "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME",
-                            "partitions_4mb.csv").strip().strip('"')
-        args.partitions = os.path.join(ROOT, named)
+                            '"partitions_4mb.csv"').strip('"')
+        args.partitions = named if os.path.isabs(named)             else os.path.join(ROOT, named)
         print("mksysfs: layout %s (from sdkconfig)" % named)
 
     offset, size = read_partition(args.partitions, "sysfs")
@@ -215,6 +271,24 @@ def main():
         size_wh = (int(m.group(1)), int(m.group(2)))
 
     board = None if args.board.lower() == "none" else args.board
+
+    # AND THE BOARD PACK HAS TO BE THIS CHIP'S.
+    #
+    # Naming a board while the tree is built for a different one produced an
+    # image with that board's files in it and the OTHER chip's layout - the C3's
+    # SYSTEM.CFG at the S3's offset - and said nothing.  The two mistakes are
+    # the same mistake: a C: laid out against a partition table the board does
+    # not have.
+    if board is not None:
+        want = read_ini(os.path.join(board, "BOARD.CFG"), "chip")
+        if want and want != chip:
+            raise SystemExit(
+                "mksysfs: %s is a %s board, but this tree is built for %s.\n"
+                "         Its C: would be laid out at the wrong offset or "
+                "half the size.\n"
+                "         Run `argon target %s` first, or pass --partitions "
+                "and --sdkconfig for it."
+                % (os.path.basename(board.rstrip("\\/")), want, chip, want))
 
     staged_dir = tempfile.mkdtemp(prefix="argon-sysfs-")
     try:

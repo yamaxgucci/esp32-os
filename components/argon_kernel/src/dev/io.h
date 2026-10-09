@@ -36,4 +36,12 @@ void ag_io_register_devices(void);
  * never said where the bus is. */
 ag_err_t ag_io_i2c_up(int bus);
 
+/*
+ * True when this layer has the port up for a caller: a wire, a Modbus session,
+ * a scanner.  Asked by whatever opens a port behind io's back, because "give
+ * the port back" is not that caller's to do if somebody else has since taken
+ * it.  See the hostfs probe on UART1 for what that costs when it is ignored.
+ */
+bool ag_io_uart_claimed(int port);
+
 #endif /* ARGON_DEV_IO_H */

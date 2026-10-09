@@ -33,6 +33,7 @@ const char *ag_path_drive(char letter)
     case 't': return "/tmp";
     case 'd': return "/dev";
     case 'h': return "/host"; /* HostFS — live host folder (QEMU) */
+    case 'n': return "/node"; /* the other node's card, over the link */
     default:  return NULL;
     }
 }

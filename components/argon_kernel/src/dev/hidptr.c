@@ -28,9 +28,12 @@
 
 #if AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID
 
+#include <argon/cfg.h>
 #include <argon/console.h>
 #include <argon/display.h>
 #include <argon/screen.h>
+
+#include "core/sysconfig.h"
 
 #include <argon/port/time.h>
 
@@ -147,15 +150,74 @@ void ag_hidptr_report(const uint8_t *data, uint32_t len)
     if (data == NULL || len < 3u) {
         return;
     }
+    ag_hidptr_move(data[0], (int32_t)(int8_t)data[1], (int32_t)(int8_t)data[2],
+                   (len >= 4u) ? (int32_t)(int8_t)data[3] : 0);
+}
+
+/*
+ * How far the pointer goes for one count of the mouse, in per cent:
+ * `[mouse] speed = 100` in SYSTEM.CFG, 10 to 1000.  Read once, on the first
+ * report, because the configuration is long loaded by then and a mouse is
+ * never the thing that has to start early.
+ *
+ * A flat factor, no acceleration.  The part that is not a whole pixel is kept
+ * and added to the next report, so at 50 a mouse moved slowly still moves -
+ * every other count, rather than never.
+ */
+#define SPEED_DEFAULT 100
+#define SPEED_MIN     10
+#define SPEED_MAX     1000
+
+static int32_t s_speed; /* 0 until read */
+static int32_t s_rest_x, s_rest_y;
+
+static int32_t clamp_speed(int32_t v)
+{
+    return (v < SPEED_MIN) ? SPEED_MIN : ((v > SPEED_MAX) ? SPEED_MAX : v);
+}
+
+int32_t ag_hidptr_speed(void)
+{
+    if (s_speed == 0) {
+        s_speed = clamp_speed(
+            ag_cfg_get_int(ag_sysconfig(), "mouse.speed", SPEED_DEFAULT));
+    }
+    return s_speed;
+}
+
+int32_t ag_hidptr_set_speed(int32_t percent)
+{
+    s_speed = clamp_speed(percent);
+    s_rest_x = 0;
+    s_rest_y = 0;
+    return s_speed;
+}
+
+static int32_t scaled(int32_t d, int32_t *rest)
+{
+    if (ag_hidptr_speed() == 100) {
+        return d;
+    }
+    const int32_t total = d * s_speed + *rest;
+    *rest = total % 100;
+    return total / 100;
+}
+
+static int16_t to16(int32_t v)
+{
+    return (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+}
+
+void ag_hidptr_move(uint8_t buttons_in, int32_t dx, int32_t dy, int32_t wheel)
+{
     if (!s_placed) {
         ag_hidptr_reset();
     }
     s_reports++;
-
-    const uint8_t buttons = (uint8_t)(data[0] & (BTN_LEFT | BTN_RIGHT | BTN_MIDDLE));
-    const int32_t dx = (int32_t)(int8_t)data[1];
-    const int32_t dy = (int32_t)(int8_t)data[2];
-    const int32_t wheel = (len >= 4u) ? (int32_t)(int8_t)data[3] : 0;
+    dx = scaled(dx, &s_rest_x);
+    dy = scaled(dy, &s_rest_y);
+    const uint8_t buttons =
+        (uint8_t)(buttons_in & (BTN_LEFT | BTN_RIGHT | BTN_MIDDLE));
 
     int32_t w, h;
     bounds(&w, &h);
@@ -163,7 +225,7 @@ void ag_hidptr_report(const uint8_t *data, uint32_t len)
     if (dx != 0 || dy != 0) {
         s_x = clamp(s_x + dx, w);
         s_y = clamp(s_y + dy, h);
-        emit(AG_EV_POINTER_MOVE, (int16_t)dx, (int16_t)dy, buttons);
+        emit(AG_EV_POINTER_MOVE, to16(dx), to16(dy), buttons);
     }
 
     /*
@@ -185,7 +247,7 @@ void ag_hidptr_report(const uint8_t *data, uint32_t len)
 
     if (wheel != 0) {
         /* dy carries the notches, the way the terminal's wheel report does. */
-        emit(AG_EV_WHEEL, 0, (int16_t)wheel, buttons);
+        emit(AG_EV_WHEEL, 0, to16(wheel), buttons);
     }
 }
 

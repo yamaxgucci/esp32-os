@@ -114,6 +114,8 @@ static const char *dac_be_name(void) { return "dac"; }
 
 static dac_continuous_handle_t s_dac;
 static uint8_t                 s_dac_channels = 2;
+/* each input sample is given this many times (see ag_port_audio_open) */
+static uint8_t                 s_up = 1;
 static uint8_t                 s_acc[ACC_BYTES];
 static size_t                  s_acc_used;
 
@@ -189,6 +191,17 @@ static bool dac_be_open(uint32_t rate, uint8_t channels)
     if (rate < 20000u) {
         rate = 20000u;
     }
+    /*
+     * And below 32 kHz the converter is run at twice the rate, each sample
+     * given twice.  Near the bottom of what the divider reaches the rate it
+     * gives is not the rate asked for: at 22 050 this DAC played about 16%
+     * slow, measured as a stream from the C3 that the CYD could only keep up
+     * with by throwing a sixth of it away (25 Sep 2026), where at 44 100 a
+     * sixty-second tone takes sixty seconds.  A sample held twice is the same
+     * sound to an 8-bit converter behind a small speaker.
+     */
+    s_up = (rate < 32000u) ? 2u : 1u;
+    rate *= s_up;
 
     const dac_continuous_config_t cfg = {
         /* Channel 1 is GPIO 26: the pin the amplifier is on. */
@@ -264,7 +277,14 @@ static int32_t dac_be_write(const int16_t *pcm, int32_t frames)
     int32_t done = 0;
     while (done < frames) {
         int32_t n = frames - done;
-        const int32_t room = (int32_t)(ACC_BYTES - s_acc_used);
+        const int32_t room = (int32_t)(ACC_BYTES - s_acc_used) / s_up;
+        if (room == 0) {
+            /* less than one doubled sample left: out with what is there */
+            if (!acc_flush()) {
+                break;
+            }
+            continue;
+        }
         if (n > room) {
             n = room;
         }
@@ -280,15 +300,21 @@ static int32_t dac_be_write(const int16_t *pcm, int32_t frames)
             const int16_t *src = pcm + (size_t)done * 2u;
             for (int32_t i = 0; i < n; i++) {
                 const int32_t mono = ((int32_t)src[i * 2] + src[i * 2 + 1]) / 2;
-                out[i] = (uint8_t)((mono + 32768) >> 8);
+                const uint8_t v = (uint8_t)((mono + 32768) >> 8);
+                for (uint8_t k = 0; k < s_up; k++) {
+                    *out++ = v;
+                }
             }
         } else {
             const int16_t *src = pcm + done;
             for (int32_t i = 0; i < n; i++) {
-                out[i] = (uint8_t)(((int32_t)src[i] + 32768) >> 8);
+                const uint8_t v = (uint8_t)(((int32_t)src[i] + 32768) >> 8);
+                for (uint8_t k = 0; k < s_up; k++) {
+                    *out++ = v;
+                }
             }
         }
-        s_acc_used += (size_t)n;
+        s_acc_used += (size_t)n * s_up;
         done += n;
 
         if (s_acc_used >= ACC_BYTES && !acc_flush()) {
@@ -300,7 +326,7 @@ static int32_t dac_be_write(const int16_t *pcm, int32_t frames)
 
 static int32_t dac_be_space(void)
 {
-    return s_dac != NULL ? (int32_t)(ACC_BYTES - s_acc_used) : 0;
+    return s_dac != NULL ? (int32_t)((ACC_BYTES - s_acc_used) / s_up) : 0;
 }
 
 /* The chip's own converters are digital-to-analogue and nothing else. */
@@ -335,7 +361,14 @@ static int32_t dac_be_read(int16_t *pcm, int32_t frames)
  * buzz at that buffer's own frequency, which is the first thing anyone hears
  * when an application falls behind.  The price is a memset per descriptor.
  */
-#define I2S_DESCS   4
+/*
+ * Eight, not four (27 Sep 2026): sound poured from a neighbour arrives with
+ * the wire's jitter, and four descriptors are 22 ms at 44.1 kHz - the S3-Zero
+ * ran dry 70-115 times in five minutes with every period arriving, while the
+ * CYD beside it, whose converter holds some 90 ms, never did.  Eight are
+ * 44 ms, and 3.8 KB more while something plays.
+ */
+#define I2S_DESCS   8
 #define I2S_FRAMES  240
 #define I2S_WAIT_MS 120
 

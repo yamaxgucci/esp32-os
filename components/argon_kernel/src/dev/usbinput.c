@@ -13,6 +13,27 @@
 
 #include <argon/hidkbd.h>
 #include <argon/hidptr.h>
+#include <argon/hidrep.h>
+
+/*
+ * The mouse's own layout, when its descriptor could be read (argon/hidrep.h).
+ * One, because the port attaches one device; a new descriptor replaces it.
+ * Written on the port's task before the interface's first report and read on
+ * the same task, so nothing guards it.
+ */
+static ag_hidrep_mouse_t s_mouse;
+static bool              s_mouse_known;
+
+static bool on_descriptor(ag_usb_usage_t usage, uint8_t itf,
+                          const uint8_t *desc, uint32_t len)
+{
+    (void)itf;
+    if (usage != AG_USB_USAGE_MOUSE) {
+        return false;
+    }
+    s_mouse_known = ag_hidrep_parse_mouse(desc, len, &s_mouse);
+    return s_mouse_known;
+}
 
 static void on_report(ag_usb_usage_t usage, uint8_t report_id,
                       const uint8_t *data, uint32_t len)
@@ -22,7 +43,16 @@ static void on_report(ag_usb_usage_t usage, uint8_t report_id,
         ag_hidkbd_report(data, len);
     } else if (usage == AG_USB_USAGE_MOUSE) {
         /* The same shared pointer path a Bluetooth mouse takes. */
-        ag_hidptr_report(data, len);
+        if (!s_mouse_known) {
+            ag_hidptr_report(data, len);
+            return;
+        }
+        uint8_t buttons = 0;
+        int32_t dx = 0, dy = 0, wheel = 0;
+        if (ag_hidrep_decode_mouse(&s_mouse, data, len, &buttons, &dx, &dy,
+                                   &wheel)) {
+            ag_hidptr_move(buttons, dx, dy, wheel);
+        }
     }
 }
 
@@ -31,6 +61,7 @@ ag_err_t ag_usbinput_init(void)
     ag_hidkbd_reset();
     ag_hidptr_reset();
     ag_port_usb_on_report(on_report);
+    ag_port_usb_on_descriptor(on_descriptor);
     return AG_OK;
 }
 

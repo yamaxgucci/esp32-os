@@ -25,6 +25,8 @@
 #include <argon/shell.h>
 #include <argon/textpanel.h>
 
+#include <argon/nodeboot.h>
+#include <argon/port/mem.h>
 #include <argon/port/time.h>
 #include <argon/port/task.h>
 #include <argon/port/uart.h>
@@ -285,6 +287,16 @@ static ag_err_t stage_modules(void)
      * the call does nothing.
      */
     apply_console_size();
+
+    /*
+     * The wire, if SYSTEM.CFG asked for one.  Here because the link driver is
+     * a loadable .SYS and has only just registered its device, and before
+     * AUTOEXEC because a board that is half of a cluster should come up as
+     * half of a cluster - the binding is lost on every reset, so leaving it to
+     * a line in a batch file lost it on every test that resets a board and on
+     * every power cut in the field.
+     */
+    ag_node_autobind();
     return err;
 }
 
@@ -343,6 +355,14 @@ void ag_kernel_main(void)
     const int64_t t0 = ag_port_us();
 
     memset(&s_report, 0, sizeof(s_report));
+    /*
+     * Who holds the memory, by stage.  `mem` says only how much the system
+     * holds (137 KB on the C3, with no way to say whose), and "the system" is
+     * everything from the chip's own layer up; this is the same figure taken
+     * apart as it is built up.
+     */
+    s_report.entry_used = (uint32_t)(ag_port_mem_total(AG_MEM_FAST) -
+                                     ag_port_mem_free(AG_MEM_FAST));
 
     bool fatal_failure = false;
 
@@ -356,9 +376,34 @@ void ag_kernel_main(void)
         }
 
         const int64_t ts = ag_port_us();
+        const size_t  free0 = ag_port_mem_free(AG_MEM_FAST);
         const ag_err_t err = st->fn();
         s_report.stage_us[i] = (uint32_t)(ag_port_us() - ts);
+        s_report.stage_mem[i] =
+            (int32_t)free0 - (int32_t)ag_port_mem_free(AG_MEM_FAST);
         s_report.stage_result[i] = err;
+
+        /*
+         * ABSENT IS NOT BROKEN.  -AG_ENODEV from a stage means "there is
+         * nothing of this kind on this board" - no card slot, no panel - which
+         * is a fact about the hardware and not a fault in it.
+         *
+         * It used to be reported as a failure, in red, on every single boot of
+         * any board without an SD card, and printed again in the summary:
+         *
+         *   E (17) boot: stage 'media' failed with -19
+         *     stage 'media' FAILED with -19
+         *
+         * on a board whose own BOARD.CFG says `[sd] interface = none`.  A
+         * message that is wrong on every boot is worse than no message: it
+         * teaches whoever reads the board's first twenty lines to skip them,
+         * and the next line down is where a real fault will appear.
+         */
+        if (err == -AG_ENODEV) {
+            s_report.stage_result[i] = AG_OK;
+            ag_log(AG_LOG_INFO, "boot", "%s: none on this board", st->name);
+            continue;
+        }
 
         if (err != AG_OK) {
             s_report.degraded = true;

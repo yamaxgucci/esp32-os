@@ -26,6 +26,19 @@
  *
  * The lookup walks at most AG_DEV_MAX entries and happens ten times a second.
  */
+/*
+ * A neighbour's glass is not this console's.  Its devices are in the list for
+ * whoever chooses them (`dev default display`, an application opening it by
+ * name); the console does not take one because it appeared.  It also must not:
+ * every row to it is a message over a wire, sent with the registry held, and a
+ * C3 whose wire to the CYD was losing frames sat 86 s in text_row with the
+ * whole machine behind it (25 Sep 2026).
+ */
+static bool is_remote(const ag_device_t *dev)
+{
+    return strcmp(dev->driver, "node") == 0;
+}
+
 static const ag_display_ops_t *panel_ops(ag_device_t **out_dev)
 {
     for (uint32_t i = 0;; i++) {
@@ -34,7 +47,7 @@ static const ag_display_ops_t *panel_ops(ag_device_t **out_dev)
             return NULL;
         }
         ag_device_t *dev = ag_dev_find(info.name);
-        if (dev == NULL || dev->class_ops == NULL) {
+        if (dev == NULL || dev->class_ops == NULL || is_remote(dev)) {
             continue;
         }
         const ag_display_ops_t *ops = (const ag_display_ops_t *)dev->class_ops;
@@ -567,7 +580,7 @@ static void render_locked(const ag_screen_t *screen)
             break;
         }
         ag_device_t *dev = ag_dev_find(info.name);
-        if (dev == NULL || dev->class_ops == NULL) {
+        if (dev == NULL || dev->class_ops == NULL || is_remote(dev)) {
             continue;
         }
         const ag_display_ops_t *ops = (const ag_display_ops_t *)dev->class_ops;

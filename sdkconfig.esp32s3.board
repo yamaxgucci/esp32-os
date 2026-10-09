@@ -151,3 +151,10 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"
+
+# Room for a neighbour's devices as well as this board's (30 Sep 2026): at
+# the default 24 the S3-CAM, with its radios and its own soft screen, took
+# only eight of the CYD's fifteen - null, zero, the console, the buses - and
+# not the screen, the sound or the card (-23, the registry full), so the
+# picture went into its own fb0.  The C3 has 48 and the CYD 40.
+CONFIG_ARGON_DEV_MAX=48

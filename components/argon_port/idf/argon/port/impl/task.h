@@ -70,6 +70,21 @@ static inline bool ag_port_task_create(ag_port_task_fn fn, const char *name,
 
 static inline void ag_port_task_delete(ag_port_task_t t) { vTaskDelete(t); }
 
+/*
+ * Stopping another task where it stands, for the kernel's kill.  On two cores
+ * vTaskSuspend of a task running on the other one only asks that core to
+ * switch away, and returns before it has: eTaskGetState answers eRunning until
+ * it really is off, which is what ag_port_task_on_cpu is for.
+ */
+static inline void ag_port_task_suspend(ag_port_task_t t) { vTaskSuspend(t); }
+
+static inline void ag_port_task_resume(ag_port_task_t t) { vTaskResume(t); }
+
+static inline bool ag_port_task_on_cpu(ag_port_task_t t)
+{
+    return eTaskGetState(t) == eRunning;
+}
+
 static inline void ag_port_task_delay(ag_port_ticks_t ticks) { vTaskDelay(ticks); }
 
 static inline ag_port_task_t ag_port_task_self(void)
@@ -135,6 +150,10 @@ static inline void ag_port_task_yield(void) { taskYIELD(); }
 
 typedef void (*ag_port_tick_fn)(int core, ag_port_task_t running);
 bool ag_port_tick_hook(ag_port_tick_fn fn);
+
+/* The scheduler's idle task on `core`, or NULL where there is no such core:
+ * a tick that finds it running is a tick nobody wanted. */
+ag_port_task_t ag_port_task_idle_of(int core);
 
 /* A notification from interrupt context, with the yield the ISR owes. */
 static inline void ag_port_notify_give_isr(ag_port_task_t t)

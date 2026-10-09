@@ -12,6 +12,7 @@
 #include <argon/audio.h>
 #include <argon/board.h>
 #include <argon/cmdline.h>
+#include <argon/devdefault.h>
 #include <argon/codepage.h>
 #include <argon/budget.h>
 #include <argon/console.h>
@@ -22,6 +23,7 @@
 #include <argon/ioclaim.h>
 #include <argon/kernel.h>
 #include <argon/lineedit.h>
+#include <argon/migrate.h>
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/module.h>
@@ -64,6 +66,15 @@
 #include "shell/cmd_fs.h"
 #include "net/espnow.h"
 #include "net/wifimon.h"
+#include <argon/linkprov.h>
+#include <argon/nodeproc.h>
+#include <argon/nodedev.h>
+#include <argon/nodedrv.h>
+#include <argon/nodename.h>
+#include <argon/noderdev.h>
+#include <argon/nodeps.h>
+
+#include "shell/cmd_link.h"
 #include "shell/cmd_net.h"
 #include "shell/cmd_power.h"
 #include "shell/cmd_unzip.h"
@@ -166,6 +177,9 @@ static const struct {
     {"/tmp", 'T'},
     {"/dev", 'D'},
     {"/host", 'H'},
+    /* The other node's card, when one is mounted.  A letter like any other:
+     * that is the whole point of doing it as a filesystem. */
+    {"/node", 'N'},
 };
 
 void ag_shell_dos_path(const char *posix_path, char *out, size_t n)
@@ -393,10 +407,244 @@ static bool narrow_screen(void)
     return s == NULL || s->cols < 60;
 }
 
+/*
+ * `mem /t`: the tasks, and their stacks - most of what a task costs, and the
+ * part of "used by the system" no other list names.  Largest first.
+ */
+static int mem_tasks(void)
+{
+    enum { MAX_TASKS = 48 };
+    ag_port_task_info_t *t =
+        ag_port_alloc(sizeof(*t) * MAX_TASKS, AG_MEM_BYTE);
+    if (t == NULL) {
+        ag_console_puts("mem: no memory for the list\n");
+        return 1;
+    }
+    uint32_t n = ag_port_task_list(t, MAX_TASKS);
+    const uint32_t all = n;
+    if (n > MAX_TASKS) {
+        n = MAX_TASKS;
+    }
+    for (uint32_t i = 1; i < n; i++) { /* a few dozen: insertion is enough */
+        const ag_port_task_info_t x = t[i];
+        uint32_t k = i;
+        while (k > 0 && t[k - 1].stack_bytes < x.stack_bytes) {
+            t[k] = t[k - 1];
+            k--;
+        }
+        t[k] = x;
+    }
+    uint32_t sum = 0, unused = 0;
+    ag_console_puts("  task              stack   unused  prio\n");
+    for (uint32_t i = 0; i < n; i++) {
+        ag_console_printf("  %-16s %6u  %6u  %4u\n", t[i].name,
+                          (unsigned)t[i].stack_bytes,
+                          (unsigned)t[i].stack_unused, t[i].prio);
+        sum += t[i].stack_bytes;
+        unused += t[i].stack_unused;
+    }
+    ag_console_printf("  %u tasks, %u KB of stacks, %u KB of it never used\n",
+                      (unsigned)all, (unsigned)(sum / 1024),
+                      (unsigned)(unused / 1024));
+    ag_port_free(t);
+    return 0;
+}
+
+/*
+ * `cpu [secs]`: who spends the processor, per core, sampled on the tick.
+ * The question "is it the wire or the board" needs this answer first: a
+ * board whose link tasks never get to run looks exactly like a slow wire.
+ */
+static int cmd_cpu(int argc, char **argv)
+{
+    enum { MAX_TASKS = 48 };
+    const uint32_t secs = (argc > 1) ? (uint32_t)atoi(argv[1]) : 3u;
+    /*
+     * THE TASKS BEFORE AS WELL AS AFTER (29 Sep 2026).  The list was taken
+     * when the sampling ended, and a task that spent the processor and then
+     * ended - a request's worker, a file's server - was "(ended)", a name
+     * that said nothing.  The list before names it; one made and gone
+     * inside the window is still unnamed, and says so.  A second list is
+     * the first thing given up when memory is short.
+     */
+    ag_port_task_info_t *t =
+        ag_port_alloc(sizeof(*t) * MAX_TASKS * 2u, AG_MEM_BYTE);
+    uint32_t before = 0;
+    if (t == NULL) {
+        t = ag_port_alloc(sizeof(*t) * MAX_TASKS, AG_MEM_BYTE);
+    } else {
+        before = ag_port_task_list(t + MAX_TASKS, MAX_TASKS);
+        if (before > MAX_TASKS) {
+            before = MAX_TASKS;
+        }
+    }
+    if (t == NULL) {
+        ag_console_puts("cpu: no memory for the list\n");
+        return 1;
+    }
+    ag_cpu_sample(true);
+    ag_port_task_delay(ag_port_ms_to_ticks(((secs == 0u) ? 1u : secs) * 1000u));
+    ag_cpu_sample(false);
+    uint32_t n = ag_port_task_list(t, MAX_TASKS);
+    if (n > MAX_TASKS) {
+        n = MAX_TASKS;
+    }
+    for (int core = 0; core < 2; core++) {
+        uint32_t       lost = 0;
+        const uint32_t total = ag_cpu_sampled_total(core, &lost);
+        if (total == 0u) {
+            continue;
+        }
+        ag_console_printf("core %d: %u ticks%s\n", core, (unsigned)total,
+                          (lost != 0u) ? " (some not placed)" : "");
+        /* largest first, a few dozen at most: pick the next largest each time */
+        uint32_t done_mask[2] = {0u, 0u};
+        for (;;) {
+            uint32_t best = 0, best_i = 0;
+            bool     any = false;
+            ag_port_task_t task = NULL, best_task = NULL;
+            uint32_t ticks = 0;
+            for (uint32_t i = 0; i < 64u && ag_cpu_sampled(core, i, &task, &ticks);
+                 i++) {
+                if ((done_mask[i / 32u] & (1u << (i % 32u))) == 0u &&
+                    (!any || ticks > best)) {
+                    best = ticks;
+                    best_i = i;
+                    best_task = task;
+                    any = true;
+                }
+            }
+            if (!any) {
+                break;
+            }
+            done_mask[best_i / 32u] |= 1u << (best_i % 32u);
+            const char *name = "(came and went)";
+            const char *gone = "";
+            unsigned    prio = 0;
+            bool        found = false;
+            for (uint32_t k = 0; k < n; k++) {
+                if (t[k].task == best_task) {
+                    name = t[k].name;
+                    prio = t[k].prio;
+                    found = true;
+                }
+            }
+            for (uint32_t k = 0; !found && k < before; k++) {
+                if (t[MAX_TASKS + k].task == best_task) {
+                    name = t[MAX_TASKS + k].name;
+                    prio = t[MAX_TASKS + k].prio;
+                    gone = " (ended)";
+                    found = true;
+                }
+            }
+            const uint32_t tenths = (uint32_t)((uint64_t)best * 1000u / total);
+            if (tenths == 0u) {
+                continue;
+            }
+            ag_console_printf("  %3u.%u%%  %-16s prio %u%s\n",
+                              (unsigned)(tenths / 10u),
+                              (unsigned)(tenths % 10u), name, prio, gone);
+        }
+    }
+    ag_port_free(t);
+    return 0;
+}
+
+/*
+ * mem /x: extended memory in address order.
+ *
+ * `mem` says the largest block is smaller than what is free, and stops there.
+ * On 8 Oct 2026 that gap was 102 KB on the S3-CAM under REMDISP, and it was
+ * exactly what kept Fallout's 6000 KB arena from starting next to its own
+ * 1651 KB of data - with 7654 KB free.  The question is what sits in the
+ * middle, and only a walk answers it.
+ *
+ * Blocks of MEM_MAP_BIG and over get a line each; the small ones between two
+ * big ones are one line, counted.  The walk only records: printing allocates,
+ * and the heap must not change under it.
+ */
+#define MEM_MAP_BIG   (16u * 1024u)
+#define MEM_MAP_LINES 64
+
+typedef struct {
+    uintptr_t addr;
+    size_t    used, free_bytes;
+    unsigned  count;
+    bool      big;
+} mem_map_line_t;
+
+typedef struct {
+    mem_map_line_t line[MEM_MAP_LINES];
+    unsigned       n;
+    bool           cut;
+} mem_map_t;
+
+static void mem_map_block(void *ctx, const void *addr, size_t bytes, int used)
+{
+    mem_map_t *m = (mem_map_t *)ctx;
+    const bool big = bytes >= MEM_MAP_BIG;
+    mem_map_line_t *last = (m->n > 0) ? &m->line[m->n - 1] : NULL;
+
+    if (!big && last != NULL && !last->big) {
+        last->count++;
+        if (used) {
+            last->used += bytes;
+        } else {
+            last->free_bytes += bytes;
+        }
+        return;
+    }
+    if (m->n == MEM_MAP_LINES) {
+        m->cut = true;
+        return;
+    }
+    mem_map_line_t *l = &m->line[m->n++];
+    l->addr = (uintptr_t)addr;
+    l->used = used ? bytes : 0;
+    l->free_bytes = used ? 0 : bytes;
+    l->count = 1;
+    l->big = big;
+}
+
+static int mem_map(void)
+{
+    static mem_map_t m;   /* 1.5 KB: not on the shell's stack */
+    memset(&m, 0, sizeof(m));
+    ag_port_mem_walk(AG_MEM_SLOW, mem_map_block, &m);
+    if (m.n == 0) {
+        ag_console_puts("  extended memory: none, or this port cannot walk it\n");
+        return 0;
+    }
+    ag_console_puts("  address      used KB   free KB\n");
+    for (unsigned i = 0; i < m.n; i++) {
+        const mem_map_line_t *l = &m.line[i];
+        if (l->big) {
+            ag_console_printf("  %08x  %8u  %8u\n", (unsigned)l->addr,
+                              (unsigned)(l->used / 1024),
+                              (unsigned)(l->free_bytes / 1024));
+        } else {
+            ag_console_printf("  %08x  %8u  %8u   %u small blocks\n",
+                              (unsigned)l->addr, (unsigned)(l->used / 1024),
+                              (unsigned)(l->free_bytes / 1024), l->count);
+        }
+    }
+    if (m.cut) {
+        ag_console_printf("  (more: only the first %u lines kept)\n",
+                          (unsigned)MEM_MAP_LINES);
+    }
+    return 0;
+}
+
 static int cmd_mem(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    if (argc > 1 && (strcmp(argv[1], "/x") == 0 ||
+                     strcmp(argv[1], "map") == 0)) {
+        return mem_map();
+    }
+    if (argc > 1 && (strcmp(argv[1], "/t") == 0 ||
+                     strcmp(argv[1], "tasks") == 0)) {
+        return mem_tasks();
+    }
 
     const size_t int_free = ag_port_mem_free(AG_MEM_FAST);
     const size_t int_total = ag_port_mem_total(AG_MEM_FAST);
@@ -628,27 +876,70 @@ static int cmd_boot(int argc, char **argv)
         return 0;
     }
 
-    static const char *const k_stage_names[AG_STAGE_COUNT] = {
-        "platform", "memory", "log",     "board",  "console",    "storage",
-        "config",   "devices", "media",  "modules", "supervisor", "shell",
+    /*
+     * EVERY stage, named by the enum it belongs to, and both halves of that are
+     * the fix for a fault that made this command unrunable.
+     *
+     * It was a plain list of twelve strings for a thirteen-value AG_STAGE_COUNT,
+     * and an array with fewer initialisers than its size is not an error in C:
+     * the rest is zero.  So `power` was missing, every stage from there down
+     * printed its neighbour's name, and the last one - AG_STAGE_SHELL, the
+     * thirteenth - was a NULL handed to `printf("  %-11s ok ...")`.  In this
+     * newlib that goes straight to `strlen(NULL)`: a Load access fault, from the
+     * one command whose whole job is to say what happened at boot.  It took the
+     * board down every time anybody asked it why the board had gone down.
+     *
+     * Designated initialisers with the kernel's own AG_STAGE_* names are what
+     * make the order right by construction, and the assertion is what makes a
+     * stage added to kernel.h a build error here rather than a NULL at run time
+     * - which is the part that would otherwise happen again, because nothing in
+     * this file tells you how many stages there are.
+     */
+    static const char *const k_stage_names[] = {
+        [AG_STAGE_PLATFORM]   = "platform",
+        [AG_STAGE_MEMORY]     = "memory",
+        [AG_STAGE_LOG]        = "log",
+        [AG_STAGE_BOARD]      = "board",
+        [AG_STAGE_CONSOLE]    = "console",
+        [AG_STAGE_STORAGE]    = "storage",
+        [AG_STAGE_CONFIG]     = "config",
+        [AG_STAGE_POWER]      = "power",
+        [AG_STAGE_DEVICES]    = "devices",
+        [AG_STAGE_MEDIA]      = "media",
+        [AG_STAGE_MODULES]    = "modules",
+        [AG_STAGE_SUPERVISOR] = "supervisor",
+        [AG_STAGE_SHELL]      = "shell",
     };
+
+    _Static_assert(sizeof(k_stage_names) / sizeof(k_stage_names[0]) ==
+                       AG_STAGE_COUNT,
+                   "every AG_STAGE_* needs a name in k_stage_names");
 
     const ag_boot_report_t *r = ag_boot_report();
 
     ag_console_printf("boot took %u us%s\n\n", (unsigned)r->boot_us,
                       r->degraded ? "  (degraded)" : "");
+    /* internal memory, as `mem` counts "used by the system": what the chip's
+     * layer held before the first stage, what each stage kept, what now */
+    ag_console_printf("  %-11s            %9s  %+7d B\n", "before", "",
+                      (int)r->entry_used);
     for (int i = 0; i < AG_STAGE_COUNT; i++) {
         if (r->stage_result[i] == -AG_ENOSYS) {
             ag_console_printf("  %-11s not implemented yet\n",
                               k_stage_names[i]);
         } else if (r->stage_result[i] == AG_OK) {
-            ag_console_printf("  %-11s ok         %6u us\n", k_stage_names[i],
-                              (unsigned)r->stage_us[i]);
+            ag_console_printf("  %-11s ok         %6u us  %+7d B\n",
+                              k_stage_names[i], (unsigned)r->stage_us[i],
+                              (int)r->stage_mem[i]);
         } else {
             ag_console_printf("  %-11s FAILED     err %d\n", k_stage_names[i],
                               (int)r->stage_result[i]);
         }
     }
+
+    ag_console_printf("  %-11s            %9s  %7u B\n", "in use now", "",
+                      (unsigned)(ag_port_mem_total(AG_MEM_FAST) -
+                                 ag_port_mem_free(AG_MEM_FAST)));
 
     ag_console_printf("\nrecovery: %s",
                       ag_boot_in_recovery() ? "ACTIVE" : "off");
@@ -705,6 +996,41 @@ static int cmd_ptr(int argc, char **argv)
     if (reports == 0) {
         ag_console_puts("nothing has reported: check `log` for what attached\n");
     }
+    return 0;
+}
+
+/* Defined further down with the other SYSTEM.CFG writers. */
+static ag_err_t cfg_replace_section(const char *section, const char *body);
+
+/*
+ * `mouse speed N`: how far the pointer goes, in per cent, now and after the
+ * next boot.  The file is what makes it last - a setting that is gone after a
+ * reset is a setting nobody trusts - so it is written at once, the [mouse]
+ * section replaced and the rest of SYSTEM.CFG left as it stands.
+ */
+static int cmd_mouse(int argc, char **argv)
+{
+    if (argc >= 3 && ag_path_icmp(argv[1], "speed") == 0) {
+        char *end = NULL;
+        const long want = strtol(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0') {
+            ag_console_puts("usage: mouse speed <10..1000>  (per cent)\n");
+            return 1;
+        }
+        const int32_t got = ag_hidptr_set_speed((int32_t)want);
+        char body[32];
+        snprintf(body, sizeof(body), "speed = %d\n", (int)got);
+        const ag_err_t err = cfg_replace_section("mouse", body);
+        ag_console_printf("mouse speed %d%%%s\n", (int)got,
+                          (err == AG_OK) ? ", saved to SYSTEM.CFG"
+                                         : ", NOT saved (SYSTEM.CFG not written)");
+        return (err == AG_OK) ? 0 : 1;
+    }
+    if (argc >= 2) {
+        ag_console_puts("usage: mouse [speed <10..1000>]\n");
+        return 1;
+    }
+    ag_console_printf("mouse speed %d%%\n", (int)ag_hidptr_speed());
     return 0;
 }
 #endif
@@ -988,24 +1314,17 @@ static int cmd_color(int argc, char **argv)
 
 static void print_load_error(const char *path, ag_err_t err)
 {
-    const char *why;
-
-    switch (-err) {
-    case AG_ENOENT:  why = "file not found"; break;
-    case AG_EFORMAT: why = "not an ArgonOS application"; break;
-    case AG_ENOTSUP: why = "built for a different processor"; break;
-    case AG_EABI:    why = "built for a different version of this system"; break;
-    case AG_ENOMEM:
-        why = "not enough memory (task stack / heap / code arena)";
-        break;
-    case AG_EBUSY:   why = "too many applications are loaded"; break;
-    case AG_ERANGE:  why = "too many arguments"; break;
-    case AG_EINVAL:  why = "is a driver; use 'drv load'"; break;
-    case AG_EEXIST:  why = "already loaded"; break;
-    case AG_ENFILE:  why = "too many modules are loaded"; break;
-    default:         why = "could not be loaded"; break;
-    }
-    ag_console_printf("%s: %s\n", path, why);
+    /*
+     * The loader's own words - see ag_loader_why().
+     *
+     * This used to be a table right here, which meant the shell's `run`
+     * explained itself in a sentence and every other path printed a bare
+     * number: a board refused an image built for the other instruction set
+     * and what reached the screen was "returned -45", which is correct,
+     * useless, and indistinguishable from a program that chose to return -45.
+     * A second copy of a user-facing table is a second copy to drift.
+     */
+    ag_console_printf("%s: %s\n", path, ag_loader_why(err));
 }
 
 static const char *shell_path_env(void)
@@ -1060,7 +1379,42 @@ static int spawn_in_slot(const char *path, int argc, char **argv,
         }
     }
 
-    if (ag_session_bind_to(pid, name, target_slot) != AG_OK) {
+    /*
+     * WHERE IT GOES, and the whole difference /b makes.
+     *
+     * A slot has one program, and the keyboard belongs to whoever holds the
+     * slot.  So binding a background program into the slot the shell is sitting
+     * in takes the keyboard away from the shell: the prompt is still drawn and
+     * still redrawn, and not one character typed at it is ever seen again -
+     * they go to a program that is not reading them.  That is not a background
+     * program, it is a foreground program with an invisible grip on the console.
+     *
+     * It cost a whole test run to see, because the symptom is that a command
+     * "did not arrive" rather than that the shell is deaf.
+     *
+     * So /b looks for any OTHER free slot and leaves this one alone.  Its
+     * output still reaches the journal and the log echo, which is where the
+     * output of something running in the background belongs.
+     */
+    bool placed = false;
+    if (detach_only) {
+        for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+            if (i == target_slot) {
+                continue;
+            }
+            if (ag_session_bind_to(pid, name, i) == AG_OK) {
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) {
+            /* Every other slot is taken.  Say so rather than quietly stealing
+             * the keyboard - the user can free a slot and try again. */
+            ag_console_puts("run /b: no free slot; it shares this one and the "
+                            "prompt will not answer until it ends\n");
+        }
+    }
+    if (!placed && ag_session_bind_to(pid, name, target_slot) != AG_OK) {
         /* Target slot already has an app — keep whatever free slot spawn used. */
         (void)ag_session_bind(pid, name);
     }
@@ -1150,9 +1504,226 @@ static int cmd_run(int argc, char **argv)
         ag_shell_resolve_cmd(argv[first], s_cwd, shell_path_env(), resolved,
                              sizeof(resolved));
     if (rerr != AG_OK) {
+        /*
+         * Not here.  If there is another node, ask it - and say so.
+         *
+         * This is the placement rule at its simplest and, it turns out, its
+         * most honest: the plan says move the process to the data, and the
+         * first datum a program needs is its own image.  A file that is on the
+         * other node IS the statement that the program belongs there, and it
+         * needs no manifest, no policy table and no names.
+         *
+         * The manifest was the intended source of this decision, and it still
+         * is for the harder half - "this program wants a sound card" cannot be
+         * read off a directory.  But it has a constraint nobody had noticed:
+         * to decide by manifest you must READ the manifest, which means
+         * reading the file, which means the file has to be reachable from the
+         * node deciding.  With one card per node it is not.  So the easy half
+         * is done by where the file is, and the hard half waits for the
+         * filesystem to cross the wire.
+         *
+         * Only for "no such file": a file that is here and will not load is a
+         * broken file, and running it somewhere else would turn one clear
+         * error into two confusing ones.
+         */
+        if (rerr == -AG_ENOENT && !detach_only && ag_linkprov_bound()) {
+            char line[AG_PATH_MAX + 64];
+            size_t at = 0;
+            for (int i = first; i < argc; i++) {
+                const size_t n = strlen(argv[i]);
+                if (at + n + 2u >= sizeof(line)) {
+                    at = 0;
+                    break;
+                }
+                if (at > 0) {
+                    line[at++] = ' ';
+                }
+                memcpy(line + at, argv[i], n);
+                at += n;
+            }
+            if (at > 0) {
+                line[at] = '\0';
+                ag_console_printf("not here; running it on %s\n",
+                                  ag_linkprov_active());
+                int32_t        code = 0;
+                const ag_err_t err = ag_nodeproc_run(line, 60000u, &code);
+                if (err == AG_OK) {
+                    if (code < 0) {
+                        ag_console_printf("did not run there either: %d\n",
+                                          (int)code);
+                        return 1;
+                    }
+                    /*
+                     * SAID, and in the same words a run that stayed here is
+                     * said in.  This printed nothing at all on success, so a
+                     * run that crossed the wire ended in silence: the program's
+                     * output arrived and then the prompt came back, with no way
+                     * to tell a program that finished from one still running
+                     * over there.  `link run` has always reported this - the
+                     * two ways of asking for the same thing answered
+                     * differently.
+                     *
+                     * It cost more than tidiness.  The harness waits for
+                     * "returned " to know a `run` is over (tools\qemu-boot.ps1)
+                     * and there was no such line, so every remote run in a
+                     * scripted scenario burned the whole command timeout -
+                     * seven minutes in xclutest - and the node it had been
+                     * talking to reached the end of its own script and exited
+                     * while it waited.  Anything asked after that got no answer
+                     * at all, which is where "a node serves exactly one remote
+                     * run per session" came from.  There was no such rule.
+                     */
+                    ag_console_printf("returned %d from %s\n", (int)code,
+                                      ag_linkprov_active());
+                    return (code == 0) ? 0 : 1;
+                }
+                /* Fall through to the local error: a neighbour that could not
+                 * run it does not change what is wrong here. */
+                ag_console_printf("  (the other node: %d)\n", (int)err);
+            }
+        }
         print_load_error(argv[first], rerr);
         return 1;
     }
+    /*
+     * The file is here.  The other half of placement: can this node do what the
+     * program says it needs, and if not, can the neighbour?
+     *
+     * The program moves and the FILE DOES NOT, which is the whole difficulty
+     * and the reason this waited for a filesystem over the wire: the far node
+     * has to read an image off this node's card.  It does that through its own
+     * view of us - `/node` there is this node's root - so the path sent over is
+     * the local one with that prefix.
+     */
+    if (!detach_only && ag_linkprov_bound()) {
+        ag_axe_header_t h;
+        if (ag_loader_peek(resolved, NULL, &h) == AG_OK) {
+            const uint32_t unmet = ag_proc_unmet_needs(h.flags);
+            /*
+             * A screen this node HAS but has already given away.
+             *
+             * Not an unmet need - the hardware is here and the loader would
+             * start the program quite happily, by taking the glass from
+             * whatever is on it.  That is the DOS answer and it is the wrong
+             * one for a system with two boards: the model Maxim asked for is a
+             * second monitor, where a new application opens on a screen nobody
+             * is using rather than on top of the one being watched.
+             *
+             * So this is a reason to look next door even when nothing is
+             * missing, and the neighbour answers the same question about its
+             * own glass before accepting.
+             */
+            const bool glass_taken =
+                (h.flags & AG_AXE_NEEDS_GFX) != 0 &&
+                ag_display_owner() != AG_PID_KERNEL;
+            if (unmet != 0 || glass_taken) {
+                /*
+                 * WHICH NEIGHBOUR.  The one `link use` last named was the only
+                 * one asked, so on the C3 between the Zero and the CYD a
+                 * program that needs a screen went to the Zero's framebuffer in
+                 * memory - 1 490 frames a second drawn where nobody could see -
+                 * with the CYD's panel one wire away (26 Sep 2026).  Asked of
+                 * the neighbour whose device fits (noderdev knows which screen
+                 * is a panel), then the selection is given back as it was.
+                 */
+                const int32_t  was_wire = ag_linkprov_current();
+                const uint16_t was_target = ag_linkprov_target();
+                const int32_t  best = ag_noderdev_wire_for(h.flags);
+                bool           moved = false;
+                if (best >= 0 && best != was_wire &&
+                    ag_linkprov_select(best) == AG_OK) {
+                    const char *peer = ag_node_peer_name_at(best);
+                    ag_linkprov_set_target(peer != NULL ? ag_node_hash(peer)
+                                                        : 0u);
+                    moved = true;
+                }
+                int rc = -1;
+                const int32_t there = ag_nodedev_can(h.flags, 8000u);
+                if (there == 1) {
+                    char line[AG_PATH_MAX + 64];
+                    int  at = snprintf(line, sizeof(line), "%s%s",
+                                       AG_NODEDRV_MOUNT, resolved);
+                    for (int i = first + 1; i < argc && at > 0; i++) {
+                        at += snprintf(line + at, sizeof(line) - (size_t)at,
+                                       " %s", argv[i]);
+                    }
+                    if (at > 0 && (size_t)at < sizeof(line)) {
+                        /*
+                         * Which reason, in the words of the reason.  "This
+                         * screen is busy" and "this board has no screen" lead
+                         * to the same place and are different facts, and an
+                         * operator who is told the wrong one goes looking for
+                         * hardware that is sitting in front of them.
+                         */
+                        /*
+                         * And in the journal, not only on the screen.
+                         *
+                         * "Where did my program go" is a question asked after
+                         * the fact, by somebody who was not watching - and the
+                         * console is twenty-five lines that an application may
+                         * own by then.  A placement decision that exists only
+                         * as a line that has scrolled away is a decision nobody
+                         * can audit.
+                         */
+                        ag_log(AG_LOG_INFO, "proc",
+                               "%s placed on %s (%s)", resolved,
+                               ag_linkprov_active(),
+                               (unmet == 0) ? "this screen is busy"
+                                            : "this node cannot");
+                        if (unmet == 0) {
+                            ag_console_printf(
+                                "this screen is busy; running it on %s\n",
+                                ag_linkprov_active());
+                        } else {
+                            ag_console_printf(
+                                "needs %s; running it on %s\n",
+                                ((unmet & AG_AXE_NEEDS_GFX) != 0) ? "a display"
+                                : ((unmet & AG_AXE_NEEDS_NET) != 0)
+                                    ? "networking"
+                                    : "audio",
+                                ag_linkprov_active());
+                        }
+                        int32_t        code = 0;
+                        const ag_err_t err = ag_nodeproc_run(line, 120000u,
+                                                             &code);
+                        if (err == AG_OK) {
+                            if (code < 0) {
+                                ag_console_printf(
+                                    "did not run there either: %d\n",
+                                    (int)code);
+                                rc = 1;
+                                goto placed;
+                            }
+                            /* The same sentence as the other placement path
+                             * above, for the same reason. */
+                            ag_console_printf("returned %d from %s\n",
+                                              (int)code,
+                                              ag_linkprov_active());
+                            rc = (code == 0) ? 0 : 1;
+                            goto placed;
+                        }
+                        ag_console_printf("  (the other node: %d)\n",
+                                          (int)err);
+                    }
+                }
+                /*
+                 * A neighbour that said no, or did not answer, changes nothing:
+                 * start it here and let the loader give its own clear refusal.
+                 * Guessing on its behalf would replace one true message with a
+                 * different one.
+                 */
+            placed:
+                if (moved) {
+                    (void)ag_linkprov_select(was_wire);
+                    ag_linkprov_set_target(was_target);
+                }
+                if (rc >= 0) {
+                    return rc;
+                }
+            }
+        }
+    }
+
     argv[first] = resolved;
     return launch_resolved(resolved, argc - first, &argv[first], detach_only,
                            system_core);
@@ -1178,6 +1749,56 @@ static int cmd_call(int argc, char **argv)
         return 1;
     }
     return ag_shell_run_script(resolved);
+}
+
+/*
+ * Move a running program to the other board.
+ *
+ * Everything this prints is about CONSENT, because that is what migration is
+ * here.  A program that never promised is refused by name rather than by a
+ * number; one that was asked and simply ended without handing anything over
+ * has DECLINED, and that is a legitimate answer which has to be said plainly -
+ * it is also gone, and an operator who is not told would look for it on the
+ * other board.
+ */
+static int cmd_migrate(int argc, char **argv)
+{
+    if (argc < 2) {
+        ag_console_puts("usage: migrate <pid>\n");
+        ag_console_puts("  asks it to move to the other node; it must have "
+                        "said it can\n");
+        return 1;
+    }
+    const ag_pid_t pid = (ag_pid_t)atoi(argv[1]);
+    if (pid <= 0) {
+        ag_console_printf("migrate: %s is not a pid\n", argv[1]);
+        return 1;
+    }
+
+    const ag_err_t e = ag_migrate_away(pid, 15000u);
+    switch (e) {
+    case AG_OK:
+        ag_console_printf("pid %d is now on %s\n", (int)pid,
+                          ag_linkprov_active());
+        return 0;
+    case -AG_ENOTSUP:
+        ag_console_printf("pid %d never said it could move\n", (int)pid);
+        return 1;
+    case -AG_ENODEV:
+        ag_console_puts("no link bound; there is nowhere to move it to\n");
+        return 1;
+    case -AG_EAGAIN:
+        ag_console_printf("pid %d ended without saving: it declined, and it "
+                          "is gone\n", (int)pid);
+        return 1;
+    case -AG_ETIMEDOUT:
+        ag_console_printf("pid %d did not answer; it is still here\n",
+                          (int)pid);
+        return 1;
+    default:
+        ag_console_printf("migrate %d: %d\n", (int)pid, (int)e);
+        return 1;
+    }
 }
 
 static int cmd_log(int argc, char **argv)
@@ -1272,6 +1893,49 @@ static int cmd_errorlevel(int argc, char **argv)
 
 static int cmd_reboot(int argc, char **argv)
 {
+    /*
+     * `reboot /download` comes back up as the chip's OWN ROM LOADER, so that
+     * something on the other end of a wire can flash this board - see
+     * docs/user/06-flashing-a-coprocessor.md.  It is the software half of the
+     * classic strap-and-reset dance, and it exists because on the boards this
+     * matters for the reset line is not brought out at all.
+     *
+     * A switch on `reboot` rather than a command of its own, because it IS a
+     * restart and a person looking for how to restart differently will look
+     * here.  What comes back is not this system, which is why it says so and
+     * why it says the price out loud.
+     */
+    if (argc >= 2 && (ag_path_icmp(argv[1], "/download") == 0 ||
+                      ag_path_icmp(argv[1], "/d") == 0)) {
+        if (!ag_port_download_boot_capable()) {
+            /*
+             * Said as the WIRING it implies, not as "unsupported".  The answer
+             * to this on an ESP32 is two wires and a flasher that drives them,
+             * which the person holding the board can act on; "not supported"
+             * is a dead end they would have to go and research.
+             */
+            ag_console_puts(
+                "this part has no software download boot: hold its boot pin "
+                "low\n  and pulse its reset line instead (ESPFLASH.AXE "
+                "-r <gpio0> <rst>)\n");
+            return 1;
+        }
+        /*
+         * THE PRICE, BEFORE THE FACT.  The bit lives in the RTC domain, a
+         * software reset does not clear it, and nothing in the ROM or in
+         * ESP-IDF clears it either.  A board sent here is a loader until it
+         * loses power - so anybody typing this on a board they cannot reach
+         * the plug of should know that before they press return, not after.
+         */
+        ag_console_puts(
+            "restarting as the ROM loader; it stays one until the power is "
+            "cut\n");
+        ag_console_sync();
+        ag_port_download_boot();
+        /* Only reached if the port declined after all. */
+        ag_console_puts("it did not go\n");
+        return 1;
+    }
     (void)argc;
     (void)argv;
 
@@ -1302,6 +1966,41 @@ static int cmd_ps(int argc, char **argv)
                           (unsigned)(info.mem_used / 1024u),
                           info.foreground ? "  (foreground)" : "");
         shown++;
+    }
+
+    /*
+     * And the other node, in the same table.  One `ps` for the system was asked
+     * for in the same breath as one `dev`, and for the same reason: how many
+     * boards there are is not the operator's problem.
+     */
+    if (ag_linkprov_bound()) {
+        ag_procinfo_t far_info[8];
+        const int32_t n = ag_nodeps_list(far_info, 8, 5000u);
+        const char   *peer = ag_node_peer_name();
+        if (n < 0) {
+            /*
+             * Said, not swallowed.  A neighbour that has stopped answering is
+             * news; an empty space where its processes were is not, and a `ps`
+             * that shows nothing for a board that has gone quiet is a `ps` that
+             * lies about the system.
+             */
+            ag_console_printf("  (%s did not answer: %d)\n",
+                              (peer != NULL) ? peer : "the other node", (int)n);
+        } else {
+            for (int32_t i = 0; i < n; i++) {
+                char qualified[40];
+                snprintf(qualified, sizeof(qualified), "%s.%u",
+                         (peer != NULL) ? peer : "there",
+                         (unsigned)far_info[i].pid);
+                ag_console_printf(
+                    "  %-4s %-17s %-12s %-7s %5u KB%s\n", qualified,
+                    far_info[i].name, ag_proc_state_name(far_info[i].state),
+                    ag_proc_prio_name((ag_proc_prio_t)far_info[i].priority),
+                    (unsigned)(far_info[i].mem_used / 1024u),
+                    far_info[i].foreground ? "  (foreground there)" : "");
+                shown++;
+            }
+        }
     }
 
     if (shown == 0) {
@@ -1378,8 +2077,74 @@ static void dev_flag_text(uint32_t flags, char *out, size_t len)
  * "what does this board have", which on a system whose whole point is being
  * brought up on an unknown board is the first question anybody asks.
  */
+/*
+ * `dev default [class [name|auto]]` - which device a class uses when a
+ * program names none: where sound comes out, which screen a program draws on.
+ * The names are the ones `dev` lists; a neighbour's devices are in that list
+ * like this board's own, and nothing here asks which wire one is on.
+ */
+static const struct {
+    const char    *word;
+    ag_dev_class_t cls;
+} k_default_classes[] = {
+    {"audio", AG_DEV_AUDIO},
+    {"display", AG_DEV_DISPLAY},
+    {"net", AG_DEV_NET},
+    {"input", AG_DEV_INPUT},
+};
+
+static int cmd_dev_default(int argc, char **argv)
+{
+    const size_t n = sizeof(k_default_classes) / sizeof(k_default_classes[0]);
+    if (argc < 3) {
+        for (size_t i = 0; i < n; i++) {
+            const char *c = ag_dev_default_chosen(k_default_classes[i].cls);
+            ag_console_printf("%-8s %s\n", k_default_classes[i].word,
+                              (c != NULL) ? c : "auto");
+        }
+        return 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (ag_path_icmp(argv[2], k_default_classes[i].word) != 0) {
+            continue;
+        }
+        const ag_dev_class_t cls = k_default_classes[i].cls;
+        if (argc < 4) {
+            const char *c = ag_dev_default_chosen(cls);
+            ag_console_printf("%s\n", (c != NULL) ? c : "auto");
+            return 0;
+        }
+        const bool automatic = ag_path_icmp(argv[3], "auto") == 0;
+        const ag_err_t err = ag_dev_default_choose(cls, automatic ? NULL : argv[3]);
+        if (err != AG_OK) {
+            ag_console_printf("dev default: %s\n",
+                              ag_loader_api()->sys->strerror(err));
+            return 1;
+        }
+        if (automatic) {
+            ag_console_printf("%s: back to the best there is\n", argv[2]);
+        } else if (strchr(argv[3], '+') != NULL) {
+            ag_device_t *g[8];
+            const int    n = ag_dev_default_group(cls, g, 8);
+            ag_console_printf("%s: all of %s - %d of them here now\n", argv[2],
+                              argv[3], n);
+        } else if (ag_dev_find(argv[3]) == NULL) {
+            ag_console_printf("%s: %s is not in the list (yet); nothing until it "
+                              "is\n", argv[2], argv[3]);
+        } else {
+            ag_console_printf("%s: %s\n", argv[2], argv[3]);
+        }
+        return 0;
+    }
+    ag_console_puts("usage: dev default [audio|display|net|input [name|auto]]\n");
+    return 1;
+}
+
 static int cmd_dev(int argc, char **argv)
 {
+    if (argc > 1 && ag_path_icmp(argv[1], "default") == 0) {
+        return cmd_dev_default(argc, argv);
+    }
     if (argc > 1) {
         ag_device_t *dev = ag_dev_find(argv[1]);
         if (dev == NULL) {
@@ -1442,6 +2207,54 @@ static int cmd_dev(int argc, char **argv)
 
     if (shown == 0) {
         ag_console_puts("no devices\n");
+    }
+
+    /*
+     * And the other node's, under a rule of its own.
+     *
+     * Asked for rather than cached: a cache would be a second answer to "what
+     * is there", and the moment the two disagree the operator believes the
+     * stale one.  It costs one message and one answer, and `dev` is not a hot
+     * path.
+     *
+     * Marked rather than renamed.  `n2.pcm0` is the decided form and it needs
+     * node names, which are what a THIRD board makes necessary - with two,
+     * "the other one" is unambiguous and a prefix would be ceremony.
+     */
+    if (ag_linkprov_bound()) {
+        ag_devinfo_t far_dev[12];
+        const int32_t n =
+            ag_nodedev_list(far_dev, (uint32_t)(sizeof(far_dev) /
+                                                sizeof(far_dev[0])), 3000);
+        if (n < 0) {
+            /* Said, not swallowed: a neighbour that has stopped answering is
+             * news, and an empty space where its devices were is not. */
+            ag_console_printf("\nthe other node did not answer (%d)\n", (int)n);
+        } else {
+            /*
+             * By name once it has given one.  "The other node" is enough for
+             * two boards and stops being enough at three - and a name is the
+             * only form of this that can be typed into a config file.
+             */
+            const char *peer = ag_node_peer_name();
+            if (peer != NULL) {
+                ag_console_printf("\non %s, over %s:\n", peer,
+                                  ag_linkprov_active());
+            } else {
+                ag_console_printf("\non the other node, over %s:\n",
+                                  ag_linkprov_active());
+            }
+            if (n == 0) {
+                ag_console_puts("  nothing\n");
+            }
+            for (int32_t i = 0; i < n; i++) {
+                ag_console_printf(narrow ? "  %-8s %-8s %s\n"
+                                         : "  %-9s %-9s %s\n",
+                                  far_dev[i].name,
+                                  ag_dev_class_name(far_dev[i].cls),
+                                  far_dev[i].driver);
+            }
+        }
     }
     return 0;
 }
@@ -1528,7 +2341,20 @@ static int cfg_has_device_line(const char *text, const char *dos_path)
     return 0;
 }
 
-#if AG_PORT_HAS_WIFI || AG_PORT_HAS_BT || \
+/*
+ * A radio the prompt can drive.  Not the same as a radio on this chip since ABI
+ * 0.48: `net use <dev>` binds one on a wire, and `wifi scan` has to work at
+ * this board's prompt or the operator is back to knowing which box holds which
+ * chip - which is the whole thing an external radio exists to avoid.  Every
+ * station call below goes through ag_netprov_wifi_*, which answers -AG_ENODEV
+ * while there is no radio anywhere.
+ *
+ * The access point and ESP-NOW halves keep the narrower gate: they need this
+ * chip's own radio, because RLINK carries the station half and no more.
+ */
+#define ARGON_SHELL_HAS_WIFI (AG_PORT_HAS_WIFI || AG_HAS_NET)
+
+#if ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID || \
     (defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH)
 
 /* Case-insensitive compare of a fixed length; the section name in the file may
@@ -1674,9 +2500,9 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
     return (w < 0) ? (ag_err_t)w : AG_OK;
 }
 
-#endif /* AG_PORT_HAS_WIFI || AG_PORT_HAS_BT || CONFIG_ARGON_NET_SSH */
+#endif /* ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID || CONFIG_ARGON_NET_SSH */
 
-#if AG_PORT_HAS_WIFI
+#if ARGON_SHELL_HAS_WIFI
 static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass,
                                 const uint8_t *bssid)
 {
@@ -1975,7 +2801,9 @@ static ag_err_t drv_copy_file(const char *src_abs, const char *dst_abs)
         return -AG_ENOMEM;
     }
 
-    while ((n = ag_vfs_read(in, chunk, sizeof(chunk))) > 0) {
+    /* DRV_COPY_CHUNK, not sizeof(chunk): the buffer is on the heap, so sizeof
+     * is four.  See the same fix in cmd_fs.c's copy for what that costs. */
+    while ((n = ag_vfs_read(in, chunk, DRV_COPY_CHUNK)) > 0) {
         size_t left = (size_t)n;
         size_t off = 0;
         while (left > 0) {
@@ -2257,7 +3085,7 @@ static int cmd_drv(int argc, char **argv)
         return 1;
     }
 
-    ag_console_puts("name      version  code       data       path\n");
+    ag_console_puts("name      version  code       data       held       path\n");
 
     uint32_t shown = 0;
     for (uint32_t i = 0;; i++) {
@@ -2268,11 +3096,15 @@ static int cmd_drv(int argc, char **argv)
 
         char code[16];
         char data[16];
+        char held[16];
         human_size(info.code_bytes, code, sizeof(code));
         human_size(info.data_bytes, data, sizeof(data));
+        /* what loading and starting it took from internal memory */
+        human_size(info.held_bytes > 0 ? (size_t)info.held_bytes : 0u, held,
+                   sizeof(held));
 
-        ag_console_printf("%-9s %-8s %-10s %-10s %s\n", info.name,
-                          info.version, code, data, info.path);
+        ag_console_printf("%-9s %-8s %-10s %-10s %-10s %s\n", info.name,
+                          info.version, code, data, held, info.path);
         shown++;
     }
 
@@ -2318,44 +3150,65 @@ static void io_show_pin(int pin)
  * because the moment you need them is before anything has been copied onto the
  * board - see docs/user/02-board-setup.md.
  */
-#if AG_PORT_HAS_WIFI
+#if ARGON_SHELL_HAS_WIFI
 
-static const char *wifi_auth_name(ag_wifi_auth_t a)
+/*
+ * The ABI's numbering, not the port's.  What arrives here may have been read
+ * off the air by a chip at the far end of a wire, which has no port types of
+ * ours at all; the two enums carry the same numbers on purpose, and ag_rlink.h
+ * says why renumbering either alone mislabels every network.
+ */
+static const char *wifi_auth_name(uint8_t a)
 {
     switch (a) {
-    case AG_WIFI_OPEN:       return "open";
-    case AG_WIFI_WEP:        return "WEP";
-    case AG_WIFI_WPA:        return "WPA";
-    case AG_WIFI_WPA2:       return "WPA2";
-    case AG_WIFI_WPA3:       return "WPA3";
-    case AG_WIFI_ENTERPRISE: return "802.1X";
-    default:                 return "?";
+    case AG_WIFI_SEC_OPEN:       return "open";
+    case AG_WIFI_SEC_WEP:        return "WEP";
+    case AG_WIFI_SEC_WPA:        return "WPA";
+    case AG_WIFI_SEC_WPA2:       return "WPA2";
+    case AG_WIFI_SEC_WPA3:       return "WPA3";
+    case AG_WIFI_SEC_ENTERPRISE: return "802.1X";
+    default:                     return "?";
     }
 }
 
-static const char *wifi_state_name(ag_wifi_state_t s)
+static const char *wifi_state_name(uint8_t s)
 {
     switch (s) {
-    case AG_WIFI_OFF:     return "off";
-    case AG_WIFI_IDLE:    return "on, not joined";
-    case AG_WIFI_JOINING: return "joining";
-    default:              return "joined";
+    case AG_WIFI_ST_OFF:     return "off";
+    case AG_WIFI_ST_IDLE:    return "on, not joined";
+    case AG_WIFI_ST_JOINING: return "joining";
+    default:                 return "joined";
     }
 }
 
 static int wifi_status(void)
 {
-    ag_port_wifi_status_t st;
-    const ag_err_t        err = ag_port_wifi_status(&st);
+    ag_wifi_status_t st;
+    const ag_err_t   err = ag_netprov_wifi_status(&st);
+    if (err == -AG_ENODEV) {
+        ag_console_puts("no radio: none on this board and none bound\n");
+        ag_console_puts("  `dev` for what is here, `net use <dev>` to bind one "
+                        "on a wire\n");
+        return 1;
+    }
     if (err != AG_OK) {
         ag_console_printf("wifi: %s\n", ag_loader_api()->sys->strerror(err));
         return 1;
     }
 
+    /*
+     * Which radio answered.  Silent for the built-in one, because saying "via
+     * builtin" at every prompt is noise; named otherwise, because that is the
+     * one fact about this board the numbers below cannot show.
+     */
+    if (!ag_netprov_is_builtin()) {
+        ag_console_printf("radio on %s\n", ag_netprov_active());
+    }
+
     ag_console_printf("radio %s\n", wifi_state_name(st.state));
     if (st.ssid[0] != '\0') {
         ag_console_printf("ssid %s", st.ssid);
-        if (st.state == AG_WIFI_JOINED) {
+        if (st.state == AG_WIFI_ST_JOINED) {
             ag_console_printf(", %d dBm, channel %u", (int)st.rssi,
                               (unsigned)st.channel);
         }
@@ -2377,9 +3230,19 @@ static int wifi_status(void)
     } else if (st.pinned) {
         ag_console_puts("pinned to an access point that has not answered\n");
     }
-    if (st.state != AG_WIFI_JOINED && st.last_reason != 0) {
+    if (st.state != AG_WIFI_ST_JOINED && st.last_reason != 0) {
+#if AG_PORT_HAS_WIFI
+        /*
+         * The names live in this chip's own radio driver.  A remote radio's
+         * codes are the same numbers - both ends are IDF - so the table still
+         * fits; a build without the driver prints the number, which is worse
+         * than a name and much better than nothing.
+         */
         ag_console_printf("last failure: %s\n",
-                          ag_port_wifi_reason(st.last_reason));
+                          ag_port_wifi_reason((int)st.last_reason));
+#else
+        ag_console_printf("last failure: reason %d\n", (int)st.last_reason);
+#endif
     }
     if (st.attempts > 1u) {
         ag_console_printf("%u attempts\n", (unsigned)st.attempts);
@@ -2391,7 +3254,7 @@ static int wifi_status(void)
                           (unsigned)((addr >> 16) & 0xffu),
                           (unsigned)((addr >> 8) & 0xffu),
                           (unsigned)(addr & 0xffu));
-    } else if (st.state == AG_WIFI_JOINED) {
+    } else if (st.state == AG_WIFI_ST_JOINED) {
         ag_console_puts("no address yet (DHCP)\n");
     }
 
@@ -2438,11 +3301,17 @@ static uint32_t s_scan_count;
 
 static int wifi_scan(void)
 {
-    ag_port_wifi_ap_t aps[WIFI_SCAN_MAX];
-    uint32_t          found = 0;
+    ag_wifi_ap_t aps[WIFI_SCAN_MAX];
+    uint32_t     found = 0;
 
     ag_console_puts("scanning...\n");
-    const ag_err_t err = ag_port_wifi_scan(aps, WIFI_SCAN_MAX, &found);
+    const ag_err_t err = ag_netprov_wifi_scan(aps, WIFI_SCAN_MAX, &found);
+    if (err == -AG_ENODEV) {
+        ag_console_puts("no radio: none on this board and none bound\n");
+        ag_console_puts("  `dev` for what is here, `net use <dev>` to bind one "
+                        "on a wire\n");
+        return 1;
+    }
     if (err == -AG_EBUSY) {
         /*
          * The radio cannot scan and associate at once, and a board that has
@@ -2450,8 +3319,8 @@ static int wifi_scan(void)
          * the answer every time, which reads as a broken command.  Say which
          * of the two it is and what stops it.
          */
-        ag_port_wifi_status_t st;
-        if (ag_port_wifi_status(&st) == AG_OK && st.ssid[0] != '\0') {
+        ag_wifi_status_t st;
+        if (ag_netprov_wifi_status(&st) == AG_OK && st.ssid[0] != '\0') {
             ag_console_printf("busy joining %s\n", st.ssid);
         } else {
             ag_console_puts("the radio is busy\n");
@@ -2584,9 +3453,22 @@ static int cmd_wifi(int argc, char **argv)
      * cannot.  Both radios are in every image; only one usually runs.
      */
     if (ag_path_icmp(argv[1], "on") == 0) {
-        const size_t before = ag_port_mem_free(AG_MEM_FAST);
+        /*
+         * The memory arithmetic below is about THIS chip's radio.  A radio at
+         * the far end of a wire costs this board nothing to switch on, and
+         * printing "took 0 KB" about it would be a measurement of the wrong
+         * board - so the whole report is skipped when it is not ours.
+         */
+        const bool   ours = ag_netprov_is_builtin();
+        const size_t before = ours ? ag_port_mem_free(AG_MEM_FAST) : 0u;
 
-        const ag_err_t err = ag_net_init();
+        const ag_err_t err = ag_netprov_wifi_start();
+        if (err == -AG_ENODEV) {
+            ag_console_puts("no radio: none on this board and none bound\n");
+            ag_console_puts("  `dev` for what is here, `net use <dev>` to bind "
+                            "one on a wire\n");
+            return 1;
+        }
         if (err != AG_OK) {
             ag_console_printf("wifi on: %s\n",
                               ag_loader_api()->sys->strerror(err));
@@ -2606,15 +3488,20 @@ static int cmd_wifi(int argc, char **argv)
          * So the numbers are printed rather than left to be guessed, and a
          * margin too thin to associate in says so before anyone tries.
          */
-        const size_t after = ag_port_mem_free(AG_MEM_FAST);
-        ag_console_printf("radio on: took %u KB, %u KB free\n",
-                          (unsigned)((before - after) / 1024u),
-                          (unsigned)(after / 1024u));
-        if (after < 24u * 1024u) {
-            ag_console_puts(
-                "  that is thin: association and DHCP want ~16 KB more.\n"
-                "  if the board resets while joining, this is why - stop what\n"
-                "  else is running, or use a build with less in it.\n");
+        if (ours) {
+            const size_t after = ag_port_mem_free(AG_MEM_FAST);
+            ag_console_printf("radio on: took %u KB, %u KB free\n",
+                              (unsigned)((before - after) / 1024u),
+                              (unsigned)(after / 1024u));
+            if (after < 24u * 1024u) {
+                ag_console_puts(
+                    "  that is thin: association and DHCP want ~16 KB more.\n"
+                    "  if the board resets while joining, this is why - stop "
+                    "what\n"
+                    "  else is running, or use a build with less in it.\n");
+            }
+        } else {
+            ag_console_printf("radio on %s\n", ag_netprov_active());
         }
 
         const char *ssid = ag_cfg_get(ag_sysconfig(), "wifi.ssid", NULL);
@@ -2626,7 +3513,7 @@ static int cmd_wifi(int argc, char **argv)
             const bool  have_pin =
                 (pinned != NULL) && ag_mac_parse(pinned, bssid);
 
-            (void)ag_port_wifi_connect(
+            (void)ag_netprov_wifi_connect(
                 ssid, ag_cfg_get(ag_sysconfig(), "wifi.pass", ""),
                 have_pin ? bssid : NULL);
             ag_console_printf("joining %s%s\n", ssid,
@@ -2712,7 +3599,7 @@ static int cmd_wifi(int argc, char **argv)
             }
         }
 
-        const ag_err_t err = ag_port_wifi_connect(ssid, pass, bssid);
+        const ag_err_t err = ag_netprov_wifi_connect(ssid, pass, bssid);
         if (err != AG_OK) {
             ag_console_printf("wifi connect: %s\n",
                               ag_loader_api()->sys->strerror(err));
@@ -2987,16 +3874,27 @@ static int cmd_wifi(int argc, char **argv)
 #endif /* AG_PORT_WIFI_HAS_AP */
 
     if (ag_path_icmp(argv[1], "off") == 0) {
-        const size_t before = ag_port_mem_free(AG_MEM_FAST);
-        (void)ag_port_wifi_stop();
-        const size_t after = ag_port_mem_free(AG_MEM_FAST);
-        ag_console_printf("radio off, %u KB back\n",
-                          (unsigned)((after - before) / 1024u));
+        /* As with `on`: the kilobytes are this chip's, so only count them when
+         * the radio being stopped is this chip's. */
+        const bool   ours = ag_netprov_is_builtin();
+        const size_t before = ours ? ag_port_mem_free(AG_MEM_FAST) : 0u;
+        const ag_err_t err = ag_netprov_wifi_stop();
+        if (err == -AG_ENODEV) {
+            ag_console_puts("no radio to stop\n");
+            return 1;
+        }
+        if (ours) {
+            const size_t after = ag_port_mem_free(AG_MEM_FAST);
+            ag_console_printf("radio off, %u KB back\n",
+                              (unsigned)((after - before) / 1024u));
+        } else {
+            ag_console_printf("radio off on %s\n", ag_netprov_active());
+        }
         return 0;
     }
 
     if (ag_path_icmp(argv[1], "forget") == 0) {
-        (void)ag_port_wifi_disconnect();
+        (void)ag_netprov_wifi_disconnect();
         const ag_err_t cerr = cfg_ensure_wifi(NULL, NULL, NULL);
         if (cerr != AG_OK) {
             ag_console_printf("SYSTEM.CFG: %d\n", (int)cerr);
@@ -3021,7 +3919,7 @@ static int cmd_wifi(int argc, char **argv)
     return 1;
 }
 
-#endif /* AG_PORT_HAS_WIFI */
+#endif /* ARGON_SHELL_HAS_WIFI */
 
 #if AG_PORT_HAS_ESPNOW
 
@@ -4906,6 +5804,29 @@ static int cmd_kill(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * `kill n2.7` stops it on the other node.  The same spelling `ps` prints,
+     * which is the whole point of printing it that way: what an operator reads
+     * off the screen has to be what they can type back.
+     */
+    char     node[AG_NODE_NAME_MAX];
+    ag_pid_t parsed = 0;
+    if (ag_nodeps_split(argv[1], node, sizeof(node), &parsed)) {
+        const char *peer = ag_node_peer_name();
+        if (peer == NULL || strcmp(peer, node) != 0) {
+            ag_console_printf("no node called %s is here\n", node);
+            return 1;
+        }
+        const ag_err_t rerr = ag_nodeps_kill(parsed, 5000u);
+        if (rerr != AG_OK) {
+            ag_console_printf("%s.%u: %d\n", node, (unsigned)parsed,
+                              (int)rerr);
+            return 1;
+        }
+        ag_console_printf("%s.%u stopped\n", node, (unsigned)parsed);
+        return 0;
+    }
+
     const ag_pid_t pid = (ag_pid_t)atoi(argv[1]);
     if (pid <= 0) {
         ag_console_puts("pid must be a number above zero\n");
@@ -5270,13 +6191,15 @@ static int cmd_guard(int argc, char **argv)
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
-    {"mem", "", "memory usage", cmd_mem},
+    {"mem", "[/t|/x]", "memory usage; /t: every task and its stack; /x: extended memory block by block", cmd_mem},
+    {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
     {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
      cmd_boot},
     {"log", "[-n N|clear]", "system journal", cmd_log},
 #if AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID
     {"ptr", "", "where the pointer is, and how much it has said", cmd_ptr},
+    {"mouse", "[speed N]", "pointer speed in per cent, kept in SYSTEM.CFG", cmd_mouse},
 #endif
     {"uptime", "", "time since reset", cmd_uptime},
     {"date", "[set D T | sync [srv]]", "show the clock, or set it", cmd_date},
@@ -5289,7 +6212,8 @@ static const ag_command_t k_commands[] = {
     {"fm", "[left] [right]", "file manager, two panels", cmd_fm},
     {"edit", "[file]", "create or edit a text file", cmd_edit},
     {"gfxdump", "[/live] <file.ppm>", "save framebuffer as PPM", cmd_gfxdump},
-    {"dev", "[name]", "list devices, or describe one", cmd_dev},
+    {"dev", "[name | default [class [name|auto]]]",
+     "list devices, describe one, or choose a class's default", cmd_dev},
     {"drv", "[load|unload|install|uninstall|probe]",
      "modules: list, load, install to C:, unload, I2C probe", cmd_drv},
     {"io", "[pin [mode]] | i2c <bus> | spi <bus> <hex...> | xclk <pin> [hz] | adc [ch]",
@@ -5300,7 +6224,7 @@ static const ag_command_t k_commands[] = {
     {"beep", "[hz] [ms]", "a tone on /dev/pcm0", cmd_beep},
     {"power", "[full|eco|doze|screen on|off|auto on|off]",
      "the clock, the screen, and what applications make of it", ag_cmd_power},
-#if AG_PORT_HAS_WIFI
+#if ARGON_SHELL_HAS_WIFI
     {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|ap <ssid> [pass]|power <dBm>|forget]",
      "the radio", cmd_wifi},
 #endif
@@ -5312,6 +6236,11 @@ static const ag_command_t k_commands[] = {
     {"mon", "[on|off|watch|hop|channel <n>|tx <hex>|deauth <bssid>|beacon]",
      "watch the air and inject frames", cmd_mon},
 #endif
+    /* The wire to another node of this system.  Not gated on networking:
+     * a link is not a network, and a board with no radio and no stack still
+     * has a neighbour if one is wired to it. */
+    {"link", "[use <dev>|none | run | get | mount [N:] | ping [n]]",
+     "the wire to another node of this system", ag_cmd_link},
 #if AG_HAS_NET
     {"net", "[wait|resolve <name>|sockets]",
      "address, waiting, names into addresses, and what the stack holds",
@@ -5366,7 +6295,8 @@ static const ag_command_t k_commands[] = {
     {"prio", "<slot|pid> [low|normal|high]", "show or set process priority",
      cmd_prio},
     {"slots", "", "list session slots (* = focused)", cmd_slots},
-    {"kill", "<pid>", "stop an application", cmd_kill},
+    {"kill", "<pid|node.pid>", "stop an application, here or on the other node", cmd_kill},
+    {"migrate", "<pid>", "move a running program to the other node", cmd_migrate},
     {"fg", "<slot|pid>", "focus a session slot (or pid's slot)", cmd_fg},
     {"dir", "[path]", "list a directory", ag_cmd_dir},
     {"cd", "[path]", "change directory", ag_cmd_cd},
@@ -5385,7 +6315,8 @@ static const ag_command_t k_commands[] = {
     {"run", "[/b] <file> [args]", "run an application or .bat script", cmd_run},
     {"call", "<script.bat>", "run a shell command script", cmd_call},
     {"errorlevel", "", "exit code of the last command", cmd_errorlevel},
-    {"reboot", "", "restart the board", cmd_reboot},
+    {"reboot", "[/download]", "restart the board (/download: as the ROM loader)",
+     cmd_reboot},
     {NULL, NULL, NULL, NULL},
 };
 

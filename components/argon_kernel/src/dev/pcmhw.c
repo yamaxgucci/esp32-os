@@ -26,6 +26,7 @@
 #include "argon/log.h"
 
 #include <argon/port/audio.h>
+#include <argon/port/time.h>
 
 #include "io.h" /* ag_io_i2c_up, for a board whose output is a codec */
 
@@ -70,10 +71,26 @@ static void hw_close(void)
     }
 }
 
+/*
+ * A FAILED START IS NOT TRIED AGAIN ON THE NEXT WRITE.  A write comes every
+ * period, and a converter that cannot start - no DMA memory for its
+ * descriptors - was tried again every six milliseconds, each failure four
+ * lines from the driver below: the Zero spent 64% of a core printing them,
+ * its picture stopped going out, and its console could not be heard over them
+ * (26 Sep 2026).  After a failure the next try waits a second, then two, then
+ * four, up to eight; the writes in between are refused at once.
+ */
+static int64_t  s_retry_us;
+static uint32_t s_backoff_ms;
+
 static ag_err_t hw_open(void)
 {
     if (s_hw_open) {
         return AG_OK;
+    }
+    const int64_t now = ag_port_us();
+    if (s_retry_us != 0 && now < s_retry_us) {
+        return -AG_EIO;
     }
     /*
      * A codec has to be woken before it is clocked, and waking it is I2C.
@@ -94,8 +111,17 @@ static ag_err_t hw_open(void)
         }
     }
     if (!ag_port_audio_open(s_fmt.rate, s_fmt.channels)) {
+        s_backoff_ms = (s_backoff_ms == 0u) ? 1000u
+                       : (s_backoff_ms < 8000u) ? s_backoff_ms * 2u
+                                                : 8000u;
+        s_retry_us = now + (int64_t)s_backoff_ms * 1000;
+        ag_log(AG_LOG_WARN, TAG,
+               "the converter would not start (no DMA memory?); trying again "
+               "in %u ms", (unsigned)s_backoff_ms);
         return -AG_EIO;
     }
+    s_retry_us = 0;
+    s_backoff_ms = 0;
     s_hw_open = true;
     return AG_OK;
 }
@@ -167,6 +193,95 @@ static ag_err_t pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
     return -AG_ENOTSUP;
 }
 
+/*
+ * WHAT A CLICK IS, COUNTED (27 Sep 2026).  Every counter the sound had was a
+ * piece turned away, and Maxim heard clicks far more often than any of them
+ * said: the converter running out between two pieces that both arrived.  The
+ * converter has no word for that here, so its clock is kept instead - frames
+ * given since a start against the time since it, at the stream's rate.  When
+ * the time has run past the frames by more than DRY_SLACK_US the converter
+ * played nothing for that long.  A pause of DRY_STOP_US or more is a sound
+ * that ended, not a click.
+ */
+#define DRY_SLACK_US 2000
+#define DRY_STOP_US  300000
+static int64_t  s_dry_t0_us;
+static uint64_t s_dry_frames;
+static uint32_t s_dry_times, s_dry_max_us;
+/*
+ * AND WHEN (29 Sep 2026).  Maxim hears clicks at the start and none after;
+ * a count cannot say which.  The first few are kept as milliseconds since
+ * the first sound this board played, the top bit set for a pause of
+ * DRY_STOP_US or more - which the count leaves out as a sound that ended,
+ * and which at the start of one may be exactly what is heard.
+ */
+#define DRY_KEEP 8u
+#define DRY_PAUSE_BIT 0x80000000u
+static int64_t  s_dry_first_us;
+static uint32_t s_dry_at[DRY_KEEP];
+static uint32_t s_dry_at_n, s_dry_pauses;
+
+static void count_dry(uint32_t frames)
+{
+    const int64_t now = ag_port_us();
+    const uint32_t rate = (s_fmt.rate != 0u) ? s_fmt.rate : 22050u;
+    if (s_dry_first_us == 0) {
+        s_dry_first_us = now;
+    }
+    /*
+     * What the converter holds ahead of what it is playing covers a late
+     * piece: the S3's I2S chain is 960 frames, 43 ms at 22 kHz, and a clock
+     * that counted from the first write called every 3 ms late a click
+     * (27 Sep 2026).  Late by more than the chain is silence.
+     */
+    const int32_t chain = ag_port_audio_space();
+    const int64_t slack = DRY_SLACK_US +
+                          ((chain > 0) ? (int64_t)chain * 1000000 / rate : 0);
+    if (s_dry_t0_us != 0) {
+        const int64_t played_until =
+            s_dry_t0_us + (int64_t)(s_dry_frames * 1000000u / rate);
+        const int64_t late = now - played_until;
+        if (late > slack) {
+            if (late < DRY_STOP_US) {
+                s_dry_times++;
+                if ((uint32_t)late > s_dry_max_us) {
+                    s_dry_max_us = (uint32_t)late;
+                }
+            } else {
+                s_dry_pauses++;
+            }
+            if (s_dry_at_n < DRY_KEEP) {
+                const uint32_t at =
+                    (uint32_t)((now - s_dry_first_us) / 1000) & ~DRY_PAUSE_BIT;
+                s_dry_at[s_dry_at_n++] =
+                    at | ((late >= DRY_STOP_US) ? DRY_PAUSE_BIT : 0u);
+            }
+            s_dry_t0_us = 0; /* a new start */
+        }
+    }
+    if (s_dry_t0_us == 0) {
+        s_dry_t0_us = now;
+        s_dry_frames = 0;
+    }
+    s_dry_frames += frames;
+}
+
+void ag_pcmhw_dry(uint32_t *times, uint32_t *longest_us)
+{
+    *times = s_dry_times;
+    *longest_us = s_dry_max_us;
+}
+
+uint32_t ag_pcmhw_dry_at(uint32_t *at_ms, uint32_t cap, uint32_t *pauses)
+{
+    const uint32_t n = (s_dry_at_n < cap) ? s_dry_at_n : cap;
+    for (uint32_t i = 0; i < n; i++) {
+        at_ms[i] = s_dry_at[i];
+    }
+    *pauses = s_dry_pauses;
+    return n;
+}
+
 static int32_t pcm_write(ag_device_t *dev, const void *buf, size_t len,
                          uint64_t off)
 {
@@ -195,6 +310,7 @@ static int32_t pcm_write(ag_device_t *dev, const void *buf, size_t len,
     }
     s_frames_in += frames;
     s_frames_out += (uint64_t)done;
+    count_dry((uint32_t)done);
 
     /*
      * Bytes accepted, which is what a caller checks against what it asked for.
@@ -319,6 +435,20 @@ ag_err_t ag_pcmhw_init(void)
 ag_err_t ag_pcmhw_init(void)
 {
     return AG_OK; /* nothing to register, and that is not a failure */
+}
+
+void ag_pcmhw_dry(uint32_t *times, uint32_t *longest_us)
+{
+    *times = 0;
+    *longest_us = 0;
+}
+
+uint32_t ag_pcmhw_dry_at(uint32_t *at_ms, uint32_t cap, uint32_t *pauses)
+{
+    (void)at_ms;
+    (void)cap;
+    *pauses = 0;
+    return 0;
 }
 
 #endif

@@ -9,6 +9,7 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
+#include "ag_bc.h"
 #include "cc_compile.h"
 
 #ifdef AG_HOST
@@ -40,6 +41,13 @@ static void cc_free(void *p)
 #define CODE_BASE 0x42000000u
 #define DATA_BASE 0x3C000000u
 #define AXE_HDR   176u
+/*
+ * And the same header with ireloc_offset / ireloc_count on the end, which a
+ * RISC-V image needs and an Xtensa one has no use for.  Two sizes rather than
+ * one because header_size is how a loader that predates those fields knows to
+ * stop before them - see the note on ag_axe_header_t.
+ */
+#define AXE_HDR_I 184u
 
 /*
  * Code may exceed the IRAM arena (CONFIG_ARGON_APP_ARENA_KB, 192 on S3): the
@@ -88,12 +96,24 @@ static void cc_free(void *p)
 #define MAX_LOCAL_WORDS 224
 #define FRAME_TOP_SAVE 32
 #define MAX_PARAMS 6
+/* Returns in one function, and instruction relocations in one image. */
+#define MAX_RET_SITES 128
+#define MAX_IRELOCS   8192
 
 #define AG_AXE_R_IN_DATA 0x1u
 #define AG_AXE_R_TO_DATA 0x2u
+/* Relocations inside an instruction, which only RISC-V has.  The names and the
+ * bits are ag_axe_ireloc_t's in sdk/include/argon/axe.h; the compiler has no
+ * headers of its own, so they are repeated here and asserted against the real
+ * ones in host-tests/test_cc.c. */
+#define AG_AXE_I_TO_DATA 0x10000000u
+#define AG_AXE_I_HI20    0x20000000u
+#define AG_AXE_I_LO12_I  0x40000000u
+#define AG_AXE_I_LO12_S  0x60000000u
 #define AG_AXE_NEEDS_GFX (1u << 1)
 #define AG_AXE_DRIVER (1u << 3)
 #define AG_AXE_NEEDS_AUDIO (1u << 6)
+#define AG_AXE_CAN_MIGRATE (1u << 8)
 
 #define RET_VOID 0
 #define RET_BOOL 1
@@ -148,6 +168,8 @@ typedef enum {
     T_STRING,
     T_INT,
     T_CHAR,
+    T_UNSIGNED,
+    T_SIGNED,
     T_VOID,
     T_RETURN,
     T_IF,
@@ -165,6 +187,7 @@ typedef enum {
     T_SIZEOF,
     T_CONST,
     T_VOLATILE,
+    T_STATIC,
     T_LPAREN,
     T_RPAREN,
     T_LBRACE,
@@ -267,8 +290,15 @@ typedef struct {
     char       exp[EXP_CAP];
     cc_read_file_fn reader;
     void      *reader_ctx;
-    /* #pragma drv "NAME" "VER" "AUTHOR" — header identity for .SYS images. */
+    /*
+     * #pragma drv "NAME" "VER" "AUTHOR" — header identity for .SYS images,
+     * and #pragma app for the same three fields of a .AXE.  One set of
+     * strings because it is one set of header fields; has_drv is what decides
+     * whether the image is a driver, and has_app only that somebody said.
+     */
     int        has_drv;
+    int        has_app;
+    int        can_migrate; /* #pragma migrate */
     char       drv_name[32];
     char       drv_ver[16];
     char       drv_author[32];
@@ -827,6 +857,53 @@ static void pp_directive(lex_t *L)
             skip_line(L);
             return;
         }
+        /*
+         * #pragma app "NAME" "VER" "AUTHOR" - what this program IS.
+         *
+         * Every image this compiler produced was called "TCC 0.2 cc", which
+         * was harmless while a program only ever ran where it was built and
+         * fatal the moment one travels: a cluster spanning two instruction
+         * sets hands a far board the program's NAME and asks for its own
+         * build of it (cluster.md 3b).  Two boards that had both compiled
+         * their own copy would both answer to "TCC", and the far one would
+         * run whichever image it happened to find first.
+         *
+         * The same three strings a driver already gives, because it is the
+         * same three fields in the same header - a program is not a lesser
+         * kind of image, it just had nobody to tell.
+         */
+        if (CC_STRCMP(kind, "app") == 0) {
+            if (!pp_qstr(L, L->pp->drv_name, sizeof(L->pp->drv_name)) ||
+                !pp_qstr(L, L->pp->drv_ver, sizeof(L->pp->drv_ver)) ||
+                !pp_qstr(L, L->pp->drv_author, sizeof(L->pp->drv_author))) {
+                if (!L->err) {
+                    lex_fail(L,
+                             "expected #pragma app \"NAME\" \"VER\" \"AUTHOR\"");
+                }
+                return;
+            }
+            if (L->pp->drv_name[0] == '\0') {
+                lex_fail(L, "empty program name in #pragma app");
+                return;
+            }
+            L->pp->has_app = 1;
+            skip_line(L);
+            return;
+        }
+        /*
+         * #pragma migrate - this program can be asked to move to another
+         * board, and promises to save what it needs when asked.
+         *
+         * A flag rather than something the compiler could work out: only the
+         * author knows whether the state the program keeps is all of it.  A
+         * program that claims this and does not answer the request is simply
+         * left where it is, so the claim costs nothing but a missed handover.
+         */
+        if (CC_STRCMP(kind, "migrate") == 0) {
+            L->pp->can_migrate = 1;
+            skip_line(L);
+            return;
+        }
         if (CC_STRCMP(kind, "appstack") == 0) {
             uint32_t n = 0;
             if (!pp_u32(L, &n) || n == 0) {
@@ -917,6 +994,12 @@ static tok_t kw(const char *s)
     if (CC_STRCMP(s, "char") == 0) {
         return T_CHAR;
     }
+    if (CC_STRCMP(s, "unsigned") == 0) {
+        return T_UNSIGNED;
+    }
+    if (CC_STRCMP(s, "signed") == 0) {
+        return T_SIGNED;
+    }
     if (CC_STRCMP(s, "struct") == 0) {
         return T_STRUCT;
     }
@@ -967,6 +1050,9 @@ static tok_t kw(const char *s)
     }
     if (CC_STRCMP(s, "const") == 0) {
         return T_CONST;
+    }
+    if (CC_STRCMP(s, "static") == 0) {
+        return T_STATIC;
     }
     if (CC_STRCMP(s, "volatile") == 0) {
         return T_VOLATILE;
@@ -1230,7 +1316,20 @@ static void lex_next(lex_t *L)
                 } else {
                     break;
                 }
-                if (v > (int32_t)((0x7fffffffu - (uint32_t)d) / 16u)) {
+                /*
+                 * A HEX CONSTANT MAY FILL THE WORD.  0x80000000 and
+                 * 0xffffffff are how a mask, a top bit and an all-ones are
+                 * written, and refusing them because they do not fit a SIGNED
+                 * int made every such program unwritable - which mattered
+                 * little while there were no unsigned types and matters a
+                 * great deal now that there are.  The value is kept as the
+                 * same 32 bits either way; what it MEANS is decided by what
+                 * it is compared or divided against.
+                 *
+                 * Decimal below is left alone: `4294967295` written out is far
+                 * more likely to be a typo than an intention.
+                 */
+                if ((uint32_t)v > ((0xffffffffu - (uint32_t)d) / 16u)) {
                     lex_fail(L, "integer constant too large");
                     return;
                 }
@@ -1533,12 +1632,21 @@ typedef struct {
     int kind;
     int esize;
     int sidx;
+    /* Counts upwards only: see type_t.  Of the ELEMENT for an array or a
+     * pointer, which is what a load off it yields. */
+    int uns;
 } ptype_t;
 
 typedef struct {
     char    name[MAX_NAME];
     int     off;
     int     nwords;
+    /*
+     * And the exact byte count, which nwords cannot answer: it is rounded up
+     * to a word, so `char b[5]` stores 2 and `sizeof b` must say 5.  Kept for
+     * sizeof alone - everything else works in words or in elements.
+     */
+    int     nbytes;
     ptype_t t;
 } sym_t;
 
@@ -1556,16 +1664,10 @@ typedef struct {
     field_t fields[MAX_FIELDS];
 } struct_t;
 
-static ptype_t ty_scalar(int esize)
-{
-    ptype_t t = {PK_SCALAR, esize, -1};
-    return t;
-}
-
 /* What one element of an array, or the target of a pointer, is. */
 static ptype_t ty_elem(const ptype_t *t)
 {
-    ptype_t e = {PK_SCALAR, t->esize, t->sidx};
+    ptype_t e = {PK_SCALAR, t->esize, t->sidx, t->uns};
     if (t->sidx >= 0) {
         e.kind = PK_STRUCT;
     }
@@ -1592,12 +1694,14 @@ typedef struct {
     int    is_void;
 } func_t;
 
-/* A typedef is only a name for an existing type (optional pointer). */
+/* A typedef is only a name for an existing type (optional pointer).  This is
+ * what makes `typedef unsigned int uint32_t;` mean what it says. */
 typedef struct {
     char name[MAX_NAME];
     int  esize;
     int  sidx;
     int  is_ptr;
+    int  uns;
 } tdef_t;
 
 typedef struct {
@@ -1640,6 +1744,20 @@ typedef struct {
     int      needs_gfx;
     int      needs_audio;
     int      min_abi;
+    int      arch; /* cc_arch_t: which back end below is in use */
+    /*
+     * Relocations that live inside an instruction, which only RISC-V has:
+     * there is no literal pool there, an address is built by a lui/addi pair
+     * carrying it in their immediate fields, and relocating one means
+     * rewriting the instruction.  Two words an entry, allocated on first use
+     * so an Xtensa compile never pays for it.  See ag_axe_ireloc_t.
+     */
+    uint32_t *irel;
+    int       nirel;
+    /* Where each `return` in the function being written jumps to be given the
+     * epilogue: on RISC-V the frame size is not known when they are emitted. */
+    size_t   ret_site[MAX_RET_SITES];
+    int      nret;
     int      spill_top;
     int      err;
     char     errmsg[160];
@@ -1690,7 +1808,15 @@ static void emit3(gen_t *g, uint8_t a, uint8_t b, uint8_t c)
     emit_raw(g, x, 3);
 }
 
-static void emit_entry(gen_t *g, int framesize)
+/* ---- the Xtensa back end ------------------------------------------------ */
+/*
+ * Everything below here down to the seam knows what an Xtensa instruction
+ * looks like, and nothing above or below it does.  The names begin xt_ for
+ * exactly that reason: a call to one of them from the parser is a leak, and a
+ * leak with a name is one a reader can see.
+ */
+
+static void xt_entry(gen_t *g, int framesize)
 {
     const int imm = framesize / 8;
     emit3(g, 0x36, (uint8_t)(((imm & 0xf) << 4) | 1), (uint8_t)(imm >> 4));
@@ -1702,7 +1828,7 @@ static void emit_entry(gen_t *g, int framesize)
  * and rewritten with the real one.  Sizing every frame at the maximum instead
  * would cost each call the deepest function's stack.
  */
-static void patch_entry(gen_t *g, size_t site, int framesize)
+static void xt_patch_entry(gen_t *g, size_t site, int framesize)
 {
     if (site + 2 >= g->len || g->code[site] != 0x36) {
         gfail(g, "bad entry site");
@@ -1713,12 +1839,12 @@ static void patch_entry(gen_t *g, size_t site, int framesize)
     g->code[site + 2] = (uint8_t)(imm >> 4);
 }
 
-static void emit_retw_n(gen_t *g)
+static void xt_retw_n(gen_t *g)
 {
     emit2(g, 0x1d, 0xf0);
 }
 
-static void emit_mov_n(gen_t *g, int ad, int as)
+static void xt_mov_n(gen_t *g, int ad, int as)
 {
     emit2(g, (uint8_t)((ad << 4) | 0x0d), (uint8_t)as);
 }
@@ -1741,7 +1867,7 @@ static int add_lit(gen_t *g, uint8_t kind, uint32_t val_or_off)
     return li;
 }
 
-static void emit_l32r_lit(gen_t *g, int at, int li)
+static void xt_l32r_lit(gen_t *g, int at, int li)
 {
     if (li < 0 || li >= g->nlit) {
         gfail(g, "bad literal index");
@@ -1758,7 +1884,7 @@ static void emit_l32r_lit(gen_t *g, int at, int li)
     emit3(g, (uint8_t)((at << 4) | 0x1), 0xff, 0xff);
 }
 
-static void emit_movi(gen_t *g, int at, int32_t imm)
+static void xt_movi(gen_t *g, int at, int32_t imm)
 {
     if (imm >= -32 && imm <= 95) {
         const uint32_t u = (uint32_t)imm & 0x7fu;
@@ -1776,70 +1902,86 @@ static void emit_movi(gen_t *g, int at, int32_t imm)
     if (li < 0) {
         return;
     }
-    emit_l32r_lit(g, at, li);
+    xt_l32r_lit(g, at, li);
 }
 
-static void emit_li_data(gen_t *g, int at, uint32_t data_off)
+static void xt_li_data(gen_t *g, int at, uint32_t data_off)
 {
     const int li = add_lit(g, LIT_DATA_OFF, data_off);
     if (li < 0) {
         return;
     }
-    emit_l32r_lit(g, at, li);
+    xt_l32r_lit(g, at, li);
 }
 
-static void emit_li_code(gen_t *g, int at, uint32_t code_off)
+static void xt_li_code(gen_t *g, int at, uint32_t code_off)
 {
     const int li = add_lit(g, LIT_CODE_OFF, code_off);
     if (li < 0) {
         return;
     }
-    emit_l32r_lit(g, at, li);
+    xt_l32r_lit(g, at, li);
 }
 
-static void emit_add_n(gen_t *g, int ar, int as, int at)
+static void xt_add_n(gen_t *g, int ar, int as, int at)
 {
     emit2(g, (uint8_t)((at << 4) | 0x0a), (uint8_t)((ar << 4) | as));
 }
 
-static void emit_rrr(gen_t *g, uint8_t opc, int ar, int as, int at)
+static void xt_rrr(gen_t *g, uint8_t opc, int ar, int as, int at)
 {
     emit3(g, (uint8_t)((at << 4) | 0x0), (uint8_t)((ar << 4) | as), opc);
 }
 
-static void emit_sub(gen_t *g, int ar, int as, int at)
+static void xt_sub(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0xc0, ar, as, at);
+    xt_rrr(g, 0xc0, ar, as, at);
 }
 
-static void emit_mull(gen_t *g, int ar, int as, int at)
+static void xt_mull(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0x82, ar, as, at);
+    xt_rrr(g, 0x82, ar, as, at);
 }
 
-static void emit_quos(gen_t *g, int ar, int as, int at)
+static void xt_quos(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0xd2, ar, as, at);
+    xt_rrr(g, 0xd2, ar, as, at);
 }
 
-static void emit_rems(gen_t *g, int ar, int as, int at)
+static void xt_rems(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0xf2, ar, as, at);
+    xt_rrr(g, 0xf2, ar, as, at);
 }
 
-static void emit_and(gen_t *g, int ar, int as, int at)
+/*
+ * The same two, counting upwards only.  QUOU and REMU sit beside QUOS and REMS
+ * in the same encoding group - 0xc and 0xe where those are 0xd and 0xf - which
+ * is the ISA saying the two kinds of division are the same instruction with a
+ * different idea of the top bit.
+ */
+static void xt_quou(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0x10, ar, as, at);
+    xt_rrr(g, 0xc2, ar, as, at);
 }
 
-static void emit_or(gen_t *g, int ar, int as, int at)
+static void xt_remu(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0x20, ar, as, at);
+    xt_rrr(g, 0xe2, ar, as, at);
 }
 
-static void emit_xor(gen_t *g, int ar, int as, int at)
+static void xt_and(gen_t *g, int ar, int as, int at)
 {
-    emit_rrr(g, 0x30, ar, as, at);
+    xt_rrr(g, 0x10, ar, as, at);
+}
+
+static void xt_or(gen_t *g, int ar, int as, int at)
+{
+    xt_rrr(g, 0x20, ar, as, at);
+}
+
+static void xt_xor(gen_t *g, int ar, int as, int at)
+{
+    xt_rrr(g, 0x30, ar, as, at);
 }
 
 /*
@@ -1847,41 +1989,104 @@ static void emit_xor(gen_t *g, int ar, int as, int at)
  * takes its operand in the s field and SRA in the t field - an asymmetry of the
  * ISA, not of this compiler.
  */
-static void emit_ssl(gen_t *g, int as)
+static void xt_ssl(gen_t *g, int as)
 {
     emit3(g, 0x00, (uint8_t)(0x10 | as), 0x40);
 }
 
-static void emit_ssr(gen_t *g, int as)
+static void xt_ssr(gen_t *g, int as)
 {
     emit3(g, 0x00, (uint8_t)as, 0x40);
 }
 
-static void emit_sll(gen_t *g, int ar, int as)
+static void xt_sll(gen_t *g, int ar, int as)
 {
     emit3(g, 0x00, (uint8_t)((ar << 4) | as), 0xa1);
 }
 
-static void emit_sra(gen_t *g, int ar, int at)
+static void xt_sra(gen_t *g, int ar, int at)
 {
     emit3(g, (uint8_t)(at << 4), (uint8_t)(ar << 4), 0xb1);
 }
 
+/* SRL, the same shape as SRA and the same asymmetry: the operand is in t.  It
+ * shifts zeros in where SRA shifts the sign, which is the whole difference
+ * between `>>` on a count and `>>` on a measurement. */
+static void xt_srl(gen_t *g, int ar, int at)
+{
+    emit3(g, (uint8_t)(at << 4), (uint8_t)(ar << 4), 0x91);
+}
+
 /* SLLI encodes 32 - sa, which is why a shift by 0 has no encoding at all. */
-static void emit_slli(gen_t *g, int ar, int as, int sa)
+static void xt_slli(gen_t *g, int ar, int as, int sa)
 {
     const int inv = 32 - sa;
     emit3(g, (uint8_t)((inv & 0xf) << 4), (uint8_t)((ar << 4) | as),
           (uint8_t)(((inv >> 4) << 4) | 0x1));
 }
 
-static void emit_srai(gen_t *g, int ar, int at, int sa)
+static void xt_srai(gen_t *g, int ar, int at, int sa)
 {
     emit3(g, (uint8_t)(at << 4), (uint8_t)((ar << 4) | (sa & 0xf)),
           (uint8_t)(((0x2 | (sa >> 4)) << 4) | 0x1));
 }
 
-static void emit_l8ui(gen_t *g, int at, int as, int off)
+/*
+ * Shifting, as four operations, because this is the other place a machine
+ * shows through.  Xtensa has no shift-by-register instruction: the count goes
+ * into the shift-amount register first (SSL for left, SSR for right) and the
+ * shift itself then reads it.  A machine with an ordinary three-register shift
+ * needs none of that, and the parser should not have to know which it is on.
+ *
+ * xt_shr_i USES REGISTER 9 when the value is unsigned, for the reason
+ * written at its body; every caller has 9 free, and a caller that has not must
+ * not use it.
+ */
+static void xt_shl_rr(gen_t *g, int dst, int lhs, int amt)
+{
+    xt_ssl(g, amt);
+    xt_sll(g, dst, lhs);
+}
+
+static void xt_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
+{
+    xt_ssr(g, amt);
+    if (uns) {
+        xt_srl(g, dst, lhs);
+    } else {
+        xt_sra(g, dst, lhs);
+    }
+}
+
+static void xt_shl_i(gen_t *g, int dst, int src, int sa)
+{
+    if (sa == 0) {
+        return;
+    }
+    xt_slli(g, dst, src, sa);
+}
+
+static void xt_shr_i(gen_t *g, int dst, int src, int sa, int uns)
+{
+    if (sa == 0) {
+        return;
+    }
+    if (!uns) {
+        xt_srai(g, dst, src, sa);
+        return;
+    }
+    /*
+     * Through the shift-amount register even for a constant.  SRLI exists but
+     * takes a four-bit count, so it cannot shift by more than 15 - and a right
+     * shift by 16 or more is exactly what a program taking the top half of a
+     * word does.  One extra instruction beats a silent wrong answer above 15.
+     */
+    xt_movi(g, 9, sa);
+    xt_ssr(g, 9);
+    xt_srl(g, dst, src);
+}
+
+static void xt_l8ui(gen_t *g, int at, int as, int off)
 {
     if (off < 0 || off > 255) {
         gfail(g, "bad load offset");
@@ -1890,7 +2095,7 @@ static void emit_l8ui(gen_t *g, int at, int as, int off)
     emit3(g, (uint8_t)((at << 4) | 0x2), (uint8_t)as, (uint8_t)off);
 }
 
-static void emit_s8i(gen_t *g, int at, int as, int off)
+static void xt_s8i(gen_t *g, int at, int as, int off)
 {
     if (off < 0 || off > 255) {
         gfail(g, "bad store offset");
@@ -1900,7 +2105,7 @@ static void emit_s8i(gen_t *g, int at, int as, int off)
           (uint8_t)off);
 }
 
-static void emit_l32i(gen_t *g, int at, int as, int off)
+static void xt_l32i(gen_t *g, int at, int as, int off)
 {
     if ((off & 3) != 0 || off < 0 || off > 1020) {
         gfail(g, "bad load offset");
@@ -1915,7 +2120,7 @@ static void emit_l32i(gen_t *g, int at, int as, int off)
     }
 }
 
-static void emit_s32i(gen_t *g, int at, int as, int off)
+static void xt_s32i(gen_t *g, int at, int as, int off)
 {
     if ((off & 3) != 0 || off < 0 || off > 1020) {
         gfail(g, "bad store offset");
@@ -1930,12 +2135,12 @@ static void emit_s32i(gen_t *g, int at, int as, int off)
     }
 }
 
-static void emit_callx8(gen_t *g, int as)
+static void xt_call_reg(gen_t *g, int as)
 {
     emit3(g, 0xe0, (uint8_t)as, 0x00);
 }
 
-static void emit_j_to(gen_t *g, size_t from_off, size_t target_off)
+static void xt_j_to(gen_t *g, size_t from_off, size_t target_off)
 {
     const int32_t imm = (int32_t)target_off - (int32_t)(from_off + 4);
     if (imm < -131072 || imm > 131071) {
@@ -1952,7 +2157,7 @@ static void emit_j_to(gen_t *g, size_t from_off, size_t target_off)
     g->code[from_off + 2] = (uint8_t)(w >> 16);
 }
 
-static void emit_j_placeholder(gen_t *g, size_t *site)
+static void xt_j_placeholder(gen_t *g, size_t *site)
 {
     *site = g->len;
     emit3(g, 0x46, 0x00, 0x00);
@@ -1961,11 +2166,14 @@ static void emit_j_placeholder(gen_t *g, size_t *site)
 enum {
     B_BEQ = 0x1,
     B_BLT = 0x2,
+    /* Counting upwards only: BLTU sits beside BLT, BGEU beside BGE. */
+    B_BLTU = 0x3,
     B_BGE = 0xa,
+    B_BGEU = 0xb,
     B_BNE = 0x9
 };
 
-static void emit_b_rr(gen_t *g, int opn, int as, int at, size_t from_off,
+static void xt_b_rr(gen_t *g, int opn, int as, int at, size_t from_off,
                       size_t target_off)
 {
     const int32_t imm = (int32_t)target_off - (int32_t)(from_off + 4);
@@ -1978,27 +2186,1088 @@ static void emit_b_rr(gen_t *g, int opn, int as, int at, size_t from_off,
     g->code[from_off + 2] = (uint8_t)imm;
 }
 
-static void emit_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
+static void xt_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
 {
     *site = g->len;
     emit3(g, (uint8_t)((at << 4) | 0x7), (uint8_t)((opn << 4) | as), 0x00);
 }
 
-static void patch_b(gen_t *g, size_t site, size_t target)
+static void xt_patch_b(gen_t *g, size_t site, size_t target)
 {
-    emit_b_rr(g, (g->code[site + 1] >> 4) & 0xf, g->code[site + 1] & 0xf,
+    xt_b_rr(g, (g->code[site + 1] >> 4) & 0xf, g->code[site + 1] & 0xf,
               (g->code[site] >> 4) & 0xf, site, target);
 }
 
-static void emit_setlt(gen_t *g, int ar, int as, int at)
+static void xt_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
 {
     size_t blt_site, j_site;
-    emit_b_placeholder(g, B_BLT, as, at, &blt_site);
-    emit_movi(g, ar, 0);
-    emit_j_placeholder(g, &j_site);
-    patch_b(g, blt_site, g->len);
-    emit_movi(g, ar, 1);
-    emit_j_to(g, j_site, g->len);
+    xt_b_placeholder(g, uns ? B_BLTU : B_BLT, as, at, &blt_site);
+    xt_movi(g, ar, 0);
+    xt_j_placeholder(g, &j_site);
+    xt_patch_b(g, blt_site, g->len);
+    xt_movi(g, ar, 1);
+    xt_j_to(g, j_site, g->len);
+}
+
+
+/* ---- the RISC-V back end ------------------------------------------------ */
+/*
+ * RV32IM, which is what every RISC-V part in this project has (C3, C6, H2,
+ * P4).  Written out rather than assembled because there is no assembler here
+ * and because the whole of what this compiler emits is a few dozen shapes.
+ *
+ * THE TWO THINGS THAT ARE NOT LIKE XTENSA, and they are the whole of the work:
+ *
+ *  - There is no literal pool.  An address is built by `lui` with its top
+ *    twenty bits and `addi` with its low twelve, and the loader relocates it
+ *    by rewriting those two instructions - ag_axe_ireloc_t, which already
+ *    exists because images built on a PC for the C3 need exactly this.
+ *
+ *  - There is no register window.  A function's arguments arrive where the
+ *    caller put them (a0..a5) instead of eight registers along, and nothing
+ *    saves the return address for us, so the prologue does.  And the frame
+ *    size is not known until the body has been read, which on Xtensa costs one
+ *    rewritten ENTRY and here would cost an immediate in every `return` - so
+ *    every return JUMPS to one epilogue, written when the size is known.
+ *
+ * Registers, mapping the seam's numbers onto the machine:
+ *      7  the frame     -> s0 (x8), callee-saved, so it survives a call
+ *      8  the value     -> t0 (x5)
+ *      9  the other one -> t1 (x6)
+ *  10..15 arguments     -> a0..a5, which ARE x10..x15
+ * and an answer comes back in a0, which is number 10 - the same as on the
+ * windowed machine, where the callee's a2 is the caller's a10.
+ */
+
+#define RV_ZERO 0
+#define RV_RA   1
+#define RV_SP   2
+#define RV_S0   8
+
+static int rvr(int v)
+{
+    switch (v) {
+    case 7:
+        return RV_S0;
+    case 8:
+        return 5; /* t0 */
+    case 9:
+        return 6; /* t1 */
+    default:
+        return v; /* 10..15 are a0..a5 already */
+    }
+}
+
+static void rv_word(gen_t *g, uint32_t w)
+{
+    const uint8_t b[4] = {(uint8_t)w, (uint8_t)(w >> 8), (uint8_t)(w >> 16),
+                          (uint8_t)(w >> 24)};
+    emit_raw(g, b, 4);
+}
+
+static uint32_t rv_enc_r(uint32_t f7, int rs2, int rs1, uint32_t f3, int rd,
+                         uint32_t op)
+{
+    return (f7 << 25) | ((uint32_t)rs2 << 20) | ((uint32_t)rs1 << 15) |
+           (f3 << 12) | ((uint32_t)rd << 7) | op;
+}
+
+static uint32_t rv_enc_i(int32_t imm, int rs1, uint32_t f3, int rd,
+                         uint32_t op)
+{
+    return (((uint32_t)imm & 0xfffu) << 20) | ((uint32_t)rs1 << 15) |
+           (f3 << 12) | ((uint32_t)rd << 7) | op;
+}
+
+static uint32_t rv_enc_s(int32_t imm, int rs2, int rs1, uint32_t f3,
+                         uint32_t op)
+{
+    const uint32_t u = (uint32_t)imm & 0xfffu;
+    return ((u >> 5) << 25) | ((uint32_t)rs2 << 20) | ((uint32_t)rs1 << 15) |
+           (f3 << 12) | ((u & 0x1fu) << 7) | op;
+}
+
+/* ---- instructions, in real register numbers ---------------------------- */
+
+static void rvi_alu(gen_t *g, uint32_t f7, uint32_t f3, int rd, int rs1,
+                    int rs2)
+{
+    rv_word(g, rv_enc_r(f7, rs2, rs1, f3, rd, 0x33u));
+}
+
+static void rvi_addi(gen_t *g, int rd, int rs1, int32_t imm)
+{
+    if (imm < -2048 || imm > 2047) {
+        gfail(g, "immediate out of range");
+        return;
+    }
+    rv_word(g, rv_enc_i(imm, rs1, 0x0u, rd, 0x13u));
+}
+
+static void rvi_shifti(gen_t *g, uint32_t f7, uint32_t f3, int rd, int rs1,
+                       int sa)
+{
+    if (sa < 0 || sa > 31) {
+        gfail(g, "bad shift count");
+        return;
+    }
+    rv_word(g, rv_enc_r(f7, sa, rs1, f3, rd, 0x13u));
+}
+
+static void rvi_lw(gen_t *g, int rd, int rs1, int32_t off)
+{
+    if (off < -2048 || off > 2047) {
+        gfail(g, "bad load offset");
+        return;
+    }
+    rv_word(g, rv_enc_i(off, rs1, 0x2u, rd, 0x03u));
+}
+
+static void rvi_lbu(gen_t *g, int rd, int rs1, int32_t off)
+{
+    if (off < -2048 || off > 2047) {
+        gfail(g, "bad load offset");
+        return;
+    }
+    rv_word(g, rv_enc_i(off, rs1, 0x4u, rd, 0x03u));
+}
+
+static void rvi_sw(gen_t *g, int rs2, int rs1, int32_t off)
+{
+    if (off < -2048 || off > 2047) {
+        gfail(g, "bad store offset");
+        return;
+    }
+    rv_word(g, rv_enc_s(off, rs2, rs1, 0x2u, 0x23u));
+}
+
+static void rvi_sb(gen_t *g, int rs2, int rs1, int32_t off)
+{
+    if (off < -2048 || off > 2047) {
+        gfail(g, "bad store offset");
+        return;
+    }
+    rv_word(g, rv_enc_s(off, rs2, rs1, 0x0u, 0x23u));
+}
+
+/* ---- the seam's operations --------------------------------------------- */
+
+static void rv_mov_n(gen_t *g, int ad, int as)
+{
+    rvi_addi(g, rvr(ad), rvr(as), 0);
+}
+
+static void rv_movi(gen_t *g, int at, int32_t imm)
+{
+    const int rd = rvr(at);
+    if (imm >= -2048 && imm <= 2047) {
+        rvi_addi(g, rd, RV_ZERO, imm);
+        return;
+    }
+    /*
+     * ADDI sign-extends its twelve bits, so the top half has to be rounded up
+     * whenever the low half will come back negative.  Getting this wrong is
+     * off by exactly 4096 for half of all constants, which is the kind of
+     * mistake that passes every test written with small numbers.
+     */
+    const int32_t  lo = (int32_t)(((uint32_t)imm & 0xfffu) ^ 0x800u) - 0x800;
+    const uint32_t hi = ((uint32_t)imm - (uint32_t)lo) & 0xfffff000u;
+    rv_word(g, hi | ((uint32_t)rd << 7) | 0x37u); /* lui rd, hi */
+    if (lo != 0) {
+        rvi_addi(g, rd, rd, lo);
+    }
+}
+
+static void rv_ireloc(gen_t *g, uint32_t site, uint32_t kind, uint32_t target,
+                      int to_data)
+{
+    if (g->irel == NULL) {
+        g->irel = (uint32_t *)CC_ALLOC((size_t)MAX_IRELOCS * 8u);
+        if (g->irel == NULL) {
+            gfail(g, "out of memory");
+            return;
+        }
+        g->nirel = 0;
+    }
+    if (g->nirel >= MAX_IRELOCS) {
+        gfail(g, "too many address references");
+        return;
+    }
+    g->irel[g->nirel * 2] = site | kind | (to_data ? AG_AXE_I_TO_DATA : 0u);
+    g->irel[g->nirel * 2 + 1] = target;
+    g->nirel++;
+}
+
+/*
+ * An address, as a lui/addi pair the loader will fill in.  Both go out holding
+ * zero: ireloc_patch writes the whole field rather than adding to it, which is
+ * what makes applying an entry twice harmless - and the streamed XIP path does
+ * apply some of them twice, from both sides of a page boundary.
+ *
+ * The ADDI is always emitted, even for an address whose low twelve bits will
+ * turn out to be zero: which bits they are is not known until the image is
+ * loaded, and an instruction that is not there cannot be patched.
+ */
+static void rv_li_part(gen_t *g, int at, uint32_t off, int to_data)
+{
+    const int rd = rvr(at);
+    rv_ireloc(g, (uint32_t)g->len, AG_AXE_I_HI20, off, to_data);
+    rv_word(g, ((uint32_t)rd << 7) | 0x37u); /* lui rd, 0 */
+    rv_ireloc(g, (uint32_t)g->len, AG_AXE_I_LO12_I, off, to_data);
+    rvi_addi(g, rd, rd, 0);
+}
+
+static void rv_li_data(gen_t *g, int at, uint32_t data_off)
+{
+    rv_li_part(g, at, data_off, 1);
+}
+
+static void rv_li_code(gen_t *g, int at, uint32_t code_off)
+{
+    rv_li_part(g, at, code_off, 0);
+}
+
+static void rv_add_n(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x00u, 0x0u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_sub(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x20u, 0x0u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_mull(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x01u, 0x0u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_quos(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x01u, 0x4u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_rems(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x01u, 0x6u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_quou(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x01u, 0x5u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_remu(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x01u, 0x7u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_and(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x00u, 0x7u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_or(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x00u, 0x6u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_xor(gen_t *g, int ar, int as, int at)
+{
+    rvi_alu(g, 0x00u, 0x4u, rvr(ar), rvr(as), rvr(at));
+}
+
+static void rv_shl_rr(gen_t *g, int dst, int lhs, int amt)
+{
+    rvi_alu(g, 0x00u, 0x1u, rvr(dst), rvr(lhs), rvr(amt));
+}
+
+static void rv_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
+{
+    rvi_alu(g, uns ? 0x00u : 0x20u, 0x5u, rvr(dst), rvr(lhs), rvr(amt));
+}
+
+static void rv_shl_i(gen_t *g, int dst, int src, int sa)
+{
+    if (sa == 0) {
+        return;
+    }
+    rvi_shifti(g, 0x00u, 0x1u, rvr(dst), rvr(src), sa);
+}
+
+/*
+ * Unlike the Xtensa one this needs no register for the count and no warning
+ * about which: SRLI takes a full five-bit shift, so there is nothing here that
+ * cannot shift a word by twenty.
+ */
+static void rv_shr_i(gen_t *g, int dst, int src, int sa, int uns)
+{
+    if (sa == 0) {
+        return;
+    }
+    rvi_shifti(g, uns ? 0x00u : 0x20u, 0x5u, rvr(dst), rvr(src), sa);
+}
+
+static void rv_l8ui(gen_t *g, int at, int as, int off)
+{
+    rvi_lbu(g, rvr(at), rvr(as), off);
+}
+
+static void rv_s8i(gen_t *g, int at, int as, int off)
+{
+    rvi_sb(g, rvr(at), rvr(as), off);
+}
+
+static void rv_l32i(gen_t *g, int at, int as, int off)
+{
+    rvi_lw(g, rvr(at), rvr(as), off);
+}
+
+static void rv_s32i(gen_t *g, int at, int as, int off)
+{
+    rvi_sw(g, rvr(at), rvr(as), off);
+}
+
+static void rv_call_reg(gen_t *g, int as)
+{
+    rv_word(g, rv_enc_i(0, rvr(as), 0x0u, RV_RA, 0x67u)); /* jalr ra, 0(rs) */
+}
+
+/* ---- jumps and branches ------------------------------------------------- */
+
+static void rv_j_to(gen_t *g, size_t from_off, size_t target_off)
+{
+    const int32_t imm = (int32_t)target_off - (int32_t)from_off;
+    if (imm < -1048576 || imm > 1048574 || (imm & 1) != 0) {
+        gfail(g, "jump too far");
+        return;
+    }
+    if (from_off + 4u > g->len) {
+        gfail(g, "bad jump site");
+        return;
+    }
+    const uint32_t u = (uint32_t)imm;
+    const uint32_t w = 0x6fu | (((u >> 20) & 1u) << 31) |
+                       (((u >> 1) & 0x3ffu) << 21) | (((u >> 11) & 1u) << 20) |
+                       (((u >> 12) & 0xffu) << 12);
+    g->code[from_off] = (uint8_t)w;
+    g->code[from_off + 1] = (uint8_t)(w >> 8);
+    g->code[from_off + 2] = (uint8_t)(w >> 16);
+    g->code[from_off + 3] = (uint8_t)(w >> 24);
+}
+
+static void rv_j_placeholder(gen_t *g, size_t *site)
+{
+    *site = g->len;
+    rv_word(g, 0x6fu); /* jal zero, 0 */
+}
+
+/*
+ * The seam's condition numbers are Xtensa's, and this is where they become the
+ * other machine's.  A translation rather than a renumbering, because those
+ * numbers are written at a dozen places in the parser and renumbering them is
+ * a change that does not show up in a diff of the file that matters.
+ */
+static uint32_t rv_cond(int opn)
+{
+    switch (opn) {
+    case B_BEQ:
+        return 0x0u;
+    case B_BNE:
+        return 0x1u;
+    case B_BLT:
+        return 0x4u;
+    case B_BGE:
+        return 0x5u;
+    case B_BLTU:
+        return 0x6u;
+    default:
+        return 0x7u; /* B_BGEU */
+    }
+}
+
+static void rv_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
+{
+    *site = g->len;
+    rv_word(g, rv_enc_r(0u, rvr(at), rvr(as), rv_cond(opn), 0, 0x63u));
+}
+
+/*
+ * The registers and the condition are already in the instruction, so patching
+ * one only rewrites its immediate - no decoding of the placeholder, which is
+ * what the Xtensa side has to do.
+ */
+static void rv_patch_b(gen_t *g, size_t site, size_t target)
+{
+    const int32_t imm = (int32_t)target - (int32_t)site;
+    if (imm < -4096 || imm > 4094 || (imm & 1) != 0) {
+        gfail(g, "branch too far");
+        return;
+    }
+    if (site + 4u > g->len) {
+        gfail(g, "bad branch site");
+        return;
+    }
+    uint32_t w = (uint32_t)g->code[site] | ((uint32_t)g->code[site + 1] << 8) |
+                 ((uint32_t)g->code[site + 2] << 16) |
+                 ((uint32_t)g->code[site + 3] << 24);
+    const uint32_t u = (uint32_t)imm;
+    w &= 0x01fff07fu;
+    w |= (((u >> 12) & 1u) << 31) | (((u >> 5) & 0x3fu) << 25) |
+         (((u >> 1) & 0xfu) << 8) | (((u >> 11) & 1u) << 7);
+    g->code[site] = (uint8_t)w;
+    g->code[site + 1] = (uint8_t)(w >> 8);
+    g->code[site + 2] = (uint8_t)(w >> 16);
+    g->code[site + 3] = (uint8_t)(w >> 24);
+}
+
+/* One instruction, where the windowed machine needs a branch and two moves:
+ * SLT is exactly this operation. */
+static void rv_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
+{
+    rvi_alu(g, 0x00u, uns ? 0x3u : 0x2u, rvr(ar), rvr(as), rvr(at));
+}
+
+/* ---- the bytecode back end ----------------------------------------------- */
+/*
+ * The third machine, and the only one with no processor: `cc -bc x.c x.bc`
+ * writes an image that AGVM.AXE runs anywhere.  See apps/common/agvm/ag_bc.h
+ * for what the instructions are and why this rung exists at all.
+ *
+ * It is the shortest of the three back ends by a long way, and that is the
+ * point of having had a seam: the instruction set IS the seam, so most of what
+ * follows is one line an operation.  Registers keep the seam's own numbers -
+ * there is nothing to map them onto.
+ */
+
+static void bc_byte(gen_t *g, uint8_t b)
+{
+    emit_raw(g, &b, 1);
+}
+
+static void bc_rr(gen_t *g, int a, int b)
+{
+    bc_byte(g, (uint8_t)(((a & 0xf) << 4) | (b & 0xf)));
+}
+
+static void bc_u16(gen_t *g, uint32_t v)
+{
+    const uint8_t b[2] = {(uint8_t)v, (uint8_t)(v >> 8)};
+    emit_raw(g, b, 2);
+}
+
+static void bc_u32(gen_t *g, uint32_t v)
+{
+    const uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16),
+                          (uint8_t)(v >> 24)};
+    emit_raw(g, b, 4);
+}
+
+static void bc_put_u32(gen_t *g, size_t at, uint32_t v)
+{
+    if (at + 4u > g->len) {
+        gfail(g, "bad patch site");
+        return;
+    }
+    g->code[at] = (uint8_t)v;
+    g->code[at + 1] = (uint8_t)(v >> 8);
+    g->code[at + 2] = (uint8_t)(v >> 16);
+    g->code[at + 3] = (uint8_t)(v >> 24);
+}
+
+/* rd <- rs1 OP rs2 */
+static void bc_alu(gen_t *g, uint8_t op, int ar, int as, int at)
+{
+    bc_byte(g, op);
+    bc_rr(g, ar, as);
+    bc_byte(g, (uint8_t)(at & 0xf));
+}
+
+static void bc_mov_n(gen_t *g, int ad, int as)
+{
+    bc_byte(g, AG_BC_MOV);
+    bc_rr(g, ad, as);
+}
+
+static void bc_movi(gen_t *g, int at, int32_t imm)
+{
+    bc_byte(g, AG_BC_LI);
+    bc_byte(g, (uint8_t)(at & 0xf));
+    bc_u32(g, (uint32_t)imm);
+}
+
+/*
+ * An address, and the one place this machine is simpler than both the others:
+ * there are no relocations at all.  Xtensa fetches an address from a literal
+ * beside the code and RISC-V builds it in a pair of instructions, and both need
+ * the loader to fix them up once the parts are placed.  Here the interpreter
+ * knows where it put the data and adds the offset as it runs.
+ */
+static void bc_li_data(gen_t *g, int at, uint32_t data_off)
+{
+    bc_byte(g, AG_BC_LIDATA);
+    bc_byte(g, (uint8_t)(at & 0xf));
+    bc_u32(g, data_off);
+}
+
+static void bc_li_code(gen_t *g, int at, uint32_t code_off)
+{
+    bc_byte(g, AG_BC_LICODE);
+    bc_byte(g, (uint8_t)(at & 0xf));
+    bc_u32(g, code_off);
+}
+
+static void bc_add_n(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_ADD, ar, as, at);
+}
+
+static void bc_sub(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_SUB, ar, as, at);
+}
+
+static void bc_mull(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_MUL, ar, as, at);
+}
+
+static void bc_quos(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_DIVS, ar, as, at);
+}
+
+static void bc_rems(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_REMS, ar, as, at);
+}
+
+static void bc_quou(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_DIVU, ar, as, at);
+}
+
+static void bc_remu(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_REMU, ar, as, at);
+}
+
+static void bc_and(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_AND, ar, as, at);
+}
+
+static void bc_or(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_OR, ar, as, at);
+}
+
+static void bc_xor(gen_t *g, int ar, int as, int at)
+{
+    bc_alu(g, AG_BC_XOR, ar, as, at);
+}
+
+static void bc_shl_rr(gen_t *g, int dst, int lhs, int amt)
+{
+    bc_alu(g, AG_BC_SHL, dst, lhs, amt);
+}
+
+static void bc_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
+{
+    bc_alu(g, uns ? AG_BC_SHRU : AG_BC_SHRS, dst, lhs, amt);
+}
+
+static void bc_shift_i(gen_t *g, uint8_t op, int dst, int src, int sa)
+{
+    bc_byte(g, op);
+    bc_rr(g, dst, src);
+    bc_byte(g, (uint8_t)sa);
+}
+
+static void bc_shl_i(gen_t *g, int dst, int src, int sa)
+{
+    if (sa == 0) {
+        return;
+    }
+    bc_shift_i(g, AG_BC_SHLI, dst, src, sa);
+}
+
+static void bc_shr_i(gen_t *g, int dst, int src, int sa, int uns)
+{
+    if (sa == 0) {
+        return;
+    }
+    bc_shift_i(g, uns ? AG_BC_SHRUI : AG_BC_SHRSI, dst, src, sa);
+}
+
+static void bc_mem(gen_t *g, uint8_t op, int a, int b, int off)
+{
+    if (off < 0 || off > 65535) {
+        gfail(g, "bad memory offset");
+        return;
+    }
+    bc_byte(g, op);
+    bc_rr(g, a, b);
+    bc_u16(g, (uint32_t)off);
+}
+
+static void bc_l8ui(gen_t *g, int at, int as, int off)
+{
+    bc_mem(g, AG_BC_LBU, at, as, off);
+}
+
+static void bc_s8i(gen_t *g, int at, int as, int off)
+{
+    bc_mem(g, AG_BC_SB, at, as, off);
+}
+
+static void bc_l32i(gen_t *g, int at, int as, int off)
+{
+    bc_mem(g, AG_BC_LW, at, as, off);
+}
+
+static void bc_s32i(gen_t *g, int at, int as, int off)
+{
+    bc_mem(g, AG_BC_SW, at, as, off);
+}
+
+static void bc_call_reg(gen_t *g, int as)
+{
+    bc_byte(g, AG_BC_CALL);
+    bc_byte(g, (uint8_t)(as & 0xf));
+}
+
+static void bc_j_to(gen_t *g, size_t from_off, size_t target_off)
+{
+    bc_put_u32(g, from_off + 1u, (uint32_t)target_off);
+}
+
+static void bc_j_placeholder(gen_t *g, size_t *site)
+{
+    *site = g->len;
+    bc_byte(g, AG_BC_JMP);
+    bc_u32(g, 0);
+}
+
+static uint8_t bc_cond(int opn)
+{
+    switch (opn) {
+    case B_BEQ:
+        return AG_BC_BEQ;
+    case B_BNE:
+        return AG_BC_BNE;
+    case B_BLT:
+        return AG_BC_BLT;
+    case B_BGE:
+        return AG_BC_BGE;
+    case B_BLTU:
+        return AG_BC_BLTU;
+    default:
+        return AG_BC_BGEU;
+    }
+}
+
+static void bc_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
+{
+    *site = g->len;
+    bc_byte(g, bc_cond(opn));
+    bc_rr(g, as, at);
+    bc_u32(g, 0);
+}
+
+static void bc_patch_b(gen_t *g, size_t site, size_t target)
+{
+    bc_put_u32(g, site + 2u, (uint32_t)target);
+}
+
+static void bc_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
+{
+    bc_alu(g, uns ? AG_BC_SLTU : AG_BC_SLT, ar, as, at);
+}
+
+/* ---- the seam ----------------------------------------------------------- */
+/*
+ * One function per operation the parser can ask for, and the whole of what a
+ * back end has to answer.  Below this line nothing knows an instruction; above
+ * it nothing knows what a statement is.
+ *
+ * THE REGISTERS ARE NUMBERS, NOT REGISTERS.  8 is the value in hand, 9 the
+ * other operand, 7 the frame, 10..15 the arguments going out - and a call's
+ * answer comes back in 10, which is true of a windowed machine (a2 seen as
+ * a10) and of an ordinary one (a0) alike.  Each back end maps them to whatever
+ * its own architecture calls those things.
+ *
+ * Dispatch at run time rather than at build time because one binary has to be
+ * able to write both: the host tests compile every example for both machines,
+ * and a board asked for a program its neighbour can run has to produce the
+ * neighbour's instructions, not its own.
+ */
+
+static void emit_mov_n(gen_t *g, int ad, int as)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_mov_n(g, ad, as);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_mov_n(g, ad, as);
+        return;
+    }
+    xt_mov_n(g, ad, as);
+}
+
+static void emit_movi(gen_t *g, int at, int32_t imm)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_movi(g, at, imm);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_movi(g, at, imm);
+        return;
+    }
+    xt_movi(g, at, imm);
+}
+
+static void emit_li_data(gen_t *g, int at, uint32_t data_off)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_li_data(g, at, data_off);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_li_data(g, at, data_off);
+        return;
+    }
+    xt_li_data(g, at, data_off);
+}
+
+static void emit_li_code(gen_t *g, int at, uint32_t code_off)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_li_code(g, at, code_off);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_li_code(g, at, code_off);
+        return;
+    }
+    xt_li_code(g, at, code_off);
+}
+
+static void emit_add_n(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_add_n(g, ar, as, at);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_add_n(g, ar, as, at);
+        return;
+    }
+    xt_add_n(g, ar, as, at);
+}
+
+static void emit_sub(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_sub(g, ar, as, at);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_sub(g, ar, as, at);
+        return;
+    }
+    xt_sub(g, ar, as, at);
+}
+
+static void emit_mull(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_mull(g, ar, as, at);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_mull(g, ar, as, at);
+        return;
+    }
+    xt_mull(g, ar, as, at);
+}
+
+static void emit_quos(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_quos(g, ar, as, at);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_quos(g, ar, as, at);
+        return;
+    }
+    xt_quos(g, ar, as, at);
+}
+
+static void emit_rems(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_rems(g, ar, as, at);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_rems(g, ar, as, at);
+        return;
+    }
+    xt_rems(g, ar, as, at);
+}
+
+static void emit_quou(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_quou(g, ar, as, at);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_quou(g, ar, as, at);
+        return;
+    }
+    xt_quou(g, ar, as, at);
+}
+
+static void emit_remu(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_remu(g, ar, as, at);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_remu(g, ar, as, at);
+        return;
+    }
+    xt_remu(g, ar, as, at);
+}
+
+static void emit_and(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_and(g, ar, as, at);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_and(g, ar, as, at);
+        return;
+    }
+    xt_and(g, ar, as, at);
+}
+
+static void emit_or(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_or(g, ar, as, at);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_or(g, ar, as, at);
+        return;
+    }
+    xt_or(g, ar, as, at);
+}
+
+static void emit_xor(gen_t *g, int ar, int as, int at)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_xor(g, ar, as, at);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_xor(g, ar, as, at);
+        return;
+    }
+    xt_xor(g, ar, as, at);
+}
+
+static void emit_shl_rr(gen_t *g, int dst, int lhs, int amt)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_shl_rr(g, dst, lhs, amt);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_shl_rr(g, dst, lhs, amt);
+        return;
+    }
+    xt_shl_rr(g, dst, lhs, amt);
+}
+
+static void emit_shr_rr(gen_t *g, int dst, int lhs, int amt, int uns)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_shr_rr(g, dst, lhs, amt, uns);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_shr_rr(g, dst, lhs, amt, uns);
+        return;
+    }
+    xt_shr_rr(g, dst, lhs, amt, uns);
+}
+
+static void emit_shl_i(gen_t *g, int dst, int src, int sa)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_shl_i(g, dst, src, sa);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_shl_i(g, dst, src, sa);
+        return;
+    }
+    xt_shl_i(g, dst, src, sa);
+}
+
+/* May use register 9; see the body it dispatches to. */
+static void emit_shr_i(gen_t *g, int dst, int src, int sa, int uns)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_shr_i(g, dst, src, sa, uns);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_shr_i(g, dst, src, sa, uns);
+        return;
+    }
+    xt_shr_i(g, dst, src, sa, uns);
+}
+
+static void emit_l8ui(gen_t *g, int at, int as, int off)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_l8ui(g, at, as, off);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_l8ui(g, at, as, off);
+        return;
+    }
+    xt_l8ui(g, at, as, off);
+}
+
+static void emit_s8i(gen_t *g, int at, int as, int off)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_s8i(g, at, as, off);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_s8i(g, at, as, off);
+        return;
+    }
+    xt_s8i(g, at, as, off);
+}
+
+static void emit_l32i(gen_t *g, int at, int as, int off)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_l32i(g, at, as, off);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_l32i(g, at, as, off);
+        return;
+    }
+    xt_l32i(g, at, as, off);
+}
+
+static void emit_s32i(gen_t *g, int at, int as, int off)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_s32i(g, at, as, off);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_s32i(g, at, as, off);
+        return;
+    }
+    xt_s32i(g, at, as, off);
+}
+
+/* Call the address in a register.  The answer is in register 10 afterwards. */
+static void emit_call_reg(gen_t *g, int as)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_call_reg(g, as);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_call_reg(g, as);
+        return;
+    }
+    xt_call_reg(g, as);
+}
+
+static void emit_j_to(gen_t *g, size_t from_off, size_t target_off)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_j_to(g, from_off, target_off);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_j_to(g, from_off, target_off);
+        return;
+    }
+    xt_j_to(g, from_off, target_off);
+}
+
+static void emit_j_placeholder(gen_t *g, size_t *site)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_j_placeholder(g, site);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_j_placeholder(g, site);
+        return;
+    }
+    xt_j_placeholder(g, site);
+}
+
+static void emit_b_placeholder(gen_t *g, int opn, int as, int at, size_t *site)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_b_placeholder(g, opn, as, at, site);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_b_placeholder(g, opn, as, at, site);
+        return;
+    }
+    xt_b_placeholder(g, opn, as, at, site);
+}
+
+static void patch_b(gen_t *g, size_t site, size_t target)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_patch_b(g, site, target);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_patch_b(g, site, target);
+        return;
+    }
+    xt_patch_b(g, site, target);
+}
+
+/* ar = (as < at), 0 or 1. */
+static void emit_setlt_cc(gen_t *g, int ar, int as, int at, int uns)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_setlt_cc(g, ar, as, at, uns);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_setlt_cc(g, ar, as, at, uns);
+        return;
+    }
+    xt_setlt_cc(g, ar, as, at, uns);
 }
 
 static int find_local(gen_t *g, const char *name)
@@ -2067,6 +3336,7 @@ static int add_local_t(gen_t *g, const char *name, const ptype_t *t, int nelem)
     cpy_err(g->locals[i].name, MAX_NAME, name);
     g->locals[i].off = SPILL_BYTES + g->local_words * 4;
     g->locals[i].nwords = nwords;
+    g->locals[i].nbytes = sym_bytes(g, t, nelem);
     g->locals[i].t = *t;
     g->local_words += nwords;
     return i;
@@ -2101,6 +3371,7 @@ static int add_global_t(gen_t *g, const char *name, const ptype_t *t, int nelem)
     cpy_err(g->globals[i].name, MAX_NAME, name);
     g->globals[i].off = g->data_next;
     g->globals[i].nwords = (bytes + 3) / 4;
+    g->globals[i].nbytes = bytes;
     g->globals[i].t = *t;
     g->data_next += bytes;
     return i;
@@ -2299,7 +3570,7 @@ static void emit_scale(gen_t *g, int reg, int size)
         sh++;
     }
     if (v == 1 && sh <= 31) {
-        emit_slli(g, reg, reg, sh);
+        emit_shl_i(g, reg, reg, sh);
         return;
     }
     emit_movi(g, 11, size);
@@ -2406,6 +3677,292 @@ static void place_store(gen_t *g, place_t *pl, int val, int scratch)
     emit_store_sized(g, val, 8, pl->off, size, scratch);
 }
 
+/* ---- the frame ---------------------------------------------------------- */
+/*
+ * Opening and closing a function, kept together and away from the parser,
+ * because this is where a machine shows through hardest.
+ *
+ * Xtensa's windowed call gives a function its arguments in a2..a7 and its
+ * caller's in a10..a15; a machine without a window would use one set for both.
+ * ENTRY allocates the frame and rotates the window in a single instruction;
+ * a machine without one would subtract from the stack pointer and save the
+ * return address itself.  None of that belongs in the code that parses an
+ * expression, and while it was written out there the parser named a1, a2 and
+ * a7 directly - three registers whose meaning is not the same twice.
+ *
+ * What is left in the parser is a set of NUMBERS, not registers: 8 is the
+ * value in hand, 9 the other operand, 7 the frame, 10..15 the outgoing
+ * arguments.  A second back end is free to put those wherever it likes.
+ */
+
+/*
+ * On Xtensa.  ENTRY rotates the register window and allocates the frame in one
+ * instruction, which is why nothing here saves a return address: the window
+ * holds it.  The size is only known once the body has been read, so ENTRY goes
+ * out at the maximum and is rewritten - see xt_patch_entry.
+ */
+static void xt_frame_open(gen_t *g)
+{
+    xt_entry(g, SPILL_BYTES + MAX_LOCAL_WORDS * 4 + FRAME_TOP_SAVE);
+}
+
+static void xt_frame_size(gen_t *g, size_t site, int framesize)
+{
+    xt_patch_entry(g, site, framesize);
+}
+
+/*
+ * Parameters into their frame slots.  They arrive in a2..a7 - the window turns
+ * the caller's a10..a15 into these - and are stored through a1 rather than a7,
+ * because a7 is about to become the frame pointer: with six parameters the
+ * last one would otherwise be overwritten by its own frame pointer.  a1 and a7
+ * hold the same address; only the order matters.
+ */
+static void xt_params_home(gen_t *g, int nparams)
+{
+    for (int i = 0; i < nparams && i < MAX_PARAMS; i++) {
+        emit_store_sized(g, 2 + i, 1, g->locals[i].off,
+                         sym_access_size(&g->locals[i]), 8);
+    }
+    xt_mov_n(g, 7, 1);
+}
+
+/*
+ * `return expr;` with the value in 8, or `return;` with none.  RETW unwinds the
+ * window, so a2 here is the caller's a10 - which is why the seam can say "the
+ * answer comes back in 10" and mean it on a machine with no window too.
+ */
+static void xt_return(gen_t *g, int have_value)
+{
+    if (have_value) {
+        xt_mov_n(g, 2, 8);
+    } else {
+        xt_movi(g, 2, 0);
+    }
+    xt_retw_n(g);
+}
+
+static void xt_func_return(gen_t *g)
+{
+    xt_return(g, 0);
+}
+
+/*
+ * And on RISC-V, where the prologue has to do by hand what ENTRY does in one
+ * instruction:
+ *
+ *      addi sp, sp, -F
+ *      sw   ra, F-4(sp)
+ *      sw   s0, F-8(sp)
+ *
+ * F is not known yet, so these three go out holding zero and are rewritten by
+ * rv_frame_size - the same trick as the rewritten ENTRY, and for the same
+ * reason.  The save area at the top of the frame is the one Xtensa keeps for a
+ * window overflow, which on this machine holds these two words instead.
+ */
+static void rv_frame_open(gen_t *g)
+{
+    g->nret = 0;
+    rvi_addi(g, RV_SP, RV_SP, 0);
+    rvi_sw(g, RV_RA, RV_SP, 0);
+    rvi_sw(g, RV_S0, RV_SP, 0);
+}
+
+/*
+ * Parameters into their frame slots.  They arrive in a0..a5 - there is no
+ * window to shift them - and go out through sp, because s0 is not the frame
+ * pointer until the line after.
+ */
+static void rv_params_home(gen_t *g, int nparams)
+{
+    for (int i = 0; i < nparams && i < MAX_PARAMS; i++) {
+        const int reg = 10 + i; /* a0..a5, where the caller left them */
+        const int off = g->locals[i].off;
+        if (sym_access_size(&g->locals[i]) == 1) {
+            rvi_sb(g, reg, RV_SP, off);
+        } else {
+            rvi_sw(g, reg, RV_SP, off);
+        }
+    }
+    rvi_addi(g, RV_S0, RV_SP, 0); /* mv s0, sp */
+}
+
+/*
+ * Every return jumps to the one epilogue at the end of the function, written
+ * by rv_frame_size once the frame is known.  An epilogue at each return would
+ * need the frame size in three immediates at every one of them, and a `return`
+ * inside a loop inside a switch is not a place to be patching a list of sites.
+ */
+static void rv_return(gen_t *g, int have_value)
+{
+    if (have_value) {
+        rvi_addi(g, 10, rvr(8), 0); /* mv a0, t0 */
+    } else {
+        rvi_addi(g, 10, RV_ZERO, 0);
+    }
+    if (g->nret >= MAX_RET_SITES) {
+        gfail(g, "too many returns in one function");
+        return;
+    }
+    g->ret_site[g->nret++] = g->len;
+    rv_word(g, 0x6fu); /* jal zero, <epilogue> */
+}
+
+static void rv_func_return(gen_t *g)
+{
+    rv_return(g, 0);
+}
+
+static void rv_frame_size(gen_t *g, size_t site, int framesize)
+{
+    if (site + 12u > g->len) {
+        gfail(g, "bad frame site");
+        return;
+    }
+    /* The prologue, now that the size is known.  Written by rewinding the
+     * emit position, which is why these three must be exactly as long the
+     * second time - all of them are ordinary 32-bit instructions, so they
+     * are. */
+    const size_t end = g->len;
+    g->len = site;
+    rvi_addi(g, RV_SP, RV_SP, -framesize);
+    rvi_sw(g, RV_RA, RV_SP, framesize - 4);
+    rvi_sw(g, RV_S0, RV_SP, framesize - 8);
+    if (g->len != site + 12u) {
+        gfail(g, "bad frame site");
+        return;
+    }
+    g->len = end;
+
+    /* And the epilogue every return jumps to. */
+    const size_t epi = g->len;
+    rvi_lw(g, RV_RA, RV_SP, framesize - 4);
+    rvi_lw(g, RV_S0, RV_SP, framesize - 8);
+    rvi_addi(g, RV_SP, RV_SP, framesize);
+    rv_word(g, rv_enc_i(0, RV_RA, 0x0u, RV_ZERO, 0x67u)); /* jalr zero, 0(ra) */
+    for (int i = 0; i < g->nret; i++) {
+        rv_j_to(g, g->ret_site[i], epi);
+    }
+    g->nret = 0;
+}
+
+/*
+ * And on the machine with no processor, where the frame is the interpreter's
+ * own store rather than a stack pointer: ENTER carries the size and the
+ * interpreter points register 7 at a block of that many bytes.  The size is
+ * patched the same way the other two patch theirs.
+ *
+ * `&local` therefore has to be a REAL address - a program hands it to ag_read
+ * and to ag_migrate_save like any other - so that block is ordinary memory and
+ * not an index into anything.
+ */
+static void bc_frame_open(gen_t *g)
+{
+    bc_byte(g, AG_BC_ENTER);
+    bc_u32(g, 0);
+}
+
+static void bc_frame_size(gen_t *g, size_t site, int framesize)
+{
+    bc_put_u32(g, site + 1u, (uint32_t)framesize);
+}
+
+static void bc_params_home(gen_t *g, int nparams)
+{
+    for (int i = 0; i < nparams && i < MAX_PARAMS; i++) {
+        const int reg = 10 + i; /* where the caller left them */
+        const int off = g->locals[i].off;
+        if (sym_access_size(&g->locals[i]) == 1) {
+            bc_s8i(g, reg, 7, off);
+        } else {
+            bc_s32i(g, reg, 7, off);
+        }
+    }
+}
+
+static void bc_return(gen_t *g, int have_value)
+{
+    if (have_value) {
+        bc_mov_n(g, 10, 8);
+    } else {
+        bc_movi(g, 10, 0);
+    }
+    bc_byte(g, AG_BC_RET);
+}
+
+static void bc_func_return(gen_t *g)
+{
+    bc_return(g, 0);
+}
+
+/* ---- the frame, at the seam --------------------------------------------- */
+
+static void emit_frame_open(gen_t *g)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_frame_open(g);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_frame_open(g);
+        return;
+    }
+    xt_frame_open(g);
+}
+
+static void emit_frame_size(gen_t *g, size_t site, int framesize)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_frame_size(g, site, framesize);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_frame_size(g, site, framesize);
+        return;
+    }
+    xt_frame_size(g, site, framesize);
+}
+
+static void emit_params_home(gen_t *g, int nparams)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_params_home(g, nparams);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_params_home(g, nparams);
+        return;
+    }
+    xt_params_home(g, nparams);
+}
+
+/* Falling off the end of a function is `return 0`. */
+static void emit_func_return(gen_t *g)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_func_return(g);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_func_return(g);
+        return;
+    }
+    xt_func_return(g);
+}
+
+static void emit_return(gen_t *g, int have_value)
+{
+    if (g->arch == CC_ARCH_BC) {
+        bc_return(g, have_value);
+        return;
+    }
+    if (g->arch == CC_ARCH_RV32) {
+        rv_return(g, have_value);
+        return;
+    }
+    xt_return(g, have_value);
+}
+
 /* ---- builtins ---------------------------------------------------------- */
 
 typedef struct {
@@ -2431,6 +3988,65 @@ static const builtin_t BUILTINS[] = {
     {"ag_poll_event", 2, API_OFF_INP, INP_OFF_POLL, RET_BOOL, 0, ABI_MINOR_BASE, NULL},
     {"ag_heartbeat", 0, API_OFF_SYS, SYS_OFF_HEARTBEAT, RET_VOID, 0, ABI_MINOR_BASE, NULL},
     {"ag_focused", 0, API_OFF_PROC, PROC_OFF_FOCUSED, RET_BOOL, 0, ABI_MINOR_FOCUS, NULL},
+    /*
+     * Moving to another board, which is three calls and a promise.
+     *
+     *   while (running) {
+     *       ... a slice of the work ...
+     *       if (ag_migrate_wanted()) { ag_migrate_save(&s, sizeof_state); return 0; }
+     *   }
+     *
+     * and at the top, ag_migrate_restore(&s, cap) - 0 means a fresh start,
+     * which is the answer every program gets the first time.  The promise is
+     * that the state named here is ALL of it: the handles and the screen do
+     * not travel, and nothing can check that but the author.
+     *
+     * Declared with #pragma migrate, or the kernel will never ask.
+     */
+    {"ag_migrate_wanted", 0, API_OFF_PROC, PROC_OFF_MIG_WANTED, RET_BOOL, 0, ABI_MINOR_MIGRATE, NULL},
+    {"ag_migrate_save", 2, API_OFF_PROC, PROC_OFF_MIG_SAVE, RET_RAW, 0, ABI_MINOR_MIGRATE, NULL},
+    {"ag_migrate_restore", 2, API_OFF_PROC, PROC_OFF_MIG_RESTORE, RET_RAW, 0, ABI_MINOR_MIGRATE, NULL},
+
+    /*
+     * The cluster: threads of ONE program on the cores of every board that
+     * answered.  The table is never NULL, so all of this works on a board that
+     * is alone - it says there is one node and runs every thread here - and a
+     * program written with these calls is the same program on one board and on
+     * three.  That is the point of putting them in a compiler that lives on the
+     * board: the job can be written where it is to run.
+     *
+     * The shape of a job, and it is short enough to give whole:
+     *
+     *   struct entry { int name; int fn; };   // ag_clu_entry_t, word by word
+     *   struct entry tab[1];
+     *
+     *   void worker(int self, char *arg, int len) { ... ag_clu_send(0, ...); }
+     *
+     *   int ag_main(void) {
+     *       tab[0].name = "work";
+     *       tab[0].fn   = &worker;
+     *       if (ag_clu_start(&tab[0], 1)) return 0;   // a share, now finished
+     *       t = ag_clu_spawn(-1, "work", &job, sizeof(job));
+     *       ...
+     *   }
+     *
+     * `&worker` is an ordinary word here, as it is in a .SYS built by this
+     * compiler; the kernel calls it with the windowed ABI every function this
+     * compiler writes already uses.
+     *
+     * ag_clu_start is the line that decides which half of the job this copy is.
+     * TRUE means another node started us to serve its share, the call has
+     * already run that share to its end, and the only right answer is to return
+     * from ag_main at once.
+     */
+    {"ag_clu_nodes", 2, API_OFF_CLU, CLU_OFF_NODES, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_start", 2, API_OFF_CLU, CLU_OFF_START, RET_BOOL, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_spawn", 4, API_OFF_CLU, CLU_OFF_SPAWN, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_send", 4, API_OFF_CLU, CLU_OFF_SEND, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_recv", 4, API_OFF_CLU, CLU_OFF_RECV, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_join", 2, API_OFF_CLU, CLU_OFF_JOIN, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_self", 0, API_OFF_CLU, CLU_OFF_SELF, RET_RAW, 0, ABI_MINOR_CLUSTER, NULL},
+    {"ag_clu_done", 0, API_OFF_CLU, CLU_OFF_DONE, RET_VOID, 0, ABI_MINOR_CLUSTER, NULL},
 
     /* Console text.  ag_printf is the kernel's own, reached with its arguments
      * in the outgoing registers, which is what the windowed ABI asks of any
@@ -2562,15 +4178,41 @@ typedef struct {
     gen_t        *g;
     int           pesize;
     int           psidx;
+    /*
+     * And whether the value now in a8 counts upwards only.  The fourth member
+     * of the same one-value type system: whatever produced the value sets it,
+     * and the six operators whose machine instruction differs between signed
+     * and unsigned - / % >> < <= > >= - consult it.
+     *
+     * Set from the DECLARED type at the point of a load, because that is the
+     * only place the answer is known: a word in a register looks the same
+     * either way, which is exactly why getting this wrong is silent.
+     */
+    int           puns;
+    /* Whether the type just parsed carried `static`.  Kept so that a static
+     * LOCAL - which promises to outlive the call, and would not - can be
+     * refused rather than quietly turned into an ordinary one. */
+    int           saw_static;
     jump_frame_t  jumps[MAX_LOOP_DEPTH];
     int           njumps;
 } par_t;
 
-/* A declared type: what one element is, and whether the name is a pointer. */
+/*
+ * A declared type: what one element is, whether the name is a pointer, and
+ * whether it counts upwards only.
+ *
+ * `uns` is not decoration.  Three operators mean different machine
+ * instructions for it - divide, remainder and shift-right - and four
+ * comparisons take a different branch, so a compiler that recorded the word
+ * and ignored it would produce code that is wrong by a sign bit, silently and
+ * only for large values.  A `char` has always been unsigned here; this is the
+ * same fact said about a word.
+ */
 typedef struct {
     int esize;
     int sidx;
     int is_ptr;
+    int uns;
 } type_t;
 
 static void pfail(par_t *p, const char *msg)
@@ -2602,7 +4244,25 @@ static int32_t const_expr_from(lex_t *L, gen_t *g);
 
 static void skip_cv(par_t *p)
 {
-    while (accept(p, T_CONST) || accept(p, T_VOLATILE)) {
+    /*
+     * `static` is accepted and ignored, beside const and volatile.
+     *
+     * Ignored honestly rather than by accident: an image compiled here is one
+     * translation unit and nothing outside it can see a name, so `static` on
+     * a function or a global already describes what happens.  A `static`
+     * LOCAL would be a different promise - one that outlives the call - and
+     * that one is refused where locals are declared rather than silently
+     * broken here.
+     */
+    for (;;) {
+        if (accept(p, T_STATIC)) {
+            p->saw_static = 1;
+            continue;
+        }
+        if (accept(p, T_CONST) || accept(p, T_VOLATILE)) {
+            continue;
+        }
+        break;
     }
 }
 
@@ -2715,13 +4375,40 @@ static int parse_array_size(par_t *p)
 
 static int accept_type(par_t *p, type_t *ty)
 {
+    p->saw_static = 0;
     skip_cv(p);
     ty->sidx = -1;
     ty->is_ptr = 0;
-    if (accept(p, T_INT)) {
+    ty->uns = 0;
+    /*
+     * `unsigned`, `unsigned int`, `unsigned char`, and `signed` said out loud
+     * for symmetry.  A bare `unsigned` is a word, as it is in C - the `int`
+     * after it is optional and means nothing extra.
+     */
+    if (p->L->tok == T_UNSIGNED || p->L->tok == T_SIGNED) {
+        ty->uns = (p->L->tok == T_UNSIGNED);
+        lex_next(p->L);
+        skip_cv(p);
+        if (accept(p, T_CHAR)) {
+            ty->esize = 1;
+            /* `signed char` is a byte this compiler cannot represent: loads
+             * of a byte are zero-extending here and always have been.  Said
+             * rather than quietly treated as unsigned. */
+            if (!ty->uns) {
+                pfail(p, "signed char is not supported; char is unsigned here");
+                return 0;
+            }
+        } else {
+            (void)accept(p, T_INT);
+            ty->esize = 4;
+        }
+    } else if (accept(p, T_INT)) {
         ty->esize = 4;
     } else if (accept(p, T_CHAR)) {
+        /* A char is unsigned here, and has been since before there was a word
+         * for it - see the README. */
         ty->esize = 1;
+        ty->uns = 1;
     } else if (p->L->tok == T_STRUCT) {
         lex_next(p->L);
         if (p->L->tok != T_IDENT) {
@@ -2736,6 +4423,14 @@ static int accept_type(par_t *p, type_t *ty)
         lex_next(p->L);
         ty->sidx = si;
         ty->esize = p->g->structs[si].size;
+    } else if (p->L->tok == T_IDENT && CC_STRCMP(p->L->text, "bool") == 0 &&
+               find_tdef(p->g, p->L->text) < 0) {
+        /* One byte, unsigned - the host compiler's _Bool, so a struct shared
+         * across the ABI has the same shape on both sides.  Not a keyword: a
+         * program that says `typedef int bool;` keeps its own meaning. */
+        lex_next(p->L);
+        ty->esize = 1;
+        ty->uns = 1;
     } else if (p->L->tok == T_IDENT) {
         const int ti = find_tdef(p->g, p->L->text);
         if (ti < 0) {
@@ -2745,6 +4440,7 @@ static int accept_type(par_t *p, type_t *ty)
         ty->esize = p->g->tdefs[ti].esize;
         ty->sidx = p->g->tdefs[ti].sidx;
         ty->is_ptr = p->g->tdefs[ti].is_ptr;
+        ty->uns = p->g->tdefs[ti].uns;
     } else {
         return 0;
     }
@@ -2766,6 +4462,7 @@ static ptype_t ty_of(const type_t *ty, int is_array)
     ptype_t t;
     t.esize = ty->esize;
     t.sidx = ty->sidx;
+    t.uns = ty->uns;
     if (ty->is_ptr) {
         t.kind = PK_PTR;
     } else if (is_array) {
@@ -2840,7 +4537,7 @@ static void emit_user_call(par_t *p, int fi)
     const func_t *fn = &p->g->funcs[fi];
     parse_call_args_to_regs(p, fn->nparams);
     emit_li_code(p->g, 8, (uint32_t)fn->code_off);
-    emit_callx8(p->g, 8);
+    emit_call_reg(p->g, 8);
     if (!fn->is_void) {
         emit_mov_n(p->g, 8, 10);
     } else {
@@ -2880,7 +4577,7 @@ static void emit_builtin_call(par_t *p, const builtin_t *b)
         parse_call_args_to_regs(p, b->nargs);
     }
     emit_load_api_fn(p->g, 8, b->api_off, b->fn_off);
-    emit_callx8(p->g, 8);
+    emit_call_reg(p->g, 8);
     if (b->ret_mode == RET_BOOL) {
         emit_mov_n(p->g, 8, 10);
         emit_movi(p->g, 9, 0);
@@ -2981,6 +4678,7 @@ static int try_operand_to_a9(par_t *p, int level)
         emit_movi(p->g, 9, L->num);
         lex_next(L);
         p->pesize = 0;
+        p->puns = 0;
         p->psidx = -1;
         return 1;
     }
@@ -3002,6 +4700,7 @@ static int try_operand_to_a9(par_t *p, int level)
     lex_next(L);
     p->pesize = (s->t.kind == PK_PTR) ? ty_size(p->g, &s->t) : 0;
     p->psidx = (s->t.kind == PK_PTR) ? s->t.sidx : -1;
+    p->puns = (s->t.kind == PK_PTR) ? 0 : s->t.uns;
     return 1;
 }
 
@@ -3141,8 +4840,12 @@ static void place_rvalue(par_t *p, place_t *pl)
     if (pl->t.kind == PK_PTR) {
         p->pesize = ty_size(p->g, &pl->t);
         p->psidx = pl->t.sidx;
+        p->puns = 0; /* a pointer is a pointer, not a number */
     } else {
         p->pesize = 0;
+        /* THE POINT WHERE THE ANSWER IS KNOWN.  A word in a register carries
+         * no sign; the declared type of the place it came from does. */
+        p->puns = pl->t.uns;
         p->psidx = -1;
     }
 }
@@ -3183,11 +4886,9 @@ static void emit_compound_op(gen_t *g, tok_t op, int dst, int lhs, int rhs)
     } else if (op == T_CARET_EQ) {
         emit_xor(g, dst, lhs, rhs);
     } else if (op == T_SHL_EQ) {
-        emit_ssl(g, rhs);
-        emit_sll(g, dst, lhs);
+        emit_shl_rr(g, dst, lhs, rhs);
     } else {
-        emit_ssr(g, rhs);
-        emit_sra(g, dst, lhs);
+        emit_shr_rr(g, dst, lhs, rhs, 0);
     }
 }
 
@@ -3330,13 +5031,43 @@ static void parse_sizeof(par_t *p)
 {
     expect(p, T_LPAREN, "expected '(' after sizeof");
     type_t ty;
-    if (!accept_type(p, &ty)) {
+    int    bytes = -1;
+    if (accept_type(p, &ty)) {
+        bytes = sizeof_type_bytes(p, &ty);
+    } else if (p->L->tok == T_IDENT) {
+        /*
+         * `sizeof(s)` on a NAME, which is how a program asks for the size of
+         * the thing it is about to hand over rather than repeating a number:
+         *
+         *     ag_migrate_save(&s, sizeof(s));
+         *
+         * The alternative is what apps/cc/examples/migrant.c had to write -
+         * a literal 12 beside a three-field struct - and a literal that has
+         * to be kept in step with a declaration is a bug with a date on it.
+         *
+         * Only a name, not an expression: the compiler has no typed tree to
+         * ask, and a `sizeof(a + b)` it could not answer honestly would be
+         * worse than one it refuses.
+         */
+        const int li = find_local(p->g, p->L->text);
+        const int gi = (li < 0) ? find_global(p->g, p->L->text) : -1;
+        if (li >= 0) {
+            bytes = p->g->locals[li].nbytes;
+        } else if (gi >= 0) {
+            bytes = p->g->globals[gi].nbytes;
+        } else {
+            pfail(p, "sizeof: not a type or a variable");
+            return;
+        }
+        lex_next(p->L);
+    } else {
         pfail(p, "expected type in sizeof");
         return;
     }
     expect(p, T_RPAREN, "expected ')'");
-    emit_movi(p->g, 8, sizeof_type_bytes(p, &ty));
+    emit_movi(p->g, 8, bytes);
     p->pesize = 0;
+    p->puns = 0;
     p->psidx = -1;
 }
 
@@ -3346,6 +5077,7 @@ static void parse_primary(par_t *p)
         return;
     }
     p->pesize = 0;
+    p->puns = 0;
     p->psidx = -1;
     if (p->L->tok == T_NUM) {
         emit_movi(p->g, 8, p->L->num);
@@ -3369,6 +5101,7 @@ static void parse_primary(par_t *p)
         if (p->L->tok == T_LPAREN) {
             parse_call_by_name(p, name);
             p->pesize = 0;
+            p->puns = 0;
             p->psidx = -1;
             return;
         }
@@ -3474,12 +5207,14 @@ static void parse_unary(par_t *p)
         emit_movi(p->g, 9, 0);
         emit_sub(p->g, 8, 9, 8);
         p->pesize = 0;
+        p->puns = 0;
         return;
     }
     if (accept(p, T_NOT)) {
         parse_unary(p);
         emit_bool_not_a8(p->g);
         p->pesize = 0;
+        p->puns = 0;
         return;
     }
     if (accept(p, T_TILDE)) {
@@ -3487,6 +5222,7 @@ static void parse_unary(par_t *p)
         emit_movi(p->g, 9, -1);
         emit_xor(p->g, 8, 8, 9);
         p->pesize = 0;
+        p->puns = 0;
         return;
     }
     if (accept(p, T_STAR)) {
@@ -3502,6 +5238,7 @@ static void parse_unary(par_t *p)
         }
         emit_load_sized(p->g, 8, 8, 0, k);
         p->pesize = 0;
+        p->puns = 0;
         return;
     }
     if (accept(p, T_AMP)) {
@@ -3522,6 +5259,14 @@ static void parse_mul(par_t *p)
            p->L->tok == T_PERCENT) {
         const tok_t op = p->L->tok;
         lex_next(p->L);
+        /*
+         * WHAT THE LEFT SIDE WAS, taken before the right side overwrites it.
+         * The one-value type system describes whatever is in a8 NOW, so the
+         * left operand's answer has to be kept by hand across parsing the
+         * right - and the result counts upwards if either side does, which is
+         * C's rule for two operands of the same width.
+         */
+        const int lu = p->puns;
         int lhs = 8, rhs = 9;
         if (!try_operand_to_a9(p, 0)) {
             push_a8(p->g);
@@ -3530,14 +5275,26 @@ static void parse_mul(par_t *p)
             lhs = 9;
             rhs = 8;
         }
+        const int uns = lu || p->puns;
         if (op == T_STAR) {
+            /* Multiplication does not care: the low 32 bits of a product are
+             * the same bits either way. */
             emit_mull(p->g, 8, lhs, rhs);
         } else if (op == T_SLASH) {
-            emit_quos(p->g, 8, lhs, rhs);
+            if (uns) {
+                emit_quou(p->g, 8, lhs, rhs);
+            } else {
+                emit_quos(p->g, 8, lhs, rhs);
+            }
+        } else if (uns) {
+            emit_remu(p->g, 8, lhs, rhs);
         } else {
             emit_rems(p->g, 8, lhs, rhs);
         }
         p->pesize = 0;
+        /* Carried, not cleared: `a / b * c` must still know what a and b were
+         * when it reaches the second operator. */
+        p->puns = uns;
     }
 }
 
@@ -3597,18 +5354,23 @@ static void parse_shift(par_t *p)
          * a phase accumulator - and it needs neither SAR nor a register for the
          * count.  A shift by zero is not encodable in SLLI, and is nothing.
          */
+        /*
+         * WHAT IS BEING SHIFTED decides which way `>>` fills.  Only the left
+         * side matters here - C says so, and it is also the only one that
+         * makes sense: how far you shift has no sign.
+         */
+        const int uns = p->puns;
         if (p->L->tok == T_NUM && p->L->num >= 0 && p->L->num <= 31 &&
             !binds_tighter(peek_tok(p->L), 2)) {
             const int sa = (int)p->L->num;
             lex_next(p->L);
-            if (sa != 0) {
-                if (op == T_SHL) {
-                    emit_slli(p->g, 8, 8, sa);
-                } else {
-                    emit_srai(p->g, 8, 8, sa);
-                }
+            if (op == T_SHL) {
+                emit_shl_i(p->g, 8, 8, sa);
+            } else {
+                emit_shr_i(p->g, 8, 8, sa, uns);
             }
             p->pesize = 0;
+            p->puns = uns;
             continue;
         }
         int lhs = 8, rhs = 9;
@@ -3620,13 +5382,12 @@ static void parse_shift(par_t *p)
             rhs = 8;
         }
         if (op == T_SHL) {
-            emit_ssl(p->g, rhs);
-            emit_sll(p->g, 8, lhs);
+            emit_shl_rr(p->g, 8, lhs, rhs);
         } else {
-            emit_ssr(p->g, rhs);
-            emit_sra(p->g, 8, lhs);
+            emit_shr_rr(p->g, 8, lhs, rhs, uns);
         }
         p->pesize = 0;
+        p->puns = uns;
     }
 }
 
@@ -3637,6 +5398,16 @@ static void parse_rel(par_t *p)
            p->L->tok == T_GE) {
         const tok_t op = p->L->tok;
         lex_next(p->L);
+        /*
+         * As with divide: the left side's answer has to survive parsing the
+         * right, and either side being unsigned makes the comparison so.
+         *
+         * This is the one that bites hardest in practice.  A counter that has
+         * passed 0x80000000 is a large number, and a signed `<` calls it
+         * negative - so `while (i < n)` runs for ever or not at all, on the
+         * one value in four billion nobody tests with.
+         */
+        const int lu = p->puns;
         int lhs = 8, rhs = 9;
         if (!try_operand_to_a9(p, 3)) {
             push_a8(p->g);
@@ -3645,18 +5416,21 @@ static void parse_rel(par_t *p)
             lhs = 9;
             rhs = 8;
         }
+        const int uns = lu || p->puns;
         if (op == T_LT) {
-            emit_setlt(p->g, 8, lhs, rhs);
+            emit_setlt_cc(p->g, 8, lhs, rhs, uns);
         } else if (op == T_GT) {
-            emit_setlt(p->g, 8, rhs, lhs);
+            emit_setlt_cc(p->g, 8, rhs, lhs, uns);
         } else if (op == T_LE) {
-            emit_setlt(p->g, 8, rhs, lhs);
+            emit_setlt_cc(p->g, 8, rhs, lhs, uns);
             emit_bool_not_a8(p->g);
         } else {
-            emit_setlt(p->g, 8, lhs, rhs);
+            emit_setlt_cc(p->g, 8, lhs, rhs, uns);
             emit_bool_not_a8(p->g);
         }
         p->pesize = 0;
+        /* The result is 0 or 1: a plain int, whatever was compared. */
+        p->puns = 0;
     }
 }
 
@@ -3683,6 +5457,7 @@ static void parse_eq(par_t *p)
         emit_movi(p->g, 8, 1);
         emit_j_to(p->g, j_site, p->g->len);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3705,6 +5480,7 @@ static void parse_bitand(par_t *p)
         }
         emit_and(p->g, 8, lhs, rhs);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3723,6 +5499,7 @@ static void parse_bitxor(par_t *p)
         }
         emit_xor(p->g, 8, lhs, rhs);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3741,6 +5518,7 @@ static void parse_bitor(par_t *p)
         }
         emit_or(p->g, 8, lhs, rhs);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3766,6 +5544,7 @@ static void parse_and(par_t *p)
         emit_movi(p->g, 8, 0);
         emit_j_to(p->g, end_j, p->g->len);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3786,6 +5565,7 @@ static void parse_or(par_t *p)
         emit_movi(p->g, 8, 1);
         emit_j_to(p->g, end_j, p->g->len);
         p->pesize = 0;
+        p->puns = 0;
     }
 }
 
@@ -3808,6 +5588,7 @@ static void parse_cond(par_t *p)
     parse_cond(p);
     emit_j_to(p->g, j_end, p->g->len);
     p->pesize = 0;
+    p->puns = 0;
     p->psidx = -1;
 }
 
@@ -3871,6 +5652,19 @@ static void parse_local_decl(par_t *p, const type_t *ty)
         pfail(p, "expected identifier after type");
         return;
     }
+    /*
+     * `static` outside a function is what this compiler already does - one
+     * translation unit, nothing outside can see a name - so it is accepted
+     * and ignored there.  Inside one it promises something else: a variable
+     * that survives the call.  This compiler gives every local a frame slot,
+     * so accepting the word would be agreeing to a promise it does not keep,
+     * and the program would be wrong in the way that is hardest to see - it
+     * would work until the second call.
+     */
+    if (p->saw_static) {
+        pfail(p, "a static local is not supported; make it a global");
+        return;
+    }
     char name[MAX_NAME];
     cpy_err(name, sizeof(name), p->L->text);
     lex_next(p->L);
@@ -3894,8 +5688,69 @@ static void parse_local_decl(par_t *p, const type_t *ty)
         return;
     }
     if (t.kind == PK_STRUCT) {
-        if (p->L->tok == T_ASSIGN) {
-            pfail(p, "cannot assign a whole struct");
+        if (p->L->tok != T_ASSIGN) {
+            return;
+        }
+        lex_next(p->L);
+        /*
+         * `struct v s = {1, 0, 0};` - AT A DECLARATION ONLY.
+         *
+         * Not struct assignment, which stays refused: `a = b` between two
+         * structs would be a copy this compiler has no instruction for and
+         * the reader no reason to expect.  This is a list of values written
+         * into the fields in declaration order, which is what a brace list
+         * means and all it means.
+         *
+         * Worth having because the alternative is what every program here had
+         * to write - three lines of `s.x = ...` where C says one - and
+         * because a field left out of that sequence is invisible, while a
+         * field left out of a brace list is zeroed by rule.
+         */
+        if (p->L->tok != T_LBRACE) {
+            pfail(p, "a struct is initialised with a brace list, "
+                     "and cannot be assigned");
+            return;
+        }
+        lex_next(p->L);
+        const int      si = t.sidx;
+        const struct_t *st = &p->g->structs[si];
+        const int      base = p->g->locals[idx].off;
+        int            fi = 0;
+        if (p->L->tok != T_RBRACE) {
+            for (;;) {
+                if (fi >= st->nfields) {
+                    pfail(p, "more values than the struct has fields");
+                    return;
+                }
+                const field_t *f = &st->fields[fi];
+                if (f->t.kind == PK_STRUCT || f->t.kind == PK_ARRAY) {
+                    pfail(p, "a nested struct or array cannot be given a "
+                             "value in a brace list");
+                    return;
+                }
+                parse_expr(p);
+                emit_store_sized(p->g, 8, 7, base + f->off, ty_store(&f->t),
+                                 9);
+                fi++;
+                if (!accept(p, T_COMMA)) {
+                    break;
+                }
+                /* `{1, 2,}` - a trailing comma is how a list is edited. */
+                if (p->L->tok == T_RBRACE) {
+                    break;
+                }
+            }
+        }
+        expect(p, T_RBRACE, "expected '}'");
+        /* What was left out is zero, which is what C promises and what makes
+         * `= {0}` mean "all of it". */
+        for (; fi < st->nfields; fi++) {
+            const field_t *f = &st->fields[fi];
+            if (f->t.kind == PK_STRUCT || f->t.kind == PK_ARRAY) {
+                continue; /* not reachable by a value above; left as it was */
+            }
+            emit_movi(p->g, 8, 0);
+            emit_store_sized(p->g, 8, 7, base + f->off, ty_store(&f->t), 9);
         }
         return;
     }
@@ -4044,14 +5899,12 @@ static void parse_stmt(par_t *p)
         return;
     }
     if (accept(p, T_RETURN)) {
-        if (p->L->tok != T_SEMI) {
+        const int has_value = (p->L->tok != T_SEMI);
+        if (has_value) {
             parse_expr(p);
-            emit_mov_n(p->g, 2, 8);
-        } else {
-            emit_movi(p->g, 2, 0);
         }
         expect(p, T_SEMI, "expected ';' after return");
-        emit_retw_n(p->g);
+        emit_return(p->g, has_value);
         return;
     }
     if (accept(p, T_IF)) {
@@ -4245,23 +6098,13 @@ static void parse_function(par_t *p, int is_void, const char *name)
     p->g->spill_top = 0;
 
     const size_t code_off = p->g->len;
-    emit_entry(p->g, SPILL_BYTES + MAX_LOCAL_WORDS * 4 + FRAME_TOP_SAVE);
+    emit_frame_open(p->g);
 
-    /*
-     * Parameters arrive in a2..a7 and are stored through a1, because a7 is
-     * about to become the frame pointer - with six parameters the last one
-     * would otherwise be overwritten by its own frame pointer.  a7 and a1 hold
-     * the same address; only the order matters.
-     */
     const int nparams = parse_params(p);
     if (p->g->err) {
         return;
     }
-    for (int i = 0; i < nparams && i < MAX_PARAMS; i++) {
-        emit_store_sized(p->g, 2 + i, 1, p->g->locals[i].off,
-                         sym_access_size(&p->g->locals[i]), 8);
-    }
-    emit_mov_n(p->g, 7, 1);
+    emit_params_home(p->g, nparams);
 
     const int fi = p->g->nfuncs++;
     cpy_err(p->g->funcs[fi].name, MAX_NAME, name);
@@ -4280,12 +6123,11 @@ static void parse_function(par_t *p, int is_void, const char *name)
 
     parse_block(p);
 
-    emit_movi(p->g, 2, 0);
-    emit_retw_n(p->g);
+    emit_func_return(p->g);
 
     /* The stack pointer stays 16-byte aligned, so the frame rounds to 16. */
     const int used = SPILL_BYTES + p->g->local_words * 4 + FRAME_TOP_SAVE;
-    patch_entry(p->g, code_off, (used + 15) & ~15);
+    emit_frame_size(p->g, code_off, (used + 15) & ~15);
 }
 
 /*
@@ -4455,6 +6297,7 @@ static void parse_typedef(par_t *p)
     td->esize = ty.esize;
     td->sidx = ty.sidx;
     td->is_ptr = ty.is_ptr;
+    td->uns = ty.uns;
     lex_next(p->L);
     expect(p, T_SEMI, "expected ';' after typedef");
 }
@@ -4464,6 +6307,19 @@ static void parse_program(par_t *p)
     p->g->data_next = 4;
     p->g->entry_idx = -1;
     p->g->is_driver = 0;
+
+    /*
+     * `true` and `false`, and `bool` in accept_type beside them.
+     *
+     * As enumerators rather than as keywords, so that a program which defines
+     * its own - and plenty do, out of habit - gets the ordinary "duplicate
+     * enumerator" rather than a parse error it cannot read.  A `bool` is ONE
+     * BYTE here, the same as the host compiler's _Bool: a struct with a bool
+     * in it is handed across the ABI by address, and a field that was four
+     * bytes on one side and one on the other would be read as nonsense.
+     */
+    (void)add_enum(p->g, "false", 0);
+    (void)add_enum(p->g, "true", 1);
 
     while (p->L->tok != T_EOF && !p->g->err && !p->L->err) {
         if (accept(p, T_TYPEDEF)) {
@@ -4652,6 +6508,7 @@ static void gen_free(gen_t *g)
         CC_FREE(g->pp.incls[i].text);
     }
     CC_FREE(g->data);
+    CC_FREE(g->irel);
     CC_FREE(g);
 }
 
@@ -4663,12 +6520,24 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out)
 int cc_compile_to_axe_inc(const char *src, size_t src_len,
                           cc_read_file_fn reader, void *ctx, cc_result_t *out)
 {
+    return cc_compile_to_axe_for(src, src_len, reader, ctx, CC_ARCH_HOST, out);
+}
+
+int cc_compile_to_axe_for(const char *src, size_t src_len,
+                          cc_read_file_fn reader, void *ctx, int arch,
+                          cc_result_t *out)
+{
     if (out == NULL) {
         return -1;
     }
     memset(out, 0, sizeof(*out));
     if (src == NULL) {
         cpy_err(out->err, sizeof(out->err), "null source");
+        return -1;
+    }
+    if (arch != CC_ARCH_XTENSA && arch != CC_ARCH_RV32 &&
+        arch != CC_ARCH_BC) {
+        cpy_err(out->err, sizeof(out->err), "unknown architecture");
         return -1;
     }
 
@@ -4702,6 +6571,7 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
     g->is_driver = 0;
     g->data_next = 4;
     g->min_abi = ABI_MINOR_BASE;
+    g->arch = arch;
     g->pp.reader = reader;
     g->pp.reader_ctx = ctx;
 
@@ -4750,7 +6620,10 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
     const size_t data_size = ((size_t)g->data_next + 3u) & ~3u;
     const size_t data_file = data_size;
     const size_t reloc_bytes = (size_t)g->nrelocs * 4u;
-    const size_t file_size = AXE_HDR + code_size + data_file + reloc_bytes;
+    const size_t irel_bytes = (size_t)g->nirel * 8u;
+    const size_t hdr = (g->arch == CC_ARCH_RV32) ? AXE_HDR_I : AXE_HDR;
+    const size_t file_size =
+        hdr + code_size + data_file + reloc_bytes + irel_bytes;
 
     uint8_t *axe = (uint8_t *)CC_ALLOC(file_size);
     if (axe == NULL) {
@@ -4764,8 +6637,8 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
     memcpy(axe + 0, "AXE1", 4);
     wr_u16(axe + 4, 0);
     wr_u16(axe + 6, (uint16_t)g->min_abi);
-    wr_u16(axe + 8, 1);
-    wr_u16(axe + 10, (uint16_t)AXE_HDR);
+    wr_u16(axe + 8, (uint16_t)g->arch);
+    wr_u16(axe + 10, (uint16_t)hdr);
     {
         uint32_t flags = 0;
         if (g->needs_gfx) {
@@ -4777,51 +6650,70 @@ int cc_compile_to_axe_inc(const char *src, size_t src_len,
         if (g->is_driver) {
             flags |= AG_AXE_DRIVER;
         }
+        if (g->pp.can_migrate) {
+            flags |= AG_AXE_CAN_MIGRATE;
+        }
         wr_u32(axe + 12, flags);
     }
 
     wr_u32(axe + 16, CODE_BASE);
     wr_u32(axe + 20, (uint32_t)code_size);
     wr_u32(axe + 24, (uint32_t)code_size);
-    wr_u32(axe + 28, AXE_HDR);
+    wr_u32(axe + 28, (uint32_t)hdr);
 
     wr_u32(axe + 32, DATA_BASE);
     wr_u32(axe + 36, (uint32_t)data_size);
     wr_u32(axe + 40, (uint32_t)data_file);
-    wr_u32(axe + 44, AXE_HDR + (uint32_t)code_size);
+    wr_u32(axe + 44, (uint32_t)hdr + (uint32_t)code_size);
 
     const uint32_t entry = CODE_BASE + (uint32_t)lit_bytes +
                            (uint32_t)g->funcs[g->entry_idx].code_off;
     wr_u32(axe + 48, entry);
     wr_u32(axe + 52, DATA_BASE);
 
-    wr_u32(axe + 56, AXE_HDR + (uint32_t)code_size + (uint32_t)data_file);
+    wr_u32(axe + 56, (uint32_t)hdr + (uint32_t)code_size + (uint32_t)data_file);
     wr_u32(axe + 60, (uint32_t)g->nrelocs);
+    if (hdr == AXE_HDR_I) {
+        wr_u32(axe + 176, (uint32_t)hdr + (uint32_t)code_size +
+                              (uint32_t)data_file + (uint32_t)reloc_bytes);
+        wr_u32(axe + 180, (uint32_t)g->nirel);
+    }
 
     wr_u32(axe + 64, g->pp.app_stack);
     wr_u32(axe + 68, g->pp.app_heap);
-    if (g->is_driver) {
+    if (g->is_driver || g->pp.has_app) {
         wr_str(axe + 72, 32, g->pp.drv_name);
         wr_str(axe + 104, 16, g->pp.drv_ver);
         wr_str(axe + 120, 32, g->pp.drv_author);
     } else {
+        /* Nobody said, so the compiler owns the name.  It is worth nothing to
+         * anyone but the loader's log - and a program that is going to travel
+         * must say, or the far board cannot tell it from every other program
+         * compiled here. */
         wr_str(axe + 72, 32, "TCC");
         wr_str(axe + 104, 16, "0.2");
         wr_str(axe + 120, 32, "cc");
     }
 
-    uint8_t *code = axe + AXE_HDR;
+    uint8_t *code = axe + hdr;
     for (int i = 0; i < g->nlit; i++) {
         wr_u32(code + (size_t)i * 4u, g->lit[i]);
     }
     memcpy(code + lit_bytes, text, g->len);
 
-    uint8_t *data = axe + AXE_HDR + code_size;
+    uint8_t *data = axe + hdr + code_size;
     memcpy(data, g->data, (size_t)g->data_next);
 
     uint8_t *rel = data + data_file;
     for (int i = 0; i < g->nrelocs; i++) {
         wr_u32(rel + (size_t)i * 4u, g->relocs[i]);
+    }
+
+    /* Two words an entry: where the instruction is, and the offset of the
+     * address it should end up holding.  See ag_axe_ireloc_t. */
+    uint8_t *irel = rel + reloc_bytes;
+    for (int i = 0; i < g->nirel * 2; i++) {
+        wr_u32(irel + (size_t)i * 4u, g->irel[i]);
     }
 
     CC_FREE(text);

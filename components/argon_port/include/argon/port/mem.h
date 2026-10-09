@@ -28,6 +28,7 @@
  *   size_t ag_port_mem_free(unsigned caps)
  *   size_t ag_port_mem_total(unsigned caps)
  *   size_t ag_port_mem_largest(unsigned caps)
+ *   void   ag_port_mem_walk(unsigned caps, ag_port_mem_walk_fn fn, void *ctx)
  *
  * All allocators return NULL on failure and never abort.  ag_port_free(NULL) is
  * legal and does nothing.  Memory from ag_port_alloc_aligned is released by
@@ -37,6 +38,13 @@
  * to be approximate on a port that cannot answer exactly - but they must not
  * lie about zero: a port with no such memory reports 0 rather than the total of
  * some other pool.
+ *
+ * ag_port_mem_walk calls fn once for every block of every heap with those
+ * caps, in address order within a heap: where it is, how large, and whether
+ * it is handed out.  It answers the question the three sizes cannot - WHY the
+ * largest block is smaller than what is free, which is a block sitting in the
+ * middle.  fn must not allocate or free.  A port that cannot walk calls fn
+ * never.
  *
  *   size_t ag_port_alloc_size(const void *p)
  *
@@ -80,6 +88,9 @@ typedef struct {
     size_t free_bytes;
     size_t largest_free;
 } ag_port_heap_info_t;
+
+typedef void (*ag_port_mem_walk_fn)(void *ctx, const void *addr, size_t bytes,
+                                    int used);
 
 #include <argon/port/impl/mem.h>
 

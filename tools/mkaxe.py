@@ -129,6 +129,7 @@ I_TO_DATA = 0x10000000
 I_HI20 = 0x20000000
 I_LO12_I = 0x40000000
 I_LO12_S = 0x60000000
+I_REACH = 2048  # AG_AXE_I_REACH
 
 IRELOC_KIND = {
     R_RISCV_HI20: I_HI20,
@@ -763,6 +764,7 @@ def main():
         args.gxx = re.sub(r"gcc(\.exe)?$", lambda m: "g++" + (m.group(1) or ""),
                           args.gcc)
 
+    link_arch = []
     # An .AXE is freestanding: it links -nostdlib and carries its own libc
     # (apps/common/libc). Without this, the compiler recognises the standard
     # idioms - and rewrites the shim's own `while (s[n]) n++` into a *call to
@@ -795,6 +797,35 @@ def main():
     if args.arch == "xtensa":
         # Long calls: the linker cannot shorten a call whose target moves.
         args.cflags += " -mlongcalls"
+    else:
+        # THE INSTRUCTION SET, NAMED, because the compiler's own default is
+        # wrong for every chip this system runs on.
+        #
+        # riscv32-esp-elf-gcc defaults to rv32imafdc: hardware single AND double
+        # floating point, and atomics.  No ESP RISC-V part has the float unit at
+        # all, and the C3 has no atomics either - it is rv32imc, while the C6 is
+        # rv32imac.  An image built at the default therefore holds instructions
+        # that do not exist on the machine it is for, and the way that shows up
+        # is an illegal-instruction panic somewhere inside a program that
+        # loaded perfectly.
+        #
+        # Everything built here has run so far only because none of it reached
+        # a float.  That is luck, not design, and the first application to
+        # divide two doubles would have spent a day being blamed on the loader.
+        #
+        # rv32imc is the common denominator: it runs on the C3, and on the C6,
+        # whose extra atomics are a superset.  One image for both boards.
+        args.cflags += " -march=rv32imc_zicsr_zifencei -mabi=ilp32"
+        # And at the LINK, which picks the libgcc.  Without the pair there the
+        # driver takes its default multilib, whose soft-float helpers read the
+        # rounding mode with `frrm` - an F-extension instruction the C3 does
+        # not have.  TONE was the first image to reach one and died on it with
+        # an illegal instruction (25 Sep 2026); every image that ever divides
+        # two floats would have.
+        link_arch = ["-march=rv32imc_zicsr_zifencei", "-mabi=ilp32"]
+
+    if args.arch == "xtensa":
+        pass
     elif args.contiguous:
         # PC-relative addressing throughout, which is what asking for one block
         # means: the distance between code and data is then part of the
@@ -858,6 +889,7 @@ def main():
 
         elf_path = os.path.join(workdir, "image.elf")
         ldflags = args.ldflags.split() if args.ldflags else []
+        ldflags += link_arch
         run([args.gcc, "-nostdlib", "-nostartfiles",
              "-Wl,--emit-relocs", "-Wl,-T", script,
              "-Wl,--no-warn-rwx-segments", "-o", elf_path] + ldflags +
@@ -1018,8 +1050,12 @@ def main():
                         "%u)" % (where["name"], offset, word,
                                  encode_imm(kind, word, addr), addr, rtype))
 
+                # A base may lie up to one load offset past the part: GCC
+                # reaches a large static's fields from `s + 8192` with a
+                # negative offset.  AG_AXE_I_REACH in axe.h; the loader
+                # accepts the same.
                 low = points_to["addr"]
-                if not low <= addr <= low + points_to["size"]:
+                if not low <= addr <= low + points_to["size"] + I_REACH:
                     raise SystemExit(
                         "mkaxe: %s+%#x points at %#x, which is outside %s"
                         % (where["name"], offset, addr, points_to["name"]))

@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
+#include <argon/proc.h>
 #include <argon/console.h>
 #include <argon/input.h>
 
@@ -448,6 +449,32 @@ void ag_console_set_live(ag_con_live_fn fn, void *ctx)
     ag_console_unlock();
 }
 
+/*
+ * Where this write goes, and the order of the two questions is the point.
+ *
+ * A PROCESS'S OWN SINK COMES FIRST.  A node running a program for another node
+ * gives that program a sink of its own, so the guest's output - and the
+ * loader's lines about it - go down the wire while the board's own shell keeps
+ * its screen.  The global redirect below cannot do that: it catches every
+ * writer on the board, which for a guest that never ends (a migrated program)
+ * means the board never speaks to its own user again.  It did exactly that.
+ *
+ * The global one stays for what it was written for: the shell redirecting a
+ * single command it is itself waiting for, `dir > files.txt`.
+ */
+static bool sink_for_this_write(ag_con_sink_fn *fn, void **ctx)
+{
+    if (ag_proc_out_sink(fn, ctx)) {
+        return true;
+    }
+    if (s_redirect != NULL) {
+        *fn = s_redirect;
+        *ctx = s_redirect_ctx;
+        return true;
+    }
+    return false;
+}
+
 void ag_console_write(const char *buf, size_t len)
 {
     if (!s_ready || buf == NULL) {
@@ -455,8 +482,10 @@ void ag_console_write(const char *buf, size_t len)
     }
 
     ag_console_lock();
-    if (s_redirect != NULL) {
-        s_redirect(s_redirect_ctx, buf, len);
+    ag_con_sink_fn sink = NULL;
+    void          *sink_ctx = NULL;
+    if (sink_for_this_write(&sink, &sink_ctx)) {
+        sink(sink_ctx, buf, len);
     } else {
         ag_screen_write(write_screen(), buf, len);
     }
@@ -470,8 +499,10 @@ void ag_console_write_log(const char *buf, size_t len)
     }
 
     ag_console_lock();
-    if (s_redirect != NULL) {
-        s_redirect(s_redirect_ctx, buf, len);
+    ag_con_sink_fn sink = NULL;
+    void          *sink_ctx = NULL;
+    if (sink_for_this_write(&sink, &sink_ctx)) {
+        sink(sink_ctx, buf, len);
     } else if (s_live != NULL) {
         /*
          * The prompt leaves the cursor mid-line.  Break away, print the

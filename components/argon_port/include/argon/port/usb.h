@@ -21,6 +21,7 @@
  *   ag_err_t ag_port_usb_stop(void)
  *   ag_err_t ag_port_usb_status(ag_port_usb_status_t *out)
  *   void     ag_port_usb_on_report(ag_port_usb_report_fn fn)
+ *   void     ag_port_usb_on_descriptor(ag_port_usb_desc_fn fn)
  *
  * Contract, not advice:
  *
@@ -33,6 +34,13 @@
  *   queue.  A report is the raw boot payload - deciding that byte 2 is the
  *   first keycode is the business of whoever knows the report layout, which for
  *   a boot keyboard is a fixed fact the parser holds, not the port.
+ * - A mouse's report descriptor goes up before its first report.  If the
+ *   callback returns true the kernel can read the device's own layout, and
+ *   the port leaves that interface in report protocol instead of asking for
+ *   boot - what a PC does, and the only thing that works for a receiver that
+ *   ignores SET_PROTOCOL(boot) (046d:c542, 8 Oct 2026).  False, or no
+ *   callback: boot protocol, as before.  Keyboards are always boot.  A
+ *   descriptor that could not be read is passed as NULL, 0.
  * - The board powers the device.  Host mode sources 5 V on the OTG port's VBUS;
  *   a keyboard that draws more than the port can give will not enumerate, and
  *   that is a wiring fact, not a fault the port hides.
@@ -106,12 +114,17 @@ typedef struct {
 typedef void (*ag_port_usb_report_fn)(ag_usb_usage_t usage, uint8_t report_id,
                                       const uint8_t *data, uint32_t len);
 
+/* One interface's HID report descriptor; true = "keep it in report protocol". */
+typedef bool (*ag_port_usb_desc_fn)(ag_usb_usage_t usage, uint8_t itf,
+                                    const uint8_t *desc, uint32_t len);
+
 #if AG_PORT_HAS_USB_HID
 
 ag_err_t ag_port_usb_start(void);
 ag_err_t ag_port_usb_stop(void);
 ag_err_t ag_port_usb_status(ag_port_usb_status_t *out);
 void     ag_port_usb_on_report(ag_port_usb_report_fn fn);
+void     ag_port_usb_on_descriptor(ag_port_usb_desc_fn fn);
 
 #endif /* AG_PORT_HAS_USB_HID */
 

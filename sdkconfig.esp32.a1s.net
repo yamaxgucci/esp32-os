@@ -21,7 +21,17 @@ CONFIG_ARGON_NET_WIFI=y
 # The arena, cut to what is left once the radio has taken its share.  It is
 # still worth having: a smaller .AXE - the file manager, the console tools -
 # runs from RAM, and only the big ones fall back to flash.
-CONFIG_ARGON_APP_ARENA_KB=60
+#
+# 60 was the ceiling and sat on it: this target would not link with 68, and
+# when main's kernel grew a band renderer it would not link with 60 either -
+# `iram0_0_seg' overflowed by 16 bytes, which is how little was left.
+#
+# It no longer has to be at the ceiling.  Splitting the amplifier into a hot
+# part and a cold one took what it asks of the arena from 60684 bytes to
+# 29056, so 56 is still nearly twice what the largest thing on this board
+# wants, and the four kilobytes go back to the kernel - where the next
+# addition to it can land without this target being the one that breaks.
+CONFIG_ARGON_APP_ARENA_KB=56
 
 # THE INSTRUCTION RAM THE RADIO TOOK, BOUGHT BACK.
 #

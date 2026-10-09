@@ -1,0 +1,39 @@
+# What goes into C:\drv on this board, staged by tools\mksysfs.py.
+#
+# NODELINK.SYS, which is the S3's own build: NODELN32 is the CYD's (an LX6)
+# and NODELNRV is the C3's (RISC-V).  A .SYS for the wrong instruction set
+# does not refuse to load - it loads and throws an illegal instruction
+# somewhere inside, which reads as a driver bug rather than the wrong image.
+NODELINK.SYS
+#
+# LINKSPI.SYS - the same link driver over a four-wire SPI cable instead of the
+# UART, and this board's own build for it.  Both ends of the cable are S3s, so
+# ONE image serves either end: [linkspi] role in SYSTEM.CFG says which end holds
+# the clock, and the driver publishes node1 by default so that it can sit beside
+# the UART's node0.
+#
+# The pins are BOARD.CFG's, not the driver's: [spi2] is sck 12, mosi 11,
+# miso 13 on this board, which are SPI2's own IOMUX pins, and the link's cs is
+# 10 (the driver's default).  The rate is [linkspi] khz, which the driver asks
+# the port for on its own chip select - BOARD.CFG's [spi2] khz is only where the
+# bus comes up before the driver does.
+#
+# LOADED BY HAND for the SPI test - `drv load c:\drv\linkspi.sys` - and
+# deliberately NOT in SYSTEM.CFG's [modules]: an image that auto-loads on a
+# board with nothing soldered to those pads would only add noise to every boot
+# log, and the UART wire is the one that has to keep answering while the new one
+# is being measured.
+LINKSPI.SYS
+#
+# REMDISP.SYS - THIS BOARD'S SCREEN, AT THE OTHER END OF THE CABLE.
+#
+# It publishes a display device whose panel is uart1, so an application's
+# pixels go down the wire and nothing above it knows.  It does NOT go through
+# the cluster link: no frames, no window, no acknowledgements - which is why it
+# runs at the wire's own rate (400 067 B/s measured at 4 Mbaud, zero corrupt)
+# while the link over the same copper manages a few thousand.
+#
+# LOADED BY HAND, like LINKSPI: the far end has to be running REMTERM.AXE for
+# any of it to mean anything, and a driver that auto-loaded would spend every
+# boot talking to nobody.
+REMDISP.SYS

@@ -31,7 +31,45 @@ phone: http://192.168.4.1:8765/
 port = 8765        ; 80 is HTTPD.AXE's, 8080 is too common
 text = yes         ; offer the console as characters (default)
 password = secret  ; leave it out and anybody who reaches the port is in
+frame = no         ; never hold a copy of the picture (see below)
+codec = light      ; never hold picture memory at all (see below)
 ```
+
+## Pictures with no memory to spare
+
+Three ways a picture reaches the phone, and the driver takes the best one the
+board can afford - nothing has to be configured for it to work:
+
+| | memory on the board | how |
+|---|---|---|
+| frame | a copy of the screen (150 KB at 320x240) + 13 KB | `blit_rect` copies, the driver's task sends; a phone that connects later gets the whole picture at once |
+| direct | 13 KB (band, packed output, palette context) | sent from the drawing application's task, all three encodings |
+| light | **none** - 2 KB inside the driver as loaded | sent from the drawing application's task, a few rows per message, raw or PackBits (no palette) |
+
+In the last two the application's pixels go straight onto the wire and the
+**page assembles the picture**: every band lands on a canvas that keeps it.
+A frame that cannot be had is given up and the picture goes direct; buffers
+that cannot be had send it light, and are asked for again every two seconds.
+Neither stops the console or the page - an allocation that failed used to
+stall the driver's whole loop. `frame = no` and `codec = light` choose the
+cheaper ways up front, on a board whose owner knows the memory is wanted
+elsewhere (the CYD: those 13 KB are what keeps the page loading with an
+application running).
+
+**With no framebuffer on the board at all** (`[display] driver = panel`), an
+application that draws with the ordinary primitives - rectangles, text,
+circles, blits - still has a picture: the kernel writes the primitives into a
+list and, on `flush`, plays them back a strip of a few rows at a time, handing
+each strip to this driver as it goes (display.c, the band renderer). About
+12 KB while an application holds the screen, nothing otherwise. The page is
+the only place the whole frame exists. In this mode the drawing application
+waits for the wire rather than having bands dropped, because a dropped band
+has nowhere to be sent from again.
+
+What the board does not hold, it cannot send again: with no frame, a phone
+that connects after the picture was drawn sees it only when the application
+draws again. GFXPIX redraws twice a second for that reason. The beat in the
+journal (`log`) counts the light bands: `picture: ... bands out (N light)`.
 
 ## The password
 
@@ -101,6 +139,15 @@ python tools/phonefixture.py
 then open `http://127.0.0.1:8765/` in a browser. `--picture` sends a picture
 with flat panels, a gradient and noise in it, so all three encodings are used
 on one screen.
+
+The other way round, [`tools/phoneshot.py`](../../tools/phoneshot.py) is the
+phone: it connects to a running PHONE.SYS (a board, or QEMU), assembles the
+bands as the page does and writes what it would have shown as a PNG, with the
+bands counted by encoding.
+
+```
+python tools/phoneshot.py 127.0.0.1:8765 --seconds 20 --out shot.png
+```
 
 The codec and the WebSocket framing are checked in `argon tests`
 (`host-tests/test_phonelink.c`) against the shipped sources, bit for bit.

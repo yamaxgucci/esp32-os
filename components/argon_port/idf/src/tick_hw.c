@@ -42,6 +42,14 @@ static void AG_PORT_IRAM tick_on_core1(void)
     }
 }
 
+ag_port_task_t ag_port_task_idle_of(int core)
+{
+    if (core < 0 || core >= portNUM_PROCESSORS) {
+        return NULL;
+    }
+    return xTaskGetIdleTaskHandleForCore((BaseType_t)core);
+}
+
 bool ag_port_tick_hook(ag_port_tick_fn fn)
 {
     /*

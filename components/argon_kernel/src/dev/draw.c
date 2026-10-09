@@ -24,6 +24,10 @@ static bool in_clip(const ag_draw_surf_t *s, int32_t x, int32_t y)
     if ((uint32_t)x >= s->w || (uint32_t)y >= s->h) {
         return false;
     }
+    if (s->rows != 0 &&
+        ((uint32_t)y < s->row0 || (uint32_t)y >= (uint32_t)s->row0 + s->rows)) {
+        return false;
+    }
     if (s->clip_w == 0 || s->clip_h == 0) {
         return true;
     }
@@ -44,7 +48,7 @@ void ag_draw_pixel(ag_draw_surf_t *s, int32_t x, int32_t y, uint16_t c565)
     if (!in_clip(s, x, y)) {
         return;
     }
-    s->pix[(uint32_t)y * s->w + (uint32_t)x] = c565;
+    s->pix[((uint32_t)y - s->row0) * s->w + (uint32_t)x] = c565;
 }
 
 void ag_draw_line(ag_draw_surf_t *s, int32_t x0, int32_t y0, int32_t x1,
@@ -118,6 +122,10 @@ static void hline(ag_draw_surf_t *s, int32_t x0, int32_t x1, int32_t y,
     if (s == NULL || s->pix == NULL || (uint32_t)y >= s->h) {
         return;
     }
+    if (s->rows != 0 &&
+        ((uint32_t)y < s->row0 || (uint32_t)y >= (uint32_t)s->row0 + s->rows)) {
+        return;
+    }
     if (s->clip_w != 0 && s->clip_h != 0) {
         if (y < s->clip_y || y >= (int32_t)s->clip_y + (int32_t)s->clip_h) {
             return;
@@ -143,7 +151,7 @@ static void hline(ag_draw_surf_t *s, int32_t x0, int32_t x1, int32_t y,
     if (x1 >= (int32_t)s->w) {
         x1 = (int32_t)s->w - 1;
     }
-    uint16_t *row = &s->pix[(uint32_t)y * s->w + (uint32_t)x0];
+    uint16_t *row = &s->pix[((uint32_t)y - s->row0) * s->w + (uint32_t)x0];
     for (int32_t x = x0; x <= x1; x++) {
         *row++ = c565;
     }
@@ -380,7 +388,7 @@ void ag_draw_blit_argb8888(ag_draw_surf_t *s, int32_t x, int32_t y, int32_t w,
                 continue;
             }
             const uint16_t dst =
-                s->pix[(uint32_t)dy * s->w + (uint32_t)dx];
+                s->pix[((uint32_t)dy - s->row0) * s->w + (uint32_t)dx];
             ag_draw_pixel(s, dx, dy, blend_565(dst, r, g, b, a));
         }
     }

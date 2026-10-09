@@ -146,4 +146,18 @@ const ag_api_t *ag_loader_api(void);
 }
 #endif
 
+/*
+ * Why an image would not load, in words.  Used by whoever reports a load
+ * failure to a person - the shell when it waits for one, and the process
+ * layer when the load happens on the new task and nobody is waiting.
+ */
+const char *ag_loader_why(ag_err_t err);
+
+/*
+ * This board's own image of the program called `want`, by the name in its
+ * header rather than by any filename.  -AG_ENOENT when this board has no
+ * build of it that it could execute.
+ */
+ag_err_t ag_loader_find_by_name(const char *want, char *out, size_t cap);
+
 #endif /* ARGON_LOADER_H */

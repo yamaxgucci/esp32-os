@@ -72,6 +72,20 @@ typedef enum {
     AG_ARCH_NONE = 0,
     AG_ARCH_XTENSA = 1,  /* ESP32, S2, S3          */
     AG_ARCH_RISCV32 = 2, /* C3, C6, H2, P4         */
+    /*
+     * And one that is not a processor: portable bytecode, run by AGVM.AXE.
+     * The cascade's third rung - one image every board can execute, at five to
+     * fifty times the cost.  It is an arch like the others because an image is
+     * an image: same header, same name and version, same way of saying what it
+     * needs.  ag_axe_native_arch() never answers this, so everything that asks
+     * "can I run this" keeps its old answer, and the one place that knows
+     * better is the spawn - see via_interpreter in proc.c.
+     *
+     * The instruction set itself is apps/common/agvm/ag_bc.h, which repeats
+     * this number for the compiler's sake; host-tests/test_cc.c asserts they
+     * agree.
+     */
+    AG_ARCH_BC = 3,
 } ag_axe_arch_t;
 
 /*
@@ -135,6 +149,18 @@ typedef struct {
 #define AG_AXE_I_HI20 0x20000000u   /* lui: bits 31..12 hold imm[31:12]     */
 #define AG_AXE_I_LO12_I 0x40000000u /* addi/lw: bits 31..20 hold imm[11:0]  */
 #define AG_AXE_I_LO12_S 0x60000000u /* sw: imm split across 31..25 and 11..7 */
+
+/*
+ * How far past the end of its part an instruction's address may point.
+ *
+ * Not every address a pair builds is one that is read.  For a static bigger
+ * than a load's reach, GCC builds a BASE inside or past the object and
+ * reaches the fields from it with the load's signed 12-bit offset - PHONECL's
+ * state is `s + 8192`, 400 bytes past the end of the data part, and every
+ * field it reads through it is inside.  So the base may lie up to one
+ * offset's reach (2048) past the part; what is read never does.
+ */
+#define AG_AXE_I_REACH 2048u
 
 /*
  * An image built for one architecture will not run on the other.  The shell

@@ -121,6 +121,18 @@ ag_err_t ag_axe_validate(const ag_axe_header_t *header, size_t file_bytes,
     if (header->abi_major != abi_major || header->abi_minor > abi_minor) {
         return -AG_EABI;
     }
+    /*
+     * 0.53 to 0.62 were the cluster line's own numbers before it was merged
+     * with main as 0.63 (25 Sep 2026), and in the merge its members moved past
+     * main's.  An image stamped with one of them reads io, task and the api
+     * root at the offsets of a table that no longer exists - it would load and
+     * call the wrong functions.  Refused, so the answer is "rebuild it" and not
+     * a board that does something else.
+     */
+    if (abi_major == 0u && abi_minor >= 63u && header->abi_minor >= 53u &&
+        header->abi_minor <= 62u) {
+        return -AG_EABI;
+    }
 
     /*
      * The strings come from a file and end up printed, logged and handed to
@@ -389,10 +401,10 @@ bool ag_axe_ireloc_apply(const ag_axe_header_t *header, uint8_t *code_bytes,
         return false;
     }
     if (to_data) {
-        if (entry.target > header->data.size) {
+        if (entry.target > header->data.size + AG_AXE_I_REACH) {
             return false;
         }
-    } else if (entry.target > header->code.size) {
+    } else if (entry.target > header->code.size + AG_AXE_I_REACH) {
         return false;
     }
     if (at < code_off) {

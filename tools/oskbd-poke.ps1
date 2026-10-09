@@ -47,7 +47,7 @@ function Get-LastMatch {
 
 # The transcript arrives full of escape codes and line breaks; the numbers
 # survive both, so they are what is looked for.
-$text = (Get-Content -Raw $Log) -replace "`e\[[0-9;?]*[A-Za-z]", '' -replace "`r?`n", ''
+$text = (Get-Content -Raw $Log) -replace "$([char]27)\[[0-9;?]*[A-Za-z]", '' -replace "`r?`n", ''
 
 $keys = Get-LastMatch $text 'keyboard keys (-?\d+),(-?\d+) (\d+)x(\d+) row (-?\d+),(-?\d+) (\d+)x(\d+)'
 if ($null -eq $keys) { throw 'oskbd-poke: the desktop never said where its keyboard is' }

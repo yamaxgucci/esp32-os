@@ -17,6 +17,8 @@
 #include <argon/log.h>
 #include <argon/module.h>
 #include <argon/proc.h>
+#include <argon/path.h>
+#include <argon/libc.h>
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
@@ -896,8 +898,16 @@ static ag_err_t place_parts(const ag_axe_header_t *header,
      * PSRAM execution is slower than internal SRAM but far faster than flash for
      * a working set that does not fit the cache, and it leaves the internal
      * memory to the radios - which is the whole reason the arena moved.
+     *
+     * And the arena is mapped only for code that can go into it.  It maps
+     * once for the life of the system, 64 KB-aligned, so it lands low in
+     * PSRAM with a hole under it - and on 8 Oct 2026 Fallout, whose 788 KB of
+     * code never goes there, lost it anyway: its 6000 KB arena was refused
+     * next to a free block of 6003, because the heap rounds a request that
+     * large up to 6016.  The 102 KB of arena and hole was the difference.
      */
-    if (!want_xip && !contiguous && psram_ready() &&
+    if (!want_xip && !contiguous &&
+        (size_t)header->code.size <= AG_PSRAM_ARENA_BYTES && psram_ready() &&
         ag_arena_largest_free(&s_psram, 16) >= (size_t)header->code.size) {
         const ag_err_t perr = place_psram(header, out);
         if (perr == AG_OK) {
@@ -1322,6 +1332,129 @@ ag_err_t ag_loader_peek(const char *path, const char *cwd,
     }
     return ag_axe_validate(out, (size_t)size, ag_axe_native_arch(),
                            AG_ABI_MAJOR, AG_ABI_MINOR);
+}
+
+/*
+ * Why an image would not load, in words, once.
+ *
+ * It lived in the shell, which meant the shell's `run` explained itself and
+ * everything else printed a number.  On a board that mattered: an image built
+ * for the other instruction set is refused with -AG_ENOTSUP, and what reached
+ * the screen was "nodehirv.axe (pid 2) returned -45".  Correct, useless, and
+ * indistinguishable from a program that chose to return -45.
+ *
+ * Here rather than in the shell because these are the loader's own answers,
+ * and a second copy of the table is a second copy to drift.
+ */
+/*
+ * MY OWN BUILD OF THAT PROGRAM, found by what it IS rather than by what it is
+ * called.
+ *
+ * A cluster spanning two instruction sets passes messages and shares devices
+ * without noticing the line; code stops at it dead.  The answer is not to
+ * carry one binary that runs on both - there is no such thing for Xtensa and
+ * RISC-V - but to stop sending code at all: send the program's IDENTITY and
+ * let each board use the copy it can execute.
+ *
+ * The identity is already in every image: name, version, author and the
+ * instruction set, in the header, and until now nothing read them for this.
+ *
+ * Searched rather than indexed because the set is small - a board's C: holds
+ * tens of images, not thousands - and because an index is a second thing to
+ * keep true.  If that ever stops being cheap, the place to put the index is
+ * here, behind this function, and nothing above it changes.
+ */
+ag_err_t ag_loader_find_by_name(const char *want, char *out, size_t cap)
+{
+    if (want == NULL || want[0] == '\0' || out == NULL || cap == 0) {
+        return -AG_EINVAL;
+    }
+
+    const ag_handle_t d = ag_vfs_opendir("/sys", "/sys");
+    if (d < 0) {
+        return -AG_ENOENT;
+    }
+
+    ag_err_t found = -AG_ENOENT;
+    /*
+     * A bytecode build of the same program, kept aside in case there is no
+     * native one.  That is the cascade's third rung and it costs this much:
+     * the second-best answer is remembered while the best one is looked for,
+     * and only used if the search ends without it.
+     *
+     * Second-best on purpose.  Bytecode runs five to fifty times slower, so a
+     * board that has its own build must never be given the portable one -
+     * which is exactly what would happen if this took the first match.
+     */
+    char     bc[AG_PATH_MAX];
+    bool     have_bc = false;
+
+    for (;;) {
+        ag_dirent_t e;
+        if (ag_vfs_readdir(d, &e) != AG_OK) {
+            break;
+        }
+        if ((e.st.attr & (uint32_t)AG_A_DIR) != 0u) {
+            continue;
+        }
+
+        char path[AG_PATH_MAX];
+        if (snprintf(path, sizeof(path), "/sys/%s", e.name) >= (int)sizeof(path)) {
+            continue;
+        }
+
+        ag_axe_header_t h;
+        const ag_err_t  pk = ag_loader_peek(path, "/sys", &h);
+        /*
+         * -AG_ENOTSUP is "read and understood, not for this machine", which is
+         * what a bytecode image always answers - ag_axe_native_arch() is never
+         * AG_ARCH_BC.  Anything else that cannot be read is not an image.
+         */
+        if (pk != AG_OK && pk != -AG_ENOTSUP) {
+            continue;
+        }
+        if (ag_path_icmp(h.name, want) != 0) {
+            continue;
+        }
+
+        if ((ag_axe_arch_t)h.arch == ag_axe_native_arch()) {
+            ag_strlcpy(out, path, cap);
+            found = AG_OK;
+            break;
+        }
+        if ((ag_axe_arch_t)h.arch == AG_ARCH_BC && !have_bc) {
+            ag_strlcpy(bc, path, sizeof(bc));
+            have_bc = true;
+        }
+        /*
+         * And anything else is an image of the OTHER instruction set, which is
+         * exactly what sent us looking: taking one would be a loop.
+         */
+    }
+    ag_vfs_closedir(d);
+
+    if (found != AG_OK && have_bc) {
+        ag_strlcpy(out, bc, cap);
+        found = AG_OK;
+    }
+    return found;
+}
+
+const char *ag_loader_why(ag_err_t err)
+{
+    switch (-err) {
+    case AG_ENOENT:  return "file not found";
+    case AG_EFORMAT: return "not an ArgonOS application";
+    case AG_ENOTSUP: return "built for a different processor";
+    case AG_EABI:    return "built for a different version of this system";
+    case AG_ENOMEM:  return "not enough memory (task stack / heap / code arena)";
+    case AG_EBUSY:   return "too many applications are loaded";
+    case AG_ERANGE:  return "too many arguments";
+    case AG_EINVAL:  return "is a driver; use 'drv load'";
+    case AG_EEXIST:  return "already loaded";
+    case AG_ENFILE:  return "too many modules are loaded";
+    default:         return "could not be loaded";
+    }
 }
 
 ag_err_t ag_loader_load(const char *path, const char *cwd,

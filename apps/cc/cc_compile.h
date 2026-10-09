@@ -34,6 +34,7 @@ extern "C" {
 #define API_OFF_TIME  40
 #define API_OFF_PROC  48
 #define API_OFF_AUDIO 60
+#define API_OFF_CLU   88 /* after main's store, since the 0.63 merge */
 
 #define MEM_OFF_ALLOC   4
 #define MEM_OFF_REALLOC 12
@@ -69,6 +70,11 @@ extern "C" {
 #define SYS_OFF_HEARTBEAT 32
 
 #define PROC_OFF_FOCUSED 48
+/* Moving a running program to another board (ABI 0.53).  Four bytes an entry
+ * from the `size` field, so these follow focused in declaration order. */
+#define PROC_OFF_MIG_WANTED  52
+#define PROC_OFF_MIG_SAVE    56
+#define PROC_OFF_MIG_RESTORE 60
 
 #define TIME_OFF_US       4
 #define TIME_OFF_MS       8
@@ -109,6 +115,21 @@ extern "C" {
 #define GFX_OFF_POLY_UV         128
 #define GFX_OFF_POLY_FILL_TEX   132
 
+/*
+ * Threads of one program over several boards (ABI 0.52).  The table is never
+ * NULL: a board alone answers "one node, this one" and runs every thread here,
+ * so a program written against these calls is the same program on one board
+ * and on three.
+ */
+#define CLU_OFF_NODES 4
+#define CLU_OFF_START 8
+#define CLU_OFF_SPAWN 12
+#define CLU_OFF_SEND  16
+#define CLU_OFF_RECV  20
+#define CLU_OFF_JOIN  24
+#define CLU_OFF_SELF  28
+#define CLU_OFF_DONE  32
+
 #define AUDIO_OFF_PRESENT 4
 #define AUDIO_OFF_IS_HW   8
 #define AUDIO_OFF_OPEN    12
@@ -130,6 +151,32 @@ extern "C" {
 #define ABI_MINOR_GFX25  25
 #define ABI_MINOR_GFX26  26
 #define ABI_MINOR_FOCUS  20
+#define ABI_MINOR_CLUSTER 63 /* 0.52 on main's line is a kernel without clu */
+#define ABI_MINOR_MIGRATE 63 /* 53 is a pre-merge cluster number the loader now refuses */
+
+/*
+ * Which machine to write instructions for.  The numbers are ag_axe_arch_t's,
+ * because they go straight into the image header and a second set of names for
+ * the same two things is a second thing to keep in step.
+ *
+ * CC_ARCH_HOST is what this build of the compiler targets when nothing says
+ * otherwise: the board it is running on.  A board asked for a program its
+ * NEIGHBOUR can run says so explicitly.
+ */
+typedef enum {
+    CC_ARCH_XTENSA = 1,
+    CC_ARCH_RV32 = 2,
+    /* The machine with no processor - see apps/common/agvm/ag_bc.h.  It is an
+     * arch like the others because an image is an image: same header, same
+     * name and version, same way of saying what it needs. */
+    CC_ARCH_BC = 3
+} cc_arch_t;
+
+#if defined(__riscv)
+#define CC_ARCH_HOST CC_ARCH_RV32
+#else
+#define CC_ARCH_HOST CC_ARCH_XTENSA
+#endif
 
 typedef struct {
     uint8_t *axe;
@@ -153,6 +200,11 @@ int cc_compile_to_axe(const char *src, size_t src_len, cc_result_t *out);
 /* The same, for a source that may include files. A NULL reader refuses them. */
 int cc_compile_to_axe_inc(const char *src, size_t src_len,
                           cc_read_file_fn reader, void *ctx, cc_result_t *out);
+
+/* And the same again, for a machine other than the one this build targets. */
+int cc_compile_to_axe_for(const char *src, size_t src_len,
+                          cc_read_file_fn reader, void *ctx, int arch,
+                          cc_result_t *out);
 
 void cc_result_free(cc_result_t *out);
 

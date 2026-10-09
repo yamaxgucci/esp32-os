@@ -21,6 +21,7 @@
 
 #include <argon/kernel.h>
 #include <argon/log.h>
+#include <argon/service.h>
 
 #include <argon/port/mem.h>
 #include <argon/port/sync.h>
@@ -100,14 +101,21 @@ void ag_thread_release(void *record)
          * journal; a lost console is a board that has to be power-cycled, and
          * Maxim had to do exactly that.
          */
+        /*
+         * And stopped before it is asked, not asked and then deleted: the
+         * thread runs on in between, and can walk into a lock in the moment
+         * after the answer (see stop_outside_kernel in proc.c).
+         */
+        bool stopped = false;
         for (unsigned i = 0; i < AG_THREAD_UNLOCK_TRIES; i++) {
-            if (!ag_proc_task_in_kernel(rec->task)) {
+            stopped = ag_proc_task_stop_outside_kernel(rec->task);
+            if (stopped) {
                 break;
             }
             ag_port_task_delay(AG_THREAD_UNLOCK_WAIT_MS);
         }
 
-        if (ag_proc_task_in_kernel(rec->task)) {
+        if (!stopped) {
             ag_log(AG_LOG_ERROR, "thread",
                    "a thread (task %p) is inside the kernel holding a lock "
                    "after 2 s; left running rather than killed - deleting it "
@@ -146,11 +154,22 @@ static void thread_entry(void *arg)
     ag_port_task_delete(NULL);
 }
 
-static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
-                              size_t stack, int priority, uint32_t flags)
+/*
+ * The body of create(), with the process named rather than taken from whoever
+ * is calling.
+ *
+ * Both are needed and they are not the same question.  An application creating
+ * a thread of its own is the caller's process, always.  A thread of a CLUSTER
+ * job is asked for by the node next door, and it arrives on the link's task -
+ * which belongs to no process at all, so "the caller's" would be NULL and the
+ * thread could not be owned by anything.  Naming the process is what lets the
+ * thread still belong to the program it runs inside, and therefore still be
+ * reclaimed when that program ends.
+ */
+static ag_thread_t thread_create_in(proc_t *p, void (*fn)(void *), void *arg,
+                                    const char *name, size_t stack,
+                                    int priority, uint32_t flags)
 {
-    proc_t *p = ag_proc_current();
-
     if (fn == NULL) {
         return NULL;
     }
@@ -234,6 +253,29 @@ static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
 
     ag_proc_table_unlock();
     return (ag_thread_t)rec;
+}
+
+static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
+                              size_t stack, int priority, uint32_t flags)
+{
+    return thread_create_in(ag_proc_current(), fn, arg, name, stack, priority,
+                            flags);
+}
+
+ag_thread_t ag_thread_create_in(ag_pid_t pid, void (*fn)(void *), void *arg,
+                                const char *name, size_t stack, int priority,
+                                uint32_t flags)
+{
+    ag_proc_table_lock();
+    proc_t *p = ag_proc_by_pid(pid);
+    ag_proc_table_unlock();
+    /*
+     * The pointer is used after the lock is dropped, which is safe for the one
+     * thing it is used for: a slot is only freed once its process's task has
+     * gone, and the caller here is asking on behalf of a process it has just
+     * seen alive.  thread_create_in takes the lock again for the change itself.
+     */
+    return thread_create_in(p, fn, arg, name, stack, priority, flags);
 }
 
 /*
@@ -535,6 +577,8 @@ const ag_task_api_t ag_task_api_table = {
     .queue_delete = api_queue_delete,
     .queue_send = api_queue_send,
     .queue_recv = api_queue_recv,
+    .svc_start = ag_svc_start,
+    .svc_stopping = ag_svc_stopping,
     .critical_enter = api_critical_enter,
     .critical_exit = api_critical_exit,
     .stack_left = api_stack_left,

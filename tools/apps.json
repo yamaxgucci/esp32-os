@@ -23,13 +23,34 @@
   },
   "apps": [
     { "out": "HELLO.AXE", "group": "core", "src": ["apps/hello/hello.c"] },
+    { "out": "NEEDSND.AXE", "group": "core", "src": ["apps/needsnd/needsnd.c"] },
+    { "out": "NEEDGFX.AXE", "group": "core", "src": ["apps/needgfx/needgfx.c"] },
+    { "out": "GRIND.AXE", "group": "core", "src": ["apps/grind/grind.c"] },
+    { "out": "REAPWAIT.AXE", "group": "core", "src": ["apps/reapwait/reapwait.c"] },
+    { "out": "MIGRANT.AXE", "group": "core", "src": ["apps/migrant/migrant.c"] },
     { "out": "DISK.AXE", "group": "core", "src": ["apps/disk/disk.c"] },
+    {
+      "out": "USBMSC.AXE", "group": "core",
+      "_note": "The board as a USB card reader, stage 1 read-only.  Started by an operator command, takes the board's one USB port away from the console for the session, and ends on a host eject/unplug or a timeout - never a typed command, because there is no console while it runs.  Needs CONFIG_ARGON_USB_MSC in the firmware.",
+      "src": ["apps/usbmsc/usbmsc.c"] },
     { "out": "DEVS.AXE", "group": "core", "src": ["apps/devs/devs.c"] },
+    { "out": "DEVPOKE.AXE", "group": "core", "src": ["apps/devpoke/devpoke.c"] },
+    {
+      "out": "DEVPOKRV.AXE", "group": "board",
+      "_note": "DEVPOKE for RISC-V.  Its job in the cluster tests is to write to a device BY CLASS rather than by name - `devpokrv.axe pcmmix 192 40` - which is the only way to test that a board with no output of its own reaches the neighbour's.  TONE cannot do it: it opens /dev/pcm0 by name and simply fails with -2 on a board that has none, so the class default never gets a chance.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/devpoke/devpoke.c"] },
     { "out": "SPIN.AXE", "group": "core", "src": ["apps/spin/spin.c"] },
+    { "out": "IDLE.AXE", "group": "core", "src": ["apps/idle/idle.c"] },
     { "out": "PWR.AXE", "group": "core", "src": ["apps/pwr/pwr.c"] },
     { "out": "LEAK.AXE", "group": "core", "src": ["apps/leak/leak.c"] },
     { "out": "THREADS.AXE", "group": "core", "src": ["apps/threads/threads.c"] },
     { "out": "CRASH.AXE", "group": "core", "src": ["apps/crash/crash.c"] },
+    {
+      "out": "CRASHRV.AXE", "group": "board",
+      "_note": "CRASH for RISC-V, and it has to name its compiler rather than rely on the target.  TOOLCHAIN_FOR_TARGET has no esp32c3 entry, so on a C3 build an entry that names neither arch nor gcc is built for the manifest's default - xtensa-esp32s3 - and the board answers `built for a different processor (-45)` when it is asked to run it.  That is the right default for the images the C3 carries FOR THE ZERO (NODEHI/GRIND/MIGRANT are LX7 builds and must stay so); it is the wrong one for a program the C3 runs ITSELF.  A deliberate panic on the C3 is what proves that a fault the kernel cannot recover still leaves a record across the reboot, so this image exists.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/crash/crash.c"] },
     { "out": "EDIT.AXE", "group": "core", "src": ["apps/edit/edit.c"] },
     { "out": "GFXDEMO.AXE", "group": "core", "src": ["apps/gfxdemo/gfxdemo.c"] },
     {
@@ -126,6 +147,84 @@
     { "out": "ATRADIO.SYS", "group": "core",
       "include": ["apps/common", "apps/common/atproto"],
       "src": ["apps/atradio/atradio.c", "apps/common/atproto/ag_atproto.c"] },
+    { "out": "NODELINK.SYS", "group": "core",
+      "include": ["apps/common"],
+      "src": ["apps/nodelink/nodelink.c"] },
+    { "out": "NULLDISP.SYS", "group": "core",
+      "_note": "A screen with no glass: a 320x240 RGB565 display with a text mode that draws nothing and says once a second in the journal what reached it - frames/s, KB/s, text rows. For measuring a neighbour's picture over the cluster link on a bench with no panel.",
+      "include": ["apps/common"],
+      "src": ["apps/nulldisp/nulldisp.c"] },
+    {
+      "out": "LINKSPI.SYS", "group": "core",
+      "_note": "The cluster wire over a four-wire SPI cable: one message is one block of the kernel's framed link (io->spi_link_open2 in block mode, ABI 0.60), which clocks, checksums, acknowledges and sends again on its own - no nlink underneath any more. One image serves either end; the role - master or slave, who holds the clock - is a SYSTEM.CFG line. Built for the current target (group core), so the C3 gets a RISC-V one. Loaded by hand (`drv load c:\\drv\\linkspi.sys`) after NODELINK is unloaded, because the two share pins on the Zero-C3 cable.",
+      "include": ["apps/common"],
+      "src": ["apps/linkspi/linkspi.c"] },
+    {
+      "out": "NODELN32.SYS", "group": "board",
+      "_note": "The same wire driver for an LX6 - the CYD is an ESP32, the S3 an ESP32-S3, and a .AXE or .SYS built for one throws an illegal instruction on the other rather than refusing to load. Two boards joined by this wire therefore need two images of it, and the only difference is the compiler. Needed to test the cluster on real hardware at all.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "include": ["apps/common"],
+      "src": ["apps/nodelink/nodelink.c"] },
+    {
+      "out": "MIGRAN32.AXE", "group": "board",
+      "_note": "MIGRANT for an LX6, so a program can be moved BETWEEN the two boards in either direction. One direction would prove less than half: the number has to survive the trip back.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "src": ["apps/migrant/migrant.c"] },
+    {
+      "out": "GRIND32.AXE", "group": "board",
+      "_note": "GRIND for an LX6: cluster threads run the SAME program on every core of every board, so the program has to exist as an image each board can execute.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "src": ["apps/grind/grind.c"] },
+    {
+      "out": "LINK32.AXE", "group": "board",
+      "_note": "LINK for an LX6 - the image docs/09-esp32-cyd.md has been naming for a month while nothing built it. It measures the wire ALONE, with none of our stack on it, which is the first thing to run on real hardware: a failure there is the wiring or the baud, and everything above would have been read as a cluster fault.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "src": ["apps/link/link.c"] },
+    {
+      "out": "NODEHI.AXE", "group": "core",
+      "_note": "The smallest program worth sending to another board: one line, no buffers.  HELLO.AXE cannot be used for that - it carries a deliberate 512 KB static buffer to prove a large .bss lands outside the arena, which makes it impossible on any board without PSRAM (the CYD has 203 KB in total, the C3 has 174).  A remote-run check written with HELLO fails with -12 for a reason that has nothing to do with the wire.",
+      "src": ["apps/nodehi/nodehi.c"] },
+    {
+      "out": "NODEHI32.AXE", "group": "board",
+      "_note": "NODEHI for an LX6 - what a RISC-V board hands to an Xtensa neighbour.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "src": ["apps/nodehi/nodehi.c"] },
+    {
+      "out": "NODEHIRV.AXE", "group": "board",
+      "_note": "NODEHI for RISC-V - what an Xtensa board hands to a RISC-V neighbour.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/nodehi/nodehi.c"] },
+    {
+      "out": "HELLO32.AXE", "group": "board",
+      "_note": "HELLO for an LX6, so a RISC-V board can ask an Xtensa one to run something.  A cluster that spans instruction sets can pass messages and share devices freely, but CODE only runs where its instruction set is - so each board carries the images its NEIGHBOUR can execute, not only its own.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "src": ["apps/hello/hello.c"] },
+    {
+      "out": "HELLORV.AXE", "group": "board",
+      "_note": "HELLO for RISC-V, the mirror of HELLO32: what an Xtensa board hands to a RISC-V neighbour.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/hello/hello.c"] },
+    {
+      "out": "NODELNRV.SYS", "group": "board",
+      "_note": "The wire driver for a RISC-V board - the C3 SuperMini and the C6.  One image for both: mkaxe names rv32imc, which the C3 is and the C6 is a superset of.  A third build of the same source, and the reason is always the same - an image built for the wrong instruction set does not refuse to load, it loads and throws an illegal instruction somewhere inside.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "include": ["apps/common"],
+      "src": ["apps/nodelink/nodelink.c"] },
+    {
+      "out": "MIGRANRV.AXE", "group": "board",
+      "_note": "MIGRANT for RISC-V, so a program can move between an Xtensa board and a RISC-V one.  That direction is the interesting one: the state that travels is the program's own bytes, and it has to mean the same on both - which is exactly why migrate_save carries a version stamp.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/migrant/migrant.c"] },
+    {
+      "out": "GRINDRV.AXE", "group": "board",
+      "_note": "GRIND for RISC-V.  The C3 has ONE core, so a job spread across two boards gets three threads rather than four, and the speed-up it prints is the honest one for this pair.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/grind/grind.c"] },
+    {
+      "out": "LINKRV.AXE", "group": "board",
+      "_note": "LINK for RISC-V: the wire alone, with none of our stack on it.  The first thing to run on any new pair of boards - a failure there is the wiring or the baud, and everything above would have been read as a cluster fault.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "src": ["apps/link/link.c"] },
     { "out": "ESPFLASH.AXE", "group": "core",
       "_note": "the board flashes a wired ESP chip itself from a .bin on disk; ESP8266 + ESP32-family ROM protocol over a non-console UART. Codec host-tested (test_espldr).",
       "include": ["apps/common"],
@@ -154,6 +253,14 @@
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
       "src": ["apps/loopback/loopback.c", "apps/common/pcm/ag_pcm.c",
               "apps/common/libc/libc_shim.c"]
+    },
+    {
+      "out": "TONERV.AXE", "group": "board",
+      "_note": "TONE for RISC-V.  Its point on the C3 is that the board has no DAC at all: the tone goes to the default audio device, which by class is the NEIGHBOUR'S - nothing in the program knows or asks. That is the sound half of the cluster, and it is counted on the receiving board because the CYD's speaker connector ships empty and silence proves nothing.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "include": ["apps/common", "apps/common/libc"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/tone/tone.c", "apps/common/libc/libc_shim.c"]
     },
     {
       "out": "HTTPD.AXE", "group": "core",
@@ -221,24 +328,39 @@
       "src": ["apps/st7789/st7789.c"]
     },
     {
-      "out": "ST7789WS2.SYS", "group": "board",
-      "_note": "The same source again, for the Waveshare ESP32-S3-Touch-LCD-2: -DST7789_BOARD_WSLCD2 is a third block of constants - the panel is on SPI2 with the microSD, and it has no reset line the documents agree on, so the driver brings it up with SWRESET instead of a pin.",
+      "out": "ST7789LCD2.SYS", "group": "board",
+      "_note": "The same controller again, for the 2 inch panel built into the Waveshare ESP32-S3-Touch-LCD-2: -DST7789_BOARD_LCD2 selects that board's constants (chip select 45, data/command 42, backlight 1, NO reset pin, landscape 320x240, no offset).  A third image rather than a pin someone edits by hand, because the constants are the wiring: ST7789S3.SYS loaded on this board would drive GPIO 10 and 13, which here are camera data lines, and would take GPIO 3 - a strapping pin on this chip - for a reset line the panel does not have.  This image loaded on the S3-CAM board would spend 45 on nothing and drive 42, which there is that board's wire to the CYD.",
       "arch": "xtensa", "gcc": "xtensa-esp32s3-elf-gcc",
-      "cflags": "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_WSLCD2",
+      "cflags": "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_LCD2",
       "include": ["apps/common"],
       "src": ["apps/st7789/st7789.c"]
     },
-    {
-      "out": "CST816.SYS", "group": "board",
-      "_note": "The capacitive touch controller on that board's glass, and its only pointing device until something is plugged into the header: one USB socket, and it is the console.",
-      "arch": "xtensa", "gcc": "xtensa-esp32s3-elf-gcc",
-      "src": ["apps/cst816/cst816.c"]
-    },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
+    { "out": "CST816.SYS", "group": "board", "src": ["apps/cst816/cst816.c"] },
 
     {
+      "out": "AGVM.AXE", "group": "core",
+      "_note": "The machine with no processor - the cascade's third rung.  It runs a .bc image, which is one file every board can execute, at five to fifty times the cost of native code.  Small because it knows no builtins: a bytecode program reaches the ABI the same way a native one does, so the interpreter only has to be able to call an ordinary function address.",
+      "include": ["apps/common/agvm"],
+      "src": ["apps/agvm/agvm.c"]
+    },
+    {
+      "out": "AGVMRV.AXE", "group": "board",
+      "_note": "The same interpreter for RISC-V.  The INTERPRETER is native code and therefore per-machine; the images it runs are not, which is the whole point.",
+      "arch": "riscv32", "gcc": "riscv32-esp-elf-gcc",
+      "include": ["apps/common/agvm"],
+      "src": ["apps/agvm/agvm.c"]
+    },
+    {
+      "out": "AGVM32.AXE", "group": "board",
+      "_note": "And for an LX6 - the CYD.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "include": ["apps/common/agvm"],
+      "src": ["apps/agvm/agvm.c"]
+    },
+    {
       "out": "CC.AXE", "group": "core",
-      "include": ["apps/cc"],
+      "include": ["apps/cc", "apps/common/agvm"],
       "src": ["apps/cc/cc_main.c", "apps/cc/cc_compile.c"]
     },
     {
@@ -314,6 +436,26 @@
       "out": "LINK.AXE", "group": "core",
       "_note": "The wire between two boards, measured. Sends framed blocks with a sequence number and a checksum one way - `link send <baud> [kb] [block]` and `link recv <baud> [secs] [block]`, block being the whole block on the wire, 16..1040, default 260 - and counts ok/corrupt/lost/stray at the other end, so a line too fast for the wiring is told apart from a receiver that was not listening. Needs [uart1] tx/rx in BOARD.CFG on both ends. Build it once per chip - the CYD is an LX6, the S3 an LX7 - and note that this manifest only ever builds for CONFIG_IDF_TARGET, so the other image comes from a direct mkaxe call with --gcc xtensa-esp32-elf-gcc. 4 Mbaud = 400 067 B/s clean over 4 MB; docs/09-esp32-cyd.md has the table.",
       "src": ["apps/link/link.c"]
+    },
+    {
+      "out": "GFXNOISE.AXE", "group": "core",
+      "_note": "A picture that will not compress, so a wire can be measured. Every other graphics test draws shapes on a flat ground and REMDISP packs those to almost nothing - the demo picture crossed as 3 KB for 75 000 pixels, so comparing two transports on it measures the encoder and not the copper. Noise does not pack, does not index and never matches the previous frame, so every band is sent whole. Reports the frames and bytes it offered, so the sender is readable without the receiver.",
+      "src": ["apps/gfxnoise/gfxnoise.c"]
+    },
+    {
+      "out": "PINS.AXE", "group": "core",
+      "_note": "Rings out the wires between two boards: one board drives one pin, the other reads every pin of the bundle pulled up or down. tools/pinring.py walks it both ways.",
+      "src": ["apps/pins/pins.c"]
+    },
+    {
+      "out": "WIREBLK.AXE", "group": "core",
+      "_note": "Fixed-size blocks across the wire between two boards, counted one by one: each carries its sequence and a payload the receiver recomputes, so every block is intact, damaged or missing. UART, SPI as master (holds the clock) or SPI as slave (the kernel link service), either direction. tools/wireblk.py runs the matrix.",
+      "src": ["apps/wireblk/wireblk.c"]
+    },
+    {
+      "out": "WIREBENCH.AXE", "group": "core",
+      "_note": "How fast the wire between two boards carries ANYBODY'S bytes. Writes noise to /dev/wire0 - the pipe REMDISP publishes beside its display - so the path that moves a picture at 2.68 MB/s can be measured carrying something that is not a picture. The far end (REMTERM) counts what arrived and what failed its checksum.",
+      "src": ["apps/wirebench/wirebench.c"]
     },
     {
       "out": "REMDISP.SYS", "group": "core",

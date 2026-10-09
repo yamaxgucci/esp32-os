@@ -8,6 +8,7 @@
 int ag_test_failures = 0;
 int ag_test_checks = 0;
 
+void run_rdcodec_tests(void);
 void run_path_tests(void);
 void run_cfg_tests(void);
 void run_screen_tests(void);
@@ -24,10 +25,12 @@ void run_journal_tests(void);
 void run_axeload_tests(void);
 void run_axesig_tests(void);
 void run_codepage_tests(void);
+void run_hidrep_tests(void);
 void run_reslist_tests(void);
 void run_arena_tests(void);
 void run_probe_tests(void);
 void run_cc_tests(void);
+void run_rv32_tests(void);
 void run_draw_tests(void);
 void run_dsp_tests(void);
 void run_ckt_tests(void);
@@ -39,12 +42,14 @@ void run_desktop_tests(void);
 void run_fsops_tests(void);
 void run_rlink_tests(void);
 void run_atproto_tests(void);
+void run_cluframe_tests(void);
 void run_phonelink_tests(void);
 void run_espldr_tests(void);
 void run_stm32ldr_tests(void);
 
 int main(void)
 {
+    run_rdcodec_tests();
     run_path_tests();
     run_cfg_tests();
     run_screen_tests();
@@ -61,10 +66,12 @@ int main(void)
     run_axeload_tests();
     run_axesig_tests();
     run_codepage_tests();
+    run_hidrep_tests();
     run_reslist_tests();
     run_arena_tests();
     run_probe_tests();
     run_cc_tests();
+    run_rv32_tests();
     run_draw_tests();
     run_dsp_tests();
     run_ckt_tests();
@@ -76,6 +83,7 @@ int main(void)
     run_fsops_tests();
     run_rlink_tests();
     run_atproto_tests();
+    run_cluframe_tests();
     run_phonelink_tests();
     run_espldr_tests();
     run_stm32ldr_tests();

@@ -1,5 +1,27 @@
 menu "ArgonOS"
 
+    config ARGON_DEV_MAX
+        int "Devices the registry can hold"
+        range 16 64
+        default 24
+        help
+            How many devices can exist at once, this board's own and any it
+            has borrowed from a neighbour.
+
+            A bound rather than a list that grows, on purpose: a bound that is
+            reached is a diagnosable event, and the registry has to work when
+            memory is short.  Each entry is about seventy bytes of internal
+            SRAM, and every board pays for all of them - so this is a number to
+            raise for a board that is in a cluster, and to leave alone for one
+            that is not.
+
+            Twenty-four is exactly one short of the pair on the desk: a C3 with
+            ten of its own, pulling fifteen from a CYD, registers thirteen and
+            refuses the last two - which were the SCREEN and the touchscreen,
+            because loadable drivers register after built-in ones and what
+            falls off the end is always the interesting half.  It refused them
+            with -AG_ENFILE and, until this was found, without a word.
+
     config ARGON_APP_ARENA_KB
         int "Application code arena, KB"
         range 4 192
@@ -528,6 +550,29 @@ menu "ArgonOS"
             OTG port's VBUS.  Off by default and only on the chips that have the
             OTG peripheral (the S3 does, the original ESP32 does not).  Not
             verifiable in QEMU, which models no USB host - the gate is the
+            board.
+
+    config ARGON_USB_MSC
+        bool "USB device: mass-storage card reader (read-only)"
+        depends on SOC_USB_OTG_SUPPORTED
+        default n
+        help
+            The USB-OTG peripheral as a DEVICE that exposes the SD card as a
+            USB mass-storage volume, so a PC can copy files off the card with
+            no card reader.  Stage 1 is read-only on purpose: the write hook is
+            refused and the host mounts the volume read-only, which cannot
+            corrupt the card.
+
+            This takes the one USB port the board has away from the console.
+            On a board whose console is the native USB-Serial-JTAG the two
+            cannot run at once (one internal PHY, two owners), so starting a
+            session silently drops the console until it ends.  The session is
+            therefore started by an operator command - the usbmsc application -
+            never from the boot path, and it ends on a host eject or a timeout,
+            never a typed command.
+
+            Off by default and only on chips with the OTG peripheral.  Not
+            verifiable in QEMU, which models no USB device - the gate is the
             board.
 
     config ARGON_CONSOLE_COLS

@@ -11,6 +11,45 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Handing arguments on to another PowerShell script, BY NAME.
+#
+# `& $script @Rest` looks exactly like it does this, and does not: splatting an
+# ARRAY binds POSITIONALLY.  So `argon nodetest -Scenario link` put the string
+# "-Scenario" into nodetest's first positional parameter, which is -TimeoutSec,
+# and failed with a message about converting a string to an integer that
+# mentions neither -Scenario nor this file.  It was written down for months as
+# "the wrapper eats the first argument; run the script directly", and it is not
+# nodetest's problem: every named argument to every subcommand went this way.
+#
+# A HASHTABLE splat binds by name, so the pairs are rebuilt here.  Native
+# programs (idf.py, python) are left on the array splat, which is right for
+# them: they take their arguments as plain strings and do their own parsing.
+function Invoke-Ps1 {
+    param([string]$Script, [string[]]$Argv)
+
+    $named = @{}
+    $positional = @()
+    for ($i = 0; $i -lt $Argv.Count; $i++) {
+        $a = $Argv[$i]
+        if ($a -notmatch '^-[A-Za-z]') {
+            $positional += $a
+            continue
+        }
+        $name = $a.Substring(1)
+        $next = if ($i + 1 -lt $Argv.Count) { $Argv[$i + 1] } else { $null }
+        # Its value, or a switch with none.  Something starting with '-' counts
+        # as a value only when it is a number, so -Baud -1 works and
+        # -Scenario -Verbose does not silently eat the second flag.
+        if ($null -ne $next -and $next -notmatch '^-[A-Za-z]') {
+            $named[$name] = $next
+            $i++
+        } else {
+            $named[$name] = $true
+        }
+    }
+    & $Script @named @positional
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
@@ -236,12 +275,14 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32s3-board  the S3 on the desk: no OpenEth, no HostFS'
             Write-Host '                esp32s3-cam    esp32s3-board + the camera built into the image'
             Write-Host '                esp32s3-zero   ESP32-S3-Zero: 4 MB flash, USB-JTAG console, I2S DAC, no display/SD'
-            Write-Host '                esp32s3-touch-lcd-2  Waveshare ESP32-S3-Touch-LCD-2: 2in 240x320 ST7789 + CST816 touch, 16 MB, USB-JTAG console'
+            Write-Host '                esp32s3-lcd2   Waveshare ESP32-S3-Touch-LCD-2: 16 MB flash, ST7789 panel and TF card on one SPI bus'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             Write-Host '                esp32-a1s   ESP32-A1S Audio Kit: ES8388 codec on I2S, external RAM'
             Write-Host '                esp32-a1s-net  the same, with Wi-Fi for a phone screen (smaller arena)'
             Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
+            Write-Host '                esp32c3     hardware: RISC-V, USB console, one core, 400 KB - the C3 SuperMini'
+        Write-Host '                esp32c3-qemu  the same in the emulator: console on UART0, no radio'
             exit 0
         }
 
@@ -274,12 +315,16 @@ switch ($Command.ToLowerInvariant()) {
                             $chip = 'esp32s3' }
             'esp32s3-zero' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.zero'
                              $chip = 'esp32s3' }
-            # Waveshare ESP32-S3-Touch-LCD-2: the board profile plus a panel,
-            # a touch controller, 16 MB of flash and a console on the chip's
-            # own USB.  See sdkconfig.esp32s3.wslcd2.
-            'esp32s3-touch-lcd-2' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board;sdkconfig.esp32s3.wslcd2'
-                                    $chip = 'esp32s3' }
+            # Waveshare ESP32-S3-Touch-LCD-2.  main called the same board
+            # esp32s3-touch-lcd-2 (sdkconfig.esp32s3.wslcd2) while this line
+            # called it esp32s3-lcd2; the merge of 25 Sep 2026 kept one build
+            # and both names.
+            { $_ -in 'esp32s3-lcd2', 'esp32s3-touch-lcd-2' } { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.lcd2'
+                             $chip = 'esp32s3' }
             'esp32c6'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c6' }
+            'esp32c3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3' }
+            'esp32c3-qemu' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3;sdkconfig.esp32c3.qemu'
+                             $chip = 'esp32c3' }
             default {
                 Write-Host "argon target: no defaults for '$chip'."
                 Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'
@@ -563,7 +608,7 @@ switch ($Command.ToLowerInvariant()) {
         # The network in the emulator, against servers this PC runs.  Not part
         # of `check`: it wants two ports and a Python that can bind them, and a
         # firewall prompt is not a test failure.
-        & (Join-Path $PSScriptRoot 'nettest.ps1') @Rest
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'nettest.ps1') $Rest
         exit $LASTEXITCODE
     }
 
@@ -571,7 +616,34 @@ switch ($Command.ToLowerInvariant()) {
         # The same network, but over an external radio: EXTRADIO.SYS bound with
         # `net use extradio`, talking RLINK to a fake coprocessor (rlinkd.py) on
         # a UART.  Proves the external-radio socket path with no hardware.
-        & (Join-Path $PSScriptRoot 'rlinktest.ps1') @Rest
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'rlinktest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'xclutest' {
+        # Two guests of DIFFERENT instruction sets as one cluster - an Xtensa S3
+        # under qemu-system-xtensa and a RISC-V C3 under qemu-system-riscv32.
+        # What needed both boards on the desk until the C3 emulator existed.
+        # Switches the target twice and leaves it on esp32s3.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'xclutest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'xcluprobe' {
+        # Not a check - a measurement.  Two remote runs on that pair with the
+        # frame counters printed between them, for the one-remote-run fault
+        # written up at the top of xclutest.ps1.  Reuses the last xclutest's
+        # banked C3 image and builds nothing.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'xcluprobe.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'rvtest' {
+        # The other instruction set, with no board plugged in: a CC-written
+        # RISC-V image run on an emulated ESP32-C3, and an emulated S3 writing
+        # one that matches the host build of the same compiler byte for byte.
+        # Switches the target twice and leaves it on esp32s3.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'rvtest.ps1') $Rest
         exit $LASTEXITCODE
     }
 
@@ -579,7 +651,22 @@ switch ($Command.ToLowerInvariant()) {
         # The AT variant of rlinktest: ATRADIO.SYS bound with `net use atradio`,
         # talking the stock ESP-01 AT command set to a fake modem (atmodemd.py)
         # on a UART.  Proves the same socket path over a radio's own firmware.
-        & (Join-Path $PSScriptRoot 'attest.ps1') @Rest
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'attest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'proctest' {
+        # Who collects a finished process: a parent slow to wait still gets its
+        # child's code, a killed child is kept for it, an orphan is swept up.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'proctest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'nodetest' {
+        # Two whole ArgonOS kernels in two emulators, their UART1 ports joined
+        # to each other, measured with apps\link - the cluster's wire, with no
+        # second board and nothing pretending to be a node.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'nodetest.ps1') $Rest
         exit $LASTEXITCODE
     }
 

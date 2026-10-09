@@ -1569,6 +1569,10 @@ extern "C" int ag_art_pins = 0;
  * and a setting that has to be typed to get the known-good behaviour is a
  * setting with the wrong default.  All six now match; the flags still
  * override, so nothing that was measurable stops being measurable.
+ *
+ * Except the two reports, which went back to off on 7 October 2026: a report
+ * burst during a movie froze the board (see memstat_ms in main).  For a
+ * measuring run, -memstat 30000 -fps 30000 as before.
  */
 extern "C" int ag_cache_slack_kb = 256;
 
@@ -1689,7 +1693,18 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     /* 30000 both: a report every thirty seconds is what every measured run
      * had, and with the printer on the system core it costs the game
      * nothing.  -memstat 0 and -fps 0 turn them off.  See ag_cache_slack_kb. */
-    int memstat_ms = 30000;
+    /*
+     * Off by default again, and so is fps_ms below.  Both became 30000 on
+     * 16 September 2026, when every flag of the measuring runs was made a
+     * default so that a bare `run fallout2.axe` would play - and from then on
+     * a movie froze the board: the trailer stopped dead about half a minute
+     * in, every time, right after a 30-second report burst, with the whole
+     * console silent (7 October 2026, three runs; with -memstat 0 -fps 0 it
+     * played to the end).  Why a report burst during a movie stops the
+     * console is a fault of its own, still open; until it is fixed the
+     * reports are asked for, not given.
+     */
+    int memstat_ms = 0;
     int reserve_kb = 0;
     int trace_kb = 0;
     int trace_max = 0;
@@ -1702,7 +1717,7 @@ extern "C" int ag_cxx_main(int argc, char **argv)
     int recinput = 0;
     int hud = 0;
     const char *logpath = NULL;
-    int fps_ms = 30000;
+    int fps_ms = 0;     /* see memstat_ms above */
     /* Ten minutes.  The default in the port is far shorter and kills the game
      * during a long map load - which is why every run had to say this. */
     int watchdog_s = 600;

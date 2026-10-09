@@ -43,6 +43,10 @@ typedef enum {
 typedef struct {
     ag_err_t stage_result[AG_STAGE_COUNT];
     uint32_t stage_us[AG_STAGE_COUNT];
+    /* internal memory each stage kept (bytes; less than 0: it gave back),
+     * and what was in use before the first - the chip's own layer */
+    int32_t  stage_mem[AG_STAGE_COUNT];
+    uint32_t entry_used;
     uint32_t boot_us;      /* total time to the shell prompt             */
     bool     degraded;     /* at least one non-fatal stage failed        */
 } ag_boot_report_t;

@@ -1,0 +1,14 @@
+# What goes into C:\drv on this board, staged by tools\mksysfs.py.
+#
+# One driver, because there is one thing on this board to drive.  No panel and
+# no card slot: this board has a wire and a header.
+#
+# NODELNRV.SYS is the RISC-V build - see SYSTEM.CFG in this directory, and
+# tools\apps.json for why there are three builds of one driver.
+NODELNRV.SYS
+# The SPI wire to the S3-Zero, on uart0's pins: loaded by hand, and only once
+# NODELINK is unloaded.  Built for whatever target is current (group core).
+LINKSPI.SYS
+# A screen with no glass, for measuring the neighbour's picture over the wire:
+# it counts what arrives and draws nothing (loaded by hand).
+NULLDISP.SYS

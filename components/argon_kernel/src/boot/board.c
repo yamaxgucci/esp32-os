@@ -11,6 +11,9 @@
 #include <argon/path.h>
 
 #include <argon/port/config.h>
+/* For AG_PORT_UART_CONSOLE: which port is the one the system talks over is a
+ * property of the board, not a constant - see the UART loop below. */
+#include <argon/port/uart.h>
 
 #include "sdkconfig.h"
 
@@ -80,6 +83,8 @@ static void apply_generic_defaults(void)
     s_board.sd.miso = 13;
     s_board.sd.cs = 10;
     s_board.sd.spi_host = 2; /* SPI2, as the datasheet numbers it */
+    /* Off unless a board asks for it: see ag_board_sd_t.cs_hold. */
+    s_board.sd.cs_hold = AG_PIN_NONE;
 
     /*
      * Buses start unwired, and they stay that way until BOARD.CFG says
@@ -97,6 +102,9 @@ static void apply_generic_defaults(void)
         s_board.spi[i].mosi = AG_PIN_NONE;
         s_board.spi[i].miso = AG_PIN_NONE;
         s_board.spi[i].khz = 1000;
+        /* Leave the pad drive as the chip came up with it: this is an
+         * electrical choice for one board's wiring, not a default. */
+        s_board.spi[i].drive = -1;
     }
     for (int i = 0; i < AG_UART_PORTS; i++) {
         s_board.uart[i].tx = AG_PIN_NONE;
@@ -202,11 +210,45 @@ static void apply_bus_config(const ag_cfg_t *cfg)
         bus->miso = cfg_pin(cfg, key, bus->miso);
         snprintf(key, sizeof(key), "spi%d.khz", chip);
         bus->khz = cfg_rate(cfg, key, bus->khz, 80000);
+        /*
+         * 0..3 is the whole range a chip's pad driver has; -1 and "absent" both
+         * mean leave it as it is.  A number outside that is not a strength and
+         * is refused rather than clamped: a board that wrote 7 meant something
+         * this file does not say, and quietly driving the pins at some other
+         * strength is how that goes unnoticed.
+         */
+        snprintf(key, sizeof(key), "spi%d.drive", chip);
+        const int32_t drive = ag_cfg_get_int(cfg, key, bus->drive);
+        if (drive >= -1 && drive <= 3) {
+            bus->drive = (int8_t)drive;
+        }
     }
 
-    /* UART0 is the console and is not configurable here: the pins it uses are
-     * the ones the system is talking to you over. */
-    for (int i = 1; i < AG_UART_PORTS; i++) {
+    /*
+     * EVERY PORT BUT THE CONSOLE'S, and which one that is depends on the board.
+     *
+     * This loop started at 1, with a comment saying UART0 is the console and
+     * the pins it uses are the ones the system is talking to you over.  True
+     * on a board with a USB-to-UART bridge, and FALSE on the two that have
+     * none: the C3 SuperMini and the S3-Zero talk over the chip's own
+     * USB-Serial-JTAG, the port layer models that as a pseudo-port past the
+     * real UARTs (AG_PORT_UART_CONSOLE), and UART0 on those boards drives two
+     * header pins that nothing else wants.
+     *
+     * What the old rule cost: a `[uart0]` section was read by nobody and said
+     * so to nobody.  The C3 has exactly two UARTs, so refusing UART0 refused
+     * it a SECOND WIRE - which is the whole of a three-board cluster with the
+     * C3 in the middle.  The pins were free the entire time.
+     *
+     * The ROM still prints its reset banner on UART0's DEFAULT pins (20/21 on
+     * the C3), whatever the matrix is told afterwards.  That is an argument
+     * for putting the wire on other pins, not for leaving the port unusable -
+     * and the pin table refuses the console's own pins by number either way.
+     */
+    for (int i = 0; i < AG_UART_PORTS; i++) {
+        if (i == AG_PORT_UART_CONSOLE) {
+            continue;
+        }
         ag_board_uart_t *port = &s_board.uart[i];
 
         snprintf(key, sizeof(key), "uart%d.tx", i);
@@ -279,6 +321,14 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
     s_board.sd.mosi = cfg_pin(cfg, "sd.mosi", s_board.sd.mosi);
     s_board.sd.miso = cfg_pin(cfg, "sd.miso", s_board.sd.miso);
     s_board.sd.cs = cfg_pin(cfg, "sd.cs", s_board.sd.cs);
+    /*
+     * The pin that has to be held high for the card to be readable on a board
+     * where the panel's chip select and the card's share a bus.  It is read
+     * like every other pin, so a board without this arrangement leaves it at
+     * AG_PIN_NONE and the port drives nothing; see ag_board_sd_t.cs_hold for
+     * the measurement behind it.
+     */
+    s_board.sd.cs_hold = cfg_pin(cfg, "sd.cs_hold", s_board.sd.cs_hold);
     s_board.sd.card_detect = cfg_pin(cfg, "sd.card_detect",
                                      s_board.sd.card_detect);
 

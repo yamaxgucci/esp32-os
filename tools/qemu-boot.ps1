@@ -95,15 +95,88 @@ param(
     # repeatably, whatever else the host is doing.  That is not cycles either -
     # it ignores stalls, the cache and PSRAM latency - but it is a floor that
     # belongs to the guest rather than to this PC.
-    [switch]$Icount
+    [switch]$Icount,
+
+    # ---- a second guest, for the cluster ------------------------------------
+    #
+    # Two emulators on this PC wired UART1 to UART1 are two whole ArgonOS
+    # kernels on one wire, with nothing pretending to be anything.  It is the
+    # only way to develop a cluster without a second board, and QEMU already
+    # does everything it needs: a serial port here is a TCP socket, and this
+    # script already opens one as a server (the console) and others as clients
+    # (HostFS, the radio).  The two guests are then just the two ends.
+    #
+    # -LinkPort puts UART1 on that port; -LinkListen makes this guest the one
+    # that listens.  Exactly one of the pair listens; the other connects.
+    [int]$LinkPort = 0,
+    [switch]$LinkListen,
+    # A file this guest creates once its -Put deliveries are in, so the OTHER
+    # guest of a pair can wait for it before it starts talking (nodetest.ps1).
+    [string]$ReadyFile = '',
+
+    # Which flash image, and whether to leave other emulators alone.
+    #
+    # Both exist for the same reason and neither is optional for a pair.  The
+    # flash drive is writable: two guests on one file corrupt each other's C:,
+    # and the damage shows up later as a file that reads back -91.  And this
+    # script stops the previous emulator of the same image before starting -
+    # only one this tree registered (qemu-common.ps1, Stop-Emulators), never
+    # another tree's - which for a pair sharing one image would still be the
+    # second shooting the first.
+    [string]$Flash = '',
+    # The image in -Flash is FINISHED: do not rebuild build\qemu_flash.bin and
+    # do not copy over it.  For a pair of guests that are two different
+    # machines - only one of them can be the target that was built last, so the
+    # other's image was made earlier and kept aside.
+    [switch]$FlashAsIs,
+    # Which machine this guest is, when it is not the one sdkconfig names.
+    # Goes with -FlashAsIs and means the same thing: this half of the pair was
+    # built before the target moved on.
+    [string]$Chip = '',
+    [switch]$KeepOtherEmulators,
+    # Suffix for this guest's own emulator log, so a pair does not write one
+    # file from two processes.
+    [string]$Tag = ''
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'qemu-common.ps1')
 
-$qemu = Resolve-Qemu
-Update-FlashImage -SysFs $SysFs
+$qemu = Resolve-Qemu -Chip $Chip
+if (-not $FlashAsIs) {
+    Update-FlashImage -SysFs $SysFs
+}
 $efuse = Initialize-EfuseFile
+
+# A guest of its own gets a flash image of its own, copied from the canonical
+# one so it runs exactly the same firmware.  Copied every time rather than kept:
+# the point of a second node is a repeatable pair, and a C: left over from the
+# previous run is the staleness the stamp above exists to prevent, arriving by
+# the back door.
+$flashPath = 'build\qemu_flash.bin'
+if ($Flash) {
+    if (-not $FlashAsIs) {
+        Copy-Item -LiteralPath $flashPath -Destination $Flash -Force
+    } elseif (-not (Test-Path -LiteralPath $Flash)) {
+        throw "no prepared flash image at $Flash"
+    }
+    $flashPath = $Flash
+    # Its own efuse too: blank, and written by whoever boots.
+    $efuse2 = [IO.Path]::ChangeExtension($Flash, $null) + '_efuse.bin'
+    if (-not (Test-Path $efuse2)) {
+        [IO.File]::WriteAllBytes((Join-Path (Get-Location) $efuse2),
+                                 (New-Object byte[] 1024))
+    }
+    $efuse = $efuse2
+}
+
+if ($LinkPort -gt 0 -and ($HostFs -or $Radio)) {
+    # UART1 is the only spare serial QEMU's esp32s3 has - UART2 exists in the
+    # header and passes no data - and HostFS, the radio and the node link all
+    # want it.  Saying so here beats a run where one of the three silently is
+    # not there.
+    throw 'a node link cannot share UART1 with -HostFs or -Radio.'
+}
 
 $hostfsProc = $null
 if ($HostFs) {
@@ -190,7 +263,8 @@ if ($Radio) {
 # wait=on is essential: a TCP serial port with no peer throws its output away,
 # and the whole boot is over in a quarter of a second.  Without it the test
 # races the emulator and loses often enough to be useless.
-$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse -PsramMb $Psram -Graphics:$Gfx) + @(
+$qemuArgs = (Get-QemuMachineArgs -EfusePath $efuse -PsramMb $Psram -Graphics:$Gfx `
+                                 -FlashPath $flashPath -Chip $Chip) + @(
     '-display', $(if ($Gfx) { 'sdl' } else { 'none' })
     '-monitor', 'none'
     '-serial', "tcp:127.0.0.1:$Port,server=on,wait=on"
@@ -229,6 +303,22 @@ if ($HostFs) {
     $qemuArgs += @('-serial', "tcp:127.0.0.1:$HostFsPort,reconnect=1")
 }
 
+if ($LinkPort -gt 0) {
+    # UART1: the wire to the other node.  One end listens, the other connects,
+    # and which is which is decided by the caller rather than by the firmware -
+    # the guests are identical images and must stay that way.
+    #
+    # wait=off on the listener, unlike the console: the console uses wait=on
+    # because a TCP serial with no peer throws its output away and the boot is
+    # over before a test can attach.  Here the peer is another emulator that
+    # has not started yet, and waiting for it would deadlock the pair.
+    $qemuArgs += @('-serial', $(if ($LinkListen) {
+        "tcp:127.0.0.1:$LinkPort,server=on,wait=off"
+    } else {
+        "tcp:127.0.0.1:$LinkPort,reconnect=1"
+    }))
+}
+
 if ($Radio) {
     # The radio is the next -serial after the console (UART1) - or after HostFS
     # (UART2) when that is attached too.  QEMU's esp32s3 emulates only UART0 and
@@ -245,42 +335,43 @@ if ($Sd) {
 
 # A leftover emulator would still hold the port and answer with silence.
 #
-# The leftover, and not every emulator on the machine.  This used to stop every
-# process called qemu-system-xtensa, which is right while one person runs one
-# board and wrong the moment anything else is running: a second worktree
-# emulating a second node, or a driver being tried by hand in another window,
-# died silently whenever a test started here.  It cost an afternoon to see,
-# because nothing says "somebody killed it" - the port simply stops answering.
-#
-# What identifies a leftover is the image it is running: two emulators of the
-# same flash file are the same board twice, and the older one is the one that
-# has to go.
-$ourFlash = ($qemuArgs | Where-Object { $_ -like 'file=*.bin,if=mtd,*' } |
-             Select-Object -First 1)
-$ourImage = ''
-if ($ourFlash) {
-    $ourImage = [regex]::Match($ourFlash, '[^\\/=]+\.bin(?=,if=mtd)').Value
+# -KeepOtherEmulators: not even that, when this guest is half of a pair
+# booted from a copy of the same image (tools\xclutest.ps1 keeps each
+# node's image apart, so that is belt and braces).
+if (-not $KeepOtherEmulators) {
+    # The leftover, and not every emulator on the machine.  This used to stop every
+    # process called qemu-system-xtensa, which is right while one person runs one
+    # board and wrong the moment anything else is running: a second worktree
+    # emulating a second node, or a driver being tried by hand in another window,
+    # died silently whenever a test started here.  It cost an afternoon to see,
+    # because nothing says "somebody killed it" - the port simply stops answering.
+    #
+    # What identifies a leftover is the image it is running: two emulators of the
+    # same flash file are the same board twice, and the older one is the one that
+    # has to go.
+    #
+    # And the same FILE, not the same file NAME.  This compared the name alone -
+    # `qemu_flash.bin` - which nearly every run in every worktree shares, so a run
+    # here still killed a run in another tree whenever both used the default
+    # image.  The image is now taken from this tree's own record of what it
+    # started (qemu-common.ps1, Register-Emulator), with its full path: an
+    # emulator another tree started is not in that record at all.
+    Stop-Emulators -Flash $flashPath
 }
-if ($ourImage) {
-    Get-CimInstance Win32_Process -Filter "Name='qemu-system-xtensa.exe'" `
-        -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($ourImage) } |
-        ForEach-Object {
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-        }
-} else {
-    # The image could not be read out of our own arguments, which should not
-    # happen; fall back to the old sledgehammer rather than to leaving a
-    # leftover in place, and say so, because it is the sledgehammer that once
-    # killed somebody else's board.
-    Write-Host 'qemu: cannot name this run''s flash image; stopping every emulator'
-    Get-Process qemu-system-xtensa -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+
+# Somebody else's emulator on our console port is not ours to stop - but it is
+# ours to name.  Without this the run waits a minute for a prompt and then says
+# "could not connect", which reads as a firmware that did not boot.
+$holder = Get-PortHolder -Port $Port
+if ($holder) {
+    throw ("port $Port is already held by $($holder.ProcessName) (pid $($holder.Id)), " +
+           'which this tree did not start.  Pick another -Port, or stop that ' +
+           'process if it is a leftover of yours from before 3 Oct 2026.')
 }
 
 # QEMU's own chatter goes to a file: it is not part of what the board said,
 # and PowerShell renders anything on stderr as an error.
-$qemuOut = 'build\qemu-emulator.log'
+$qemuOut = $(if ($Tag) { "build\qemu-emulator-$Tag.log" } else { 'build\qemu-emulator.log' })
 # An escape hatch for debugging, and the only way to attach one: ARGON_QEMU_EXTRA
 # is split on spaces and appended, so `-s` puts a gdb stub on :1234 and `-S`
 # holds the machine until the debugger says go.
@@ -290,6 +381,7 @@ if ($env:ARGON_QEMU_EXTRA) {
 
 $proc = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -NoNewWindow `
     -PassThru -RedirectStandardOutput $qemuOut -RedirectStandardError "$qemuOut.err"
+Register-Emulator -Process $proc -Flash $flashPath
 
 # A forward that could not be set up is said once, quietly, to that file.
 #
@@ -445,12 +537,110 @@ try {
     }
 
     # A terminal sends CR for Enter; CRLF would look like two keys.
+    # The parameter is $Line and NOT $Text, and that is not style.
+    #
+    # PowerShell variable names are case-insensitive and its scoping is dynamic,
+    # so a parameter called $Text IS the script's $text - the StringBuilder the
+    # whole transcript is appended to - inside this function and everything it
+    # calls.  It was called $Text, and the line below therefore recorded the
+    # length of the COMMAND (twelve characters, say) where it meant the length
+    # of the transcript so far (hundreds of thousands).
+    #
+    # That mark is where a `=needle` wait starts looking, so every one of them
+    # searched from the top of the run: a marker printed long before the command
+    # satisfied the wait for it instantly, and the scenario ran on.  Scenarios
+    # that appeared to skip ahead, and checks that passed on stale text, were
+    # this.
     function Send-Line {
-        param([string]$Text)
-        $bytes = [System.Text.Encoding]::ASCII.GetBytes($Text + "`r")
+        param([string]$Line)
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($Line + "`r")
         $script:sendMark = $text.Length
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush()
+    }
+
+    # Types a command and CHECKS THAT IT ARRIVED.
+    #
+    # The console drops input while it is busy printing, and a whole line
+    # arrives from a socket faster than a UART would ever deliver it.  What that
+    # looks like is not a dropped command - it is a DIFFERENT command: `link
+    # ping 24 stream` lost its first character and ran as `ink`, and the failure
+    # reported was "Bad command or file name", several checks away from the
+    # cause.
+    #
+    # So: look for the echo, and if the line is not there, clear whatever half
+    # of it is and type it again.  Once - a second failure is a real problem and
+    # should be seen, not retried into silence.
+    # NOT named $Text.  PowerShell variables are case-insensitive and its
+    # scoping is dynamic, so a parameter called $Text IS the script's $text -
+    # the StringBuilder every function here appends the transcript to - for this
+    # function and everything it calls.  Read-Available then tried to Append to
+    # a String and the whole guest died with a message about the wrong type,
+    # nowhere near the line that caused it.
+    function Send-Command {
+        param([string]$Line)
+        Send-Line $Line
+        # WAITED FOR, not sampled once, and the difference is whole runs.
+        #
+        # This looked once after 250 ms.  A console that is still printing the
+        # previous command's output echoes late - not never - so the check
+        # declared the line lost and typed it AGAIN, which is the one thing it
+        # must not do: `link devs` twice is not `link devs`, and two `run`s of
+        # the same program fight over the same device.  Three seconds of
+        # patience costs nothing when the echo is prompt, which is almost
+        # always, and a genuinely dropped line is still retyped.
+        # Searched from WHERE THE LINE WAS SENT, not in the last few thousand
+        # characters, and that pairing matters as much as the waiting.
+        #
+        # It used to look once, in a 6000-character tail.  Waiting longer
+        # without changing that made it WORSE, not better: a command whose
+        # output starts at once - `link ping 24` prints a line per message -
+        # pushes its own echo out of that tail while the check is still being
+        # patient, so the check concludes the line was lost and types it again.
+        # The retyped characters then stop the running ping, which reports
+        # seven of twenty-four and looks exactly like a bad wire.  Measured:
+        # two runs in a row, both blamed on the link.
+        #
+        # Send-Line records the transcript length before it writes, so
+        # everything from that mark on is what arrived because of this command.
+        # Nothing scrolls out of that.
+        $mark = $script:sendMark
+        for ($echoTry = 0; $echoTry -lt 12; $echoTry++) {
+            Start-Sleep -Milliseconds 250
+            [void](Read-Available)
+            $since = $text.ToString()
+            if ($mark -lt $since.Length) {
+                $since = $since.Substring($mark)
+            }
+            # Escapes stripped before looking.
+            #
+            # What arrives is a RENDERED SCREEN, not a log: a redraw lands
+            # cursor moves and erase-to-end sequences in the middle of the line
+            # being echoed, so a plain search for the command text fails while
+            # the command is sitting there perfectly.  That false alarm is not
+            # harmless - see above.
+            $since = $since -replace "$([char]27)\[[0-9;]*[A-Za-z]", ''
+            if ($since.Contains($Line)) { return }
+        }
+
+        # NOT TYPED AGAIN, and that is the fix rather than the giving up it
+        # looks like.  The check above cannot be made reliable while a program
+        # is painting: what arrives is a rendered screen, so a redraw lands in
+        # the MIDDLE of the echo ("migr" + the program's line + "ate 1") and no
+        # amount of escape-stripping puts the two halves back together.  The
+        # command is sitting there, entered, the whole time.
+        #
+        # Retyping it then does real damage, and did, twice, for months:
+        #   * `link ping 24` stops on any key, so the retyped characters cut it
+        #     short and it reported 23 of 24 - read as a lossy wire;
+        #   * `migrate 1` became `migrate 1migrate 1`, and the migration that
+        #     never happened was read as a broken feature.
+        # Both times the wrong half of the system was blamed.
+        #
+        # So: say so, and let the '=' wait that follows decide.  A command that
+        # really never arrived fails there, with its own name on it.
+        Write-Host "warning: no echo seen for '$Line' (a painting program hides it); carrying on" `
+            -ForegroundColor Yellow
     }
 
     # How many times some text appears in what has arrived so far.
@@ -515,6 +705,40 @@ try {
                 (Join-Path (Get-Location) $local))
             Write-Host "Sending $local ($($bytes.Length) bytes) to $guest"
 
+            # TRIED MORE THAN ONCE, and that is a judgement about what is being
+            # tested rather than laziness.
+            #
+            # This link has no flow control.  When the PC is busy - a build, a
+            # second run, anything - the guest's input queue fills, the port
+            # drops bytes, and recv sits waiting for the rest of a line that
+            # will never come.  The whole forty-minute run then dies on the
+            # scaffolding, having tested nothing; three runs died that way in
+            # one afternoon.
+            #
+            # A transfer is a MEANS here, not the thing under test: every
+            # scenario below is about the wire between two guests, not about
+            # getting a file into one.  So a stalled transfer is tried again,
+            # and says so loudly - a run whose transfers all needed three
+            # attempts is a machine too busy to be measuring anything, and that
+            # is worth seeing rather than hiding.
+            #
+            # recv rewrites the file from the beginning, so a retry cannot
+            # leave behind the truncation it is there to repair.
+            $sent = $false
+            $began = Get-Date
+            foreach ($attempt in 1..3) {
+                if ($attempt -gt 1) {
+                    Write-Host ("  attempt $attempt of 3 - the guest stopped " +
+                                "keeping up; the machine is busy") `
+                        -ForegroundColor Yellow
+                    # Whatever half-typed line is sitting there is not hex: a
+                    # bare return makes the guest reject it and give the prompt
+                    # back, so the retry starts from a known place.
+                    Send-Line ''
+                    Start-Sleep -Milliseconds 500
+                    [void](Read-Available)
+                }
+
             # recv says "N bytes written" when it is done, and that is what is
             # waited for: the prompt cannot be used here, because a screen full
             # of scrolling hex redraws the prompts already on it and the count
@@ -556,18 +780,58 @@ try {
             # Generous, and scaled: writing to the RAM disk is instant, but the
             # same file onto FAT on flash is a sector rewrite every 64 bytes and
             # takes seconds per kilobyte.
-            Send-Line 'END'
             # Wait for this transfer's own length, not a bare "bytes written":
             # a previous Put's report can still be on the scrolling screen and
             # would look like a new one if only the words were counted.
+            #
+            # Counted before `END` goes, so nothing that answers it can be in
+            # the count.  A transfer that is sent again costs this wait - 183 s
+            # for NODELINK.SYS - and on 26 Sep 2026 that was four times in one
+            # nodetest, each long enough for node B to finish its script and
+            # leave.  Why the report was not seen in time is not known yet: the
+            # lines below say how long each part took, to find out.
             $done = "$($bytes.Length) bytes written"
+            [void](Read-Available)
             $written = Count-Of $done
-            if (-not (Wait-Text -Needle $done -Was $written `
-                                -Seconds (120 + $bytes.Length / 64))) {
-                throw "$guest did not arrive: recv never reported it written"
+            $lines_done = Get-Date
+            Send-Line 'END'
+            if (Wait-Text -Needle $done -Was $written `
+                          -Seconds (120 + $bytes.Length / 64)) {
+                    $sent = $true
+                    # When: a transfer that takes minutes is what decides
+                    # whether the other guest of a pair is still there.
+                    Write-Host ("  {0}: lines in {1:N1} s, written {2:N1} s after END" -f
+                                $guest, ($lines_done - $began).TotalSeconds,
+                                ((Get-Date) - $lines_done).TotalSeconds)
+                    break
+                }
+                Write-Host ("  {0}: no '{1}' {2:N0} s after END (seen {3} before it)" -f
+                            $guest, $done, ((Get-Date) - $lines_done).TotalSeconds,
+                            $written) -ForegroundColor Yellow
+            }
+            if (-not $sent) {
+                throw ("$guest did not arrive after three attempts: recv " +
+                       "never reported it written.  The machine is too busy " +
+                       "to run this - nothing else should be building or " +
+                       "emulating while it does.")
             }
             $seen = Read-Available
         }
+        # SAID OUT LOUD, so a second guest can wait for it.
+        #
+        # A pair starts B first and A half a second later, and each delivers
+        # its own files - but a transfer that had to be retried costs about two
+        # minutes, and then A is sending into a node whose receiver has not
+        # started.  Two checks reported a dead wire that way today and once
+        # before.  Invoke-Pair waits for this line rather than for a number of
+        # seconds; see tools\nodetest.ps1.
+        Write-Host '--- deliveries done ---'
+
+    }
+
+    # Ready, deliveries or none: the other guest of a pair waits for this.
+    if ($found -and $ReadyFile) {
+        Set-Content -Path $ReadyFile -Value 'ready' -Encoding ascii
     }
 
     if ($found -and $Send.Count -gt 0) {
@@ -692,7 +956,7 @@ try {
             if ($cmd -match '(?i)^copy\s') {
                 $wasCopy = Count-Of 'file(s) copied'
                 $wasErr = Count-Of ': no space left'
-                Send-Line $cmd
+                Send-Command $cmd
                 $deadline = (Get-Date).AddSeconds($TimeoutSec)
                 if ($deadline -gt $runDeadline) { $deadline = $runDeadline }
                 while ((Get-Date) -lt $deadline) {
@@ -715,7 +979,7 @@ try {
                              'this system speaks', 'holds the')
                 $was = @{}
                 foreach ($e in $endings) { $was[$e] = Count-Of $e }
-                Send-Line $cmd
+                Send-Command $cmd
                 $deadline = (Get-Date).AddSeconds($TimeoutSec)
                 if ($deadline -gt $runDeadline) { $deadline = $runDeadline }
                 while ((Get-Date) -lt $deadline) {
@@ -733,20 +997,69 @@ try {
                 # nothing to wait for it with: what follows in the list is
                 # what stops it.
                 $wasUp = Count-Of 'Ctrl+C to stop'
-                Send-Line $cmd
+                Send-Command $cmd
                 [void](Wait-Text -Needle 'Ctrl+C to stop' -Was $wasUp `
                                  -Seconds $TimeoutSec)
                 $seen = Read-Available
+            } elseif ($cmd -match '(?i)^run\s+/b\b') {
+                # A BACKGROUND run never reports an exit - that is what /b
+                # means - so waiting for "returned" is waiting for something
+                # that cannot happen.  It cost the whole command timeout and
+                # then gave up, and the damage was not the wait: it pushed the
+                # commands AFTER it past the run's budget, so a journal dump
+                # that a check depended on never happened at all.  Twenty
+                # minutes of a run, and the failure pointed at the feature.
+                #
+                # What the shell does print, exactly once, when a background
+                # process starts.
+                $wasStart = Count-Of 'started pid '
+                Send-Command $cmd
+                if (-not (Wait-Text -Needle 'started pid ' -Was $wasStart `
+                                    -Seconds 60)) {
+                    Write-Host "warning: background run did not report a pid"
+                }
+                $seen = Read-Available
             } elseif ($cmd -match '(?i)^run\s') {
-                $wasRet = Count-Of 'returned '
-                Send-Line $cmd
-                if (-not (Wait-Text -Needle 'returned ' -Was $wasRet `
-                                    -Seconds $TimeoutSec)) {
+                # EVERY WAY A RUN CAN END, not only the happy one.
+                #
+                # This waited for "returned " alone, and a run that crossed the
+                # wire did not print it: the shell reported a remote run's exit
+                # in silence while `link run` reported it in words.  So the
+                # wait ran to the full command timeout - SEVEN MINUTES in
+                # xclutest - and the node on the other end, whose own script is
+                # a fixed number of seconds long, reached the end of it and
+                # exited while this one waited.  Everything asked after that
+                # went to a machine that was gone: retransmitted to the ceiling
+                # and answered -60, with the far node's counters standing still
+                # because there was no far node.  That is the whole of the
+                # "a node serves exactly one remote run per session" fault that
+                # was written up here and in docs\plans\cluster.md.
+                #
+                # The shell now says "returned N from <node>", which is the
+                # real fix; this list is the belt to that pair of braces, so
+                # that the next answer nobody thought of costs a warning rather
+                # than a timeout.
+                $endings = @('returned ', 'did not run there',
+                             'the other node:')
+                $was = @{}
+                foreach ($e in $endings) { $was[$e] = Count-Of $e }
+                Send-Command $cmd
+                $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                if ($deadline -gt $runDeadline) { $deadline = $runDeadline }
+                $done = $false
+                while (-not $done -and (Get-Date) -lt $deadline) {
+                    [void](Read-Available)
+                    foreach ($e in $endings) {
+                        if ((Count-Of $e) -gt $was[$e]) { $done = $true; break }
+                    }
+                    if (-not $done) { Start-Sleep -Milliseconds 200 }
+                }
+                if (-not $done) {
                     Write-Host "warning: run did not report process exit"
                 }
                 $seen = Read-Available
             } else {
-                Send-Line $cmd
+                Send-Command $cmd
                 $seen = Wait-Prompt -Was $seen -Seconds $TimeoutSec
             }
         }
@@ -764,6 +1077,7 @@ try {
     if ($proc -and -not $proc.HasExited) {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
+    Unregister-Emulator -Process $proc
     if ($hostfsProc -and -not $hostfsProc.HasExited) {
         Stop-Process -Id $hostfsProc.Id -Force -ErrorAction SilentlyContinue
     }

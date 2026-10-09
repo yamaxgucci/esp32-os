@@ -106,10 +106,19 @@ static void exec_and_return(const char *path, int argc, const char **argv,
     if (child < 0) {
         status = (int32_t)child;
     } else {
-        while (ag_wait(child, &status, 200u) != AG_OK) {
+        /*
+         * Only a timeout means "still running".  This used to loop on anything
+         * but AG_OK, and a killed child answers -AG_EKILLED once and then, being
+         * collected, -AG_ENOENT for ever: Ctrl+C on a program hung the desktop.
+         */
+        ag_err_t err;
+        while ((err = ag_wait(child, &status, 200u)) == -AG_ETIMEDOUT) {
             if (ag_interrupted()) {
                 (void)ag_kill(child);
             }
+        }
+        if (err != AG_OK) {
+            status = (int32_t)err;
         }
     }
 

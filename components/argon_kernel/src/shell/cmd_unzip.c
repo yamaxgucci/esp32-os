@@ -282,8 +282,11 @@ static int extract_one(mz_zip_archive *zip, mz_uint index,
             rc = 1;
             break;
         }
+        /* AG_UNZIP_CHUNK, not sizeof(chunk): the buffer is on the heap, so
+         * sizeof is four - every archive was being inflated four bytes at a
+         * time.  See cmd_fs.c's copy for the same fix and what it cost. */
         const size_t n =
-            mz_zip_reader_extract_iter_read(iter, chunk, sizeof(chunk));
+            mz_zip_reader_extract_iter_read(iter, chunk, AG_UNZIP_CHUNK);
         if (n == 0) {
             break;
         }

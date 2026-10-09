@@ -64,6 +64,18 @@ AG_EROFS = -30
 AG_ERANGE = -34
 
 HDR_FMT = "<IHH i IIII"  # magic op seq status a0 a1 path_len data_len
+
+# Set in `op` on everything the host sends - replies and PADPUSH alike.
+#
+# Without it a request and a successful reply are the same bytes, which is
+# harmless against this helper (it never sends a request) and not harmless
+# against another guest: two ArgonOS boards wired UART1 to UART1 both probe
+# with PING seq 1, each takes the other's REQUEST for its own ANSWER, and both
+# mount their neighbour as a live host folder.  See argon/hsfs_proto.h.
+#
+# A guest built before this ignores the bit; a guest built after it requires
+# the bit.  The two travel together in this tree.
+HSFS_F_FROM_HOST = 0x8000
 HDR_SIZE = struct.calcsize(HDR_FMT)
 
 
@@ -90,7 +102,8 @@ def send_resp(
     if len(data) > HSFS_MAX_DATA:
         data = data[:HSFS_MAX_DATA]
     hdr = struct.pack(
-        HDR_FMT, HSFS_MAGIC, op, seq, status, a0, a1, 0, len(data)
+        HDR_FMT, HSFS_MAGIC, op | HSFS_F_FROM_HOST, seq, status, a0, a1,
+        0, len(data)
     )
     payload = hdr + data
     if lock is not None:

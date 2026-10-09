@@ -222,6 +222,12 @@ static int do_send(uint32_t baud, uint32_t kb)
 
     ag_printf("tx bytes=%u ms=%u bps=%u\n", (unsigned)sent,
               (unsigned)(us / 1000u), (unsigned)rate_bps(sent, us));
+    /*
+     * The same in blocks, for tools/nodetest.ps1.  `sent` is what the driver
+     * ACCEPTED, not what left the wire: there is no drain in the ABI, so the
+     * last block is normally still in the transmit ring when this returns.
+     */
+    ag_printf("sent %u bytes in %u blocks\n", (unsigned)sent, (unsigned)seq);
     return 0;
 }
 
@@ -322,6 +328,16 @@ static int do_recv(uint32_t baud, uint32_t secs)
     if (bad != 0) {
         /* What one bad block really costs: itself, and then the hunt. */
         ag_printf("rx resync=%u\n", (unsigned)(stray / bad));
+    }
+    /*
+     * The bytes of a block that never completed.  Printed rather than left to
+     * be worked out from the other numbers: without it a sender that stopped
+     * with a block still in its transmit ring is indistinguishable from a wire
+     * that dropped one, and those have opposite cures.
+     */
+    if (have != 0) {
+        ag_printf("in hand: %u bytes of a block that never finished\n",
+                  (unsigned)have);
     }
     if (span != 0) {
         /*

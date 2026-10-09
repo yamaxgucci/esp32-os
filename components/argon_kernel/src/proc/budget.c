@@ -28,6 +28,7 @@
 
 #include <argon/log.h>
 
+#include <argon/port/mem.h>
 #include <argon/port/time.h>
 
 
@@ -56,8 +57,41 @@ typedef struct {
 } slot_t;
 
 static slot_t   s_slots[AG_BUDGET_SLOTS];
+
+/*
+ * `cpu`: every task that was running when a tick landed, counted, per core.
+ * A table per core so that each is written by one core only and a slot is
+ * never claimed by both at once; a task that runs on both cores has a line in
+ * each.  Handles only - a name cannot be read here (see budget_tick) - and
+ * matched to names afterwards, in task context.
+ */
+#define AG_CPU_SLOTS 40u
+
+typedef struct {
+    ag_port_task_t volatile task[AG_CPU_SLOTS];
+    uint32_t volatile       ticks[AG_CPU_SLOTS];
+    uint32_t volatile       total;
+    uint32_t volatile       lost; /* a tick the table had no room for */
+} cpu_table_t;
+
+/* On the heap, the first time `cpu` is asked: 650 bytes of static memory
+ * were more than the S3's window had left (27 Sep 2026). */
+static cpu_table_t *volatile s_cpu;
+static volatile bool         s_cpu_on;
 static uint32_t s_window_tick; /* ticks into the current window            */
 static bool     s_hooked;
+
+/*
+ * THE BOARD'S SPARE TIME (27 Sep 2026), for whatever may only use what is
+ * left - a file relayed across the C3 beside a picture and sound, whose one
+ * core it had filled to 98.5%.  Ticks that found the idle task, and all
+ * ticks, over the last AG_IDLE_WINDOW_MS of both cores together.
+ */
+#define AG_IDLE_WINDOW_MS 20u
+static ag_port_task_t    s_idle_task[2];
+static uint32_t volatile s_idle_now[2], s_all_now[2];
+static uint32_t volatile s_idle_last, s_all_last;
+static uint32_t          s_idle_tick; /* ticks into the idle window, core 0 */
 
 /*
  * Interrupt context, both cores, every millisecond - and in IRAM, calling
@@ -92,6 +126,36 @@ static void AG_PORT_IRAM budget_tick(int core, ag_port_task_t running)
         }
     }
 
+    if (core >= 0 && core < 2) {
+        s_all_now[core]++;
+        if (running != NULL && running == s_idle_task[core]) {
+            s_idle_now[core]++;
+        }
+        if (core == 0 && ++s_idle_tick >= AG_IDLE_WINDOW_MS) {
+            s_idle_tick = 0;
+            s_idle_last = s_idle_now[0] + s_idle_now[1];
+            s_all_last = s_all_now[0] + s_all_now[1];
+            s_idle_now[0] = s_idle_now[1] = 0;
+            s_all_now[0] = s_all_now[1] = 0;
+        }
+    }
+
+    if (s_cpu_on && s_cpu != NULL && core >= 0 && core < 2) {
+        cpu_table_t *const c = &s_cpu[core];
+        c->total++;
+        uint32_t i = 0;
+        while (i < AG_CPU_SLOTS && c->task[i] != running &&
+               c->task[i] != NULL) {
+            i++;
+        }
+        if (i == AG_CPU_SLOTS) {
+            c->lost++;
+        } else {
+            c->task[i] = running;
+            c->ticks[i]++;
+        }
+    }
+
     if (running == NULL) {
         return;
     }
@@ -116,6 +180,8 @@ void ag_budget_init(void)
     if (s_hooked) {
         return;
     }
+    s_idle_task[0] = ag_port_task_idle_of(0);
+    s_idle_task[1] = ag_port_task_idle_of(1);
     s_hooked = ag_port_tick_hook(budget_tick);
     if (!s_hooked) {
         ag_log(AG_LOG_WARN, "budget",
@@ -230,6 +296,54 @@ bool ag_budget_service(void)
     }
 
     return changed;
+}
+
+uint32_t ag_cpu_idle_percent(void)
+{
+    const uint32_t all = s_all_last;
+    if (!s_hooked || all == 0u) {
+        return 100u; /* not counted: nothing is held back on a guess */
+    }
+    return s_idle_last * 100u / all;
+}
+
+void ag_cpu_sample(bool on)
+{
+    if (on) {
+        s_cpu_on = false;
+        if (s_cpu == NULL) {
+            s_cpu = (cpu_table_t *)ag_port_alloc(2u * sizeof(cpu_table_t),
+                                                 AG_MEM_FAST);
+            if (s_cpu == NULL) {
+                return;
+            }
+        }
+        memset((void *)s_cpu, 0, 2u * sizeof(cpu_table_t));
+    }
+    s_cpu_on = on && s_cpu != NULL;
+}
+
+bool ag_cpu_sampled(int core, uint32_t index, ag_port_task_t *task,
+                    uint32_t *ticks)
+{
+    if (s_cpu == NULL || core < 0 || core >= 2 || index >= AG_CPU_SLOTS ||
+        s_cpu[core].task[index] == NULL) {
+        return false;
+    }
+    *task = s_cpu[core].task[index];
+    *ticks = s_cpu[core].ticks[index];
+    return true;
+}
+
+uint32_t ag_cpu_sampled_total(int core, uint32_t *lost)
+{
+    if (s_cpu == NULL || core < 0 || core >= 2) {
+        return 0;
+    }
+    if (lost != NULL) {
+        *lost = s_cpu[core].lost;
+    }
+    return s_cpu[core].total;
 }
 
 bool ag_budget_report(uint32_t index, const char **name, uint32_t *used_ms,

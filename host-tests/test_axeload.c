@@ -271,6 +271,23 @@ static void test_validate(void)
     AG_CHECK_INT(ag_axe_validate(h, a.size, AG_ARCH_XTENSA, h->abi_major,
                                  (uint16_t)(h->abi_minor - 1)),
                  -AG_EABI);
+
+    /* The cluster line's pre-merge numbers (0.53..0.62) read a table that
+     * moved; main's (up to 0.52) and 0.63 on are the ones a 0.63 kernel runs. */
+    {
+        ag_axe_header_t *w = (ag_axe_header_t *)(void *)h;
+        const uint16_t   was = w->abi_minor;
+        w->abi_minor = 60u;
+        AG_CHECK_INT(ag_axe_validate(h, a.size, AG_ARCH_XTENSA, 0u, 63u),
+                     -AG_EABI);
+        w->abi_minor = 53u;
+        AG_CHECK_INT(ag_axe_validate(h, a.size, AG_ARCH_XTENSA, 0u, 63u),
+                     -AG_EABI);
+        w->abi_minor = 52u;
+        AG_CHECK_INT(ag_axe_validate(h, a.size, AG_ARCH_XTENSA, 0u, 63u),
+                     AG_OK);
+        w->abi_minor = was;
+    }
     AG_CHECK_INT(ag_axe_validate(h, a.size, AG_ARCH_XTENSA,
                                  (uint16_t)(h->abi_major + 1), h->abi_minor),
                  -AG_EABI);
@@ -801,8 +818,10 @@ static void test_instruction_relocations(void)
     check_pair_reaches("store, low half 0x100", 0x408100FCu, 4u, true);
     check_pair_reaches("store, low half 0x8ab", 0x408108A7u, 4u, true);
 
-    /* An entry pointing past the part it names is a file contradicting
-     * itself, and must be refused rather than written. */
+    /* An entry pointing past the part it names by more than one load's
+     * reach is a file contradicting itself, and must be refused rather than
+     * written.  Within the reach it is a base GCC reaches a large static's
+     * fields from (AG_AXE_I_REACH), and is taken. */
     uint32_t        code[2] = {LUI(15), ADDI(10, 15)};
     uint8_t         data[64] = {0};
     ag_axe_header_t h = {0};
@@ -824,8 +843,16 @@ static void test_instruction_relocations(void)
     const ag_axe_place_t place = {code, sizeof(code), data, sizeof(data)};
     ag_axe_binding_t     binding;
 
+    const ag_axe_ireloc_t in_reach[1] = {
+        {0u | AG_AXE_I_HI20 | AG_AXE_I_TO_DATA,
+         (uint32_t)sizeof(data) + AG_AXE_I_REACH}};
+    AG_CHECK_INT(ag_axe_apply(&h, &place, NULL, 0, in_reach, 1, &binding),
+                 AG_OK);
+    code[0] = LUI(15);
+
     const ag_axe_ireloc_t past_data[1] = {
-        {0u | AG_AXE_I_HI20 | AG_AXE_I_TO_DATA, sizeof(data) + 1u}};
+        {0u | AG_AXE_I_HI20 | AG_AXE_I_TO_DATA,
+         (uint32_t)sizeof(data) + AG_AXE_I_REACH + 1u}};
     AG_CHECK_INT(ag_axe_apply(&h, &place, NULL, 0, past_data, 1, &binding),
                  -AG_EFORMAT);
 
