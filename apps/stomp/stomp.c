@@ -1200,12 +1200,32 @@ static void present(void)
     }
 }
 
+/*
+ * Paint here and now - but only when nothing else is painting.
+ *
+ * Several places want the screen brought up to date before they go away for a
+ * second: baking a model's curves, reading a cabinet off the card.  They did
+ * that by calling present() straight out, which was correct while the only
+ * painter was this thread.
+ *
+ * With a painter thread it is two threads inside the same drawing at once, and
+ * that is not a race that merely looks wrong: choosing a model from the panel
+ * killed the application every time, with a write to address zero inside a ROM
+ * memcpy - one thread resetting the band renderer's list while the other was
+ * playing it back.  The mark has already woken the painter, so there is
+ * nothing to do here but let it.
+ */
+static void present_now(void)
+{
+    if (s_painter == NULL) {
+        present();
+    }
+}
+
 static void draw(void)
 {
     dirty_all();
-    if (s_painter == NULL) {
-        present(); /* before the painter exists, and for the text panel */
-    }
+    present_now();
 }
 
 /*
@@ -1434,7 +1454,7 @@ static void bench(void)
     t0 = ag_micros();
     for (i = 0; i < n; i++) {
         dirty_item(0);
-        present();
+        present_now();
     }
     t1 = ag_micros();
     us_knob = t1 - t0;
@@ -1445,7 +1465,7 @@ static void bench(void)
     for (i = 0; i < n; i++) {
         dirty_item(0);
         dirty_item(1);
-        present();
+        present_now();
     }
     t1 = ag_micros();
     us_move = t1 - t0;
@@ -2073,7 +2093,7 @@ static void set_model(int m)
     (void)snprintf(s_preset, sizeof(s_preset), "%s", ag_amp_model_name(m));
     if (s_sound) {
         status("baking the curves, about a second");
-        present();
+        present_now();
         (void)amp_from_model(m);
         return;
     }
@@ -2734,13 +2754,13 @@ int ag_main(int argc, char **argv)
         draw(); /* the screen first: loading a preset takes a moment */
         if (preset != NULL) {
             status("loading the preset");
-            present();
+            present_now();
             if (amp_from_preset(preset) == 0) {
                 (void)snprintf(s_preset, sizeof(s_preset), "%s", preset);
             }
         } else {
             status("baking the curves, about a second");
-            present();
+            present_now();
             (void)amp_from_model(s_model);
         }
         if (want_os > 0 && s_amp != NULL) {
@@ -2764,7 +2784,7 @@ int ag_main(int argc, char **argv)
              * not something to do between two blocks of audio.
              */
             status("loading the cabinet");
-            present();
+            present_now();
             const int cab_ok = cabinet_from_wav(cab_path);
             /* And take it off again: every other status says what is
              * happening now, and this one stayed in the header for the rest
@@ -3038,7 +3058,7 @@ int ag_main(int argc, char **argv)
             }
             ag_pcm_pace_wait(&s_out);
         } else {
-            present();
+            present_now();
         }
     }
     painter_stop();
