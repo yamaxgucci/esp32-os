@@ -96,6 +96,24 @@ AG_APP_SIZED("STOMP", "1.0", "argon", 0, 12 * 1024, 1024 * 1024);
 /* How long an open slider waits for a hand that has gone back to the guitar. */
 #define SLIDER_IDLE_MS 5000u
 
+/*
+ * How much room before the next block is due is enough to draw in.
+ *
+ * It was six milliseconds, which is right for a whole painted panel (4.3 ms)
+ * against an 11.6 ms block.  On an instrument the block is 64 frames - 2.9 ms
+ * - and six milliseconds of slack never exist, so the panel never redrew at
+ * all: a phone looking at the board got a picture that was declared and never
+ * sent, which reads as a page that opened and stayed empty.
+ *
+ * It does not need six.  A full repaint is already painted one band of eight
+ * at a time while sound is running, and a band is about half a millisecond;
+ * the dirty rectangles of a turned knob are smaller again.  So the test is
+ * whether there is room for one step, not for the whole picture - and the
+ * whole picture arrives over eight blocks, which is twenty-three milliseconds
+ * and invisible to anybody watching.
+ */
+#define REDRAW_SLACK_US 700
+
 /* What a line in the chooser is.  A header is drawn and skipped over, so that
  * "built in" and "on the card" can separate two kinds of preset in one list. */
 enum {
@@ -2579,7 +2597,13 @@ int ag_main(int argc, char **argv)
              */
             status("loading the cabinet");
             present();
-            if (cabinet_from_wav(cab_path) == 0) {
+            const int cab_ok = cabinet_from_wav(cab_path);
+            /* And take it off again: every other status says what is
+             * happening now, and this one stayed in the header for the rest
+             * of the run - a panel that said "loading the cabinet" under an
+             * amplifier that had been playing for an hour. */
+            status("");
+            if (cab_ok == 0) {
                 s_cab_on = 1;
                 ag_ir_set_bypass(&s_ir, 0);
                 (void)snprintf(s_cab, sizeof(s_cab), "%s", cab_path);
@@ -2804,7 +2828,7 @@ int ag_main(int argc, char **argv)
              */
             if ((s_dirty_all || s_ndirty > 0 || s_text_all ||
                  s_text_rows != 0u) &&
-                ag_pcm_slack_us(&s_out) >= (s_text ? 1000 : 6000)) {
+                ag_pcm_slack_us(&s_out) >= REDRAW_SLACK_US) {
                 ag_pcm_poll_stats(&s_out);
                 present();
             }

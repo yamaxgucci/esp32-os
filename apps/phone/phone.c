@@ -1629,6 +1629,29 @@ static bool service_client(void)
             s.dy1 = s.frame_h;
         }
         unlock();
+
+        /*
+         * A picture with no frame cannot be re-sent from here, because
+         * nothing here kept it: with `frame = no` the bands go straight to
+         * the wire and are forgotten.  The only copy left is the one the
+         * application can draw again, and the way to ask for it is the event
+         * it already answers when the screen comes back to it.
+         *
+         * Without this, a phone that arrives while a panel is merely sitting
+         * there gets the text rows and a black picture, and fills in only
+         * where something happens to change - the amplifier's knobs appeared
+         * one row at a time as they were turned, and the half nobody touched
+         * stayed black.
+         */
+        if (s.picture_live && s.frame == NULL) {
+            ag_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type = AG_EV_FOCUS_GAINED;
+            (void)ag_inject_event(&ev);
+            ag_log(AG_LOG_INFO, "phone",
+                   "a visitor with no frame to send: asked the screen's owner "
+                   "to draw it again");
+        }
     }
 
     /*
