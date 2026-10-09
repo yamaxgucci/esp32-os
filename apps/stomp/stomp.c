@@ -226,6 +226,7 @@ static uint32_t     s_clipped;
 static uint32_t     s_blocks;  /* blocks written since the sink opened */
 static uint32_t     s_short;   /* writes the sink would not take whole */
 static uint32_t     s_say_ms;  /* when the console last heard how it goes */
+static char         s_hdr_shown[96]; /* what the top strip last said */
 static int          s_tab_n;   /* points the curve buffer is sized for */
 static int          s_tab_fast; /* and whether it got internal SRAM */
 static int          s_tab_stages; /* and for how many stages */
@@ -248,6 +249,58 @@ static int          s_editing; /* the slider is open on s_sel */
  * a control in the way.
  */
 static int          s_drag;      /* the finger is on the slider now */
+
+/*
+ * THE PANEL IS PAINTED BY ITS OWN THREAD
+ *
+ * It used to be painted between audio blocks, when there was room: the loop
+ * asked how long until the converter was next due and drew if the answer was
+ * big enough.  On an instrument that answer is almost never big enough.  A
+ * 64-frame block is 2.9 ms, and with a phone attached the board runs at 86 to
+ * 98 per cent of its core - so the panel was drawn in the crumbs, and a whole
+ * screen took the best part of nine seconds to arrive.
+ *
+ * A picture has no business competing with the block loop.  The painter now
+ * has a thread of its own on the *system* core, which is the one the audio is
+ * not on (applications run on the application core), so drawing costs the
+ * amplifier nothing but the memory bus.
+ *
+ * What crosses between them is one flag and one semaphore.  Everything that
+ * changes the picture marks it dirty and nudges the painter; the painter is
+ * the only thing that touches the graphics interface after start-up, so there
+ * is no second painter to race with.  The dirty *rectangles* are not shared:
+ * with a thread, a mark means the whole panel, which costs eight bands on a
+ * core that has nothing else to do and removes the list that two threads would
+ * otherwise have to agree about.
+ */
+static ag_thread_t  s_painter;
+static ag_sem_t     s_paint_wake;
+static ag_mutex_t   s_paint_lock; /* the dirty marks, and nothing else */
+static volatile int s_paint_stop;
+
+/*
+ * The marks are shared, so they are locked - and the lock is held for the
+ * length of an append or a snapshot, never for the length of a paint.
+ *
+ * The first attempt avoided the lock by making every mark a whole panel.  That
+ * worked and cost too much: the meter marks the top strip four times a second
+ * and each one became eight bands, half a megabyte of wire in twenty seconds,
+ * and the amplifier went from 55 resyncs to 1791.  Two rectangles for a turned
+ * knob is the whole reason the dirty list exists.
+ */
+static void paint_lock(void)
+{
+    if (s_paint_lock != NULL) {
+        (void)ag_mutex_lock(s_paint_lock, 50u);
+    }
+}
+
+static void paint_unlock(void)
+{
+    if (s_paint_lock != NULL) {
+        ag_mutex_unlock(s_paint_lock);
+    }
+}
 static uint32_t     s_touch_ms;  /* when it was last touched or typed at */
 static int          s_cab_on = 1;
 static char         s_cab[AG_PATH_MAX] = "";
@@ -742,19 +795,27 @@ static void draw_browser(int sw, int sh)
  */
 #define DIRTY_MAX 4
 
-static struct {
+/* Named, because the painter takes a copy of them before it draws. */
+typedef struct {
     short x, y, w, h;
-} s_dirty[DIRTY_MAX];
+} rect_t;
+
+static rect_t s_dirty[DIRTY_MAX];
 static int s_ndirty;
 static int s_dirty_all;
 static int s_band; /* which band of a full repaint comes next */
 
 static void dirty_all(void)
 {
+    paint_lock();
     s_text_all = 1;
     s_dirty_all = 1;
     s_band = 0;
     s_ndirty = 0;
+    paint_unlock();
+    if (s_paint_wake != NULL) {
+        ag_sem_give(s_paint_wake);
+    }
 }
 
 static void dirty(int x, int y, int w, int h)
@@ -785,11 +846,18 @@ static void dirty(int x, int y, int w, int h)
     if (w <= 0 || h <= 0) {
         return;
     }
-    s_dirty[s_ndirty].x = (short)x;
-    s_dirty[s_ndirty].y = (short)y;
-    s_dirty[s_ndirty].w = (short)w;
-    s_dirty[s_ndirty].h = (short)h;
-    s_ndirty++;
+    paint_lock();
+    if (s_ndirty < DIRTY_MAX) {
+        s_dirty[s_ndirty].x = (short)x;
+        s_dirty[s_ndirty].y = (short)y;
+        s_dirty[s_ndirty].w = (short)w;
+        s_dirty[s_ndirty].h = (short)h;
+        s_ndirty++;
+    }
+    paint_unlock();
+    if (s_paint_wake != NULL) {
+        ag_sem_give(s_paint_wake);
+    }
 }
 
 /* A knob's cell or a button, whichever this index is. */
@@ -827,6 +895,34 @@ static int hits(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh)
 }
 
 /* Everything that shows through the given rectangle, in the order it stacks. */
+/*
+ * What the top strip reads, in one place.
+ *
+ * Here rather than inside the painter because the loop has to ask the same
+ * question to decide whether the strip is worth redrawing at all - and a
+ * second copy of this format would be two answers to "has it changed".
+ */
+static void head_text(char *out, size_t n)
+{
+    if (s_status[0] != '\0') {
+        (void)snprintf(out, n, "%s", s_status);
+        return;
+    }
+    if (!s_sound) {
+        (void)snprintf(out, n, "silent");
+        return;
+    }
+    const int meter = (int)(s_peak * 20.0f);
+    char      bar[24];
+    int       k;
+    for (k = 0; k < 20; k++) {
+        bar[k] = (k < meter) ? '=' : '.';
+    }
+    bar[20] = '\0';
+    (void)snprintf(out, n, "%s  %s  %u%% cpu", s_out.path, bar,
+                   (unsigned)s_out.load_pct);
+}
+
 static void paint_region(int rx, int ry, int rw, int rh)
 {
     const int sw = (int)s_info.width;
@@ -841,21 +937,7 @@ static void paint_region(int rx, int ry, int rw, int rh)
                     AG_GFX_TRANS);
         /* What the sound is doing, on the same line as what is playing it:
          * the load is the number that says whether this box can keep up. */
-        if (s_status[0] != '\0') {
-            (void)snprintf(head, sizeof(head), "%s", s_status);
-        } else if (s_sound) {
-            const int meter = (int)(s_peak * 20.0f);
-            char      bar[24];
-            int       k;
-            for (k = 0; k < 20; k++) {
-                bar[k] = (k < meter) ? '=' : '.';
-            }
-            bar[20] = '\0';
-            (void)snprintf(head, sizeof(head), "%s  %s  %u%% cpu", s_out.path,
-                           bar, (unsigned)s_out.load_pct);
-        } else {
-            (void)snprintf(head, sizeof(head), "silent");
-        }
+        head_text(head, sizeof(head));
         (void)ag_gfx_text_fit(120, 6, (uint16_t)(sw - 126), head,
                               s_status[0] != '\0' ? rgb(240, 200, 130)
                                                   : rgb(130, 138, 158),
@@ -1060,44 +1142,130 @@ static void present(void)
         s_ndirty = 0;
         return;
     }
-    if (s_dirty_all && s_sound) {
+    /*
+     * Take the marks, then let go, then draw.
+     *
+     * The painter runs on another core and the marks are made on this one, so
+     * what is drawn has to be a snapshot: holding the lock across the paint
+     * would stop the amplifier's thread for the length of a band every time it
+     * reached for a knob.  Taken and released in microseconds; the painting
+     * below touches nothing shared.
+     */
+    rect_t    mine[DIRTY_MAX];
+    int       n_mine = 0;
+    int       all;
+    int       band_y = 0, band_h = 0;
+
+    paint_lock();
+    all = s_dirty_all;
+    if (all && s_sound) {
         const int h = (int)s_info.height;
         const int band = (h + BANDS - 1) / BANDS;
-        const int y = s_band * band;
-        int       hh = band;
-        if (y + hh > h) {
-            hh = h - y;
-        }
-        if (hh > 0) {
-            paint_region(0, y, (int)s_info.width, hh);
-            ag_gfx_flush(0, (uint16_t)y, s_info.width, (uint16_t)hh);
+        band_y = s_band * band;
+        band_h = band;
+        if (band_y + band_h > h) {
+            band_h = h - band_y;
         }
         if (++s_band >= BANDS) {
             s_band = 0;
             s_dirty_all = 0;
         }
-        s_ndirty = 0;
+    } else if (!all) {
+        n_mine = s_ndirty;
+        for (i = 0; i < n_mine; i++) {
+            mine[i] = s_dirty[i];
+        }
+    } else {
+        s_dirty_all = 0;
+    }
+    s_ndirty = 0;
+    paint_unlock();
+
+    if (all && s_sound) {
+        if (band_h > 0) {
+            paint_region(0, band_y, (int)s_info.width, band_h);
+            ag_gfx_flush(0, (uint16_t)band_y, s_info.width, (uint16_t)band_h);
+        }
         return;
     }
-    if (s_dirty_all) {
+    if (all) {
         paint();
         ag_gfx_flush(0, 0, s_info.width, s_info.height);
-    } else {
-        for (i = 0; i < s_ndirty; i++) {
-            paint_region(s_dirty[i].x, s_dirty[i].y, s_dirty[i].w,
-                         s_dirty[i].h);
-            ag_gfx_flush((uint16_t)s_dirty[i].x, (uint16_t)s_dirty[i].y,
-                         (uint16_t)s_dirty[i].w, (uint16_t)s_dirty[i].h);
-        }
+        return;
     }
-    s_dirty_all = 0;
-    s_ndirty = 0;
+    for (i = 0; i < n_mine; i++) {
+        paint_region(mine[i].x, mine[i].y, mine[i].w, mine[i].h);
+        ag_gfx_flush((uint16_t)mine[i].x, (uint16_t)mine[i].y,
+                     (uint16_t)mine[i].w, (uint16_t)mine[i].h);
+    }
 }
 
 static void draw(void)
 {
     dirty_all();
-    present();
+    if (s_painter == NULL) {
+        present(); /* before the painter exists, and for the text panel */
+    }
+}
+
+/*
+ * The painter.  It waits to be told the picture changed, then draws it, and
+ * the only thing it shares with the amplifier is that flag.
+ *
+ * present() paints one band of eight a call, so the loop below runs it until
+ * nothing is dirty - a whole screen in one pass, on a core the audio is not
+ * using.  The wait has a timeout as well as a semaphore so that a mark that
+ * arrived while a pass was running is never slept through.
+ */
+static void paint_thread(void *arg)
+{
+    (void)arg;
+    while (!s_paint_stop) {
+        (void)ag_sem_take(s_paint_wake, 100u);
+        while (!s_paint_stop && (s_dirty_all || s_ndirty > 0)) {
+            present();
+        }
+    }
+    ag_thread_exit();
+}
+
+/* Started once the screen is known to exist; before that `draw` paints in
+ * line, because there is nothing else running yet to disturb. */
+static void painter_start(void)
+{
+    if (s_headless || s_text || s_painter != NULL) {
+        return;
+    }
+    s_paint_wake = ag_sem_create(1, 1);
+    if (s_paint_wake == NULL) {
+        return; /* no semaphore: keep painting in line, which still works */
+    }
+    s_painter = ag_thread_create(paint_thread, NULL, "stomp.paint", 4096, 3,
+                                 (uint32_t)AG_THREAD_SYS_CORE);
+    if (s_painter == NULL) {
+        ag_sem_delete(s_paint_wake);
+        s_paint_wake = NULL;
+        ag_mutex_delete(s_paint_lock);
+        s_paint_lock = NULL;
+        ag_printf("stomp: no thread for the panel; drawing between blocks\n");
+        return;
+    }
+    ag_printf("stomp: the panel is painted on the system core\n");
+}
+
+static void painter_stop(void)
+{
+    if (s_painter == NULL) {
+        return;
+    }
+    s_paint_stop = 1;
+    ag_sem_give(s_paint_wake);
+    (void)ag_thread_join(s_painter, 1000u);
+    s_painter = NULL;
+    ag_sem_delete(s_paint_wake);
+    s_paint_wake = NULL;
+    ag_mutex_delete(s_paint_lock);
+    s_paint_lock = NULL;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -2645,6 +2813,7 @@ int ag_main(int argc, char **argv)
         (void)snprintf(s_preset, sizeof(s_preset), "%s", preset);
     }
     draw();
+    painter_start();
 
     if (s_sound) {
         ag_pcm_pace_start(&s_out);
@@ -2735,9 +2904,25 @@ int ag_main(int argc, char **argv)
                     s_editing = 0;
                     dirty_all();
                 }
+                /*
+                 * The strip, only when it says something different.
+                 *
+                 * It used to be marked four times a second whatever it read,
+                 * and on a remote screen that is 320x26 pixels over the air
+                 * sixteen times a second for a bar that had not moved: with a
+                 * phone attached the amplifier went from 13 resyncs in thirty
+                 * seconds to 608.  A picture is sent because it changed, not
+                 * because a timer went off.
+                 */
                 if (ms - s_hdr_ms >= 250u) {
+                    char now_head[96];
                     s_hdr_ms = ms;
-                    dirty(0, 0, (int)s_info.width, TOP_H);
+                    head_text(now_head, sizeof(now_head));
+                    if (strcmp(now_head, s_hdr_shown) != 0) {
+                        (void)snprintf(s_hdr_shown, sizeof(s_hdr_shown), "%%s",
+                                       now_head);
+                        dirty(0, 0, (int)s_info.width, TOP_H);
+                    }
                 }
                 /*
                  * And the same numbers to the console, because on this board
@@ -2838,7 +3023,14 @@ int ag_main(int argc, char **argv)
              * close, and a band that had to wait for the wire ends the burst
              * by itself.
              */
-            while ((s_dirty_all || s_ndirty > 0 || s_text_all ||
+            /*
+             * Only when nobody else is painting.  With the painter thread
+             * running this loop does nothing at all - which is the point of
+             * it: the block loop stops lending the picture the microseconds
+             * it does not have.
+             */
+            while (s_painter == NULL &&
+                   (s_dirty_all || s_ndirty > 0 || s_text_all ||
                     s_text_rows != 0u) &&
                    ag_pcm_slack_us(&s_out) >= REDRAW_SLACK_US) {
                 ag_pcm_poll_stats(&s_out);
@@ -2849,6 +3041,7 @@ int ag_main(int argc, char **argv)
             present();
         }
     }
+    painter_stop();
     if (s_text) {
         /* Hand the console back the way it was found: a cursor, and a line
          * below the panel rather than on top of it. */
