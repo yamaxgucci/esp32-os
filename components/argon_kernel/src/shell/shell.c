@@ -587,8 +587,97 @@ static void mem_place_line(const char *line, void *ctx)
     ag_console_puts(line);
 }
 
+/*
+ * mem /x: extended memory in address order.
+ *
+ * `mem` says the largest block is smaller than what is free, and stops there.
+ * On 8 Oct 2026 that gap was 102 KB on the S3-CAM under REMDISP, and it was
+ * exactly what kept Fallout's 6000 KB arena from starting next to its own
+ * 1651 KB of data - with 7654 KB free.  The question is what sits in the
+ * middle, and only a walk answers it.
+ *
+ * Blocks of MEM_MAP_BIG and over get a line each; the small ones between two
+ * big ones are one line, counted.  The walk only records: printing allocates,
+ * and the heap must not change under it.
+ */
+#define MEM_MAP_BIG   (16u * 1024u)
+#define MEM_MAP_LINES 64
+
+typedef struct {
+    uintptr_t addr;
+    size_t    used, free_bytes;
+    unsigned  count;
+    bool      big;
+} mem_map_line_t;
+
+typedef struct {
+    mem_map_line_t line[MEM_MAP_LINES];
+    unsigned       n;
+    bool           cut;
+} mem_map_t;
+
+static void mem_map_block(void *ctx, const void *addr, size_t bytes, int used)
+{
+    mem_map_t *m = (mem_map_t *)ctx;
+    const bool big = bytes >= MEM_MAP_BIG;
+    mem_map_line_t *last = (m->n > 0) ? &m->line[m->n - 1] : NULL;
+
+    if (!big && last != NULL && !last->big) {
+        last->count++;
+        if (used) {
+            last->used += bytes;
+        } else {
+            last->free_bytes += bytes;
+        }
+        return;
+    }
+    if (m->n == MEM_MAP_LINES) {
+        m->cut = true;
+        return;
+    }
+    mem_map_line_t *l = &m->line[m->n++];
+    l->addr = (uintptr_t)addr;
+    l->used = used ? bytes : 0;
+    l->free_bytes = used ? 0 : bytes;
+    l->count = 1;
+    l->big = big;
+}
+
+static int mem_map(void)
+{
+    static mem_map_t m AG_KERNEL_STATIC;   /* 1.5 KB: not on the shell's stack */
+    memset(&m, 0, sizeof(m));
+    ag_port_mem_walk(AG_MEM_SLOW, mem_map_block, &m);
+    if (m.n == 0) {
+        ag_console_puts("  extended memory: none, or this port cannot walk it\n");
+        return 0;
+    }
+    ag_console_puts("  address      used KB   free KB\n");
+    for (unsigned i = 0; i < m.n; i++) {
+        const mem_map_line_t *l = &m.line[i];
+        if (l->big) {
+            ag_console_printf("  %08x  %8u  %8u\n", (unsigned)l->addr,
+                              (unsigned)(l->used / 1024),
+                              (unsigned)(l->free_bytes / 1024));
+        } else {
+            ag_console_printf("  %08x  %8u  %8u   %u small blocks\n",
+                              (unsigned)l->addr, (unsigned)(l->used / 1024),
+                              (unsigned)(l->free_bytes / 1024), l->count);
+        }
+    }
+    if (m.cut) {
+        ag_console_printf("  (more: only the first %u lines kept)\n",
+                          (unsigned)MEM_MAP_LINES);
+    }
+    return 0;
+}
+
 static int cmd_mem(int argc, char **argv)
 {
+    if (argc > 1 && (strcmp(argv[1], "/x") == 0 ||
+                     strcmp(argv[1], "map") == 0)) {
+        return mem_map();
+    }
     if (argc > 1 && (strcmp(argv[1], "/t") == 0 ||
                      strcmp(argv[1], "tasks") == 0)) {
         return mem_tasks();
@@ -951,6 +1040,41 @@ static int cmd_ptr(int argc, char **argv)
     if (reports == 0) {
         ag_console_puts("nothing has reported: check `log` for what attached\n");
     }
+    return 0;
+}
+
+/* Defined further down with the other SYSTEM.CFG writers. */
+static ag_err_t cfg_replace_section(const char *section, const char *body);
+
+/*
+ * `mouse speed N`: how far the pointer goes, in per cent, now and after the
+ * next boot.  The file is what makes it last - a setting that is gone after a
+ * reset is a setting nobody trusts - so it is written at once, the [mouse]
+ * section replaced and the rest of SYSTEM.CFG left as it stands.
+ */
+static int cmd_mouse(int argc, char **argv)
+{
+    if (argc >= 3 && ag_path_icmp(argv[1], "speed") == 0) {
+        char *end = NULL;
+        const long want = strtol(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0') {
+            ag_console_puts("usage: mouse speed <10..1000>  (per cent)\n");
+            return 1;
+        }
+        const int32_t got = ag_hidptr_set_speed((int32_t)want);
+        char body[32];
+        snprintf(body, sizeof(body), "speed = %d\n", (int)got);
+        const ag_err_t err = cfg_replace_section("mouse", body);
+        ag_console_printf("mouse speed %d%%%s\n", (int)got,
+                          (err == AG_OK) ? ", saved to SYSTEM.CFG"
+                                         : ", NOT saved (SYSTEM.CFG not written)");
+        return (err == AG_OK) ? 0 : 1;
+    }
+    if (argc >= 2) {
+        ag_console_puts("usage: mouse [speed <10..1000>]\n");
+        return 1;
+    }
+    ag_console_printf("mouse speed %d%%\n", (int)ag_hidptr_speed());
     return 0;
 }
 #endif
@@ -2245,7 +2369,7 @@ static int cfg_has_device_line(const char *text, const char *dos_path)
  */
 #define ARGON_SHELL_HAS_WIFI (AG_PORT_HAS_WIFI || AG_HAS_NET)
 
-#if ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || \
+#if ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID || \
     (defined(CONFIG_ARGON_NET_SSH) && CONFIG_ARGON_NET_SSH)
 
 /* Case-insensitive compare of a fixed length; the section name in the file may
@@ -2391,7 +2515,7 @@ static ag_err_t cfg_replace_section(const char *section, const char *body)
     return (w < 0) ? (ag_err_t)w : AG_OK;
 }
 
-#endif /* ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || CONFIG_ARGON_NET_SSH */
+#endif /* ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID || CONFIG_ARGON_NET_SSH */
 
 #if ARGON_SHELL_HAS_WIFI
 static ag_err_t cfg_ensure_wifi(const char *ssid, const char *pass,
@@ -5949,7 +6073,7 @@ static int cmd_guard(int argc, char **argv)
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
-    {"mem", "[/t|/p]", "memory usage; /t: every task and its stack; /p: [memory] placement", cmd_mem},
+    {"mem", "[/t|/p|/x]", "memory usage; /t: every task and its stack; /p: [memory] placement; /x: extended memory block by block", cmd_mem},
     {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
     {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
@@ -5957,6 +6081,7 @@ static const ag_command_t k_commands[] = {
     {"log", "[-n N|clear]", "system journal", cmd_log},
 #if AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID
     {"ptr", "", "where the pointer is, and how much it has said", cmd_ptr},
+    {"mouse", "[speed N]", "pointer speed in per cent, kept in SYSTEM.CFG", cmd_mouse},
 #endif
     {"uptime", "", "time since reset", cmd_uptime},
     {"date", "[set D T | sync [srv]]", "show the clock, or set it", cmd_date},

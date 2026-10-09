@@ -25,6 +25,7 @@ void run_journal_tests(void);
 void run_axeload_tests(void);
 void run_axesig_tests(void);
 void run_codepage_tests(void);
+void run_hidrep_tests(void);
 void run_reslist_tests(void);
 void run_arena_tests(void);
 void run_probe_tests(void);
@@ -67,6 +68,7 @@ int main(void)
     run_axeload_tests();
     run_axesig_tests();
     run_codepage_tests();
+    run_hidrep_tests();
     run_reslist_tests();
     run_arena_tests();
     run_probe_tests();

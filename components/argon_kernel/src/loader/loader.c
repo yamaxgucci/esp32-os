@@ -941,7 +941,14 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
              * Slower than internal SRAM, far faster than flash for a working
              * set that does not fit the cache.
              */
-            if (!contiguous && psram_ready() &&
+            /* Mapped only for code that can go into it: the arena maps
+             * once for the life of the system, 64 KB-aligned, and on
+             * 8 Oct 2026 the hole under it kept Fallout's 6000 KB arena
+             * from starting although its 788 KB of code never goes there
+             * (the heap rounds a request that large up to 6016). */
+            if (!contiguous &&
+                (size_t)header->code.size <= AG_PSRAM_ARENA_BYTES &&
+                psram_ready() &&
                 ag_arena_largest_free(&s_psram, 16) >=
                     (size_t)header->code.size &&
                 place_psram(header, out) == AG_OK) {

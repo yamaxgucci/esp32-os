@@ -141,8 +141,15 @@ AG_DRV("PHONE", "1.1", "argon");
  * The number and the reason are HTTPD.AXE's, which found them first: a
  * connection accepted when lwIP or the Wi-Fi driver is out of memory does not
  * fail, it aborts the board.  Sixteen kilobytes is measured, not guessed.
+ *
+ * Overridable at build time for the emulator only: its image has 117 KB of
+ * internal memory and 8 KB of it free, so a scripted check of the picture path
+ * (tools/phoneshot.py) is turned away before it can look at anything.  QEMU's
+ * network is not the Wi-Fi driver this floor protects.
  */
+#ifndef MEM_FLOOR
 #define MEM_FLOOR (16u * 1024u)
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* The protocol inside the WebSocket                                         */
@@ -208,6 +215,14 @@ AG_DRV("PHONE", "1.1", "argon");
 #define IN_AUTH 'A'
 
 #define INFO_HAS_TEXT 0x01u
+/*
+ * Which screen is in front, said by the board (ABI 0.68, display held):
+ * INFO_SAYS_MODE means the board knows, and INFO_PICTURE is then the answer -
+ * an application holds the screen.  Without INFO_SAYS_MODE the page guesses
+ * from traffic, as it always did.
+ */
+#define INFO_PICTURE   0x02u
+#define INFO_SAYS_MODE 0x04u
 
 /*
  * The password, and what it is and is not.
@@ -322,7 +337,9 @@ static struct {
      */
     uint32_t      blits;
     uint32_t      bands;
+    uint32_t      bands_lite; /* of those, sent with no picture memory   */
     uint32_t      band_bytes;
+    uint64_t      mem_retry_at; /* when to ask for picture memory again  */
     /*
      * And the four ways one does not.  A picture that does not appear looks
      * the same from a chair whichever of them it was, and they want different
@@ -351,7 +368,6 @@ static struct {
     uint32_t      owe_frame_w, owe_frame_h;
     bool          owe_nostack;
     uint32_t      owe_stack_left;
-    uint64_t      direct_last;
     uint32_t      stall_band;
     uint32_t      stall_text;
     bool          moaned_stack;
@@ -418,7 +434,6 @@ static struct {
     uint32_t          band_w;
     uint32_t          band_px;
     uint32_t          band_cap;
-    uint32_t          direct_at; /* which band the budget stopped on         */
     /*
      * When it is worth offering the client another message.
      *
@@ -450,6 +465,13 @@ static struct {
     bool              moaned_frame;
     bool              moaned_mem;
     bool              want_frame;
+    bool              codec_light; /* [phone] codec = light               */
+    /*
+     * Whether an application holds the screen, as the kernel says it (held,
+     * ABI 0.68), and whether this kernel says it at all.
+     */
+    volatile bool     picture_live;
+    bool              knows_held;
 
     /* What an application reading /dev/pkbd0 has not taken yet. */
     keyev_t  ring[KEY_RING];
@@ -561,13 +583,13 @@ typedef enum {
 #define BLIT_STACK_FLOOR 6144u
 
 /*
- * The picture's share of the device registry: at most one sending pass every
- * DIRECT_EVERY_US, at most DIRECT_BUDGET_US spent inside it.  See the note in
- * send_blit_direct - these two together are what stop a fast drawing
- * application from starving the rest of the machine through this driver.
+ * Sending straight from the drawing task (no frame): how long a tile may wait
+ * for a client that is not reading before it is given up, and how long for the
+ * wire's mutex while the task finishes a message of its own.  See the note in
+ * send_blit_direct.
  */
-#define DIRECT_EVERY_US  150000ull
-#define DIRECT_BUDGET_US 25000ull
+#define DIRECT_WAIT_MS 1000u
+#define DIRECT_LOCK_MS 500u
 
 /*
  * And how long a client may prove nothing at all before it is let go.
@@ -1093,7 +1115,7 @@ static void expected_digest(uint8_t out[DIGEST_LEN])
     ag_ws_sha1(buf, NONCE_LEN + n, out);
 }
 
-static wire_t send_info(void)
+static wire_t send_info(uint32_t lock_ms)
 {
     uint8_t buf[WS_SLACK + 9];
     uint8_t *p = buf + WS_SLACK;
@@ -1117,8 +1139,10 @@ static wire_t send_info(void)
      */
     p[6] = (uint8_t)s.cell_w;
     p[7] = (uint8_t)s.cell_h;
-    p[8] = s.publish_text ? INFO_HAS_TEXT : 0u;
-    return ws_send(OP_INFO, p, 9u, SEND_IDLE_MS, 3000u);
+    p[8] = (uint8_t)((s.publish_text ? INFO_HAS_TEXT : 0u) |
+                     (s.knows_held ? INFO_SAYS_MODE : 0u) |
+                     (s.picture_live ? INFO_PICTURE : 0u));
+    return ws_send(OP_INFO, p, 9u, SEND_IDLE_MS, lock_ms);
 }
 
 /* Two bytes that stand for a screenful.  See OP_SCROLL. */
@@ -1189,18 +1213,14 @@ static wire_t send_cursor(void)
  * network takes, and neither is anything an application that happened to draw
  * should be made to wait for.
  */
-/* Encode whatever is in s.band and put it on the wire.  Both paths end here. */
-static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                              uint32_t idle_ms, uint32_t lock_ms)
+/*
+ * An encoded band, `len` bytes of it at body + BAND_HDR, put on the wire.
+ * `body` has WS_SLACK writable bytes in front of it for ws_send's header.
+ */
+static wire_t send_encoded(uint8_t op, uint8_t *body, uint32_t len, uint32_t x,
+                           uint32_t y, uint32_t w, uint32_t h, uint32_t idle_ms,
+                           uint32_t lock_ms)
 {
-    /* s.out is allocated with WS_SLACK bytes in front for ws_send's header. */
-    uint8_t       *body = s.out + WS_SLACK;
-    const uint32_t cap = s.band_cap - WS_SLACK;
-
-    uint8_t op = 0;
-    const uint32_t len = ag_pixband_encode(s.pix, s.band, w * h,
-                                           body + BAND_HDR, cap - BAND_HDR,
-                                           &op);
     if (len == 0u) {
         /*
          * Refused rather than truncated (ag_pixband.h) - and counted, because
@@ -1218,6 +1238,130 @@ static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
     if (r == WIRE_OK) {
         s.bands++;
         s.band_bytes += BAND_HDR + len;
+    }
+    return r;
+}
+
+/* Encode whatever is in s.band and put it on the wire.  Both paths end here. */
+static wire_t encode_and_send(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                              uint32_t idle_ms, uint32_t lock_ms)
+{
+    /* s.out is allocated with WS_SLACK bytes in front for ws_send's header. */
+    uint8_t       *body = s.out + WS_SLACK;
+    const uint32_t cap = s.band_cap - WS_SLACK;
+
+    uint8_t op = 0;
+    const uint32_t len = ag_pixband_encode(s.pix, s.band, w * h,
+                                           body + BAND_HDR, cap - BAND_HDR,
+                                           &op);
+    return send_encoded(op, body, len, x, y, w, h, idle_ms, lock_ms);
+}
+
+/*
+ * The picture with no picture memory at all.
+ *
+ * The band, the packed output and the codec's context are thirteen kilobytes
+ * on a 320-wide panel, and a board that cannot spare them used to show no
+ * picture: every rectangle was dropped and counted as "no memory".  But the
+ * pixels already exist - in the drawing application's own buffer, for as long
+ * as blit_rect runs - and the screen at the other end keeps whatever it is
+ * sent: the page paints each band onto a canvas that holds it.  So the only
+ * memory this needs is one message, and this is it: a few rows, encoded
+ * straight out of the caller's surface by the context-free encoder
+ * (ag_pixband_encode_rows: PackBits or raw, no palette).
+ *
+ * Static, so it is part of the driver as loaded and can never fail to be had.
+ * Two kilobytes holds three rows of a 320-wide screen raw, more when they pack.
+ * Used only by the direct path, from blit_rect.
+ */
+#define LITE_CAP 2048u
+#define LITE_PAYLOAD (LITE_CAP - WS_SLACK - BAND_HDR)
+static uint8_t s_lite[LITE_CAP];
+
+/*
+ * The light path's send, done by the driver's own task.
+ *
+ * The drawing application encodes - PackBits over a few rows is a loop with no
+ * stack to speak of - and the driver's task puts the message on the wire,
+ * because the wire is lwIP and the Wi-Fi driver, and those want stack the
+ * application may not have.  Measured on the Audio Kit: the amplifier draws
+ * with 4.3 KB of its stack left, the floor for sending from there is 6 KB, and
+ * every band of its panel was refused for want of the difference.  Handed
+ * over, it needs none of it.
+ *
+ * One message at a time, through s_lite: the application fills it, wakes the
+ * task (s_hand_go, which is also what the task naps on, so it wakes at once)
+ * and waits for s_hand_done.  The task answers whatever happens - a client
+ * that has gone answers WIRE_GONE - so the wait is long only as a backstop.
+ */
+static ag_sem_t          s_hand_go;
+static ag_sem_t          s_hand_done;
+static volatile bool     s_hand_pending;
+static volatile wire_t   s_hand_result;
+static uint8_t           s_hand_op;
+static uint32_t          s_hand_len, s_hand_x, s_hand_y, s_hand_w, s_hand_h;
+
+#define HAND_WAIT_MS 10000u
+
+/* On the task: send what the application handed over, if anything. */
+static void serve_handoff(void)
+{
+    if (!s_hand_pending) {
+        return;
+    }
+    s_hand_result =
+        send_encoded(s_hand_op, s_lite + WS_SLACK, s_hand_len, s_hand_x,
+                     s_hand_y, s_hand_w, s_hand_h, SEND_IDLE_MS, 3000u);
+    s_hand_pending = false;
+    TASK->sem_give(s_hand_done);
+}
+
+/* The task's nap, which a hand-over cuts short. */
+static void nap(uint32_t ms)
+{
+    if (s_hand_go != NULL) {
+        (void)TASK->sem_take(s_hand_go, ms);
+    } else {
+        TASK->sleep_ms(ms);
+    }
+    serve_handoff();
+}
+
+static wire_t encode_rows_and_send(const uint8_t *src, uint32_t stride,
+                                   uint32_t x, uint32_t y, uint32_t w,
+                                   uint32_t h)
+{
+    uint8_t *body = s_lite + WS_SLACK;
+    uint8_t  op = 0;
+    const uint32_t len = ag_pixband_encode_rows(src, stride, w, h,
+                                                body + BAND_HDR, LITE_PAYLOAD,
+                                                &op);
+    if (len == 0u) {
+        s.band_refused++;
+        return WIRE_OK;
+    }
+    if (s_hand_go == NULL || s_hand_done == NULL) {
+        return WIRE_GONE; /* no task to hand it to: the driver is going away */
+    }
+    s_hand_op = op;
+    s_hand_len = len;
+    s_hand_x = x;
+    s_hand_y = y;
+    s_hand_w = w;
+    s_hand_h = h;
+    s_hand_pending = true;
+    TASK->sem_give(s_hand_go);
+    if (!TASK->sem_take(s_hand_done, HAND_WAIT_MS)) {
+        /* The task never got to it.  Take the message back before s_lite is
+         * written again; if the task is sending it right now, this frame is
+         * the one that tears, and it is counted. */
+        s_hand_pending = false;
+        s.band_busy++;
+        return WIRE_STALL;
+    }
+    const wire_t r = s_hand_result;
+    if (r == WIRE_OK) {
+        s.bands_lite++;
     }
     return r;
 }
@@ -1248,106 +1392,139 @@ static wire_t send_band(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
  * The same rectangle, taken straight from the caller's pixels.
  *
  * For the board with no frame to copy into.  This runs on whichever task drew,
- * with the device registry held, and it blocks for as long as the network
- * needs - which is exactly the cost the frame exists to avoid and exactly what
- * REMDISP pays over its wire.  On a machine with 179 KB and no PSRAM that is
- * the trade that is on offer: a slower application, or no picture.
+ * under the kernel's blit lock (not the registry - display.c lets that go
+ * first), and it blocks for as long as the network needs - which is exactly
+ * the cost the frame exists to avoid and exactly what REMDISP pays over its
+ * wire.  On a machine with no room for a frame that is the trade on offer: a
+ * slower application, or no picture.
  */
-static wire_t send_blit_direct(const ag_blit_t *b)
+static wire_t send_blit_direct(const ag_blit_t *b, bool full)
 {
-    if (s.pix == NULL || s.band == NULL || s.out == NULL) {
-        return WIRE_OK;
-    }
     const uint8_t *src = (const uint8_t *)b->px;
 
     /*
-     * How often, before how long.
-     *
-     * A per-call budget bounds one rectangle and nothing else: how many
-     * rectangles arrive a second is the drawing application's business, not
-     * this driver's.  At two frames a second sixty milliseconds a call is a
-     * tenth of the machine; at twenty frames a second it is the machine, and
-     * the machine then behaves exactly as it was reported to - the picture
-     * stops half drawn and the access point stops answering, because the
-     * console, the panel, the touchscreen and the radio's own work all sit
-     * behind the one device registry this runs inside.
-     *
-     * So the gate is a share of time: a pass at most every DIRECT_EVERY_US,
-     * and DIRECT_BUDGET_US inside it.  However fast anybody draws, this takes
-     * a sixth of that lock at worst.  A frame that arrives between passes is
-     * dropped, which is a screen that updates later and not a board that stops
-     * answering.
+     * The tile: a band of the full codec (sent from this, the drawing task),
+     * or as many whole rows as one light message carries (s_lite, sent by the
+     * driver's task - see encode_rows_and_send).
      */
-    const uint64_t now0 = ag_micros();
-    if (s.direct_last != 0ull && now0 - s.direct_last < DIRECT_EVERY_US) {
-        s.band_hushed++;
-        return WIRE_OK;
-    }
-    s.direct_last = now0;
-
-    const uint64_t until = now0 + DIRECT_BUDGET_US;
-
-    const uint32_t down = (b->h + BAND_ROWS - 1u) / BAND_ROWS;
-    const uint32_t across = (b->w + s.band_w - 1u) / s.band_w;
-    const uint32_t total = down * across;
-    if (total == 0u) {
-        return WIRE_OK;
+    uint32_t   tw = full ? s.band_w : b->w;
+    uint32_t   th = BAND_ROWS;
+    if (!full) {
+        const uint32_t px = LITE_PAYLOAD / sizeof(uint16_t);
+        if (tw > px) {
+            tw = px;
+        }
+        th = px / tw;
+        if (th > BAND_ROWS) {
+            th = BAND_ROWS;
+        }
     }
 
     /*
-     * Starting where the last one stopped, and wrapping.
+     * The surface's size before any of its pixels.
      *
-     * With a budget, an application that draws the same rectangle over and
-     * over would send the top of it every time and the bottom never - the cut
-     * always falls in the same place.  Carrying the position over makes the
-     * whole picture arrive across a few frames instead of a third of it
-     * arriving for ever.
+     * The task sends it when it next looks (owe_info), but these bands go now,
+     * from here - so the first bands of a new surface used to reach the page
+     * ahead of the size they belong to.  The page then drew them on a canvas
+     * of the old size, and sizing the canvas when the size did arrive cleared
+     * it: the first picture an application drew was the one that was lost.
+     * For a program that draws once and waits, that was its whole picture.
      */
-    uint32_t at = s.direct_at % total;
-    uint32_t done = 0;
-
-    while (done < total) {
-        const uint64_t now = ag_micros();
-        if (now >= until) {
-            break; /* out of time, not out of connection */
+    const uint64_t give_up = ag_micros() + (uint64_t)DIRECT_WAIT_MS * 1000ull;
+    while (s.owe_info) {
+        if (!full) {
+            /* The task sends it (service_client), on its own stack. */
+            if (s.conn < 0) {
+                return WIRE_GONE;
+            }
+            if (ag_micros() > give_up) {
+                s.band_hushed++;
+                return WIRE_STALL;
+            }
+            if (s_hand_go != NULL) {
+                TASK->sem_give(s_hand_go);
+            }
+            TASK->sleep_ms(2u);
+            continue;
         }
-        uint32_t left_ms = (uint32_t)((until - now) / 1000ull);
-        if (left_ms > 20u) {
-            left_ms = 20u;
+        const wire_t r = send_info(DIRECT_LOCK_MS);
+        if (r == WIRE_OK) {
+            s.owe_info = false;
+        } else if (r == WIRE_GONE || ag_micros() > give_up) {
+            s.band_hushed++;
+            return r; /* the size could not go, so neither can its pixels */
+        } else {
+            TASK->sleep_ms(5u);
         }
+    }
 
-        const uint32_t y = (at / across) * BAND_ROWS;
-        const uint32_t x = (at % across) * s.band_w;
+    const uint32_t down = (b->h + th - 1u) / th;
+    const uint32_t across = (b->w + tw - 1u) / tw;
+    const uint32_t total = down * across;
+
+    /*
+     * Every tile, in order, and the drawing application waits for the wire.
+     *
+     * This used to be a share of time - a pass at most every 150 ms, 25 ms
+     * inside it, everything else dropped - because blit_rect then ran with the
+     * device registry held and the whole machine sat behind it.  It no longer
+     * does (display.c lets the registry go and holds only the blit lock, which
+     * nothing but another blit takes), and with no frame on this board a
+     * dropped tile is not a screen that updates later: there is nothing left
+     * to send it from, so it is a hole in the picture until the application
+     * happens to draw that place again.  The kernel's band renderer hands a
+     * whole flush over as many strips in quick succession, and the gate let
+     * through the first of them and threw the rest away.
+     *
+     * So the application is paced by the wire instead, which is the cost of
+     * having no frame and the one REMDISP has always paid.  A tile is given
+     * up only when the client has stopped reading for DIRECT_WAIT_MS - then it
+     * is counted as hushed, and the client is the one that is gone.
+     */
+    for (uint32_t at = 0; at < total; at++) {
+        const uint32_t y = (at / across) * th;
+        const uint32_t x = (at % across) * tw;
         uint32_t rows = b->h - y;
-        if (rows > BAND_ROWS) {
-            rows = BAND_ROWS;
+        if (rows > th) {
+            rows = th;
         }
         uint32_t cols = b->w - x;
-        if (cols > s.band_w) {
-            cols = s.band_w;
+        if (cols > tw) {
+            cols = tw;
         }
+        const uint8_t *corner =
+            src + (size_t)y * b->stride + (size_t)x * sizeof(uint16_t);
 
-        for (uint32_t r = 0; r < rows; r++) {
-            memcpy(s.band + r * cols,
-                   src + (size_t)(y + r) * b->stride +
-                       (size_t)x * sizeof(uint16_t),
-                   (size_t)cols * sizeof(uint16_t));
+        if (full) {
+            for (uint32_t k = 0; k < rows; k++) {
+                memcpy(s.band + k * cols, corner + (size_t)k * b->stride,
+                       (size_t)cols * sizeof(uint16_t));
+            }
         }
-        /* Zero patience for the mutex: see ws_send.  The registry is held here
-         * and everything else in the machine is behind it. */
-        const wire_t r = encode_and_send((uint32_t)b->x + x, (uint32_t)b->y + y,
-                                         cols, rows, left_ms, 0u);
-        if (r == WIRE_GONE) {
-            s.direct_at = at;
-            return r;
+        const uint64_t tile_by =
+            ag_micros() + (uint64_t)DIRECT_WAIT_MS * 1000ull;
+        for (;;) {
+            const wire_t r =
+                full ? encode_and_send((uint32_t)b->x + x, (uint32_t)b->y + y,
+                                       cols, rows, SEND_IDLE_MS, DIRECT_LOCK_MS)
+                     : encode_rows_and_send(corner, b->stride,
+                                            (uint32_t)b->x + x,
+                                            (uint32_t)b->y + y, cols, rows);
+            if (r == WIRE_OK) {
+                break;
+            }
+            if (r == WIRE_GONE) {
+                return r;
+            }
+            if (ag_micros() > tile_by) {
+                /* The client has stopped reading; the rest of this
+                 * rectangle is lost to it, and counted. */
+                s.band_hushed += total - at;
+                return WIRE_STALL;
+            }
+            TASK->sleep_ms(5u);
         }
-        if (r == WIRE_STALL) {
-            break; /* nothing started; leave the rest for the next frame */
-        }
-        at = (at + 1u) % total;
-        done++;
     }
-    s.direct_at = at;
     return WIRE_OK;
 }
 
@@ -1418,7 +1595,7 @@ static bool service_client(void)
     }
 
     if (s.owe_info && !s.owe_everything) {
-        const wire_t r = send_info();
+        const wire_t r = send_info(3000u);
         if (r == WIRE_GONE) {
             return false;
         }
@@ -1429,7 +1606,7 @@ static bool service_client(void)
     }
 
     if (s.owe_everything) {
-        const wire_t r = send_info();
+        const wire_t r = send_info(3000u);
         if (r == WIRE_GONE) {
             return false;
         }
@@ -1490,7 +1667,9 @@ static bool service_client(void)
      * thing that repairs a line the client never received, and it costs one
      * row per interval whether or not anything is wrong.
      */
-    if (s.rows != 0u) {
+    /* Not under a picture: the console is behind it, nobody is looking at
+     * these rows, and every one is Wi-Fi traffic beside the application. */
+    if (s.rows != 0u && !s.picture_live) {
         const uint64_t now_us = (uint64_t)ag_micros();
         if (now_us >= s.repair_at) {
             s.repair_at = now_us + REPAIR_EVERY_US;
@@ -2484,7 +2663,8 @@ static void say_what_is_owed(void)
         ag_meminfo(&mi);
         ag_log(AG_LOG_WARN, "phone",
                "no memory for %s (%u bytes): arena %u free, %u largest; "
-               "system %u free",
+               "system %u free; the picture goes the light way (no palette, "
+               "straight from the drawing task)",
                s.owe_nomem_what, (unsigned)s.owe_nomem_bytes,
                (unsigned)mi.arena_free, (unsigned)mi.arena_largest,
                (unsigned)mi.system_free);
@@ -2500,14 +2680,40 @@ static void say_what_is_owed(void)
     if (s.owe_nostack) {
         s.owe_nostack = false;
         ag_log(AG_LOG_WARN, "phone",
-               "not sending the picture: %u bytes of the drawing task's stack "
-               "left, %u wanted - give it a bigger one (AG_APP_SIZED)",
+               "picture sent the light way: %u bytes of the drawing task's "
+               "stack left, %u wanted for the full codec (AG_APP_SIZED)",
                (unsigned)s.owe_stack_left, (unsigned)BLIT_STACK_FLOOR);
+    }
+}
+
+/*
+ * The frame is given up, for this driver's life, when the board has not got
+ * the memory for it - and given up means blit_rect stops waiting for it.
+ *
+ * It did not, and the comment where the frame fails said it did: "sending from
+ * the drawing task instead" was printed, while blit_rect went on seeing
+ * want_frame, dropping every rectangle and asking for the frame again.  A
+ * board with too little memory for a frame showed no picture at all.
+ */
+static void give_up_frame(void)
+{
+    if (s.want_frame && s.frame == NULL) {
+        s.want_frame = false;
     }
 }
 
 static bool ensure_memory(void)
 {
+    if (s.codec_light) {
+        /* Nothing to allocate; the size is still the screen's (see below). */
+        if (s.want_w != 0u && s.want_h != 0u) {
+            s.cap_w = s.want_w;
+            s.cap_h = s.want_h;
+            s.want_w = 0;
+            s.want_h = 0;
+        }
+        return true;
+    }
     /*
      * The band, sized to the panel rather than to the widest panel anybody
      * might have.  On a board with PSRAM the difference is nothing; on the CYD
@@ -2529,11 +2735,17 @@ static bool ensure_memory(void)
                      s.band_px / 64u + 64u;
     }
 
+    /*
+     * A board that cannot find these thirteen kilobytes will not find a frame
+     * ten times their size either, so a refusal here gives the frame up too:
+     * the picture then goes straight from the drawing task, the light way.
+     */
     if (s.pix == NULL) {
         const size_t need = ag_pixband_size(s.band_px);
         void *mem = ag_malloc(need);
         if (mem == NULL || !ag_pixband_init(mem, need, s.band_px)) {
             ag_free(mem);
+            give_up_frame();
             return no_pixel_memory("the encoder", need);
         }
         s.pix = (ag_pixband_ctx_t *)mem;
@@ -2541,12 +2753,14 @@ static bool ensure_memory(void)
     if (s.band == NULL) {
         s.band = (uint16_t *)ag_malloc(s.band_px * sizeof(uint16_t));
         if (s.band == NULL) {
+            give_up_frame();
             return no_pixel_memory("a band", s.band_px * sizeof(uint16_t));
         }
     }
     if (s.out == NULL) {
         s.out = (uint8_t *)ag_malloc(s.band_cap);
         if (s.out == NULL) {
+            give_up_frame();
             return no_pixel_memory("the encoded band", s.band_cap);
         }
     }
@@ -2600,6 +2814,11 @@ static bool ensure_memory(void)
             s.owe_frame_h = h;
             s.owe_noframe = true; /* said by the task: see say_what_is_owed */
         }
+        give_up_frame();
+        /* The size stays the answer to "how big is this screen": see the
+         * !want_frame branch above. */
+        s.cap_w = w;
+        s.cap_h = h;
         s.want_w = 0;
         s.want_h = 0;
         return true;
@@ -2677,6 +2896,9 @@ static void phone_task(void *arg)
     uint32_t laps = 0;
 
     while (!s.stop) {
+        /* A light band an application is waiting on, whatever else this lap
+         * is about to do. */
+        serve_handoff();
         /* Anything the pixel path could not say for itself - see the note
          * above say_what_is_owed. */
         say_what_is_owed();
@@ -2714,11 +2936,14 @@ static void phone_task(void *arg)
              */
             if (s.blits != 0u || s.bands != 0u) {
                 ag_log(AG_LOG_INFO, "phone",
-                       "picture: %u blits in, %u bands out, %u bytes; "
+                       "picture: %u blits in, %u bands out (%u light), "
+                       "%u bytes; "
                        "not sent: %u no memory, %u hushed, %u wire busy, "
-                       "%u refused, %u no stack; stalls: %u band, %u text; "
+                       "%u refused; %u light for want of stack; "
+                       "stalls: %u band, %u text; "
                        "surface %ux%u, frame %s",
                        (unsigned)s.blits, (unsigned)s.bands,
+                       (unsigned)s.bands_lite,
                        (unsigned)s.band_bytes, (unsigned)s.band_nomem,
                        (unsigned)s.band_hushed, (unsigned)s.band_busy,
                        (unsigned)s.band_refused, (unsigned)s.band_nostack,
@@ -2782,9 +3007,17 @@ static void phone_task(void *arg)
          * so the scene lands in it and every client - even one that connects
          * later - gets the whole picture from owe_everything.
          */
-        if ((s.want_frame || s.want_pixels) && !ensure_memory()) {
-            TASK->sleep_ms(500u);
-            continue;
+        /*
+         * And a refusal stops nothing.  This used to sleep half a second and
+         * start the lap again, which skipped the accept, the console and the
+         * keyboard below: a board short of thirteen kilobytes for a PICTURE
+         * stopped answering the page and stopped sending text.  Now the picture
+         * goes the light way (s_lite) while there is no memory, and the memory
+         * is asked for again every two seconds rather than every lap.
+         */
+        if ((s.want_frame || s.want_pixels) && now >= s.mem_retry_at &&
+            !ensure_memory()) {
+            s.mem_retry_at = now + 2000000ull;
         }
         stage_enter(4);
 
@@ -2844,7 +3077,7 @@ static void phone_task(void *arg)
         }
 
         if (s.conn < 0 && !s.ble_client) {
-            TASK->sleep_ms(50u);
+            nap(50u); /* answers a hand-over too: WIRE_GONE, nobody to send to */
             continue;
         }
         /*
@@ -2876,8 +3109,9 @@ static void phone_task(void *arg)
          * than the interval it changes.  Nothing here polls the picture: the
          * damage is marked by blit_rect and this only notices it, so a still
          * screen costs one wakeup a hundredth of a second and no bytes at all.
+         * A light band handed over by a drawing application cuts it short.
          */
-        TASK->sleep_ms(10u);
+        nap(10u);
     }
 
     if (s.closing >= 0) {
@@ -2988,14 +3222,12 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
      *
      * The buffers therefore belong to the driver's own task, which has no
      * process and takes them from the driver's heap (the ensure_memory call in
-     * phone_task).  Here we only USE them: if the task has not made them yet,
-     * drop this rectangle - it allocates within a lap and the next one lands.
+     * phone_task).  Here we only USE them.  With no frame the direct path below
+     * needs none of them (it has s_lite); with a frame, a rectangle that
+     * arrives before the task has made them is dropped - it allocates within a
+     * lap and the next one lands.
      */
     s.want_pixels = true;
-    if (s.pix == NULL || s.band == NULL || s.out == NULL) {
-        s.band_nomem++;
-        return;
-    }
 
     /*
      * No frame at all: this board could not hold one.  Then the rectangle goes
@@ -3042,17 +3274,29 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
              * this behaves as it always did.
              */
             const uint32_t left = ag_stack_left();
-            if (left != 0u && left < BLIT_STACK_FLOOR) {
+            bool full = (s.pix != NULL && s.band != NULL && s.out != NULL);
+            if (full && left != 0u && left < BLIT_STACK_FLOOR) {
+                /*
+                 * Too little stack for the full codec and lwIP here - so not
+                 * refused any more, but sent the light way, which encodes on
+                 * this stack in a few hundred bytes and sends on the driver's.
+                 * Counted, and said once, because it costs the palette.
+                 */
+                full = false;
                 s.band_nostack++;
                 if (!s.moaned_stack) {
                     s.moaned_stack = true;
                     s.owe_stack_left = left;
                     s.owe_nostack = true; /* said by the task, not from here */
                 }
-                return;
             }
-            (void)send_blit_direct(b);
+            (void)send_blit_direct(b, full);
         }
+        return;
+    }
+
+    if (s.pix == NULL || s.band == NULL || s.out == NULL) {
+        s.band_nomem++;
         return;
     }
 
@@ -3264,6 +3508,22 @@ static int32_t pkbd_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
 /* Loading and unloading                                                     */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * An application took the screen or let it go (ABI 0.68).  The page is told
+ * with the next geometry message, and shows the picture or the console because
+ * the board said so - not because two seconds passed without a band, which is
+ * how a still picture used to turn into the console under a running program.
+ */
+static void phone_held(ag_handle_t h, bool held)
+{
+    (void)h;
+    s.knows_held = true;
+    if (s.picture_live != held) {
+        s.picture_live = held;
+        s.owe_info = true;
+    }
+}
+
 static const ag_display_ops_t k_display_ops_text = {
     .size = sizeof(ag_display_ops_t),
     .info = phone_info,
@@ -3276,6 +3536,7 @@ static const ag_display_ops_t k_display_ops_text = {
     .text_cursor = phone_text_cursor,
     .blit_rect = phone_blit_rect,
     .text_scroll = phone_text_scroll,
+    .held = phone_held,
 };
 
 static const ag_display_ops_t k_display_ops_pixels = {
@@ -3289,6 +3550,8 @@ static const ag_display_ops_t k_display_ops_pixels = {
     .text_row = NULL,
     .text_cursor = NULL,
     .blit_rect = phone_blit_rect,
+    .text_scroll = NULL,
+    .held = phone_held,
 };
 
 static const ag_dev_ops_t k_disp_dev_ops = {
@@ -3382,6 +3645,12 @@ ag_err_t ag_driver_init(void)
     if (s.lock == NULL || s.wire == NULL) {
         return -AG_ENOMEM;
     }
+    /* The light path's hand-over to the task (encode_rows_and_send).  Without
+     * them the light path answers WIRE_GONE and nothing else changes. */
+    s_hand_go = TASK->sem_create(0u, 1u);
+    s_hand_done = TASK->sem_create(0u, 1u);
+    /* A kernel at 0.68 or later says who holds the screen (phone_held). */
+    s.knows_held = (ag_api()->abi_major > 0u || ag_api()->abi_minor >= 68u);
 
     s.publish_text = want_text();
 
@@ -3446,6 +3715,21 @@ ag_err_t ag_driver_init(void)
         s.want_frame = true;
         if (cfg != NULL && AG_HAS(cfg, get_bool)) {
             s.want_frame = cfg->get_bool("phone.frame", true);
+        }
+        /*
+         * `[phone] codec = light`: never ask for the thirteen kilobytes of
+         * band, packed output and palette context either, and send every
+         * picture the light way (s_lite) - for the board where those thirteen
+         * are what keeps the page loading (argon-phone-memory-floor).  No
+         * frame then either: the frame path encodes through those buffers.
+         */
+        if (cfg != NULL && AG_HAS(cfg, get_str)) {
+            char codec[8];
+            if (cfg->get_str("phone.codec", codec, sizeof(codec)) == AG_OK &&
+                strcmp(codec, "light") == 0) {
+                s.codec_light = true;
+                s.want_frame = false;
+            }
         }
         if (cfg != NULL && AG_HAS(cfg, get_int)) {
             w = (uint32_t)cfg->get_int("display.width", 0);

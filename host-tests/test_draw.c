@@ -283,4 +283,69 @@ void run_draw_tests(void)
                      count_color(0xFFFF) >
                  20);
     }
+
+    /*
+     * A scene drawn in strips of three rows (row0/rows, the band renderer a
+     * display with no framebuffer uses) is the same scene drawn whole, pixel
+     * for pixel - and a strip never writes outside its own rows, whatever the
+     * primitive or the clip.
+     */
+    {
+        static uint16_t whole[W * H];
+        static uint16_t strip[W * 3 + 2 * W]; /* + a guard row each side */
+        static const uint16_t tex[2 * 2] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+        uint8_t font[256][16];
+        memset(font, 0, sizeof(font));
+        for (int i = 0; i < 16; i++) {
+            font[(unsigned char)'A'][i] = (uint8_t)(0x81u | (1u << (i % 8)));
+        }
+        const ag_point_t tri[3] = {{8, 2}, {28, 20}, {2, 22}};
+
+        for (int pass = 0; pass < 2; pass++) {
+            const int strips = (pass == 0) ? 1 : (H + 2) / 3;
+            for (int k = 0; k < strips; k++) {
+                ag_draw_surf_t s;
+                memset(&s, 0, sizeof(s));
+                s.w = W;
+                s.h = H;
+                int rows = H;
+                if (pass == 0) {
+                    s.pix = whole;
+                    memset(whole, 0, sizeof(whole));
+                } else {
+                    rows = (H - k * 3 < 3) ? H - k * 3 : 3;
+                    s.pix = strip + W; /* the guard row in front */
+                    s.row0 = (uint16_t)(k * 3);
+                    s.rows = (uint16_t)rows;
+                    for (int i = 0; i < (int)(sizeof(strip) / 2); i++) {
+                        strip[i] = 0xBEEF;
+                    }
+                    memset(strip + W, 0, (size_t)W * (size_t)rows * 2u);
+                }
+                ag_draw_fill_rect(&s, 1, 1, 30, 22, 0x1111);
+                ag_draw_fill_round_rect(&s, 3, 3, 20, 14, 4, 0x07E0);
+                ag_draw_fill_circle(&s, 16, 12, 7, 0xF800);
+                ag_draw_circle(&s, 16, 12, 9, 0xFFFF);
+                ag_draw_line(&s, 0, 23, 31, 0, 0x001F);
+                ag_draw_fill_convex(&s, tri, 3, 0x07FF);
+                ag_draw_stroke_rect(&s, 5, 5, 10, 10, 0xF81F);
+                ag_draw_blit_scaled(&s, 20, 10, 8, 8, tex, 4, 0, 0, 2, 2);
+                (void)ag_draw_text8x16(&s, 2, 4, font, "AA", 0xFFE0, 0, 1, -1);
+                s.clip_x = 10;
+                s.clip_y = 6;
+                s.clip_w = 12;
+                s.clip_h = 9;
+                ag_draw_fill_rect(&s, 0, 0, W, H, 0x4208);
+                if (pass == 1) {
+                    /* Nothing outside the strip's own rows. */
+                    for (int i = 0; i < W; i++) {
+                        AG_CHECK(strip[i] == 0xBEEF);
+                        AG_CHECK(strip[W + rows * W + i] == 0xBEEF);
+                    }
+                    AG_CHECK(memcmp(strip + W, whole + k * 3 * W,
+                                    (size_t)W * (size_t)rows * 2u) == 0);
+                }
+            }
+        }
+    }
 }

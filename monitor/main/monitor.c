@@ -243,6 +243,7 @@ static uint8_t *s_aout;
 static volatile uint32_t s_aw, s_ar;
 static volatile uint32_t s_arate;
 static uint32_t s_stat_asamp, s_stat_adrop, s_stat_abad, s_stat_astarve;
+static uint32_t s_stat_arestart; /* the converter had stopped and was reopened */
 
 static uint32_t aud_used(void)
 {
@@ -328,11 +329,13 @@ static void player(void *arg)
             dac = NULL;
         }
         if (dac == NULL) {
-            /* Eight descriptors of a quarter kilobyte: 93 ms of chain, and one
-             * descriptor - 11.6 ms - is the shortest a write can wait. */
+            /* Sixteen descriptors of a quarter kilobyte: 186 ms of chain, and
+             * one descriptor - 11.6 ms - is the shortest a write can wait.
+             * It was eight, 93 ms, and that was less than the reader can keep
+             * this task from running while it paints a whole frame. */
             const dac_continuous_config_t cfg = {
                 .chan_mask = DAC_CHANNEL_MASK_CH1, /* GPIO 26, the amplifier */
-                .desc_num = 8,
+                .desc_num = 16,
                 .buf_size = 256,
                 .freq_hz = rate,
                 .offset = 0,
@@ -374,11 +377,29 @@ static void player(void *arg)
             memset(out, 128, n);
         }
 
-        size_t loaded = 0;
-        if (dac_continuous_write(dac, out, n, &loaded, 200) == ESP_OK &&
-            primed) {
-            s_ar += (uint32_t)loaded;
+        size_t          loaded = 0;
+        const esp_err_t wr = dac_continuous_write(dac, out, n, &loaded, 200);
+        if (wr == ESP_OK) {
+            if (primed) {
+                s_ar += (uint32_t)loaded;
+            }
+            continue;
         }
+
+        /*
+         * The chain ran dry and the DMA stopped with it.  A write that waits
+         * 200 ms for a descriptor and gets none will wait 200 ms for ever: the
+         * peripheral does not start again on its own, so every write after
+         * this one times out too, the ring fills and every sample that arrives
+         * is dropped.  That was "no sound" on 7 October 2026 - thirteen
+         * thousand "Get available descriptor timeout" lines in one session and
+         * a speaker that never made a sound of the game.  Close the converter
+         * and let the top of the loop open it again, primed from silence.
+         */
+        s_stat_arestart++;
+        (void)dac_continuous_disable(dac);
+        (void)dac_continuous_del_channels(dac);
+        dac = NULL;
     }
 }
 
@@ -1284,7 +1305,14 @@ void app_main(void)
          * if the board is ever short of time, a sound that stutters is better
          * than a picture with holes in it.
          */
-        xTaskCreate(player, "player", 3072, NULL, 6, NULL);
+        /*
+         * Above the reader (10), not below it.  The reader paints: a whole
+         * frame is thirty slices at some 15 ms each, and at 6 this task waited
+         * out all of it while the converter's chain - 93 ms then - ran dry.
+         * It costs the picture nothing: this task spends its life asleep in
+         * dac_continuous_write and wakes for a few microseconds per descriptor.
+         */
+        xTaskCreate(player, "player", 3072, NULL, 12, NULL);
     }
 
     /*
@@ -1323,10 +1351,11 @@ void app_main(void)
         last_painted = s_stat_painted;
         if (s_stat_asamp != 0u || s_stat_adrop != 0u) {
             ESP_LOGI(TAG, "sound %u B/s, %u buffered, %u dropped, %u bad, "
-                          "%u starved",
+                          "%u starved, %u restarted",
                      (unsigned)((s_stat_asamp - last_asamp) / 5u),
                      (unsigned)aud_used(), (unsigned)s_stat_adrop,
-                     (unsigned)s_stat_abad, (unsigned)s_stat_astarve);
+                     (unsigned)s_stat_abad, (unsigned)s_stat_astarve,
+                     (unsigned)s_stat_arestart);
         }
         last_asamp = s_stat_asamp;
         last_frames = s_stat_frames;

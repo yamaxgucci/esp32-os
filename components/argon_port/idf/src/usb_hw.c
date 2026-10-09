@@ -51,6 +51,7 @@ static const char *TAG = "usb";
 #define HID_REQ_SET_IDLE     0x0Au
 #define HID_REQ_SET_PROTOCOL 0x0Bu
 #define HID_PROTOCOL_BOOT    0x00u
+#define HID_PROTOCOL_REPORT  0x01u
 #define HID_SUBCLASS_BOOT    0x01u
 #define HID_PROTOCOL_KEYBOARD 0x01u
 #define HID_PROTOCOL_MOUSE    0x02u
@@ -354,8 +355,22 @@ static int class_request(uint8_t itf, uint8_t bRequest, uint16_t wValue)
  */
 #define HID_DESC_REPORT 0x22u
 
-static int get_report_descriptor(uint8_t itf, uint16_t len)
+/*
+ * ARGON: and since 8 Oct 2026 it is used.  A mouse's descriptor goes to the
+ * kernel (ag_port_usb_on_descriptor), which says whether it can read the
+ * device's own layout - and then the interface is left in report protocol, the
+ * way a PC leaves it, because a receiver that ignores SET_PROTOCOL(boot) sends
+ * its report layout whatever is asked.  The bytes go to the journal as well:
+ * the layout of a device that misbehaves is the first thing anybody needs.
+ */
+static ag_port_usb_desc_fn s_on_desc;
+
+static int get_report_descriptor(uint8_t itf, uint16_t len,
+                                 ag_usb_usage_t usage, bool *report_proto)
 {
+    if (report_proto != NULL) {
+        *report_proto = false;
+    }
     if (len == 0u || len > 512u) {
         len = 256u;
     }
@@ -393,6 +408,21 @@ static int get_report_descriptor(uint8_t itf, uint16_t len)
     const int got = (int)ct->actual_num_bytes - (int)sizeof(usb_setup_packet_t);
     ESP_LOGI(TAG, "interface %u: report descriptor asked %u, got %d (%s)",
              itf, (unsigned)len, got, rc == 0 ? "ok" : "refused");
+    const uint8_t *desc = ct->data_buffer + sizeof(usb_setup_packet_t);
+    for (int at = 0; rc == 0 && at < got; at += 16) {
+        char line[16 * 3 + 1];
+        int  n = 0;
+        for (int k = at; k < got && k < at + 16; k++) {
+            n += snprintf(line + n, sizeof(line) - (size_t)n, "%02x ", desc[k]);
+        }
+        ESP_LOGI(TAG, "  desc %3d: %s", at, line);
+    }
+    if (s_on_desc != NULL && report_proto != NULL) {
+        /* a failed read is said too, so no layout outlives its mouse */
+        const bool have = (rc == 0 && got > 0);
+        *report_proto = s_on_desc(usage, itf, have ? desc : NULL,
+                                  have ? (uint32_t)got : 0u);
+    }
     usb_host_transfer_free(ct);
     return rc;
 }
@@ -672,14 +702,25 @@ static void attach(uint8_t addr)
          * report layout the truth.  Per interface, because that is what the
          * request is addressed to.
          */
-        if (class_request(q->itf, HID_REQ_SET_PROTOCOL, HID_PROTOCOL_BOOT) != 0) {
-            ESP_LOGW(TAG, "interface %u: SET_PROTOCOL(boot) failed", q->itf);
+        /* ARGON: a mouse's descriptor first, because it decides the
+         * protocol; a keyboard's after, as before.  See get_report_descriptor. */
+        bool report_proto = false;
+        if (q->usage == AG_USB_USAGE_MOUSE) {
+            (void)get_report_descriptor(q->itf, 0, q->usage, &report_proto);
+        }
+        const uint8_t proto = report_proto ? HID_PROTOCOL_REPORT
+                                           : HID_PROTOCOL_BOOT;
+        if (class_request(q->itf, HID_REQ_SET_PROTOCOL, proto) != 0) {
+            ESP_LOGW(TAG, "interface %u: SET_PROTOCOL(%s) failed", q->itf,
+                     report_proto ? "report" : "boot");
         }
         (void)class_request(q->itf, HID_REQ_SET_IDLE, 0);
-
-        /* ARGON: and behave like a host that means it.  See the note on
-         * get_report_descriptor. */
-        (void)get_report_descriptor(q->itf, 0);
+        if (q->usage != AG_USB_USAGE_MOUSE) {
+            (void)get_report_descriptor(q->itf, 0, q->usage, NULL);
+        }
+        if (report_proto) {
+            ESP_LOGI(TAG, "interface %u: mouse read by its own layout", q->itf);
+        }
 
         if (usb_host_transfer_alloc(q->mps, 0, &q->in) != ESP_OK) {
             (void)usb_host_interface_release(s_client, dev, q->itf);
@@ -977,6 +1018,7 @@ static void restart_task(void *arg)
 /* ---- the contract ------------------------------------------------------ */
 
 void ag_port_usb_on_report(ag_port_usb_report_fn fn) { s_on_report = fn; }
+void ag_port_usb_on_descriptor(ag_port_usb_desc_fn fn) { s_on_desc = fn; }
 
 /*
  * What an arrival costs, measured on the S3 on 6 Oct 2026 by arrival_said():

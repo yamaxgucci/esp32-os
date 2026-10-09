@@ -20,6 +20,8 @@
 #include "esp_heap_caps.h"
 #include "multi_heap.h"
 
+#include <stdbool.h>
+
 #define AG_MEM_FAST MALLOC_CAP_INTERNAL
 #define AG_MEM_SLOW MALLOC_CAP_SPIRAM
 #define AG_MEM_BYTE MALLOC_CAP_8BIT
@@ -73,6 +75,27 @@ static inline size_t ag_port_mem_total(unsigned caps)
 static inline size_t ag_port_mem_largest(unsigned caps)
 {
     return heap_caps_get_largest_free_block(caps);
+}
+
+typedef struct {
+    ag_port_mem_walk_fn fn;
+    void               *ctx;
+} ag_port_mem_walk_ctx_t;
+
+static inline bool ag_port_mem_walk_one(walker_heap_into_t heap,
+                                        walker_block_info_t block, void *arg)
+{
+    (void)heap;
+    const ag_port_mem_walk_ctx_t *w = (const ag_port_mem_walk_ctx_t *)arg;
+    w->fn(w->ctx, block.ptr, block.size, block.used ? 1 : 0);
+    return true;
+}
+
+static inline void ag_port_mem_walk(unsigned caps, ag_port_mem_walk_fn fn,
+                                    void *ctx)
+{
+    ag_port_mem_walk_ctx_t w = {fn, ctx};
+    heap_caps_walk(caps, ag_port_mem_walk_one, &w);
 }
 
 static inline size_t ag_port_alloc_size(const void *p)

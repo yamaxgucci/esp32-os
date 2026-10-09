@@ -156,6 +156,91 @@ static void pixband_tests(void)
     free(mem);
 }
 
+/*
+ * The encoder with no context, reading rows out of a wider surface.  Same
+ * claim as above - bit for bit through the shared decoder - plus the one this
+ * encoder adds: rows packed separately and laid end to end are still one PACK
+ * payload of w*h pixels.
+ */
+static void rows_round_trip(const uint16_t *surf, uint32_t stride_px,
+                            uint32_t w, uint32_t h, uint8_t want_op)
+{
+    uint8_t  enc[MAX_PX * 2u];
+    uint16_t back[MAX_PX];
+    uint16_t want[MAX_PX];
+    uint8_t  op = 0;
+
+    const uint32_t len = ag_pixband_encode_rows(surf, stride_px * 2u, w, h, enc,
+                                                sizeof(enc), &op);
+    AG_CHECK(len > 0u);
+    if (len == 0u) {
+        return;
+    }
+    AG_CHECK_INT(op, want_op);
+    for (uint32_t r = 0; r < h; r++) {
+        memcpy(want + r * w, surf + r * stride_px, w * sizeof(uint16_t));
+    }
+    memset(back, 0xa5, sizeof(back));
+    AG_CHECK(ag_pixband_decode(op, enc, len, back, w * h));
+    AG_CHECK(memcmp(want, back, (size_t)w * h * sizeof(uint16_t)) == 0);
+}
+
+static void pixband_rows_tests(void)
+{
+    /* A 64-wide surface; rectangles are cut out of it at an offset. */
+    static uint16_t surf[64u * 16u];
+
+    /* Flat: packs, and a run never crosses the end of a row. */
+    for (uint32_t i = 0; i < 64u * 16u; i++) {
+        surf[i] = 0x07e0u;
+    }
+    rows_round_trip(surf + 3, 64u, 40u, 8u, AG_PIXBAND_PACK);
+
+    /* Each row its own colour: runs end exactly at each row's end. */
+    for (uint32_t r = 0; r < 16u; r++) {
+        for (uint32_t c = 0; c < 64u; c++) {
+            surf[r * 64u + c] = (uint16_t)(r * 0x0821u);
+        }
+    }
+    rows_round_trip(surf, 64u, 64u, 16u, AG_PIXBAND_PACK);
+
+    /* Noise: PackBits would grow it, so raw - from a strided source. */
+    for (uint32_t i = 0; i < 64u * 16u; i++) {
+        surf[i] = (uint16_t)rnd();
+    }
+    rows_round_trip(surf + 5, 64u, 17u, 5u, AG_PIXBAND_RAW);
+
+    /* One pixel, one row. */
+    rows_round_trip(surf, 64u, 1u, 1u, AG_PIXBAND_RAW);
+
+    /* Too small for even raw: refused, not half-filled. */
+    uint8_t tiny[8];
+    uint8_t op = 0;
+    AG_CHECK_INT(ag_pixband_encode_rows(surf, 128u, 64u, 4u, tiny, sizeof(tiny),
+                                        &op),
+                 0);
+    /* But a flat band that packs into it is fine. */
+    for (uint32_t i = 0; i < 64u * 16u; i++) {
+        surf[i] = 0x1234u;
+    }
+    AG_CHECK_INT(ag_pixband_encode_rows(surf, 128u, 64u, 1u, tiny, sizeof(tiny),
+                                        &op),
+                 3);
+    AG_CHECK_INT(op, AG_PIXBAND_PACK);
+
+    /* Misaligned pixels or stride are refused rather than faulted on. */
+    AG_CHECK_INT(ag_pixband_encode_rows((const uint8_t *)surf + 1, 128u, 4u, 1u,
+                                        tiny, sizeof(tiny), &op),
+                 0);
+    AG_CHECK_INT(ag_pixband_encode_rows(surf, 129u, 4u, 2u, tiny, sizeof(tiny),
+                                        &op),
+                 0);
+    /* A stride narrower than the rectangle is a caller's mistake. */
+    AG_CHECK_INT(ag_pixband_encode_rows(surf, 6u, 4u, 2u, tiny, sizeof(tiny),
+                                        &op),
+                 0);
+}
+
 static void ws_tests(void)
 {
     char accept[AG_WS_ACCEPT_LEN];
@@ -355,6 +440,7 @@ static void ws_client_tests(void)
 void run_phonelink_tests(void)
 {
     pixband_tests();
+    pixband_rows_tests();
     ws_tests();
     ws_client_tests();
 }
