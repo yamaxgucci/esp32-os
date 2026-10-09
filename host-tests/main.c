@@ -45,12 +45,14 @@ void run_cluframe_tests(void);
 void run_phonelink_tests(void);
 void run_espldr_tests(void);
 void run_stm32ldr_tests(void);
+void run_place_tests(void);
 
 int main(void)
 {
     run_rdcodec_tests();
     run_path_tests();
     run_cfg_tests();
+    run_place_tests();
     run_screen_tests();
     run_vtout_tests();
     run_vtin_tests();

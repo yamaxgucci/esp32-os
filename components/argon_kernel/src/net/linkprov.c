@@ -17,6 +17,7 @@
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/place.h>
 
 #include "net/wlink.h"
 #include "proc/proc_internal.h"
@@ -1668,8 +1669,8 @@ static void reader_start(void)
      * both nodes sent into a wire nobody read ("no reader task" in the
      * journal, 0 of 24 pings back).
      */
-    if (!ag_proc_task_create(reader_task, "ag_link", 8192, NULL,
-                             READER_PRIO_HIGH, 0, &s_reader)) {
+    if (!ag_place_task("link.tasks", reader_task, "ag_link", 8192, NULL,
+                       READER_PRIO_HIGH, 0, (void **)&s_reader, NULL)) {
         ag_log(AG_LOG_ERROR, "link", "no reader task: nothing will be heard");
     }
 }

@@ -21,6 +21,7 @@ set(ARGON_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/core/path.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cfg.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/core/place_parse.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cmdline.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/codepage.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/screen.c"
@@ -109,6 +110,7 @@ add_executable(argon_tests
     main.c
     test_path.c
     test_cfg.c
+    test_place.c
     test_screen.c
     test_vtout.c
     test_vtin.c

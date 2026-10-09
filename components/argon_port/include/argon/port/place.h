@@ -21,10 +21,23 @@
 #ifndef ARGON_PORT_PLACE_H
 #define ARGON_PORT_PLACE_H
 
+#include <stdbool.h>
+
 #include <argon/port/impl/place.h>
 
 #ifndef AG_PORT_SLOW_BSS
 #define AG_PORT_SLOW_BSS
 #endif
+
+/*
+ * What the linker did with a build-time piece of the [memory] section
+ * (argon/place.h): "iram", "flash", "rom" or "psram", or NULL for a piece this
+ * port does not build at all.  Read from the build's own configuration, so it
+ * is the truth about this image, not about any file.
+ */
+const char *ag_port_place_built(const char *piece);
+
+/* Is this pointer into external memory (PSRAM)? */
+bool ag_port_ptr_is_slow(const void *p);
 
 #endif /* ARGON_PORT_PLACE_H */

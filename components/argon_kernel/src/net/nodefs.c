@@ -26,6 +26,9 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 #include <argon/port/place.h>
+#include <argon/place.h>
+
+#include "core/place_bss.h"
 
 #define NF_CHAN 4u
 
@@ -188,7 +191,7 @@ static struct {
     int32_t       wire;
     uint16_t      len;
     uint8_t       path[AG_PATH_MAX];
-} s_req AG_PORT_SLOW_BSS;
+} s_req AG_KERNEL_STATIC;
 
 /* Read the file and push it, in order, on the background class. */
 static void serve_get(uint16_t from, int32_t wire, uint8_t cls,
@@ -326,8 +329,9 @@ static void take_get(const uint8_t *payload, uint16_t len)
     memcpy(s_req.path, payload, len);
     s_req.busy = true;
     ag_port_task_t t = NULL;
-    if (!ag_port_task_create(server_task, "nodefs", NF_TASK_STACK, NULL,
-                             NF_TASK_PRIO, AG_PORT_ANY_CORE, 0u, &t)) {
+    if (!ag_place_task("cluster.tasks", server_task, "nodefs", NF_TASK_STACK,
+                       NULL, NF_TASK_PRIO, AG_PORT_ANY_CORE, (void **)&t,
+                       NULL)) {
         /*
          * No memory for the task - an emulated node has 5.5 KB free - so
          * served here, on the reader, as before there was one: on BULK,

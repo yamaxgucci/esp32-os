@@ -23,6 +23,9 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 #include <argon/port/place.h>
+#include <argon/place.h>
+
+#include "core/place_bss.h"
 
 /*
  * The channel this conversation lives on.  Channels are independent, so a file
@@ -233,7 +236,7 @@ static int32_t out_sink(void *ctx, const char *data, size_t len)
  * program to finish.  Nothing times out and nothing crashes; both nodes simply
  * stop, which is the worst shape a bug can have.
  */
-static char           s_run_line[AG_PATH_MAX + 64] AG_PORT_SLOW_BSS;
+static char           s_run_line[AG_PATH_MAX + 64] AG_KERNEL_STATIC;
 static ag_port_task_t s_run_task;
 
 /* Set by the far node's STARTED; only a handover ever waits on it. */
@@ -505,8 +508,8 @@ static void serve_run(const uint8_t *payload, uint16_t len)
     /* Internal stack if it can be had, PSRAM if not: after the merge of
      * 25 Sep 2026 an S3 with a 192 KB code arena had 5 KB internal left and
      * refused every remote run with -12. */
-    if (!ag_proc_task_create(run_task, "noderun", 6144, NULL, 1,
-                             AG_PORT_ANY_CORE, &s_run_task)) {
+    if (!ag_place_task("cluster.tasks", run_task, "noderun", 6144, NULL, 1,
+                       AG_PORT_ANY_CORE, (void **)&s_run_task, NULL)) {
         s_serving_run = false;
         (void)send_msg(from, NP_OP_EXIT, -AG_ENOMEM, NULL, 0);
     }

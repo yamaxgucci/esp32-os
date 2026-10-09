@@ -52,6 +52,9 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 #include <argon/port/place.h>
+#include <argon/place.h>
+
+#include "core/place_bss.h"
 
 #define ND_CHAN 5u
 #define ND_HDR 12u
@@ -211,7 +214,7 @@ static volatile bool     s_busy;
 static volatile uint16_t s_tag;
 static volatile bool     s_have;
 static volatile int32_t  s_status;
-static uint8_t           s_rbuf[ND_CHUNK_MAX] AG_PORT_SLOW_BSS;
+static uint8_t           s_rbuf[ND_CHUNK_MAX] AG_KERNEL_STATIC;
 static volatile uint16_t s_rlen;
 
 /*
@@ -619,8 +622,9 @@ static void serve(const uint8_t *b, uint16_t n)
             s_fsrv.want = want;
             s_fsrv.chunk = chunk;
             ag_port_task_t t = NULL;
-            if (ag_port_task_create(fetch_task, "nodedrv", ND_FETCH_STACK, NULL,
-                                    ND_FETCH_PRIO, AG_PORT_ANY_CORE, 0u, &t)) {
+            if (ag_place_task("cluster.tasks", fetch_task, "nodedrv",
+                              ND_FETCH_STACK, NULL, ND_FETCH_PRIO,
+                              AG_PORT_ANY_CORE, (void **)&t, NULL)) {
                 break; /* the task answers it all, END included */
             }
             s_fsrv.busy = false;

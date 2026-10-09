@@ -45,6 +45,8 @@
 #include <argon/path.h>
 #include <argon/port/place.h>
 
+#include "core/place_bss.h"
+
 /*
  * Channel 1 is this command's own conversation.  Channel 0 is the hello
  * exchange's (nodehello.c), and 15 the background window's credits
@@ -138,7 +140,7 @@ typedef struct {
 } link_origin_t;
 
 static volatile bool s_have;
-static uint8_t       s_msg[LINK_MSG_MAX + 1] AG_PORT_SLOW_BSS;
+static uint8_t       s_msg[LINK_MSG_MAX + 1] AG_KERNEL_STATIC;
 static volatile uint16_t s_msg_len;
 static link_origin_t     s_msg_who;
 

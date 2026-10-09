@@ -29,6 +29,7 @@
 #include <argon/module.h>
 #include <argon/netmsg.h>
 #include <argon/path.h>
+#include <argon/place.h>
 #include <argon/probe.h>
 #include <argon/power.h>
 #include <argon/proc.h>
@@ -60,6 +61,8 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 #include <argon/port/place.h>
+
+#include "core/place_bss.h"
 
 #include "boot/platform.h"
 #include "core/sysconfig.h"
@@ -127,7 +130,7 @@ typedef struct {
  * 2026).  PSRAM statics start as zeroes, not as an initialiser, so the two
  * fields that are not zero are set the first time anybody asks for it.
  */
-static shell_ctx_t s_ctx0 AG_PORT_SLOW_BSS;
+static shell_ctx_t s_ctx0 AG_KERNEL_STATIC;
 static volatile bool s_ctx0_ready;
 
 static shell_ctx_t *ctx0(void)
@@ -578,11 +581,24 @@ static int cmd_cpu(int argc, char **argv)
     return 0;
 }
 
+static void mem_place_line(const char *line, void *ctx)
+{
+    (void)ctx;
+    ag_console_puts(line);
+}
+
 static int cmd_mem(int argc, char **argv)
 {
     if (argc > 1 && (strcmp(argv[1], "/t") == 0 ||
                      strcmp(argv[1], "tasks") == 0)) {
         return mem_tasks();
+    }
+    /* `mem /p`: where each piece of [memory] was asked to go and where it
+     * went (argon/place.h). */
+    if (argc > 1 && (strcmp(argv[1], "/p") == 0 ||
+                     strcmp(argv[1], "place") == 0)) {
+        ag_place_report(mem_place_line, NULL);
+        return 0;
     }
 
     const size_t int_free = ag_port_mem_free(AG_MEM_FAST);
@@ -5876,8 +5892,8 @@ static int cmd_uartbridge(int argc, char **argv)
      * 256 bytes is far more than a 2 ms window holds at these rates, so nothing
      * is dropped for want of buffer here.
      */
-    static uint8_t from_pc[256] AG_PORT_SLOW_BSS;
-    static uint8_t from_chip[256] AG_PORT_SLOW_BSS;
+    static uint8_t from_pc[256] AG_KERNEL_STATIC;
+    static uint8_t from_chip[256] AG_KERNEL_STATIC;
     for (;;) {
         const int32_t n =
             ag_port_uart_read(AG_PORT_UART_CONSOLE, from_pc, sizeof(from_pc), 2);
@@ -5933,7 +5949,7 @@ static int cmd_guard(int argc, char **argv)
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
-    {"mem", "[/t]", "memory usage; /t: every task and its stack", cmd_mem},
+    {"mem", "[/t|/p]", "memory usage; /t: every task and its stack; /p: [memory] placement", cmd_mem},
     {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
     {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",

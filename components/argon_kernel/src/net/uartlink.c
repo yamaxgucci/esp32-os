@@ -59,6 +59,7 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 #include <argon/port/uart.h>
+#include <argon/place.h>
 
 #include "core/sysconfig.h"
 #include "net/wtrace.h"
@@ -747,11 +748,14 @@ ag_err_t ag_uartlink_open(int port, uint32_t baud, uint32_t frame,
     unlock(u);
 
     const int core = (int)ag_sysinfo()->app_core;
-    const bool ok_rx = ag_port_task_create(rx_task, "uartlink", UL_STACK, u,
-                                           UL_PRIO, core, 0, &u->rx_task);
-    const bool ok_tx = ok_rx && ag_port_task_create(tx_task, "uartltx",
-                                                    UL_STACK, u, UL_PRIO, core,
-                                                    0, &u->tx_task);
+    /* [memory] link.tasks: internal first by default - these two carry the
+     * wire's every frame. */
+    const bool ok_rx = ag_place_task("link.tasks", rx_task, "uartlink",
+                                     UL_STACK, u, UL_PRIO, core,
+                                     (void **)&u->rx_task, NULL);
+    const bool ok_tx = ok_rx && ag_place_task("link.tasks", tx_task, "uartltx",
+                                              UL_STACK, u, UL_PRIO, core,
+                                              (void **)&u->tx_task, NULL);
     if (!ok_tx) {
         u->stop = true;
         if (ok_rx) {

@@ -87,6 +87,25 @@ menu "ArgonOS"
             linked at all in this mode, which is the point - the internal memory
             it would have taken stays free for the radios.
 
+    config ARGON_PLACE_KERNEL_STATIC_PSRAM
+        bool "[memory] kernel.static = psram"
+        default n
+        help
+            The kernel's static tables - the VFS's, the configuration's, the
+            pins', the key stamps', the small cluster buffers - in PSRAM
+            rather than internal SRAM.  Written by `argon target` / `argon
+            build` from the board pack's [memory] section, not by hand: see
+            argon/place.h.  Needs SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY, which
+            also moves Wi-Fi's and lwIP's tables (IDF does that itself).
+
+    config ARGON_PLACE_DEV_TABLE_PSRAM
+        bool "[memory] dev.table = psram"
+        default n
+        help
+            The device table in PSRAM.  Every device call reads it, so on the
+            S3-Zero this cost a program crunching PSRAM tables 2% of a core
+            (9 Oct 2026).  From the board pack's [memory] section.
+
     config ARGON_APP_STACK_KB
         int "Default application stack, KB"
         range 2 64

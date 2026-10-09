@@ -214,6 +214,142 @@ function Build-HostTools {
 # `argon target <chip>` removes sdkconfig first, which is why switching targets
 # has always worked.  So this does not fix anything; it says which command to
 # run.
+# ---------------------------------------------------------------------------
+# [memory] in a board pack's BOARD.CFG, the build-time half (argon/place.h).
+#
+# Code and the kernel's static tables are placed by the linker, so where they
+# go is an sdkconfig switch - and the board pack is where a board says what
+# it wants.  `argon target` remembers which pack goes with the chip variant
+# (.argon-board, not in git) and both `target` and `build` write the pack's
+# build-time pieces into sdkconfig, so editing the pack and running
+# `argon build` is all a change takes.  The kernel reads the same section at
+# boot and says, in `mem /p`, if what was built is not what it asks for.
+#
+# Each piece's value is a list in order of preference ("psram, iram"; `only`
+# first means nothing else).  The first kind this build can have wins: psram
+# needs CONFIG_SPIRAM, rom needs a ROM flash driver.
+# ---------------------------------------------------------------------------
+$script:BoardPackOf = @{
+    'esp32'         = 'esp32-cyd'
+    'esp32-cyd'     = 'esp32-cyd'
+    'esp32s3-board' = 'esp32s3-cam'
+    'esp32s3-cam'   = 'esp32s3-cam'
+    'esp32s3-zero'  = 'esp32s3-zero'
+    'esp32s3-lcd2'  = 'esp32s3-touch-lcd-2'
+    'esp32s3-touch-lcd-2' = 'esp32s3-touch-lcd-2'
+    'esp32c6'       = 'esp32-c6-lcd-1.47'
+    'esp32c3'       = 'esp32c3-supermini'
+}
+
+# piece -> kinds it may take -> the sdkconfig switches each kind means.
+$script:MemoryPieces = [ordered]@{
+    'freertos'      = @{ flash = @{ FREERTOS_PLACE_FUNCTIONS_INTO_FLASH = 'y' }
+                         iram  = @{ FREERTOS_PLACE_FUNCTIONS_INTO_FLASH = 'n' } }
+    'heap.code'     = @{ flash = @{ HEAP_PLACE_FUNCTION_INTO_FLASH = 'y' }
+                         iram  = @{ HEAP_PLACE_FUNCTION_INTO_FLASH = 'n' } }
+    'ringbuf.code'  = @{ flash = @{ RINGBUF_PLACE_FUNCTIONS_INTO_FLASH = 'y' }
+                         iram  = @{ RINGBUF_PLACE_FUNCTIONS_INTO_FLASH = 'n' } }
+    'wifi.fast'     = @{ flash = @{ ESP_WIFI_IRAM_OPT = 'n'; ESP_WIFI_RX_IRAM_OPT = 'n' }
+                         iram  = @{ ESP_WIFI_IRAM_OPT = 'y'; ESP_WIFI_RX_IRAM_OPT = 'y' } }
+    'phy.fast'      = @{ flash = @{ ESP_PHY_IRAM_OPT = 'n' }
+                         iram  = @{ ESP_PHY_IRAM_OPT = 'y' } }
+    'libc.locks'    = @{ flash = @{ LIBC_LOCKS_PLACE_IN_IRAM = 'n' }
+                         iram  = @{ LIBC_LOCKS_PLACE_IN_IRAM = 'y' } }
+    'driver.isr'    = @{ flash = @{ I2C_MASTER_ISR_HANDLER_IN_IRAM = 'n'; GPTIMER_ISR_HANDLER_IN_IRAM = 'n'
+                                    MCPWM_ISR_HANDLER_IN_IRAM = 'n'; RMT_TX_ISR_HANDLER_IN_IRAM = 'n'
+                                    RMT_RX_ISR_HANDLER_IN_IRAM = 'n'; RMT_ENCODER_FUNC_IN_IRAM = 'n' }
+                         iram  = @{ I2C_MASTER_ISR_HANDLER_IN_IRAM = 'y'; GPTIMER_ISR_HANDLER_IN_IRAM = 'y'
+                                    MCPWM_ISR_HANDLER_IN_IRAM = 'y'; RMT_TX_ISR_HANDLER_IN_IRAM = 'y'
+                                    RMT_RX_ISR_HANDLER_IN_IRAM = 'y'; RMT_ENCODER_FUNC_IN_IRAM = 'y' } }
+    'flash.driver'  = @{ rom   = @{ SPI_FLASH_ROM_IMPL = 'y' }
+                         iram  = @{ SPI_FLASH_ROM_IMPL = 'n' } }
+    'kernel.static' = @{ psram = @{ SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = 'y'; ARGON_PLACE_KERNEL_STATIC_PSRAM = 'y' }
+                         iram  = @{ ARGON_PLACE_KERNEL_STATIC_PSRAM = 'n' } }
+    'dev.table'     = @{ psram = @{ SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = 'y'; ARGON_PLACE_DEV_TABLE_PSRAM = 'y' }
+                         iram  = @{ ARGON_PLACE_DEV_TABLE_PSRAM = 'n' } }
+}
+
+function Read-BoardMemory([string]$cfgPath) {
+    $out = [ordered]@{}
+    if (-not (Test-Path -LiteralPath $cfgPath)) { return $out }
+    $section = ''
+    foreach ($raw in Get-Content -LiteralPath $cfgPath) {
+        $line = ($raw -replace '[;#].*$', '').Trim()
+        if ($line -eq '') { continue }
+        if ($line -match '^\[(.+)\]$') { $section = $Matches[1].Trim().ToLowerInvariant(); continue }
+        if ($section -ne 'memory') { continue }
+        if ($line -match '^([^=]+)=(.*)$') { $out[$Matches[1].Trim()] = $Matches[2].Trim() }
+    }
+    return $out
+}
+
+function Sync-BoardMemory {
+    if (-not (Test-Path 'sdkconfig') -or -not (Test-Path '.argon-board')) { return $true }
+    $pack = (Get-Content '.argon-board' -TotalCount 1).Trim()
+    if ($pack -eq '') { return $true }
+    $cfgPath = Join-Path 'boards' (Join-Path $pack 'BOARD.CFG')
+    $asked = Read-BoardMemory $cfgPath
+    if ($asked.Count -eq 0) { return $true }
+
+    $lines = [System.Collections.Generic.List[string]](Get-Content 'sdkconfig')
+    $text = $lines -join "`n"
+    $hasPsram = $text -match '(?m)^CONFIG_SPIRAM=y$'
+    $hasRomFlash = $text -match '(?m)^CONFIG_ESP_ROM_HAS_SPI_FLASH=y$'
+
+    $want = [ordered]@{}
+    $ok = $true
+    foreach ($piece in $asked.Keys) {
+        if (-not $script:MemoryPieces.Contains($piece)) { continue } # a boot-time piece
+        $words = @(($asked[$piece] -split '[,\s]+') | Where-Object { $_ -ne '' } |
+                   ForEach-Object { $_.ToLowerInvariant() })
+        $only = $false
+        if ($words.Count -gt 0 -and $words[0] -eq 'only') { $only = $true; $words = @($words | Select-Object -Skip 1) }
+        $words = @($words | ForEach-Object { if ($_ -in 'sram', 'internal') { 'iram' } else { $_ } })
+        $kinds = $script:MemoryPieces[$piece]
+        $chosen = $null
+        foreach ($w in $words) {
+            if (-not $kinds.ContainsKey($w)) {
+                Write-Host "memory: $piece = $($asked[$piece]): it cannot live in $w ($pack\BOARD.CFG)" -ForegroundColor Red
+                $ok = $false; break
+            }
+            if ($w -eq 'psram' -and -not $hasPsram) { continue }
+            if ($w -eq 'rom' -and -not $hasRomFlash) { continue }
+            $chosen = $w; break
+        }
+        if (-not $ok) { break }
+        if ($null -eq $chosen) {
+            if ($only) {
+                Write-Host "memory: $piece = $($asked[$piece]), and this build has none of them" -ForegroundColor Red
+                $ok = $false; break
+            }
+            continue # nothing listed is possible here: the build's own default stands
+        }
+        foreach ($sym in $kinds[$chosen].Keys) { $want[$sym] = $kinds[$chosen][$sym] }
+    }
+    if (-not $ok) { return $false }
+
+    $changed = @()
+    foreach ($sym in $want.Keys) {
+        $set = if ($want[$sym] -eq 'y') { "CONFIG_$sym=y" } else { "# CONFIG_$sym is not set" }
+        $idx = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "^CONFIG_$sym=" -or $lines[$i] -eq "# CONFIG_$sym is not set") { $idx = $i; break }
+        }
+        if ($idx -ge 0) {
+            if ($lines[$idx] -ne $set) { $lines[$idx] = $set; $changed += $set }
+        } else {
+            $lines.Add($set); $changed += $set
+        }
+    }
+    if ($changed.Count -gt 0) {
+        Set-Content -Path 'sdkconfig' -Value $lines -Encoding ascii
+        Write-Host "memory: $pack\BOARD.CFG [memory] -> sdkconfig:"
+        foreach ($c in $changed) { Write-Host "  $c" }
+    }
+    return $true
+}
+
+
 function Warn-StaleSdkconfig {
     if (-not (Test-Path 'sdkconfig')) { return }
     $cfg = (Get-Item 'sdkconfig').LastWriteTimeUtc
@@ -248,6 +384,7 @@ switch ($Command.ToLowerInvariant()) {
     'build' {
         Initialize-Environment
         Warn-StaleSdkconfig
+        if (-not (Sync-BoardMemory)) { exit 1 }
         & idf.py build @Rest
         exit $LASTEXITCODE
     }
@@ -358,8 +495,15 @@ switch ($Command.ToLowerInvariant()) {
             }
         }
 
+        # Which board pack goes with this variant, for [memory] (Sync-BoardMemory).
+        $variant = $Rest[0]
+        $pack = if ($script:BoardPackOf.ContainsKey($variant)) { $script:BoardPackOf[$variant] } else { '' }
+        Set-Content -Path '.argon-board' -Value $pack -Encoding ascii
+
         & idf.py -D "SDKCONFIG_DEFAULTS=$defaults" set-target $chip
-        exit $LASTEXITCODE
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        if (-not (Sync-BoardMemory)) { exit 1 }
+        exit 0
     }
 
     'get' {

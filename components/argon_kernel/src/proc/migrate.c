@@ -19,6 +19,8 @@
 #include <argon/port/time.h>
 #include <argon/port/place.h>
 
+#include "core/place_bss.h"
+
 #include "proc_internal.h"
 
 #define TAG "migrate"
@@ -44,7 +46,7 @@ static bool     s_saved;               /* it agreed and handed something over */
  * against the 8 KB task stack this split exists to stop needing - see
  * ag_migrate_ask below for the measurement that made that trade.
  */
-static char     s_path[AG_PATH_MAX] AG_PORT_SLOW_BSS;
+static char     s_path[AG_PATH_MAX] AG_KERNEL_STATIC;
 
 /* What a process starting here should find - the far end of somebody else's
  * migration.  Taken once, by the first process that asks. */

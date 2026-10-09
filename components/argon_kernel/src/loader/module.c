@@ -19,7 +19,7 @@
 #include <argon/port/mem.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
-#include <argon/port/place.h>
+#include <argon/place.h>
 
 #include "core/sysconfig.h"
 
@@ -51,7 +51,26 @@ struct module_s {
     modtask_t        tasks[AG_MODULE_TASKS];
 };
 
-static module_t               s_modules[AG_MODULE_MAX] AG_PORT_SLOW_BSS;
+/*
+ * Made when the first module loads, where [memory] kernel.tables says
+ * (argon/place.h): 4.5 KB a board that loads no driver never pays for.  Until
+ * then the table is empty and every lookup answers "no such module".
+ */
+static module_t              *s_modules;
+
+static bool table_made(void)
+{
+    if (s_modules == NULL) {
+        module_t *t = (module_t *)ag_place_alloc(
+            "kernel.tables", sizeof(module_t) * AG_MODULE_MAX);
+        if (t == NULL) {
+            return false;
+        }
+        memset(t, 0, sizeof(module_t) * AG_MODULE_MAX);
+        s_modules = t;
+    }
+    return true;
+}
 static module_t              *s_loading;
 static const ag_probe_hint_t *s_hint;
 
@@ -214,7 +233,7 @@ static void set_string_path(char *dst, size_t dst_len, const char *src)
 
 static module_t *find_by_name(const char *name)
 {
-    if (name == NULL || name[0] == '\0') {
+    if (name == NULL || name[0] == '\0' || s_modules == NULL) {
         return NULL;
     }
     for (uint32_t i = 0; i < AG_MODULE_MAX; i++) {
@@ -228,6 +247,9 @@ static module_t *find_by_name(const char *name)
 
 static module_t *alloc_slot(void)
 {
+    if (!table_made()) {
+        return NULL;
+    }
     for (uint32_t i = 0; i < AG_MODULE_MAX; i++) {
         if (!s_modules[i].used) {
             return &s_modules[i];
@@ -448,6 +470,9 @@ ag_err_t ag_module_info(uint32_t index, ag_modinfo_t *out)
     if (out == NULL) {
         return -AG_EINVAL;
     }
+    if (s_modules == NULL) {
+        return -AG_ENOENT;
+    }
 
     uint32_t seen = 0;
     for (uint32_t i = 0; i < AG_MODULE_MAX; i++) {
@@ -474,6 +499,9 @@ ag_err_t ag_module_info(uint32_t index, ag_modinfo_t *out)
 uint32_t ag_module_count(void)
 {
     uint32_t n = 0;
+    if (s_modules == NULL) {
+        return 0;
+    }
     for (uint32_t i = 0; i < AG_MODULE_MAX; i++) {
         if (s_modules[i].used) {
             n++;

@@ -49,6 +49,9 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 #include <argon/port/place.h>
+#include <argon/place.h>
+
+#include "core/place_bss.h"
 
 #define TAG "rdev"
 
@@ -173,7 +176,7 @@ static volatile bool     s_busy;
 static volatile uint16_t s_tag;
 static volatile bool     s_have;
 static volatile int32_t  s_status;
-static uint8_t           s_rbuf[RD_MAX_PAYLOAD] AG_PORT_SLOW_BSS;
+static uint8_t           s_rbuf[RD_MAX_PAYLOAD] AG_KERNEL_STATIC;
 static volatile uint16_t s_rlen;
 
 /*
@@ -483,7 +486,7 @@ static uint32_t s_sent_said_n, s_sent_said_drop;
  */
 static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
 {
-    static uint8_t buf2[RD_HDR + RD_POUR_CAP] AG_PORT_SLOW_BSS;
+    static uint8_t buf2[RD_HDR + RD_POUR_CAP] AG_KERNEL_STATIC;
     if (len > RD_POUR_CAP) {
         len = RD_POUR_CAP;
     }
@@ -544,7 +547,7 @@ static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
  * caller writes what it always wrote; on a wire that can carry it, nothing is
  * changed at all.
  */
-static uint8_t s_fit_buf[RD_SND_CAP] AG_PORT_SLOW_BSS;
+static uint8_t s_fit_buf[RD_SND_CAP] AG_KERNEL_STATIC;
 
 /*
  * THE WRITE IS THE CLOCK, and a proxy had none.
@@ -1347,7 +1350,7 @@ static uint16_t s_session_from[RD_MAX_SESSIONS];
 static uint8_t s_session_ch[RD_MAX_SESSIONS];
 
 /* The request being served, and the worker serving it. */
-static uint8_t        s_req[RD_HDR + RD_MAX_PAYLOAD] AG_PORT_SLOW_BSS;
+static uint8_t        s_req[RD_HDR + RD_MAX_PAYLOAD] AG_KERNEL_STATIC;
 static volatile uint16_t s_req_len;
 static volatile bool  s_working;
 static ag_port_task_t s_worker;
@@ -2471,8 +2474,8 @@ static void acker_task(void *arg)
 static bool acker_make(void)
 {
     return s_acker != NULL ||
-           ag_proc_task_create(acker_task, "rdevack", 2048, NULL, 6,
-                               AG_PORT_ANY_CORE, &s_acker);
+           ag_place_task("cluster.tasks", acker_task, "rdevack", 2048, NULL, 6,
+                         AG_PORT_ANY_CORE, (void **)&s_acker, NULL);
 }
 
 /* frames drawn whole here, and the waits between them (ag_noderdev_frames_seen) */
@@ -2814,8 +2817,8 @@ static void sound_task(void *arg);
 static bool pour_tasks_make(void)
 {
     if (s_pour_task == NULL &&
-        !ag_proc_task_create(pour_task, "rdevpour", 4096, NULL, 1,
-                             AG_PORT_ANY_CORE, &s_pour_task)) {
+        !ag_place_task("cluster.tasks", pour_task, "rdevpour", 4096, NULL, 1,
+                       AG_PORT_ANY_CORE, (void **)&s_pour_task, NULL)) {
         return false;
     }
     /* the converter's task, above the drawing: without it the pour task
@@ -3592,8 +3595,8 @@ static void want_src(int32_t src)
     }
     s_att_running = true;
     /* As the other cluster workers: an internal stack, else PSRAM. */
-    if (!ag_proc_task_create(attach_task, "rdevatt", 4096, NULL, 1,
-                             AG_PORT_ANY_CORE, &s_att_task)) {
+    if (!ag_place_task("cluster.tasks", attach_task, "rdevatt", 4096, NULL, 1,
+                       AG_PORT_ANY_CORE, (void **)&s_att_task, NULL)) {
         s_att_running = false;
         ag_log(AG_LOG_WARN, TAG, "no task to attach the neighbour's devices; "
                                  "`link devs` does it by hand");

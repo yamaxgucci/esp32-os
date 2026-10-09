@@ -23,6 +23,7 @@
 #include <argon/log.h>
 #include <argon/net.h>
 #include <argon/path.h>
+#include <argon/place.h>
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
@@ -971,17 +972,34 @@ bool ag_proc_task_create_app(ag_port_task_fn fn, const char *name,
                              int core, ag_port_task_t *out)
 {
 #if AG_PORT_TASK_STACK_CAPS
-    if (app_internal_room(stack_bytes)) {
-        return ag_proc_task_create(fn, name, stack_bytes, arg, prio, core, out);
-    }
-    if (ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
-                            AG_MEM_SLOW | AG_MEM_BYTE, out)) {
-        ag_log(AG_LOG_INFO, "proc",
-               "%s: task stack in PSRAM (%u bytes; internal SRAM is kept for "
-               "devices, %u bytes)",
-               name != NULL ? name : "?", (unsigned)stack_bytes,
-               (unsigned)ag_proc_kept_internal());
-        return true;
+    /*
+     * [memory] app.stack: iram, psram by default.  Internal SRAM only above
+     * what is kept for arriving devices (ag_proc_keep_internal).
+     */
+    ag_place_kind_t kinds[AG_PLACE_KINDS];
+    const unsigned  n = ag_place_order("app.stack", kinds);
+    ag_port_task_t  local = NULL;
+    ag_port_task_t *t = (out != NULL) ? out : &local;
+    for (unsigned k = 0; k < n; k++) {
+        if (kinds[k] == AG_PLACE_IRAM && app_internal_room(stack_bytes) &&
+            ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                                AG_MEM_FAST | AG_MEM_BYTE, t)) {
+            ag_place_adopt("app.stack", (void *)*t);
+            return true;
+        }
+        if (kinds[k] == AG_PLACE_PSRAM &&
+            ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                                AG_MEM_SLOW | AG_MEM_BYTE, t)) {
+            ag_place_adopt("app.stack", (void *)*t);
+            if (k > 0) {
+                ag_log(AG_LOG_INFO, "proc",
+                       "%s: task stack in PSRAM (%u bytes; internal SRAM is "
+                       "kept for devices, %u bytes)",
+                       name != NULL ? name : "?", (unsigned)stack_bytes,
+                       (unsigned)ag_proc_kept_internal());
+            }
+            return true;
+        }
     }
     return false;
 #else

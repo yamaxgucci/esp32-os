@@ -12,6 +12,8 @@
 #include <argon/proc.h>
 #include <argon/port/place.h>
 
+#include "core/place_bss.h"
+
 typedef struct {
     uint8_t  state;
     bool     isr;
@@ -19,7 +21,7 @@ typedef struct {
     char     why[AG_IO_REASON_MAX];
 } pin_t;
 
-static pin_t s_pins[AG_IO_MAX_PINS] AG_PORT_SLOW_BSS;
+static pin_t s_pins[AG_IO_MAX_PINS] AG_KERNEL_STATIC;
 static int   s_count;
 
 /*

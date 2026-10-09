@@ -5,6 +5,8 @@ set(ARGON_KERNEL_SRCS
     "src/boot/recovery.c"
     "src/core/path.c"
     "src/core/cfg.c"
+    "src/core/place.c"
+    "src/core/place_parse.c"
     "src/core/cmdline.c"
     "src/core/sysconfig.c"
     "src/core/nodename.c"
