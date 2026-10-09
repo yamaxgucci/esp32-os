@@ -20,9 +20,11 @@
 #include <argon/port/net.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
-#if AG_PORT_HAS_WIFI
+/* Unconditionally: this header is what defines AG_PORT_HAS_WIFI.  Behind
+ * its own macro it was never included, the macro read as 0, and every
+ * built-in radio operation below compiled out - `wifi` answered "no radio"
+ * on an S3 with the radio linked (found 9 Oct 2026). */
 #include <argon/port/wifi.h>
-#endif
 
 /* ------------------------------------------------------------------------ */
 /* The built-in provider: the port, wrapped so it has the ag_net_ops_t shape. */
