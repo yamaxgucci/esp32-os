@@ -2826,9 +2826,21 @@ int ag_main(int argc, char **argv)
              * to be had, and with the painted panel's threshold a turned knob
              * was applied to the sound and never drawn.
              */
-            if ((s_dirty_all || s_ndirty > 0 || s_text_all ||
-                 s_text_rows != 0u) &&
-                ag_pcm_slack_us(&s_out) >= REDRAW_SLACK_US) {
+            /*
+             * As many steps as the room before the next block allows, not one
+             * a block.
+             *
+             * A whole repaint is eight bands and present() does one of them;
+             * at one call a block that is eight blocks, and on an instrument a
+             * block is 2.9 ms - so a panel took a quarter of a second to
+             * appear and a turned knob crawled.  The slack is re-read between
+             * steps, so this gives back the core the moment the next block is
+             * close, and a band that had to wait for the wire ends the burst
+             * by itself.
+             */
+            while ((s_dirty_all || s_ndirty > 0 || s_text_all ||
+                    s_text_rows != 0u) &&
+                   ag_pcm_slack_us(&s_out) >= REDRAW_SLACK_US) {
                 ag_pcm_poll_stats(&s_out);
                 present();
             }

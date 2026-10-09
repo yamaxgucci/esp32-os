@@ -203,6 +203,7 @@ def main():
     nbytes = {"B": 0, "P": 0, "I": 0}
     infos = bad = rows = 0
     first_band = None
+    full_at = None
     t0 = time.time()
     link.s.settimeout(0.5)
     next_key = t0 + args.key_at
@@ -265,12 +266,19 @@ def main():
             for r in range(bh):
                 px[(y + r) * w + x:(y + r) * w + x + bw] = out[r * bw:(r + 1) * bw]
                 covered.add(y + r)
+            # When the picture has been covered once, which is the number a
+            # person actually feels: how long after asking before the whole
+            # screen is there.
+            if full_at is None and h and len(covered) >= h:
+                full_at = time.time() - t0
 
     total = sum(counts.values())
     print("geometry %ux%u (%u info messages), %u text rows" % (w, h, infos, rows))
     print("bands: %u (raw %u, pack %u, idx %u), %u bytes; %u undecodable"
           % (total, counts["B"], counts["P"], counts["I"], sum(nbytes.values()),
              bad))
+    if full_at is not None:
+        print("the whole picture was covered after %.2f s" % full_at)
     if first_band is not None:
         print("first band after %.2f s; rows of the picture touched: %u of %u"
               % (first_band, len(covered), h))
