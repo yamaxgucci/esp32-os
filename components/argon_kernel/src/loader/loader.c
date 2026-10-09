@@ -22,6 +22,7 @@
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
+#include <argon/port/execmem.h>
 #include "loader/appfs.h"
 
 /*
@@ -368,7 +369,10 @@ static void release_image(ag_loaded_app_t *app)
         }
     } else
 #endif
-    if (app->place.code != NULL && !app->code_from_xip) {
+    if (app->code_heap != NULL) {
+        ag_port_execmem_free(app->code_heap);
+        app->code_heap = NULL;
+    } else if (app->place.code != NULL && !app->code_from_xip) {
         if (!ag_arena_free(&s_code, app->place.code)) {
             ag_log(AG_LOG_ERROR, "loader", "arena does not own %p",
                    app->place.code);
@@ -378,6 +382,9 @@ static void release_image(ag_loaded_app_t *app)
     app->code_from_xip = false;
     app->code_from_psram = false;
 }
+
+static ag_err_t place_data(const ag_axe_header_t *header, ag_loaded_app_t *out,
+                           void *code, size_t code_bytes);
 
 /*
  * IRAM arena path: code is writable and executable in place.
@@ -403,6 +410,24 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
                (unsigned)ag_arena_largest_free(&s_code, 16));
         return -AG_ENOMEM;
     }
+
+    const ag_err_t err = place_data(header, out, code, code_bytes);
+    if (err != AG_OK) {
+        (void)ag_arena_free(&s_code, code);
+    }
+    return err;
+}
+
+/*
+ * The half of placing an image that does not depend on where its code went:
+ * the code block is given, and the data goes inside it (contiguous) or into
+ * an allocation of its own.  On failure `out->place` is cleared and the code
+ * block is the caller's to give back.
+ */
+static ag_err_t place_data(const ag_axe_header_t *header, ag_loaded_app_t *out,
+                           void *code, size_t code_bytes)
+{
+    const bool contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
 
     out->place.code = code;
     out->place.code_capacity = code_bytes;
@@ -437,7 +462,6 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
                (unsigned)(ag_port_mem_free(AG_MEM_SLOW) +
                           ag_port_mem_free(AG_MEM_FAST)),
                (unsigned)ag_port_mem_largest(AG_MEM_FAST));
-        (void)ag_arena_free(&s_code, code);
         memset(&out->place, 0, sizeof(out->place));
         return -AG_ENOMEM;
     }
@@ -446,6 +470,56 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
     out->place.data_capacity = header->data.size;
     out->data_owned = data;
     guard_arm(out, (uint8_t *)data + header->data.size);
+    return AG_OK;
+}
+
+/*
+ * CODE FROM THE INTERNAL HEAP (9 Oct 2026).
+ *
+ * The link-time arena is internal SRAM reserved for code whether a program
+ * runs or not.  On the S3-Zero it was cut to 16 KB to give that memory back -
+ * and then DX7, 29 KB of code, went to the PSRAM arena while 250 KB of
+ * internal SRAM stood free, which is the memory that had been freed for
+ * exactly such programs (Maxim, 9 Oct).  So a program that does not fit the
+ * arena takes its code from the internal heap when the port can make heap
+ * memory executable (the S3), and gives it back when it ends.
+ *
+ * Only while that leaves what is kept for arriving devices
+ * (ag_proc_keep_internal) and AG_LOADER_HEAP_CODE_FLOOR on top: a radio
+ * brought up later wants one ~36 KB contiguous block of the same memory, and
+ * a program's code must not be what refuses it.  Past that the PSRAM arena,
+ * then flash, as before.
+ */
+#define AG_LOADER_HEAP_CODE_FLOOR (40u * 1024u)
+
+static bool heap_code_room(size_t bytes)
+{
+    return ag_port_mem_free(AG_MEM_FAST) >=
+           bytes + 16u + AG_LOADER_HEAP_CODE_FLOOR + ag_proc_kept_internal();
+}
+
+static ag_err_t place_heap(const ag_axe_header_t *header, ag_loaded_app_t *out)
+{
+    const bool   contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
+    const size_t code_bytes =
+        contiguous ? (size_t)header->code.size + header->data.size +
+                         AG_APP_GUARD_BYTES
+                   : (size_t)header->code.size;
+
+    void *raw = NULL;
+    void *writable = NULL;
+    void *code = ag_port_execmem_alloc(code_bytes, &writable, &raw);
+    if (code == NULL) {
+        return -AG_ENOMEM;
+    }
+    const ag_err_t err = place_data(header, out, code, code_bytes);
+    if (err != AG_OK) {
+        ag_port_execmem_free(raw);
+        return err;
+    }
+    /* Filled through the data bus, run through the instruction bus. */
+    out->place.code_writable = writable;
+    out->code_heap = raw;
     return AG_OK;
 }
 
@@ -796,6 +870,12 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
         /* place_arena says which of its two allocations failed; there is no
          * one sentence that covers both, and guessing produced the wrong one. */
         return place_arena(header, out);
+    }
+
+    /* Internal SRAM the program can have for as long as it runs - before the
+     * PSRAM arena and flash, both of which are slower to run from. */
+    if (!want_xip && heap_code_room(want) && place_heap(header, out) == AG_OK) {
+        return AG_OK;
     }
 
 #if defined(CONFIG_ARGON_APP_ARENA_PSRAM)

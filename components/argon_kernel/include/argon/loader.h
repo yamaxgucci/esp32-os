@@ -66,6 +66,13 @@ typedef struct {
      * release, and the whole-arena mapping stays for the next image.
      */
     bool  code_from_psram;
+
+    /*
+     * Code in a block of the internal heap rather than the link-time arena
+     * (ag_port_execmem_alloc): what to hand back to the heap on release.
+     * place.code is inside it, rounded up to 16.  NULL otherwise.
+     */
+    void *code_heap;
 } ag_loaded_app_t;
 
 /*

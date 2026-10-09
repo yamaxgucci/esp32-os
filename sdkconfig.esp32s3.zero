@@ -29,7 +29,8 @@ CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 
 # The code arena is internal SRAM, so it stays small: 192 KB here overflowed
 # DRAM once PSRAM's own management took its share.  It was 64 KB until 8 Oct
-# 2026; now 16 KB with a PSRAM arena behind it - see the end of this file.
+# 2026; now 16 KB for the drivers, and a program that does not fit takes its
+# code from the internal heap while it runs - see the end of this file.
 
 # No host helper: H: is the emulator's, and on this board UART1 is the wire to
 # the C3.  Left on, HostFS opened it at 115200 for three seconds after boot,
@@ -73,8 +74,11 @@ CONFIG_ARGON_DEV_MAX=56
 # which this chip can execute from.
 #
 # So IDF code that is never called with the flash cache off goes to flash, and
-# the arena keeps 16 KB internal (every .SYS on this board fits) with 256 KB of
-# PSRAM behind it.  Same code, same card, NODELINK loaded both times:
+# the arena keeps 16 KB internal (every .SYS on this board fits).  A program
+# whose code does not fit there takes it from the internal heap for as long as
+# it runs (loader.c, place_heap, 9 Oct) - not from the 256 KB PSRAM arena,
+# which is for when the heap cannot spare it.  Same code, same card, NODELINK
+# loaded both times:
 #
 #   heap total 201 -> 304 KB, free 105 -> 208 KB (with the ROM flash driver,
 #   8 KB less IRAM than what is below - see SPI_FLASH_ROM_IMPL)

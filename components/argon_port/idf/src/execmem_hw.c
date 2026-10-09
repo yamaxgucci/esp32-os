@@ -160,3 +160,63 @@ void ag_port_execmem_sync(void *writable, size_t bytes)
 void ag_port_execmem_unmap(ag_port_map_t h) { (void)h; }
 
 #endif /* CONFIG_SPIRAM */
+
+/*
+ * CODE FROM THE INTERNAL HEAP (9 Oct 2026).
+ *
+ * On the S3 instruction RAM and data RAM are one SRAM seen through two buses,
+ * and with memory protection off IDF's heap hands out a block of it as code:
+ * heap_caps_malloc(MALLOC_CAP_EXEC) returns the instruction-bus address, and
+ * heap_caps_free takes it back.  The loader used to reserve a fixed arena at
+ * link time for this, held whether a program ran or not; this is the same
+ * memory asked for when a program loads and given back when it ends.
+ *
+ * MALLOC_CAP_RETENTION is there to exclude RTC fast memory, which also says
+ * EXEC but sits on a slow bus: of the regions that can execute, only the
+ * D/IRAM carries it.  The block is over-allocated by 16 because the heap's
+ * EXEC path returns a word past the start (it keeps the data-bus address
+ * there), and the loader wants code 16-aligned.
+ *
+ * The loader writes through the data-bus alias of the block and the code runs
+ * through the instruction-bus one.  Writing through the instruction bus works
+ * too - the link-time arena has always been filled that way - but stores there
+ * are half the speed: 40 KB took 400-460 us against 215 us through the data
+ * bus, measured on the S3-Zero (9 Oct 2026).
+ */
+#if CONFIG_IDF_TARGET_ESP32S3 && !CONFIG_ESP_SYSTEM_MEMPROT_FEATURE
+#include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
+
+void *ag_port_execmem_alloc(size_t bytes, void **writable, void **raw)
+{
+    *writable = NULL;
+    *raw = NULL;
+    void *p = heap_caps_malloc(bytes + 16u, MALLOC_CAP_EXEC | MALLOC_CAP_RETENTION);
+    if (p == NULL) {
+        return NULL;
+    }
+    if (!esp_ptr_in_diram_iram(p)) {
+        heap_caps_free(p);
+        return NULL;
+    }
+    *raw = p;
+    void *const exec = (void *)(((uintptr_t)p + 15u) & ~(uintptr_t)15u);
+    *writable = esp_ptr_diram_iram_to_dram(exec);
+    return exec;
+}
+
+void ag_port_execmem_free(void *raw) { heap_caps_free(raw); }
+
+#else /* other chips: not tried, so not offered */
+
+void *ag_port_execmem_alloc(size_t bytes, void **writable, void **raw)
+{
+    (void)bytes;
+    *writable = NULL;
+    *raw = NULL;
+    return NULL;
+}
+
+void ag_port_execmem_free(void *raw) { (void)raw; }
+
+#endif

@@ -21,8 +21,6 @@
 #include <argon/port/time.h>
 #include <argon/port/place.h>
 
-#include "proc/proc_internal.h"
-
 #define NC_CHAN 8u
 
 /* How long a frame may sit waiting for room in the link's window. */
@@ -1159,11 +1157,9 @@ ag_err_t ag_nodeclu_start(void)
     if (s_task == NULL) {
         /* Below applications, like every other task this file's neighbours
          * create: a board serving somebody else's job must not stop answering
-         * its own user.  And in PSRAM where there is some, like the
-         * standing request worker: it waits for jobs for the life of the
-         * board and is in no hurry when one comes (8 Oct 2026). */
-        if (!ag_proc_task_create_slow(serve_task, "nodeclu", 4096, NULL, 1,
-                                      AG_PORT_ANY_CORE, &s_task)) {
+         * its own user. */
+        if (!ag_port_task_create(serve_task, "nodeclu", 4096, NULL, 1,
+                                 AG_PORT_ANY_CORE, 0, &s_task)) {
             ag_linkprov_unlisten(NC_CHAN);
             return -AG_ENOMEM;
         }
