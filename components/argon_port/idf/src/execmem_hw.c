@@ -207,6 +207,46 @@ void *ag_port_execmem_alloc(size_t bytes, void **writable, void **raw)
 
 void ag_port_execmem_free(void *raw) { heap_caps_free(raw); }
 
+bool ag_port_execmem_from_data(void) { return true; }
+
+#elif CONFIG_IDF_TARGET_ESP32
+/*
+ * The original ESP32 (9 Oct 2026, the CYD): what IDF leaves of the 128 KB of
+ * instruction RAM goes to the heap as its own region - 66 KB on the CYD,
+ * "heap_init: At 4008F770 len 00010890 (66 KiB): IRAM" - which nothing but
+ * code can use: it takes 32-bit accesses only.  So a program's code can run
+ * from there instead of from flash, and it costs no data memory at all.
+ *
+ * Only that region.  The D/IRAM above it also says EXEC, but it is data RAM
+ * seen backwards through the instruction bus, and on this board data RAM is
+ * what everything else is short of.  Written through the address it runs from,
+ * in 32-bit words, as the link-time arena in the same memory always was.
+ */
+#include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
+
+void *ag_port_execmem_alloc(size_t bytes, void **writable, void **raw)
+{
+    *writable = NULL;
+    *raw = NULL;
+    void *p = heap_caps_malloc(bytes + 16u, MALLOC_CAP_EXEC | MALLOC_CAP_32BIT);
+    if (p == NULL) {
+        return NULL;
+    }
+    if (!esp_ptr_in_iram(p) || esp_ptr_in_diram_iram(p)) {
+        heap_caps_free(p);
+        return NULL;
+    }
+    *raw = p;
+    void *const exec = (void *)(((uintptr_t)p + 15u) & ~(uintptr_t)15u);
+    *writable = exec;
+    return exec;
+}
+
+void ag_port_execmem_free(void *raw) { heap_caps_free(raw); }
+
+bool ag_port_execmem_from_data(void) { return false; }
+
 #else /* other chips: not tried, so not offered */
 
 void *ag_port_execmem_alloc(size_t bytes, void **writable, void **raw)
@@ -218,5 +258,7 @@ void *ag_port_execmem_alloc(size_t bytes, void **writable, void **raw)
 }
 
 void ag_port_execmem_free(void *raw) { (void)raw; }
+
+bool ag_port_execmem_from_data(void) { return true; }
 
 #endif

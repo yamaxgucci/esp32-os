@@ -521,6 +521,11 @@ static ag_err_t place_data(const ag_axe_header_t *header, ag_loaded_app_t *out,
 
 static bool heap_code_room(size_t bytes)
 {
+    /* The ESP32's instruction RAM is nobody's data memory: the heap's own
+     * answer is the only one that matters there. */
+    if (!ag_port_execmem_from_data()) {
+        return true;
+    }
     return ag_port_mem_free(AG_MEM_FAST) >=
            bytes + 16u + AG_LOADER_HEAP_CODE_FLOOR + ag_proc_kept_internal();
 }
@@ -528,6 +533,11 @@ static bool heap_code_room(size_t bytes)
 static ag_err_t place_heap(const ag_axe_header_t *header, ag_loaded_app_t *out)
 {
     const bool   contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
+    /* A contiguous image's data lives in the code block, and the ESP32's
+     * instruction RAM takes no byte stores. */
+    if (contiguous && !ag_port_execmem_from_data()) {
+        return -AG_ENOTSUP;
+    }
     const size_t code_bytes =
         contiguous ? (size_t)header->code.size + header->data.size +
                          AG_APP_GUARD_BYTES

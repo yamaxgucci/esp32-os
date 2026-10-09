@@ -47,6 +47,7 @@
 #ifndef ARGON_PORT_EXECMEM_H
 #define ARGON_PORT_EXECMEM_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -59,5 +60,8 @@ void     ag_port_execmem_sync(void *writable, size_t bytes);
 void     ag_port_execmem_unmap(ag_port_map_t h);
 void    *ag_port_execmem_alloc(size_t bytes, void **writable, void **raw);
 void     ag_port_execmem_free(void *raw);
+/* Does that executable memory come out of the data memory everything else
+ * uses (the S3's one SRAM), or is it its own (the ESP32's instruction RAM)? */
+bool     ag_port_execmem_from_data(void);
 
 #endif /* ARGON_PORT_EXECMEM_H */
