@@ -18,6 +18,18 @@
 CONFIG_ARGON_ENABLE_NET=y
 CONFIG_ARGON_NET_WIFI=y
 
+# The point hands out addresses and names itself the way out, so a phone on it
+# checks whether there is a way out and, finding none, goes back to its mobile
+# data - at which point the pedal's own address stops existing for the browser.
+# Measured: an independent client (a laptop) fetches the page from this point
+# perfectly, at full power and at 2 dBm; the phone never sends a packet.
+#
+# So the point tells the truth instead: what the board has as a station it
+# passes on.  Forwarding plus address translation, which is lwIP's own and
+# costs flash rather than the instruction RAM this target is short of.
+CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_IPV4_NAPT=y
+
 # The arena, cut to what is left once the radio has taken its share.  It is
 # still worth having: a smaller .AXE - the file manager, the console tools -
 # runs from RAM, and only the big ones fall back to flash.

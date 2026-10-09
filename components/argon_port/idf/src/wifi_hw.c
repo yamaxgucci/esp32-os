@@ -142,6 +142,86 @@ ag_err_t ag_port_wifi_tx_power_get(int *quarter_dbm)
     return AG_OK;
 }
 
+#if defined(CONFIG_LWIP_IPV4_NAPT) && CONFIG_LWIP_IPV4_NAPT
+/* True once the point is translating, so it is not set up twice. */
+static bool s_sharing;
+
+/*
+ * What the board reaches as a station, its own clients reach through it.
+ *
+ * A point that hands out addresses and names itself the gateway is promising a
+ * way out.  Without this there is none: a phone checks, finds the promise
+ * empty, and goes back to its mobile data - and the board's own address stops
+ * existing for that phone's browser, which is exactly the fault this was
+ * written for.  A laptop, which does not care about the promise, could fetch
+ * the page from the same point at the same moment.
+ *
+ * Two halves, and both are needed.  The translation is what lets a packet from
+ * 192.168.4.x leave by the station; the name server is what lets the client
+ * ask for a host at all, and a client with a gateway and no resolver looks
+ * exactly as broken as one with neither.  The DHCP server has to be stopped to
+ * be told, so this runs when the station's address arrives rather than on
+ * every packet.
+ */
+static void share_the_way_out(void)
+{
+    if (s_ap_netif == NULL || s_sta_netif == NULL || s_sharing) {
+        return;
+    }
+    esp_netif_ip_info_t sta;
+    if (esp_netif_get_ip_info(s_sta_netif, &sta) != ESP_OK || sta.ip.addr == 0) {
+        return; /* nothing to share yet */
+    }
+
+    esp_netif_dns_info_t dns;
+    memset(&dns, 0, sizeof(dns));
+    if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
+        dns.ip.u_addr.ip4.addr != 0) {
+        uint8_t offer = 1; /* DHCP option 6, the resolver, to the clients */
+        (void)esp_netif_dhcps_stop(s_ap_netif);
+        (void)esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+        (void)esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
+                                     ESP_NETIF_DOMAIN_NAME_SERVER, &offer,
+                                     sizeof(offer));
+        (void)esp_netif_dhcps_start(s_ap_netif);
+    }
+
+    const esp_err_t err = esp_netif_napt_enable(s_ap_netif);
+    if (err != ESP_OK) {
+        ESP_LOGW("wifi.ap", "no way out for the point's clients (%d)",
+                 (int)err);
+        return;
+    }
+    s_sharing = true;
+    ESP_LOGW("wifi.ap", "the point passes traffic on through %u.%u.%u.%u",
+             (unsigned)(sta.ip.addr & 0xffu),
+             (unsigned)((sta.ip.addr >> 8) & 0xffu),
+             (unsigned)((sta.ip.addr >> 16) & 0xffu),
+             (unsigned)((sta.ip.addr >> 24) & 0xffu));
+}
+
+static void stop_sharing(void)
+{
+    if (s_sharing && s_ap_netif != NULL) {
+        (void)esp_netif_napt_disable(s_ap_netif);
+    }
+    s_sharing = false;
+}
+#else
+static void share_the_way_out(void) {}
+static void stop_sharing(void) {}
+#endif
+
+static void on_sta_got_ip(void *arg, esp_event_base_t base, int32_t id,
+                          void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)id;
+    (void)data;
+    share_the_way_out();
+}
+
 static esp_err_t apply_mode(void) { return esp_wifi_set_mode(desired_mode()); }
 
 /*
@@ -329,6 +409,12 @@ ag_err_t ag_port_wifi_start(void)
 
     (void)esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                      &on_wifi_event, NULL);
+    /*
+     * The station's address is what the point has to share, so the point's
+     * side of that is set up when it arrives - see share_the_way_out.
+     */
+    (void)esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                     &on_sta_got_ip, NULL);
 
     /*
      * The calibration data and the last network live in NVS by default.  The
@@ -758,6 +844,11 @@ ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
         (void)esp_wifi_set_max_tx_power((int8_t)s_ap_tx_qdbm);
     }
 
+    /* If the station was already joined when the point came up, its clients
+     * can be given the way out at once rather than waiting for an address
+     * that has already arrived. */
+    share_the_way_out();
+
     snprintf(s_ap_ssid, sizeof(s_ap_ssid), "%s", ssid);
     snprintf(s_ap_pass, sizeof(s_ap_pass), "%s", secured ? pass : "");
     s_ap_channel = cfg.ap.channel;
@@ -792,6 +883,7 @@ ag_err_t ag_port_wifi_ap_stop(void)
         return AG_OK;
     }
     s_ap_on = false;
+    stop_sharing(); /* before the interface it was translating for goes */
     (void)apply_mode(); /* back to station-only, or station if one is joined */
 
     if (s_ap_netif != NULL) {
