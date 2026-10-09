@@ -374,6 +374,11 @@ const st = {
   dirtyRows: new Set(),
   pendingNonce: null,   /* a challenge waiting on a password being typed */
   lastBand: -1e9,       /* when a band of pixels last arrived; see showText */
+  /*
+   * "pix" or "text" when the board says which screen is in front (geometry
+   * flags, ABI 0.68), null when it does not and the page has to guess.
+   */
+  boardSays: null,
 };
 
 /* Drawn at three times the console's own cell, which is where a phone's pixel
@@ -443,8 +448,24 @@ function flushRows() {
  * the mode switch below, which returns early when the mode has not changed and
  * so never ran at all for a board that started in text and stayed there.
  */
+/*
+ * The board's word, when it gives one.  An application holding the screen is
+ * the picture whether or not it has drawn lately - a still panel sends nothing
+ * for as long as nothing changes - and the console is the console even on a
+ * board where it arrives as pixels.  Guessing by time took a still picture away
+ * after two seconds, under a program that was running and holding the screen.
+ */
+function setMode(m) {
+  ui.splash.hidden = true;
+  if (st.mode === m) return;
+  st.mode = m;
+  ui.pix.hidden = (m !== "pix");
+  ui.text.hidden = (m === "pix");
+}
+
 function showText() {
   ui.splash.hidden = true;
+  if (st.boardSays) { setMode(st.boardSays); return; }
   /*
    * Not while a picture is live.  See the note above showPixels: rows keep
    * arriving under an application that owns the screen - the repair sweep
@@ -471,6 +492,7 @@ function showText() {
 function showPixels() {
   ui.splash.hidden = true;
   st.lastBand = performance.now();
+  if (st.boardSays) { setMode(st.boardSays); return; }
   if (st.mode === "pix") return;
   st.mode = "pix";
   ui.text.hidden = true;
@@ -738,6 +760,13 @@ function onMessage(v) {
       st.cols = cols; st.rows = rows; resizeText();
     }
     if (st.surfW && st.surfH) resizePix(st.surfW, st.surfH);
+    /* Flags: 1 console offered, 4 the board says which screen is in front,
+     * and 2 is then "an application holds it". */
+    const flags = v.byteLength > 9 ? v.getUint8(9) : 0;
+    if (flags & 4) {
+      st.boardSays = (flags & 2) ? "pix" : "text";
+      setMode(st.boardSays);
+    }
     return;
   }
 

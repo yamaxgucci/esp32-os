@@ -892,6 +892,30 @@ static const ag_time_api_t k_time = {
  * carry them.  Anything that draws its own screen - a file manager, an editor -
  * needs this rather than that.
  */
+/*
+ * One event from the console, if this process still has the keyboard when it
+ * arrives.
+ *
+ * A process waits inside ag_console_read_event for as long as it asked to, and
+ * the keyboard can move to another slot while it is in there.  What arrives
+ * next is then the new slot's, not this process's - and the first thing a slot
+ * switch sends is the QUIT that wakes the shell it lands on.  Taken by the
+ * application it left, that QUIT closed the application: the amplifier on the
+ * Audio Kit exited on Alt+2, "returned 0", for no reason it had.  So an event
+ * read after the keyboard has gone goes back for whoever has it now.
+ */
+static bool read_own_event(ag_event_t *out, uint32_t timeout_ms)
+{
+    if (!ag_console_read_event(out, timeout_ms)) {
+        return false;
+    }
+    if (has_the_keyboard()) {
+        return true;
+    }
+    (void)ag_console_inject_event(out);
+    return false;
+}
+
 static bool api_inp_poll(ag_event_t *out, uint32_t timeout_ms)
 {
     if (ag_proc_take_focus_event(out)) {
@@ -914,12 +938,12 @@ static bool api_inp_poll(ag_event_t *out, uint32_t timeout_ms)
                 return true;
             }
             if (has_the_keyboard()) {
-                return ag_console_read_event(out, left);
+                return read_own_event(out, left);
             }
         }
         return false;
     }
-    return ag_console_read_event(out, timeout_ms);
+    return read_own_event(out, timeout_ms);
 }
 
 static void api_inp_flush(void) { ag_console_flush_input(); }

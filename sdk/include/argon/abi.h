@@ -451,9 +451,15 @@ extern "C" {
  *      Background written this way takes the wire's idle time and nothing
  *      else, so a picture behind it waits for one block of it, not a window.
  *      A flag an older driver never sets; nothing moves.
+ *
+ * 0.68 appended ag_display_ops_t::held: the kernel tells each display driver
+ *      when an application takes the screen and when it lets it go, so a
+ *      screen at the end of a wire says "picture" or "console" from the board
+ *      instead of guessing from traffic.  Optional; NULL is the old behaviour.
+ *      Numbered past worktree-cluster's 0.67, which is not in main yet.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 66u
+#define AG_ABI_MINOR 68u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1331,6 +1337,25 @@ typedef struct ag_display_ops {
      * same tick, and under the same rule as those - it must not print.
      */
     void (*text_scroll)(ag_handle_t h, uint16_t lines);
+
+    /*
+     * ABI 0.68: an application has taken the screen (true) or let it go
+     * (false).
+     *
+     * A driver that only ever sees rectangles cannot tell an application's
+     * picture from the console's: on a board with a framebuffer the console
+     * reaches it as rectangles too.  A remote screen then has to guess which
+     * one is in front, and guessing by time - "no picture for two seconds, so
+     * it must be the console" - takes a still picture away from whoever is
+     * looking at it.  Measured on the Audio Kit: the amplifier's panel showed
+     * for two seconds and then turned into the console, while the amplifier
+     * was running and holding the screen.
+     *
+     * Called with `h` zero from the task that acquired or released, after the
+     * kernel's own state has changed.  Under the same rule as blit_rect: it
+     * must not print and must not wait.
+     */
+    void (*held)(ag_handle_t h, bool held);
 } ag_display_ops_t;
 
 /* ------------------------------------------------------------------------ */

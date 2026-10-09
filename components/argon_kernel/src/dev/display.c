@@ -74,10 +74,10 @@ static uint16_t *s_draw;  /* s_back while acquired with DB, else front */
  * 320 KB of SRAM in total - and where the applications that want the screen
  * want it in their own shape anyway.
  *
- * s_front stays NULL, which is what makes this safe rather than delicate: every
- * drawing primitive goes through draw_surf() and every one of them refuses a
- * surface whose pixels are NULL, so the whole soft renderer becomes a no-op
- * without a single extra test.
+ * s_front stays NULL.  The soft primitives used to draw nothing here; since
+ * 8 Oct 2026 they are written into a list and played back a strip at a time
+ * on flush, straight to the drivers (br_render), so an application made of
+ * rectangles and text has a picture with no frame anywhere on the board.
  */
 static bool s_surfaceless;
 /* Said once per acquire; see the surfaceless branch of gfx_flush. */
@@ -137,6 +137,46 @@ static size_t fb_bytes(void)
  * gives: the driver is loadable and a remembered pointer outlives it by
  * exactly one frame.
  */
+/* The display drivers that take rectangles, one entry per table; see the
+ * walk in driver_present_blit for why it is locked and the calls are not. */
+static unsigned collect_drivers(const ag_display_ops_t *ops[AG_DISPLAY_MAX])
+{
+    unsigned n = 0;
+
+    ag_dev_lock_hold();
+    for (uint32_t i = 0; n < AG_DISPLAY_MAX; i++) {
+        ag_devinfo_t info;
+        if (ag_dev_info(i, AG_DEV_DISPLAY, &info) != AG_OK) {
+            break;
+        }
+        ag_device_t *dev = ag_dev_find(info.name);
+        if (dev == NULL || dev->class_ops == NULL) {
+            continue;
+        }
+        const ag_display_ops_t *o = (const ag_display_ops_t *)dev->class_ops;
+        if (!AG_HAS(o, blit_rect) || o->blit_rect == NULL) {
+            continue;
+        }
+        /*
+         * ONE TABLE, ONE SCREEN.  blit_rect is called with a zero handle, so
+         * a table several devices share cannot tell them apart and draws
+         * wherever it draws - the neighbours' screens do (noderdev.c
+         * pick_display).  Called once per device, a C3 with two neighbours
+         * sent every band to the CYD twice.
+         */
+        bool seen = false;
+        for (unsigned k = 0; k < n; k++) {
+            seen = seen || (ops[k] == o);
+        }
+        if (seen) {
+            continue;
+        }
+        ops[n++] = o;
+    }
+    ag_dev_lock_release();
+    return n;
+}
+
 /*
  * Hand one rectangle of pixels to whichever display driver can show them.
  *
@@ -171,39 +211,7 @@ static void driver_present_blit(const ag_blit_t *b)
      * under a blit.  So the walk is locked and the writes are not.
      */
     const ag_display_ops_t *ops[AG_DISPLAY_MAX];
-    unsigned n = 0;
-
-    ag_dev_lock_hold();
-    for (uint32_t i = 0; n < AG_DISPLAY_MAX; i++) {
-        ag_devinfo_t info;
-        if (ag_dev_info(i, AG_DEV_DISPLAY, &info) != AG_OK) {
-            break;
-        }
-        ag_device_t *dev = ag_dev_find(info.name);
-        if (dev == NULL || dev->class_ops == NULL) {
-            continue;
-        }
-        const ag_display_ops_t *o = (const ag_display_ops_t *)dev->class_ops;
-        if (!AG_HAS(o, blit_rect) || o->blit_rect == NULL) {
-            continue;
-        }
-        /*
-         * ONE TABLE, ONE SCREEN.  blit_rect is called with a zero handle, so
-         * a table several devices share cannot tell them apart and draws
-         * wherever it draws - the neighbours' screens do (noderdev.c
-         * pick_display).  Called once per device, a C3 with two neighbours
-         * sent every band to the CYD twice.
-         */
-        bool seen = false;
-        for (unsigned k = 0; k < n; k++) {
-            seen = seen || (ops[k] == o);
-        }
-        if (seen) {
-            continue;
-        }
-        ops[n++] = o;
-    }
-    ag_dev_lock_release();
+    const unsigned n = collect_drivers(ops);
 
     /* The blit lock, not the registry lock: it carries the same "system is
      * writing" signal to the pin layer but is not the lock audio and the
@@ -220,6 +228,22 @@ static void driver_present_blit(const ag_blit_t *b)
         ops[k]->blit_rect(0, b);
     }
     ag_dev_blit_release();
+}
+
+/*
+ * Tell every display driver that an application has taken the screen or let
+ * it go (ABI 0.68, ag_display_ops_t::held).  Walked the same way as a blit,
+ * and called without the registry held for the same reason.
+ */
+static void drivers_held(bool held)
+{
+    const ag_display_ops_t *ops[AG_DISPLAY_MAX];
+    const unsigned n = collect_drivers(ops);
+    for (unsigned k = 0; k < n; k++) {
+        if (AG_HAS(ops[k], held) && ops[k]->held != NULL) {
+            ops[k]->held(0, held);
+        }
+    }
 }
 
 /* The panel's own size, for a system that has no surface of its own to size. */
@@ -435,6 +459,462 @@ static void draw_glyph(int32_t x, int32_t y, uint8_t ch, uint16_t fg, uint16_t b
 {
     ag_draw_surf_t s = draw_surf();
     ag_draw_glyph8x16(&s, x, y, ag_font8x16[ch], fg, bg, 0);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Drawing with no surface: a list, played back a few rows at a time       */
+/* ---------------------------------------------------------------------- */
+/*
+ * On a display with no framebuffer (`[display] driver = panel`) the soft
+ * primitives used to draw into nothing: every one of them refused a NULL
+ * surface, so an application made of rectangles and text - the amplifier's
+ * panel, the desktop - showed nothing at all on a board that could not spare
+ * the 150 KB a 320x240 frame costs.  Only an application that rendered into
+ * its own memory and handed it over (gfx->present) had a picture.
+ *
+ * Now the primitives are written down instead, and `flush` plays them back
+ * over the rectangle it names, a strip of a few rows at a time, each strip
+ * handed to the display drivers the moment it is drawn.  No frame exists
+ * anywhere on the board: the screen at the other end is what assembles one -
+ * the phone's page keeps every band on its canvas, a panel keeps its own GRAM.
+ * What this costs is the list (a few kilobytes) and one strip.
+ *
+ * It relies on what flush has always meant: "this rectangle is what I drew".
+ * A pixel inside it that nothing in the list paints goes out black, because
+ * there is no older picture here to take it from.  An application that fills
+ * the background of what it redraws - every one in the tree does, it is how
+ * dirty rectangles are drawn - never sees that.
+ *
+ * Played back in order, so overlaps stack exactly as they would have in a
+ * framebuffer, and each operation keeps the clip that was in force when it was
+ * made.  A blit keeps its source POINTER, not the pixels: the source has to
+ * be alive until the flush, which an application that draws a frame and then
+ * flushes it is.  The list is emptied by every flush.
+ */
+enum {
+    BR_FILL = 1,
+    BR_STROKE_RECT,
+    BR_RRECT,
+    BR_PIXEL,
+    BR_LINE,
+    BR_CIRCLE,
+    BR_FCIRCLE,
+    BR_CONVEX_FILL,
+    BR_CONVEX_STROKE,
+    BR_TEXT,
+    BR_BLIT,
+    BR_ARGB,
+    BR_SCALED,
+    BR_TILED,
+    BR_TEX,
+};
+
+typedef struct {
+    uint8_t     op;
+    uint8_t     pad;
+    uint16_t    size; /* of this record with its tail, a multiple of 4 */
+    int16_t     bx, by, bw, bh; /* what it can touch, inside its clip      */
+    int16_t     cx, cy;         /* the clip it was made under              */
+    uint16_t    cw, ch;
+    int32_t     a[10];
+    const void *src;
+    /* then the tail: points, vertices or a string */
+} br_rec_t;
+
+#define BR_LIST_BYTES   8192u
+#define BR_LIST_MIN     2048u
+#define BR_STRIP_BYTES  4096u
+#define BR_TEXT_MAX     160u
+
+static uint8_t  *s_br_list;
+static uint32_t  s_br_cap;
+static uint32_t  s_br_len;
+static uint16_t *s_br_strip;
+static uint16_t  s_br_rows;
+static uint32_t  s_br_lost;   /* operations that did not fit, this list  */
+static bool      s_br_moaned;
+
+static bool br_on(void) { return s_surfaceless && s_br_list != NULL; }
+
+static void br_free(void)
+{
+    if (s_br_list != NULL) {
+        ag_port_free(s_br_list);
+    }
+    if (s_br_strip != NULL) {
+        ag_port_free(s_br_strip);
+    }
+    s_br_list = NULL;
+    s_br_strip = NULL;
+    s_br_cap = 0;
+    s_br_len = 0;
+}
+
+static void *br_alloc(size_t bytes)
+{
+    void *p = ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+    if (p == NULL) {
+        p = ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    return p;
+}
+
+/* Taken at acquire, given back at release: nothing is held while no
+ * application has the screen. */
+static void br_take(void)
+{
+    br_free();
+    if (s_w == 0 || s_h == 0) {
+        return;
+    }
+    uint32_t rows = BR_STRIP_BYTES / ((uint32_t)s_w * sizeof(uint16_t));
+    if (rows == 0) {
+        rows = 1;
+    }
+    if (rows > 16u) {
+        rows = 16u;
+    }
+    s_br_strip = (uint16_t *)br_alloc((size_t)s_w * rows * sizeof(uint16_t));
+    uint32_t cap = BR_LIST_BYTES;
+    while (s_br_strip != NULL && s_br_list == NULL && cap >= BR_LIST_MIN) {
+        s_br_list = (uint8_t *)br_alloc(cap);
+        if (s_br_list == NULL) {
+            cap /= 2u;
+        }
+    }
+    if (s_br_strip == NULL || s_br_list == NULL) {
+        ag_log(AG_LOG_WARN, "display",
+               "no memory to draw without a surface (%u-byte strip, a "
+               "%u-byte list); primitives will draw nothing",
+               (unsigned)((uint32_t)s_w * rows * 2u), (unsigned)BR_LIST_MIN);
+        br_free();
+        return;
+    }
+    s_br_rows = (uint16_t)rows;
+    s_br_cap = cap;
+    s_br_len = 0;
+    s_br_lost = 0;
+    s_br_moaned = false;
+}
+
+/* Intersect [x,x+w) x [y,y+h) with the surface and the current clip, into the
+ * record.  False when nothing of it can show. */
+static bool br_bound(br_rec_t *r, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    int32_t x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+    int32_t cx0 = 0, cy0 = 0, cx1 = (int32_t)s_w, cy1 = (int32_t)s_h;
+    if (s_clip_w != 0 && s_clip_h != 0) {
+        if (s_clip_x > cx0) {
+            cx0 = s_clip_x;
+        }
+        if (s_clip_y > cy0) {
+            cy0 = s_clip_y;
+        }
+        if ((int32_t)s_clip_x + (int32_t)s_clip_w < cx1) {
+            cx1 = (int32_t)s_clip_x + (int32_t)s_clip_w;
+        }
+        if ((int32_t)s_clip_y + (int32_t)s_clip_h < cy1) {
+            cy1 = (int32_t)s_clip_y + (int32_t)s_clip_h;
+        }
+    }
+    if (cx1 <= cx0 || cy1 <= cy0) {
+        return false;
+    }
+    r->cx = (int16_t)cx0;
+    r->cy = (int16_t)cy0;
+    r->cw = (uint16_t)(cx1 - cx0);
+    r->ch = (uint16_t)(cy1 - cy0);
+    if (x0 < cx0) {
+        x0 = cx0;
+    }
+    if (y0 < cy0) {
+        y0 = cy0;
+    }
+    if (x1 > cx1) {
+        x1 = cx1;
+    }
+    if (y1 > cy1) {
+        y1 = cy1;
+    }
+    if (x1 <= x0 || y1 <= y0) {
+        return false;
+    }
+    r->bx = (int16_t)x0;
+    r->by = (int16_t)y0;
+    r->bw = (int16_t)(x1 - x0);
+    r->bh = (int16_t)(y1 - y0);
+    return true;
+}
+
+/*
+ * Room for one record with `tail` bytes after it, or NULL.  A full list is
+ * not a reason to draw early - there is no rectangle to draw it over yet - so
+ * the operation is dropped and counted, and the flush says so once.
+ */
+static br_rec_t *br_new(uint8_t op, uint32_t tail)
+{
+    const uint32_t size = ((uint32_t)sizeof(br_rec_t) + tail + 3u) & ~3u;
+    if (s_br_len + size > s_br_cap) {
+        s_br_lost++;
+        return NULL;
+    }
+    br_rec_t *r = (br_rec_t *)(void *)(s_br_list + s_br_len);
+    memset(r, 0, sizeof(*r));
+    r->op = op;
+    r->size = (uint16_t)size;
+    return r;
+}
+
+static void br_commit(br_rec_t *r) { s_br_len += r->size; }
+
+/* The common case: an operation with only numbers, bounded by a box. */
+static void br_add(uint8_t op, int32_t bx, int32_t by, int32_t bw, int32_t bh,
+                   const int32_t *a, int n, const void *src)
+{
+    br_rec_t *r = br_new(op, 0);
+    if (r == NULL) {
+        return;
+    }
+    if (!br_bound(r, bx, by, bw, bh)) {
+        return; /* not committed: it cannot show */
+    }
+    for (int i = 0; i < n && i < 10; i++) {
+        r->a[i] = a[i];
+    }
+    r->src = src;
+    br_commit(r);
+}
+
+static void br_add_points(uint8_t op, const ag_point_t *pts, int n,
+                          uint16_t c565)
+{
+    if (pts == NULL || n < 2 || n > AG_POLY_MAX_VERTS) {
+        return;
+    }
+    int32_t x0 = pts[0].x, y0 = pts[0].y, x1 = pts[0].x, y1 = pts[0].y;
+    for (int i = 1; i < n; i++) {
+        x0 = (pts[i].x < x0) ? pts[i].x : x0;
+        y0 = (pts[i].y < y0) ? pts[i].y : y0;
+        x1 = (pts[i].x > x1) ? pts[i].x : x1;
+        y1 = (pts[i].y > y1) ? pts[i].y : y1;
+    }
+    br_rec_t *r = br_new(op, (uint32_t)n * sizeof(ag_point_t));
+    if (r == NULL || !br_bound(r, x0, y0, x1 - x0 + 1, y1 - y0 + 1)) {
+        return;
+    }
+    r->a[0] = n;
+    r->a[1] = c565;
+    memcpy(r + 1, pts, (size_t)n * sizeof(ag_point_t));
+    br_commit(r);
+}
+
+/* What ag_draw_text8x16 would cover, and the advance it would return, without
+ * drawing: the same call on a surface with no pixels. */
+static int32_t br_add_text(int32_t x, int32_t y, const char *str, uint16_t fg,
+                           uint16_t bg, int trans, int32_t max_w)
+{
+    ag_draw_surf_t none = {0};
+    const int32_t adv = ag_draw_text8x16(&none, x, y, ag_font8x16, str, fg, bg,
+                                         trans, max_w);
+    uint32_t len = (uint32_t)strlen(str);
+    if (len > BR_TEXT_MAX) {
+        len = BR_TEXT_MAX;
+    }
+    int32_t lines = 1, widest = 0, cur = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        if (str[i] == '\n') {
+            if (max_w >= 0) {
+                break;
+            }
+            lines++;
+            cur = 0;
+            continue;
+        }
+        cur += 8;
+        widest = (cur > widest) ? cur : widest;
+    }
+    if (max_w >= 0 && widest > max_w) {
+        widest = max_w;
+    }
+    br_rec_t *r = br_new(BR_TEXT, len + 1u);
+    if (r != NULL && br_bound(r, x, y, widest, lines * 16)) {
+        r->a[0] = x;
+        r->a[1] = y;
+        r->a[2] = fg;
+        r->a[3] = bg;
+        r->a[4] = trans;
+        r->a[5] = max_w;
+        memcpy(r + 1, str, len);
+        ((char *)(r + 1))[len] = '\0';
+        br_commit(r);
+    }
+    return adv;
+}
+
+static void br_play(const br_rec_t *r, ag_draw_surf_t *s)
+{
+    const int32_t *a = r->a;
+    switch (r->op) {
+    case BR_FILL:
+        ag_draw_fill_rect(s, a[0], a[1], a[2], a[3], (uint16_t)a[4]);
+        break;
+    case BR_STROKE_RECT:
+        ag_draw_stroke_rect(s, a[0], a[1], a[2], a[3], (uint16_t)a[4]);
+        break;
+    case BR_RRECT:
+        ag_draw_fill_round_rect(s, a[0], a[1], a[2], a[3], a[4], (uint16_t)a[5]);
+        break;
+    case BR_PIXEL:
+        ag_draw_pixel(s, a[0], a[1], (uint16_t)a[2]);
+        break;
+    case BR_LINE:
+        ag_draw_line(s, a[0], a[1], a[2], a[3], (uint16_t)a[4]);
+        break;
+    case BR_CIRCLE:
+        ag_draw_circle(s, a[0], a[1], a[2], (uint16_t)a[3]);
+        break;
+    case BR_FCIRCLE:
+        ag_draw_fill_circle(s, a[0], a[1], a[2], (uint16_t)a[3]);
+        break;
+    case BR_CONVEX_FILL:
+        ag_draw_fill_convex(s, (const ag_point_t *)(const void *)(r + 1),
+                            (int)a[0], (uint16_t)a[1]);
+        break;
+    case BR_CONVEX_STROKE:
+        ag_draw_stroke_convex(s, (const ag_point_t *)(const void *)(r + 1),
+                              (int)a[0], (uint16_t)a[1]);
+        break;
+    case BR_TEXT:
+        (void)ag_draw_text8x16(s, a[0], a[1], ag_font8x16,
+                               (const char *)(const void *)(r + 1),
+                               (uint16_t)a[2], (uint16_t)a[3], (int)a[4], a[5]);
+        break;
+    case BR_BLIT:
+        ag_draw_blit(s, a[0], a[1], a[2], a[3], r->src, (uint32_t)a[4], (int)a[5],
+                     (int)a[6], (uint16_t)a[7]);
+        break;
+    case BR_ARGB:
+        ag_draw_blit_argb8888(s, a[0], a[1], a[2], a[3], r->src,
+                              (uint32_t)a[4]);
+        break;
+    case BR_SCALED:
+        ag_draw_blit_scaled(s, a[0], a[1], a[2], a[3], r->src, (uint32_t)a[4],
+                            a[5], a[6], a[7], a[8]);
+        break;
+    case BR_TILED:
+        ag_draw_blit_tiled(s, a[0], a[1], a[2], a[3], r->src, (uint32_t)a[4],
+                           a[5], a[6], a[7], a[8]);
+        break;
+    case BR_TEX:
+        ag_draw_fill_convex_tex(s,
+                                (const ag_draw_texvert_t *)(const void *)(r + 1),
+                                (int)a[0], r->src, (uint32_t)a[1], a[2], a[3],
+                                a[4], a[5]);
+        break;
+    default:
+        break;
+    }
+}
+
+/*
+ * Play the list back over one rectangle, a strip at a time, and hand each
+ * strip to the drivers.  The strip is the only picture memory there is.
+ */
+static void br_render(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > (int32_t)s_w) {
+        w = (int32_t)s_w - x;
+    }
+    if (y + h > (int32_t)s_h) {
+        h = (int32_t)s_h - y;
+    }
+    if (w <= 0 || h <= 0 || !s_screen_on) {
+        return;
+    }
+    for (int32_t y0 = y; y0 < y + h; y0 += s_br_rows) {
+        int32_t n = (int32_t)s_br_rows;
+        if (y0 + n > y + h) {
+            n = y + h - y0;
+        }
+        for (int32_t r = 0; r < n; r++) {
+            memset(s_br_strip + (size_t)r * s_w + x, 0,
+                   (size_t)w * sizeof(uint16_t));
+        }
+        ag_draw_surf_t surf = {
+            .pix = s_br_strip,
+            .w = s_w,
+            .h = s_h,
+            .row0 = (uint16_t)y0,
+            .rows = (uint16_t)n,
+        };
+        for (uint32_t at = 0; at < s_br_len;) {
+            const br_rec_t *rec = (const br_rec_t *)(const void *)(s_br_list + at);
+            at += rec->size;
+            /* Skip what cannot touch this strip of this rectangle. */
+            if (rec->bx >= x + w || rec->bx + rec->bw <= x || rec->by >= y0 + n ||
+                rec->by + rec->bh <= y0) {
+                continue;
+            }
+            /* Its own clip, narrowed to the strip and the rectangle - never
+             * empty here, since the box above lies inside that clip. */
+            int32_t cx0 = (rec->cx > x) ? rec->cx : x;
+            int32_t cy0 = (rec->cy > y0) ? rec->cy : y0;
+            int32_t cx1 = rec->cx + (int32_t)rec->cw;
+            int32_t cy1 = rec->cy + (int32_t)rec->ch;
+            cx1 = (cx1 < x + w) ? cx1 : x + w;
+            cy1 = (cy1 < y0 + n) ? cy1 : y0 + n;
+            if (cx1 <= cx0 || cy1 <= cy0) {
+                continue;
+            }
+            surf.clip_x = (int16_t)cx0;
+            surf.clip_y = (int16_t)cy0;
+            surf.clip_w = (uint16_t)(cx1 - cx0);
+            surf.clip_h = (uint16_t)(cy1 - cy0);
+            br_play(rec, &surf);
+        }
+        const ag_blit_t b = {
+            .px = s_br_strip + x,
+            .stride = (uint32_t)s_w * sizeof(uint16_t),
+            .surf_w = s_w,
+            .surf_h = s_h,
+            .x = (uint16_t)x,
+            .y = (uint16_t)y0,
+            .w = (uint16_t)w,
+            .h = (uint16_t)n,
+        };
+        driver_present_blit(&b);
+    }
+}
+
+/* Flush: draw what the list says over the rectangle, and start a new list. */
+static void br_flush(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (w <= 0 || h <= 0) {
+        x = 0;
+        y = 0;
+        w = (int32_t)s_w;
+        h = (int32_t)s_h;
+    }
+    if (s_br_len != 0) {
+        br_render(x, y, w, h);
+    }
+    if (s_br_lost != 0 && !s_br_moaned) {
+        s_br_moaned = true;
+        ag_log(AG_LOG_WARN, "display",
+               "%u drawing operations did not fit the %u-byte list and were "
+               "not drawn; flush more often",
+               (unsigned)s_br_lost, (unsigned)s_br_cap);
+    }
+    s_br_len = 0;
+    s_br_lost = 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -811,6 +1291,11 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
         s_draw = NULL;
         s_warned_surfaceless = false;
         s_shim_seen = false;
+        s_clip_x = 0;
+        s_clip_y = 0;
+        s_clip_w = 0;
+        s_clip_h = 0;
+        br_take(); /* the primitives draw through a list now; see br_render */
         if (out != NULL) {
             out->width = pw;
             out->height = ph;
@@ -820,6 +1305,7 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
             out->double_buf = false;
             out->direct = true;
         }
+        drivers_held(true);
         return AG_OK;
     }
 
@@ -849,6 +1335,7 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
         out->double_buf = (s_back != NULL);
         out->direct = (s_back == NULL);
     }
+    drivers_held(true);
     return AG_OK;
 }
 
@@ -868,8 +1355,10 @@ static void gfx_release(void)
            (unsigned)s_owner, (unsigned)ag_proc_self());
     if (s_surfaceless) {
         shim_kick(); /* whatever was still pending is this app's last frame */
+        br_free();   /* nothing is held while nobody has the screen */
         s_acquired = false;
         s_owner = AG_PID_KERNEL;
+        drivers_held(false);
         /* The panel still has the application's last frame on it; the console
          * takes it back the same way it does after a framebuffer app. */
         s_console_gen = 0;
@@ -889,6 +1378,7 @@ static void gfx_release(void)
     s_draw = s_front;
     s_acquired = false;
     s_owner = AG_PID_KERNEL;
+    drivers_held(false);
     s_caret_col = -1;
     s_console_gen = 0; /* force a full console redraw on the next tick */
     if (ag_console_ready()) {
@@ -910,10 +1400,10 @@ static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
      * see shim_kick - but one that does gets its whole frame in one request.
      */
     if (s_surfaceless) {
-        (void)x;
-        (void)y;
-        (void)w;
-        (void)h;
+        if (br_on()) {
+            br_flush((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h);
+            s_shim_seen = true; /* the primitives did draw, so no warning */
+        }
         /*
          * And if nothing was ever handed over, say so.
          *
@@ -945,6 +1435,14 @@ static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 static void gfx_swap(void)
 {
     if (!gfx_may_present()) {
+        return;
+    }
+    if (s_surfaceless) {
+        if (br_on()) {
+            br_flush(0, 0, 0, 0);
+            s_shim_seen = true;
+        }
+        shim_kick();
         return;
     }
     present_draw_to_front();
@@ -1016,6 +1514,12 @@ static ag_err_t gfx_present(const ag_blit_t *in)
  */
 static void gfx_clear(uint32_t color)
 {
+    if (br_on()) {
+        const int32_t a[5] = {0, 0, (int32_t)s_w, (int32_t)s_h,
+                              rgb_to_565(color)};
+        br_add(BR_FILL, 0, 0, (int32_t)s_w, (int32_t)s_h, a, 5, NULL);
+        return;
+    }
     if (s_draw == NULL) {
         return;
     }
@@ -1032,12 +1536,28 @@ static void gfx_clear(uint32_t color)
 static void gfx_fill_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,
                           uint32_t color)
 {
+    if (br_on()) {
+        const int32_t a[5] = {x, y, w, h, rgb_to_565(color)};
+        br_add(BR_FILL, x, y, w, h, a, 5, NULL);
+        return;
+    }
     fill_rect_raw(x, y, (int32_t)w, (int32_t)h, rgb_to_565(color));
 }
 
 static void gfx_blit(int16_t x, int16_t y, uint16_t w, uint16_t h,
                      const void *src, uint32_t src_stride, ag_pixfmt_t src_fmt)
 {
+    if (br_on() && src != NULL && w != 0 && h != 0) {
+        if (src_fmt == AG_PIX_ARGB8888) {
+            const int32_t a[5] = {x, y, w, h, (int32_t)src_stride};
+            br_add(BR_ARGB, x, y, w, h, a, 5, src);
+        } else if (src_fmt == AG_PIX_RGB565 || src_fmt == AG_PIX_RGB565_BE) {
+            const int32_t a[8] = {x, y, w, h, (int32_t)src_stride,
+                                  src_fmt == AG_PIX_RGB565_BE, 0, 0};
+            br_add(BR_BLIT, x, y, w, h, a, 8, src);
+        }
+        return;
+    }
     if (s_draw == NULL || src == NULL || w == 0 || h == 0) {
         return;
     }
@@ -1058,6 +1578,15 @@ static void gfx_blit_key(int16_t x, int16_t y, uint16_t w, uint16_t h,
                          const void *src, uint32_t src_stride,
                          ag_pixfmt_t src_fmt, uint32_t key_rgb)
 {
+    if (br_on() && src != NULL && w != 0 && h != 0) {
+        if (src_fmt == AG_PIX_RGB565 || src_fmt == AG_PIX_RGB565_BE) {
+            const int32_t a[8] = {x, y, w, h, (int32_t)src_stride,
+                                  src_fmt == AG_PIX_RGB565_BE, 1,
+                                  rgb_to_565(key_rgb)};
+            br_add(BR_BLIT, x, y, w, h, a, 8, src);
+        }
+        return;
+    }
     if (s_draw == NULL || src == NULL || w == 0 || h == 0) {
         return;
     }
@@ -1085,6 +1614,15 @@ static void gfx_blit_src_rect(int16_t sx, int16_t sy, uint16_t sw, uint16_t sh)
 
 static void gfx_blit_scaled(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh)
 {
+    if (br_on()) {
+        if (s_blit_src != NULL && dw != 0 && dh != 0 && s_blit_sw != 0 &&
+            s_blit_sh != 0) {
+            const int32_t a[9] = {dx, dy, dw, dh, (int32_t)s_blit_stride,
+                                  s_blit_sx, s_blit_sy, s_blit_sw, s_blit_sh};
+            br_add(BR_SCALED, dx, dy, dw, dh, a, 9, s_blit_src);
+        }
+        return;
+    }
     if (s_draw == NULL || s_blit_src == NULL || dw == 0 || dh == 0 ||
         s_blit_sw == 0 || s_blit_sh == 0) {
         return;
@@ -1097,6 +1635,15 @@ static void gfx_blit_scaled(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh)
 
 static void gfx_blit_tiled(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh)
 {
+    if (br_on()) {
+        if (s_blit_src != NULL && dw != 0 && dh != 0 && s_blit_sw != 0 &&
+            s_blit_sh != 0) {
+            const int32_t a[9] = {dx, dy, dw, dh, (int32_t)s_blit_stride,
+                                  s_blit_sx, s_blit_sy, s_blit_sw, s_blit_sh};
+            br_add(BR_TILED, dx, dy, dw, dh, a, 9, s_blit_src);
+        }
+        return;
+    }
     if (s_draw == NULL || s_blit_src == NULL || dw == 0 || dh == 0 ||
         s_blit_sw == 0 || s_blit_sh == 0) {
         return;
@@ -1109,6 +1656,13 @@ static void gfx_blit_tiled(int16_t dx, int16_t dy, uint16_t dw, uint16_t dh)
 
 static void gfx_blit_copy(int16_t x, int16_t y, uint16_t w, uint16_t h)
 {
+    if (br_on()) {
+        if (s_blit_src != NULL && w != 0 && h != 0) {
+            const int32_t a[8] = {x, y, w, h, (int32_t)s_blit_stride, 0, 0, 0};
+            br_add(BR_BLIT, x, y, w, h, a, 8, s_blit_src);
+        }
+        return;
+    }
     if (s_draw == NULL || s_blit_src == NULL || w == 0 || h == 0) {
         return;
     }
@@ -1120,6 +1674,14 @@ static void gfx_blit_copy(int16_t x, int16_t y, uint16_t w, uint16_t h)
 static void gfx_blit_keyed(int16_t x, int16_t y, uint16_t w, uint16_t h,
                            uint32_t key_rgb)
 {
+    if (br_on()) {
+        if (s_blit_src != NULL && w != 0 && h != 0) {
+            const int32_t a[8] = {x, y, w, h, (int32_t)s_blit_stride, 0, 1,
+                                  rgb_to_565(key_rgb)};
+            br_add(BR_BLIT, x, y, w, h, a, 8, s_blit_src);
+        }
+        return;
+    }
     if (s_draw == NULL || s_blit_src == NULL || w == 0 || h == 0) {
         return;
     }
@@ -1131,12 +1693,18 @@ static void gfx_blit_keyed(int16_t x, int16_t y, uint16_t w, uint16_t h,
 static int32_t gfx_text(int16_t x, int16_t y, const char *s, uint32_t fg,
                         uint32_t bg)
 {
-    if (s == NULL || s_draw == NULL) {
+    if (s == NULL) {
         return 0;
     }
     const uint16_t fgc = rgb_to_565(fg);
     const int trans = (bg == AG_GFX_TRANS);
     const uint16_t bgc = trans ? 0 : rgb_to_565(bg);
+    if (br_on()) {
+        return br_add_text(x, y, s, fgc, bgc, trans, -1);
+    }
+    if (s_draw == NULL) {
+        return 0;
+    }
     ag_draw_surf_t surf = draw_surf();
     return ag_draw_text8x16(&surf, x, y, ag_font8x16, s, fgc, bgc, trans, -1);
 }
@@ -1144,12 +1712,18 @@ static int32_t gfx_text(int16_t x, int16_t y, const char *s, uint32_t fg,
 static int32_t gfx_text_fit(int16_t x, int16_t y, uint16_t w, const char *s,
                             uint32_t fg, uint32_t bg)
 {
-    if (s == NULL || s_draw == NULL) {
+    if (s == NULL) {
         return 0;
     }
     const uint16_t fgc = rgb_to_565(fg);
     const int trans = (bg == AG_GFX_TRANS);
     const uint16_t bgc = trans ? 0 : rgb_to_565(bg);
+    if (br_on()) {
+        return br_add_text(x, y, s, fgc, bgc, trans, (int32_t)w);
+    }
+    if (s_draw == NULL) {
+        return 0;
+    }
     ag_draw_surf_t surf = draw_surf();
     return ag_draw_text8x16(&surf, x, y, ag_font8x16, s, fgc, bgc, trans,
                             (int32_t)w);
@@ -1176,6 +1750,11 @@ bool ag_display_powered(void) { return s_screen_on; }
 
 static void gfx_pixel(int16_t x, int16_t y, uint32_t color)
 {
+    if (br_on()) {
+        const int32_t a[3] = {x, y, rgb_to_565(color)};
+        br_add(BR_PIXEL, x, y, 1, 1, a, 3, NULL);
+        return;
+    }
     ag_draw_surf_t s = draw_surf();
     ag_draw_pixel(&s, x, y, rgb_to_565(color));
 }
@@ -1183,18 +1762,36 @@ static void gfx_pixel(int16_t x, int16_t y, uint32_t color)
 static void gfx_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
                      uint32_t color)
 {
+    if (br_on()) {
+        const int32_t a[5] = {x0, y0, x1, y1, rgb_to_565(color)};
+        const int32_t lx = (x0 < x1) ? x0 : x1;
+        const int32_t ly = (y0 < y1) ? y0 : y1;
+        br_add(BR_LINE, lx, ly, ((x0 < x1) ? x1 - x0 : x0 - x1) + 1,
+               ((y0 < y1) ? y1 - y0 : y0 - y1) + 1, a, 5, NULL);
+        return;
+    }
     ag_draw_surf_t s = draw_surf();
     ag_draw_line(&s, x0, y0, x1, y1, rgb_to_565(color));
 }
 
 static void gfx_circle(int16_t cx, int16_t cy, uint16_t r, uint32_t color)
 {
+    if (br_on()) {
+        const int32_t a[4] = {cx, cy, r, rgb_to_565(color)};
+        br_add(BR_CIRCLE, cx - r, cy - r, 2 * r + 1, 2 * r + 1, a, 4, NULL);
+        return;
+    }
     ag_draw_surf_t s = draw_surf();
     ag_draw_circle(&s, cx, cy, (int32_t)r, rgb_to_565(color));
 }
 
 static void gfx_fill_circle(int16_t cx, int16_t cy, uint16_t r, uint32_t color)
 {
+    if (br_on()) {
+        const int32_t a[4] = {cx, cy, r, rgb_to_565(color)};
+        br_add(BR_FCIRCLE, cx - r, cy - r, 2 * r + 1, 2 * r + 1, a, 4, NULL);
+        return;
+    }
     ag_draw_surf_t s = draw_surf();
     ag_draw_fill_circle(&s, cx, cy, (int32_t)r, rgb_to_565(color));
 }
@@ -1242,6 +1839,11 @@ static void gfx_poly_fill(uint32_t color)
     if (!s_poly_active || s_poly_n < 3) {
         return;
     }
+    if (br_on()) {
+        br_add_points(BR_CONVEX_FILL, s_poly, s_poly_n, rgb_to_565(color));
+        s_poly_active = false;
+        return;
+    }
     ag_draw_surf_t s = draw_surf();
     ag_draw_fill_convex(&s, s_poly, s_poly_n, rgb_to_565(color));
     s_poly_active = false;
@@ -1250,6 +1852,11 @@ static void gfx_poly_fill(uint32_t color)
 static void gfx_poly_stroke(uint32_t color)
 {
     if (!s_poly_active || s_poly_n < 2) {
+        return;
+    }
+    if (br_on()) {
+        br_add_points(BR_CONVEX_STROKE, s_poly, s_poly_n, rgb_to_565(color));
+        s_poly_active = false;
         return;
     }
     ag_draw_surf_t s = draw_surf();
@@ -1262,7 +1869,8 @@ static void gfx_poly_fill_tex(void)
     ag_draw_texvert_t verts[AG_POLY_MAX_VERTS];
     int i;
     int any_uv = 0;
-    if (!s_poly_active || s_poly_n < 3 || s_draw == NULL || s_blit_src == NULL ||
+    if (!s_poly_active || s_poly_n < 3 || (s_draw == NULL && !br_on()) ||
+        s_blit_src == NULL ||
         s_blit_sw == 0 || s_blit_sh == 0) {
         s_poly_active = false;
         return;
@@ -1318,7 +1926,27 @@ static void gfx_poly_fill_tex(void)
             verts[i].v = s_poly_v[i];
         }
     }
-    {
+    if (br_on()) {
+        int32_t x0 = verts[0].x, y0 = verts[0].y, x1 = verts[0].x, y1 = verts[0].y;
+        for (i = 1; i < s_poly_n; i++) {
+            x0 = (verts[i].x < x0) ? verts[i].x : x0;
+            y0 = (verts[i].y < y0) ? verts[i].y : y0;
+            x1 = (verts[i].x > x1) ? verts[i].x : x1;
+            y1 = (verts[i].y > y1) ? verts[i].y : y1;
+        }
+        br_rec_t *r = br_new(BR_TEX, (uint32_t)s_poly_n * sizeof(verts[0]));
+        if (r != NULL && br_bound(r, x0, y0, x1 - x0 + 1, y1 - y0 + 1)) {
+            r->a[0] = s_poly_n;
+            r->a[1] = (int32_t)s_blit_stride;
+            r->a[2] = s_blit_sx;
+            r->a[3] = s_blit_sy;
+            r->a[4] = s_blit_sw;
+            r->a[5] = s_blit_sh;
+            r->src = s_blit_src;
+            memcpy(r + 1, verts, (size_t)s_poly_n * sizeof(verts[0]));
+            br_commit(r);
+        }
+    } else {
         ag_draw_surf_t s = draw_surf();
         ag_draw_fill_convex_tex(&s, verts, s_poly_n, s_blit_src, s_blit_stride,
                                 s_blit_sx, s_blit_sy, (int32_t)s_blit_sw,
@@ -1332,6 +1960,10 @@ static void gfx_fill_convex(const ag_point_t *pts, int32_t n, uint32_t color)
     if (pts == NULL || n < 3) {
         return;
     }
+    if (br_on()) {
+        br_add_points(BR_CONVEX_FILL, pts, (int)n, rgb_to_565(color));
+        return;
+    }
     ag_draw_surf_t s = draw_surf();
     ag_draw_fill_convex(&s, pts, (int)n, rgb_to_565(color));
 }
@@ -1339,6 +1971,10 @@ static void gfx_fill_convex(const ag_point_t *pts, int32_t n, uint32_t color)
 static void gfx_stroke_convex(const ag_point_t *pts, int32_t n, uint32_t color)
 {
     if (pts == NULL || n < 2) {
+        return;
+    }
+    if (br_on()) {
+        br_add_points(BR_CONVEX_STROKE, pts, (int)n, rgb_to_565(color));
         return;
     }
     ag_draw_surf_t s = draw_surf();
@@ -1364,6 +2000,11 @@ static void gfx_clip_reset(void)
 static void gfx_stroke_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,
                             uint32_t color)
 {
+    if (br_on()) {
+        const int32_t a[5] = {x, y, w, h, rgb_to_565(color)};
+        br_add(BR_STROKE_RECT, x, y, w, h, a, 5, NULL);
+        return;
+    }
     ag_draw_surf_t s = draw_surf();
     ag_draw_stroke_rect(&s, x, y, (int32_t)w, (int32_t)h, rgb_to_565(color));
 }
@@ -1371,6 +2012,11 @@ static void gfx_stroke_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,
 static void gfx_fill_round_rect(int16_t x, int16_t y, uint16_t w, uint16_t h,
                                 uint16_t r, uint32_t color)
 {
+    if (br_on()) {
+        const int32_t a[6] = {x, y, w, h, r, rgb_to_565(color)};
+        br_add(BR_RRECT, x, y, w, h, a, 6, NULL);
+        return;
+    }
     ag_draw_surf_t s = draw_surf();
     ag_draw_fill_round_rect(&s, x, y, (int32_t)w, (int32_t)h, (int32_t)r,
                             rgb_to_565(color));
@@ -1743,9 +2389,23 @@ ag_err_t ag_display_init(void)
                 bytes, AG_MEM_FAST | AG_MEM_BYTE);
         }
         if (front == NULL) {
-            ag_log(AG_LOG_ERROR, "display", "no memory for %ux%u framebuffer",
-                   (unsigned)w, (unsigned)h);
-            return -AG_ENOMEM;
+            /*
+             * No room for a frame is not no graphics.
+             *
+             * This used to fail the whole devices stage with -12, which is why
+             * the Audio Kit had to be told `driver = none` and had no picture
+             * at all.  With no surface the primitives are played back a strip
+             * at a time straight to whichever display driver there is (the
+             * band renderer, br_render) - the same as `driver = panel`, chosen
+             * here because the memory chose it.
+             */
+            ag_log(AG_LOG_WARN, "display",
+                   "no memory for a %ux%u framebuffer (%u KB); drawing without "
+                   "one, a strip at a time, to the display drivers",
+                   (unsigned)w, (unsigned)h, (unsigned)(bytes / 1024u));
+            s_surfaceless = true;
+            s_ready = true;
+            return AG_OK;
         }
         owned = true;
     }

@@ -25,6 +25,16 @@ typedef struct {
     int16_t   clip_y;
     uint16_t  clip_w;
     uint16_t  clip_h;
+    /*
+     * A strip of the surface rather than all of it: `pix` holds only rows
+     * row0 .. row0+rows-1, each `w` pixels, and nothing outside them is ever
+     * written whatever the clip says.  rows == 0 is the whole surface, which
+     * is what a zero-initialised surface means.  This is how a display with
+     * no framebuffer draws: the same primitives, a few rows at a time
+     * (display.c, the band renderer).
+     */
+    uint16_t  row0;
+    uint16_t  rows;
 } ag_draw_surf_t;
 
 /* Colour is already RGB565. */
