@@ -567,10 +567,28 @@ static void *br_alloc(size_t bytes)
     return p;
 }
 
-/* Taken at acquire, given back at release: nothing is held while no
- * application has the screen. */
+/*
+ * Taken at the first acquire and kept.
+ *
+ * They used to be given back at every release, and that is a race this layer
+ * cannot win: the releasing is done by whoever takes the screen away - the
+ * session's task - and the writing by the owner's painting thread on the
+ * other core, so leaving a slot freed the list under a painter that was
+ * inside it.  The record it was holding became an offset from NULL and the
+ * application was killed for writing to address zero.  Sometimes.  Which is
+ * why a slot came back on one switch and not the next.
+ *
+ * Twelve kilobytes, cut from the screen's width, which does not change while
+ * the machine runs: what is kept always fits whoever takes the screen next.
+ */
 static void br_take(void)
 {
+    if (s_br_list != NULL && s_br_strip != NULL) {
+        s_br_len = 0;
+        s_br_lost = 0;
+        s_br_moaned = false;
+        return; /* already there, and the right size */
+    }
     br_free();
     if (s_w == 0 || s_h == 0) {
         return;
@@ -1381,7 +1399,10 @@ static void gfx_release(void)
     s_taken_from = AG_PID_KERNEL; /* let go of: nothing to give back */
     if (s_surfaceless) {
         shim_kick(); /* whatever was still pending is this app's last frame */
-        br_free();   /* nothing is held while nobody has the screen */
+        /* The band list stays: see br_take.  Freeing it here is freeing it
+         * under the owner's painting thread, which is a fault at address
+         * zero and a dead application. */
+        s_br_len = 0;
         s_acquired = false;
         s_owner = AG_PID_KERNEL;
         drivers_held(false);
