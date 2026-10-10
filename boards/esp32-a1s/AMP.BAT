@@ -6,8 +6,10 @@ REM
 REM os 2      two times oversampling.  4x costs 9300 us of an 11609 us block
 REM           and does not fit on this chip whatever the cabinet is set to.
 REM blk 64    64 frames a block: 2.9 ms instead of 11.6, because latency is
-REM           what a guitarist feels.  It must be half of audio.dma_frames in
-REM           BOARD.CFG or the converter runs dry between blocks.
+REM           what a guitarist feels.  Nothing has to agree with it any more:
+REM           the converter cuts its ring to twice this and the cabinet is
+REM           partitioned for it.  B while playing cycles 256/128/64, which is
+REM           the way to judge it - by ear, against the same guitar.
 REM cabms 23  23 ms of the impulse, which measures within half a decibel of 45
 REM           in every octave band - and 507 taps is short enough to convolve
 REM           directly, which is where the other 11.6 ms of delay went.

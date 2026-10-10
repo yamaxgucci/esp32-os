@@ -209,6 +209,9 @@ static int          s_in_sum;      /* add both channels in; see `inmix` */
 static uint32_t     s_us_in;
 static uint32_t     s_us_valves;
 static uint32_t     s_us_cab;
+static uint32_t     s_us_out;    /* waiting for the converter to take it */
+static uint32_t     s_us_in_blk; /* this block's wait, kept out of the load */
+static uint32_t     s_us_fx;   /* what a borrowed effect costs a block */
 static uint32_t     s_us_total;
 static uint32_t     s_us_blocks;
 static uint32_t     s_in_starved;  /* blocks the converter had nothing for */
@@ -273,6 +276,25 @@ static int          s_drag;      /* the finger is on the slider now */
  * core that has nothing else to do and removes the list that two threads would
  * otherwise have to agree about.
  */
+/*
+ * AN EFFECT SOMEBODY ELSE WROTE
+ *
+ * Not linked in, not known at build time: a device of class AG_DEV_FX, found
+ * by name in the registry at run time and called through its class table.
+ * `fx <name>` picks one, `fx` alone takes the first there is.
+ *
+ * It is called once a block, after the cabinet and before the level, because
+ * that is where a pedal's effects loop is - the amplifier makes the sound and
+ * what comes after colours it.
+ *
+ * Holding the handle for the length of the run is what keeps the module from
+ * being unloaded out from under the audio thread; the registry counts it.
+ */
+static ag_handle_t     s_fx = -1;
+static const ag_fx_ops_t *s_fx_ops;
+static char            s_fx_name[AG_DEV_NAME_MAX];
+static int             s_fx_amount = -1; /* -1: leave whatever it came with */
+
 static ag_thread_t  s_painter;
 static ag_sem_t     s_paint_wake;
 static ag_mutex_t   s_paint_lock; /* the dirty marks, and nothing else */
@@ -307,6 +329,16 @@ static char         s_cab[AG_PATH_MAX] = "";
 static char         s_preset[AG_PATH_MAX] = "jcm800";
 
 static int  s_browse;
+/*
+ * The settings menu, behind the gear in the top strip.
+ *
+ * Not a knob and not in the amplifier: these are the machine's settings - what
+ * the block is, and therefore what the latency is - and they are reached by
+ * touch because that is how this pedal is actually driven, from a phone or
+ * from the glass, with no keyboard anywhere near it.
+ */
+static int  s_menu;      /* 0 closed, 1 open         */
+static int  s_msel;      /* which row the finger last landed on */
 static char s_dir[AG_PATH_MAX];
 static char s_names[LIST_MAX][AG_NAME_MAX];
 static unsigned char s_kind[LIST_MAX];
@@ -653,6 +685,49 @@ static void slider_box(int *x, int *y, int *w, int *h, int sw, int sh)
     *h = 62;
 }
 
+/*
+ * The gear, and the square a finger has to hit to reach it.
+ *
+ * The drawn gear is the height of the strip; the target is wider and taller,
+ * because a fingertip is about nine millimetres and the strip is twenty-six
+ * pixels.  Being generous here costs nothing - there is nothing else in that
+ * corner to hit by mistake.
+ */
+#define GEAR_W 30
+
+static void gear_box(int *x, int *y, int *w, int *h, int sw)
+{
+    *x = sw - GEAR_W;
+    *y = 0;
+    *w = GEAR_W;
+    *h = TOP_H;
+}
+
+static void gear_target(int *x, int *y, int *w, int *h, int sw)
+{
+    *x = sw - 44;
+    *y = 0;
+    *w = 44;
+    *h = TOP_H + 10;
+}
+
+#define MENU_ROW 30
+#define MENU_N   3
+
+static const uint32_t k_menu_blk[MENU_N] = { 256u, 128u, 64u };
+
+static void menu_box(int *x, int *y, int *w, int *h, int sw, int sh)
+{
+    const int bw = (sw < 220) ? sw - 24 : 196;
+    *w = bw;
+    *h = 34 + MENU_N * MENU_ROW + 10;
+    *x = sw - bw - 6;
+    *y = TOP_H + 2;
+    if (*y + *h > sh) {
+        *y = sh - *h; /* a short screen keeps it on the glass */
+    }
+}
+
 static void browser_box(int *x, int *y, int *w, int *h, int sw, int sh)
 {
     *x = 30;
@@ -718,6 +793,78 @@ static int slider_mark_at(int px, int sw)
         v = 10;
     }
     return v;
+}
+
+/*
+ * A gear out of rectangles, because there are no circles in this interface.
+ *
+ * Four teeth around a rounded hub with a hole in it reads as a gear at
+ * twenty-six pixels; a drawn circle would not have been any clearer and
+ * would have needed a primitive that is not there.
+ */
+static void draw_gear(int sw)
+{
+    int        x, y, w, h;
+    const uint32_t ink = s_menu ? rgb(245, 220, 150) : rgb(150, 156, 178);
+    int        cx, cy;
+
+    gear_box(&x, &y, &w, &h, sw);
+    ag_gfx_fill_rect((int16_t)x, (int16_t)y, (uint16_t)w, (uint16_t)h,
+                     rgb(16, 17, 22));
+    cx = x + w / 2;
+    cy = y + h / 2;
+    /* the teeth */
+    ag_gfx_fill_rect((int16_t)(cx - 2), (int16_t)(cy - 9), 4, 4, ink);
+    ag_gfx_fill_rect((int16_t)(cx - 2), (int16_t)(cy + 5), 4, 4, ink);
+    ag_gfx_fill_rect((int16_t)(cx - 9), (int16_t)(cy - 2), 4, 4, ink);
+    ag_gfx_fill_rect((int16_t)(cx + 5), (int16_t)(cy - 2), 4, 4, ink);
+    /* the hub, and the hole through it */
+    ag_gfx_fill_round_rect((int16_t)(cx - 6), (int16_t)(cy - 6), 12, 12, 4,
+                           ink);
+    ag_gfx_fill_round_rect((int16_t)(cx - 2), (int16_t)(cy - 2), 4, 4, 1,
+                           rgb(16, 17, 22));
+}
+
+/*
+ * The settings menu: one setting so far, and it is the one that cannot be
+ * judged from a datasheet.
+ *
+ * Each row says the block, what it costs in delay through the whole chain,
+ * and the one before it is marked - so the choice is made by reading what it
+ * does rather than by remembering what 128 meant.
+ */
+static void draw_menu(int sw, int sh)
+{
+    int  x, y, w, h, i;
+    char line[48];
+
+    menu_box(&x, &y, &w, &h, sw, sh);
+    ag_gfx_fill_round_rect((int16_t)x, (int16_t)y, (uint16_t)w, (uint16_t)h, 8,
+                           rgb(70, 76, 94));
+    ag_gfx_fill_round_rect((int16_t)(x + 2), (int16_t)(y + 2),
+                           (uint16_t)(w - 4), (uint16_t)(h - 4), 7,
+                           rgb(24, 26, 33));
+    ag_gfx_text((int16_t)(x + 12), (int16_t)(y + 9), "LATENCY",
+                rgb(240, 210, 130), AG_GFX_TRANS);
+
+    for (i = 0; i < MENU_N; i++) {
+        const uint32_t blk = k_menu_blk[i];
+        const int      ry = y + 34 + i * MENU_ROW;
+        const int      here = (blk == s_chunk);
+        uint32_t       ink = here ? rgb(245, 220, 150) : rgb(210, 215, 230);
+        /* In and out through the converter's rings plus the block itself. */
+        const unsigned trip = (unsigned)(blk * 5u * 1000u / RATE);
+
+        if (i == s_msel) {
+            ag_gfx_fill_round_rect((int16_t)(x + 8), (int16_t)(ry - 4),
+                                   (uint16_t)(w - 16), MENU_ROW - 2, 4,
+                                   rgb(48, 54, 72));
+        }
+        (void)snprintf(line, sizeof(line), "%s%u   about %u ms",
+                       here ? "> " : "  ", (unsigned)blk, trip);
+        (void)ag_gfx_text_fit((int16_t)(x + 14), (int16_t)(ry + 2),
+                              (uint16_t)(w - 28), line, ink, AG_GFX_TRANS);
+    }
 }
 
 static void draw_browser(int sw, int sh)
@@ -919,6 +1066,8 @@ static void head_text(char *out, size_t n)
         bar[k] = (k < meter) ? '=' : '.';
     }
     bar[20] = '\0';
+    /* No block here: on a 320-wide panel this line is already cut off before
+     * the load is reached, and the gear's menu says it with room to spare. */
     (void)snprintf(out, n, "%s  %s  %u%% cpu", s_out.path, bar,
                    (unsigned)s_out.load_pct);
 }
@@ -938,10 +1087,12 @@ static void paint_region(int rx, int ry, int rw, int rh)
         /* What the sound is doing, on the same line as what is playing it:
          * the load is the number that says whether this box can keep up. */
         head_text(head, sizeof(head));
-        (void)ag_gfx_text_fit(120, 6, (uint16_t)(sw - 126), head,
+        /* The strip stops short of the gear rather than running under it. */
+        (void)ag_gfx_text_fit(120, 6, (uint16_t)(sw - 126 - GEAR_W), head,
                               s_status[0] != '\0' ? rgb(240, 200, 130)
                                                   : rgb(130, 138, 158),
                               AG_GFX_TRANS);
+        draw_gear(sw);
     }
     for (i = 0; i < knob_n(); i++) {
         knob_box(i, &x, &y, &w, &h, sw, sh);
@@ -963,6 +1114,13 @@ static void paint_region(int rx, int ry, int rw, int rh)
         browser_box(&x, &y, &w, &h, sw, sh);
         if (hits(rx, ry, rw, rh, x, y, w, h)) {
             draw_browser(sw, sh);
+        }
+    }
+    /* Last, so it is over everything: it is the thing being touched. */
+    if (s_menu) {
+        menu_box(&x, &y, &w, &h, sw, sh);
+        if (hits(rx, ry, rw, rh, x, y, w, h)) {
+            draw_menu(sw, sh);
         }
     }
 }
@@ -1251,6 +1409,80 @@ static void paint_thread(void *arg)
 
 /* Started once the screen is known to exist; before that `draw` paints in
  * line, because there is nothing else running yet to disturb. */
+/*
+ * Find the effect and hold it open.
+ *
+ * Nothing here knows what it is or who wrote it: the registry is asked for
+ * devices of class AG_DEV_FX, the name is matched if one was given, and what
+ * comes back is a table of function pointers.  There is no MMU on this chip,
+ * so a call into another module is an ordinary call - what makes it safe is
+ * the handle, which the registry counts and which stops the module being
+ * unloaded while the audio thread is inside it.
+ */
+static void fx_start(uint32_t rate, uint32_t max_frames, uint8_t channels)
+{
+    ag_devinfo_t info;
+    uint32_t     i;
+
+    /* Only when asked.  Taking the first effect that happens to be installed
+     * would make the pedal sound different because something unrelated was
+     * loaded, which is the opposite of what a registry is for. */
+    if (s_fx_amount < 0) {
+        return;
+    }
+
+    for (i = 0; i < 64u; i++) {
+        if (ag_dev_enumerate(i, AG_DEV_FX, &info) != AG_OK) {
+            break;
+        }
+        if (s_fx_name[0] != '\0' && strcmp(info.name, s_fx_name) != 0) {
+            continue;
+        }
+        s_fx = ag_dev_open(info.name);
+        if (s_fx < 0) {
+            ag_printf("stomp: %s will not open (%d)\n", info.name, (int)s_fx);
+            s_fx = -1;
+            return;
+        }
+        s_fx_ops = (const ag_fx_ops_t *)ag_dev_ops(s_fx);
+        if (!AG_HAS(s_fx_ops, process)) {
+            ag_printf("stomp: %s is not an effect this build can call\n",
+                      info.name);
+            ag_dev_close(s_fx);
+            s_fx = -1;
+            s_fx_ops = NULL;
+            return;
+        }
+        if (AG_HAS(s_fx_ops, prepare)) {
+            (void)s_fx_ops->prepare(NULL, rate, max_frames, channels);
+        }
+        if (s_fx_amount >= 0 && AG_HAS(s_fx_ops, set_amount)) {
+            (void)s_fx_ops->set_amount(NULL, (uint8_t)s_fx_amount);
+        }
+        (void)snprintf(s_fx_name, sizeof(s_fx_name), "%s", info.name);
+        ag_printf("stomp: effect %s by %s%s%s\n", info.name, info.driver,
+                  (s_fx_amount >= 0 && AG_HAS(s_fx_ops, amount_name))
+                      ? ", " : "",
+                  (s_fx_amount >= 0 && AG_HAS(s_fx_ops, amount_name))
+                      ? s_fx_ops->amount_name(NULL) : "");
+        return;
+    }
+    if (s_fx_name[0] != '\0') {
+        ag_printf("stomp: no effect called %s is loaded\n", s_fx_name);
+    } else {
+        ag_printf("stomp: no effect is loaded (drv install one)\n");
+    }
+}
+
+static void fx_stop(void)
+{
+    if (s_fx >= 0) {
+        ag_dev_close(s_fx);
+        s_fx = -1;
+        s_fx_ops = NULL;
+    }
+}
+
 static void painter_start(void)
 {
     if (s_headless || s_text || s_painter != NULL) {
@@ -1705,11 +1937,84 @@ static int cabinet_load(const int16_t *mono, uint32_t frames, uint32_t rate)
         }
         s_ir_ready = 1;
     }
+    /*
+     * In the block the stream works in, whatever that turned out to be, and
+     * after the init above because that one starts from zero.
+     *
+     * A cabinet still partitioned for 256 frames against a 64-frame stream
+     * does not run at all: the overlap-add loop never reaches a whole block,
+     * so it costs a microsecond and does nothing.  That is how it hid - not
+     * as a fault but as a cabinet that had apparently become free.
+     */
+    (void)ag_ir_set_block(&s_ir, s_chunk);
     if (ag_ir_load(&s_ir, mono, frames, rate) != 0) {
         return -1;
     }
     ag_ir_set_bypass(&s_ir, !s_cab_on);
     return 0;
+}
+
+/*
+ * Change the block while the amplifier is playing.
+ *
+ * This is a machine setting and not a knob: it is the latency a guitarist
+ * feels in the hands, bought with arithmetic.  256 frames is 11.6 ms of
+ * convolution and about 58 ms round trip once the converter's rings are
+ * counted; 64 is 2.9 and about 14, and costs roughly half as much again per
+ * second of audio because the same impulse becomes four times as many
+ * partitions of a quarter-sized transform.  Nobody can choose that from a
+ * datasheet - it is chosen by playing through it.
+ *
+ * Three things have to move together and in this order: the converter cuts
+ * its ring to the new block, the stream takes whatever it was granted, and
+ * the cabinet is partitioned again for it.  Doing any of them alone is one of
+ * the faults this whole thread of work was about.
+ *
+ * Called from the key handler, which runs between blocks on the audio thread,
+ * so nothing is in the chain while it happens.  The sound stops for as long
+ * as the impulse takes to transform - about a fifth of a second - and that is
+ * honest: it is a different machine afterwards.
+ */
+static int cabinet_from_wav(const char *path);
+
+static void block_apply(uint32_t frames)
+{
+    char path[sizeof(s_cab)];
+
+    if (!s_sound || frames == s_chunk || frames == 0u) {
+        return;
+    }
+    status("changing the block");
+    present_now();
+
+    ag_pcm_set_chunk(&s_out, frames);
+    {
+        /* The board has a ceiling on what it will spend on DMA, so take what
+         * was granted rather than what was asked for. */
+        const int32_t period = ag_pcm_period(&s_out);
+        if (period > 0 && frames > (uint32_t)period) {
+            frames = (uint32_t)period;
+            ag_pcm_set_chunk(&s_out, frames);
+        }
+    }
+    s_chunk = frames;
+
+    (void)snprintf(path, sizeof(path), "%s", s_cab);
+    if (path[0] != '\0') {
+        if (cabinet_from_wav(path) == 0) {
+            ag_ir_set_bypass(&s_ir, !s_cab_on);
+        } else {
+            s_cab_on = 0;
+            ag_printf("stomp: the cabinet does not fit a %u-frame block\n",
+                      (unsigned)s_chunk);
+        }
+    }
+    ag_printf("stomp: block %u frames, %u.%u ms\n", (unsigned)s_chunk,
+              (unsigned)(s_chunk * 1000u / RATE),
+              (unsigned)((s_chunk * 10000u / RATE) % 10u));
+    status("");
+    ag_pcm_pace_start(&s_out);
+    dirty_all();
 }
 
 static int cabinet_from_wav(const char *path)
@@ -1953,7 +2258,8 @@ static AG_HOT void audio_block(void)
      * Timed apart it is a wait, which is what a pedal should be doing between
      * blocks rather than something to optimise away.
      */
-    s_us_in += (uint32_t)(ag_micros() - t0);
+    s_us_in_blk = (uint32_t)(ag_micros() - t0);
+    s_us_in += s_us_in_blk;
     const ag_time_t t_valves = ag_micros();
 
     for (i = 0; i < s_chunk; i++) {
@@ -2011,6 +2317,17 @@ static AG_HOT void audio_block(void)
         }
     }
     s_us_cab += (uint32_t)(ag_micros() - t_ir);
+
+    /*
+     * And whatever somebody else brought, in the pedal's effects loop: after
+     * the cabinet, before the trim.  One call a block, in place, on the
+     * stereo buffer this chain already carries.
+     */
+    if (s_fx_ops != NULL) {
+        const ag_time_t t_fx = ag_micros();
+        (void)s_fx_ops->process(NULL, s_stereo, s_chunk);
+        s_us_fx += (uint32_t)(ag_micros() - t_fx);
+    }
     /*
      * The output trim, and the peak measured where it matters.
      *
@@ -2058,10 +2375,35 @@ static AG_HOT void audio_block(void)
      */
     s_us_total += (uint32_t)(ag_micros() - t0);
     s_us_blocks++;
-    ag_pcm_mark_render(&s_out, (uint32_t)(ag_micros() - t0));
+    /*
+     * The load is the work, and waiting for the converter is not work.
+     *
+     * It reads as work because it is spent inside the block, and that one
+     * confusion is what made this board look too slow for its own amplifier:
+     * 7.4 ms of a block stalled in a read that could not be answered, counted
+     * as processing, printed as 126% cpu over a chain using 64% of the time
+     * it had.  The wait is the slack - the proof there is room - and it has
+     * its own column in the breakdown.
+     */
     {
+        const uint32_t spent = (uint32_t)(ag_micros() - t0);
+        ag_pcm_mark_render(&s_out,
+                           (spent > s_us_in_blk) ? (spent - s_us_in_blk) : 0u);
+    }
+    {
+        /*
+         * The send is timed because this is where the clock ends up.
+         *
+         * Give the input ring enough depth and the read stops blocking - the
+         * frames are already there - so the loop is held instead by the
+         * output, which cannot take a block until it has played one.  The
+         * wait does not disappear, it moves; and a breakdown that times only
+         * the read goes quiet about four milliseconds of every block.
+         */
+        const ag_time_t t_out = ag_micros();
         const int32_t wrote =
             ag_pcm_write(&s_out, s_stereo, (int32_t)s_chunk);
+        s_us_out += (uint32_t)(ag_micros() - t_out);
         s_blocks++;
         if (s_blocks == 1u) {
             /* The first block is the one worth saying out loud: on a box with
@@ -2365,7 +2707,10 @@ static void on_key(uint16_t k, int *quit)
     switch (k) {
     case AG_KEY_ESC:
     case AG_KEY_Q:
-        if (s_editing) {
+        if (s_menu) {
+            s_menu = 0;
+            dirty_all();
+        } else if (s_editing) {
             s_editing = 0;
         } else {
             *quit = 1;
@@ -2373,6 +2718,11 @@ static void on_key(uint16_t k, int *quit)
         break;
     case AG_KEY_ENTER:
         activate();
+        break;
+    case AG_KEY_B:
+        /* Round the three ways, because this is meant to be A/B'd by ear and
+         * a setting you can only walk one way is not an A/B. */
+        block_apply((s_chunk > 128u) ? 128u : (s_chunk > 64u ? 64u : 256u));
         break;
     case AG_KEY_LEFT:
         if (s_editing) {
@@ -2418,6 +2768,41 @@ static void on_tap(int px, int py)
     const int sw = (int)s_info.width, sh = (int)s_info.height;
     const int n = knob_n();
     int       i, x, y, w, h;
+
+    /*
+     * The open menu takes the tap before anything under it does - the same
+     * lesson the slider taught: a panel painted over the knobs that lets the
+     * touch through to them picks a different control than the one being
+     * reached for.
+     */
+    if (s_menu) {
+        int mx, my, mw, mh;
+        menu_box(&mx, &my, &mw, &mh, sw, sh);
+        if (px < mx || px >= mx + mw || py < my || py >= my + mh) {
+            s_menu = 0; /* a tap outside is the way out */
+            dirty_all();
+            return;
+        }
+        i = (py - (my + 30)) / MENU_ROW;
+        if (i >= 0 && i < MENU_N) {
+            s_msel = i;
+            s_menu = 0;
+            dirty_all();
+            block_apply(k_menu_blk[i]);
+        }
+        return;
+    }
+
+    {
+        int gx, gy, gw, gh;
+        gear_target(&gx, &gy, &gw, &gh, sw);
+        if (px >= gx && px < gx + gw && py >= gy && py < gy + gh) {
+            s_menu = 1;
+            s_msel = -1;
+            dirty_all();
+            return;
+        }
+    }
 
     if (s_browse != BROWSE_OFF) {
         int bx, by, bw, bh;
@@ -2541,7 +2926,34 @@ static int sound_start(const char *sink, const char *di_path)
         ag_wav_free(&s_di);
         return -1;
     }
+    /*
+     * The converter decides the block, not the convolution.
+     *
+     * A ring of a few DMA buffers cannot answer a read for more frames than
+     * half of it inside the block those frames belong to: the read blocks
+     * past its own deadline, every block is late, and the wait is counted
+     * somewhere that looks like work.  On the A1S that read as 126% cpu with
+     * 48% of real work - a board apparently too slow for the amplifier it was
+     * comfortably running.
+     *
+     * So ask, and come down if asked to.  Going up is not done: a block
+     * larger than the chain was fitted for is the caller's decision.
+     */
+    /* Said first, because the converter cuts its ring to fit the block. */
     ag_pcm_set_chunk(&s_out, s_chunk);
+    {
+        /* And then ask what it granted: a board has a ceiling on what it will
+         * spend, and working in a block it did not grant is the whole fault
+         * this handshake exists to prevent. */
+        const int32_t period = ag_pcm_period(&s_out);
+        if (period > 0 && s_chunk > (uint32_t)period) {
+            ag_printf("stomp: %s serves %d frames at a time; the block comes "
+                      "down from %u\n",
+                      s_out.path, (int)period, (unsigned)s_chunk);
+            s_chunk = (uint32_t)period;
+            ag_pcm_set_chunk(&s_out, s_chunk);
+        }
+    }
     /* A file sink is a render, not a performance: the take is played once and
      * then this stops, rather than filling the card with a loop. */
     s_di_loop = !ends_with(s_out.path, ".wav");
@@ -2598,6 +3010,17 @@ int ag_main(int argc, char **argv)
              * a fault nobody can name.
              */
             s_quiet = 1;
+        } else if (strcmp(argv[i], "fx") == 0) {
+            /* A name, or nothing for the first effect there is. */
+            if (i + 1 < argc && argv[i + 1][0] != '\0' &&
+                strchr(argv[i + 1], '=') == NULL) {
+                (void)snprintf(s_fx_name, sizeof(s_fx_name), "%s", argv[++i]);
+            } else {
+                s_fx_name[0] = '\0';
+            }
+            s_fx_amount = (s_fx_amount < 0) ? 100 : s_fx_amount;
+        } else if (strcmp(argv[i], "fxamount") == 0 && i + 1 < argc) {
+            s_fx_amount = atoi_small(argv[++i]);
         } else if (strcmp(argv[i], "notext") == 0) {
             /* No panel of any kind: play, and leave the console alone.  For a
              * run being measured, where the console is the instrument. */
@@ -2804,6 +3227,7 @@ int ag_main(int argc, char **argv)
         for (i = 0; i < n_set; i++) {
             (void)pot_set(set[i]); /* after the chain, which brings its own */
         }
+        const uint32_t blk_asked = s_chunk;
         if (sound_start(sink != NULL ? sink : "pcmnull", di_path) != 0) {
             if (!s_headless) {
                 ag_gfx_release();
@@ -2812,6 +3236,25 @@ int ag_main(int argc, char **argv)
         }
         ag_printf("stomp: sound = %s @ %u Hz, %u frames a block\n", s_out.path,
                   (unsigned)RATE, (unsigned)s_chunk);
+        /*
+         * The cabinet is partitioned for the block, and the converter may
+         * have just shortened it - so it is built again rather than left
+         * convolving against a block that no longer arrives.
+         */
+        if (s_chunk != blk_asked && s_cab_on && s_cab[0] != '\0') {
+            char path[sizeof(s_cab)];
+            (void)snprintf(path, sizeof(path), "%s", s_cab);
+            if (cabinet_from_wav(path) == 0) {
+                ag_ir_set_bypass(&s_ir, 0);
+            } else {
+                s_cab_on = 0;
+                ag_printf("stomp: the cabinet does not fit the shorter block; "
+                          "running without it\n");
+            }
+        }
+        /* The rate and the block are settled, which is what an effect has
+         * to be told before it can take whatever memory it needs. */
+        fx_start(RATE, s_chunk, 2u);
         if (want_live) {
             /* Ask for one block before promising anything.  A device with no
              * line in answers -AG_ENOSYS, and finding that out now is better
@@ -2939,7 +3382,7 @@ int ag_main(int argc, char **argv)
                     s_hdr_ms = ms;
                     head_text(now_head, sizeof(now_head));
                     if (strcmp(now_head, s_hdr_shown) != 0) {
-                        (void)snprintf(s_hdr_shown, sizeof(s_hdr_shown), "%%s",
+                        (void)snprintf(s_hdr_shown, sizeof(s_hdr_shown), "%s",
                                        now_head);
                         dirty(0, 0, (int)s_info.width, TOP_H);
                     }
@@ -2976,17 +3419,23 @@ int ag_main(int argc, char **argv)
                     } else if (s_us_blocks > 0u) {
                         const uint32_t n = s_us_blocks;
                         const uint32_t budget = (s_chunk * 1000000u) / RATE;
-                        ag_printf("stomp: of %u us a block: waiting for input "
-                                  "%u, valves %u, cabinet %u, the rest %u "
-                                  "(%u total)\n",
+                        ag_printf("stomp: of %u us a block: waiting in "
+                                  "%u, out %u, valves %u, cabinet %u, "
+                                  "%s %u, the rest %u (%u work)\n",
                                   (unsigned)budget, (unsigned)(s_us_in / n),
+                                  (unsigned)(s_us_out / n),
                                   (unsigned)(s_us_valves / n),
                                   (unsigned)(s_us_cab / n),
+                                  (s_fx_ops != NULL) ? s_fx_name : "effect",
+                                  (unsigned)(s_us_fx / n),
                                   (unsigned)((s_us_total - s_us_in -
-                                              s_us_valves - s_us_cab) / n),
+                                              s_us_valves - s_us_cab -
+                                              s_us_fx) / n),
                                   (unsigned)(s_us_total / n));
                         s_us_in = 0;
+                        s_us_out = 0;
                         s_us_valves = 0;
+                        s_us_fx = 0;
                         s_us_cab = 0;
                         s_us_total = 0;
                         s_us_blocks = 0;
@@ -3061,6 +3510,7 @@ int ag_main(int argc, char **argv)
             present_now();
         }
     }
+    fx_stop();
     painter_stop();
     if (s_text) {
         /* Hand the console back the way it was found: a cursor, and a line

@@ -247,6 +247,13 @@
       "src": ["apps/tone/tone.c", "apps/common/libc/libc_shim.c"]
     },
     {
+      "out": "TREM.SYS", "group": "core",
+      "_note": "A tremolo, and the first thing published as an AG_DEV_FX device. It exists to prove that one program can use sound processing another program brought, found by name at run time - so it is the smallest effect worth hearing rather than a good one.",
+      "include": ["apps/common", "apps/common/dsp", "apps/common/libc"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
+      "src": ["apps/trem/trem.c", "apps/common/libc/libc_shim.c"]
+    },
+    {
       "out": "LOOPBACK.AXE", "group": "core",
       "_note": "Plays a tone and reads the same device back, with a cable from the output jack to the input jack, and prints the level that came round. The instrument that ends an argument about whether a board is making a sound: registers, byte counts and clock rates all say what SHOULD be happening, and only this says what IS. Needs [audio] pins with din in BOARD.CFG.",
       "include": ["apps/common", "apps/common/pcm", "apps/common/dsp", "apps/common/libc"],
