@@ -20,20 +20,10 @@
 #include <argon/port/net.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
-/*
- * Unconditionally, because this header is what defines AG_PORT_HAS_WIFI.
- *
- * It used to be inside `#if AG_PORT_HAS_WIFI`, which cannot work: at the test
- * the macro has never been defined, so it reads as 0, the include never
- * happens, and every `#if AG_PORT_HAS_WIFI` below it - the whole radio half of
- * the built-in provider - is compiled out of every build on every board.
- *
- * Nothing noticed for as long as the shell asked the port directly.  The day
- * `wifi` started going through this file it answered "no radio: none on this
- * board and none bound" on a board that was serving an access point and had a
- * DHCP lease at the time.  The header is safe to include anywhere: on a port
- * with no radio it defines the macro as 0 and declares nothing that costs.
- */
+/* Unconditionally: this header is what defines AG_PORT_HAS_WIFI.  Behind
+ * its own macro it was never included, the macro read as 0, and every
+ * built-in radio operation below compiled out - `wifi` answered "no radio"
+ * on an S3 with the radio linked (found 9 Oct 2026). */
 #include <argon/port/wifi.h>
 
 /* ------------------------------------------------------------------------ */

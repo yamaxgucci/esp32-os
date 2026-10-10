@@ -4,11 +4,15 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "net/wlink.h"
+#include "net/wtrace.h"
 
 #include <argon/port/random.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+
+/* room a yielding block leaves behind it, for a message of sound */
+#define WL_YIELD_ROOM 1280u
 
 static void lock(wlink_t *s) { (void)ag_port_mutex_take(s->lock, AG_PORT_FOREVER); }
 
@@ -90,6 +94,134 @@ void wl_reset(wlink_t *s, uint32_t block, uint32_t flags)
     s->frames_bad = 0;
     s->seq_gaps = 0;
     s->bytes_dropped = 0;
+    for (unsigned k = 0; k < WL_LANES; k++) {
+        s->lane[k].head = s->lane[k].tail = s->lane[k].count = 0;
+    }
+}
+
+static void     put16(uint8_t *p, uint32_t v);
+static void     put32(uint8_t *p, uint32_t v);
+static uint32_t get16(const uint8_t *p);
+static uint32_t get32(const uint8_t *p);
+
+void wl_lanes(wlink_t *s, uint8_t *mem, const uint32_t caps[WL_LANES])
+{
+    for (unsigned k = 0; k < WL_LANES; k++) {
+        s->lane[k] = (ring_t){.mem = (caps[k] != 0u) ? mem : NULL,
+                              .cap = (mem != NULL) ? caps[k] : 0u};
+        if (mem != NULL) {
+            mem += caps[k];
+        }
+    }
+}
+
+static bool lanes_on(const wlink_t *s)
+{
+    return (s->lane[0].cap | s->lane[1].cap | s->lane[2].cap) != 0u;
+}
+
+static bool lanes_waiting(const wlink_t *s)
+{
+    return (s->lane[0].count | s->lane[1].count | s->lane[2].count) != 0u;
+}
+
+static unsigned lane_of(uint32_t budget_ms)
+{
+    return (budget_ms <= WL_LANE0_MS) ? 0u
+           : (budget_ms <= WL_LANE1_MS) ? 1u
+                                        : 2u;
+}
+
+/*
+ * The stream fed from the lanes, the soonest due first, while it holds less
+ * than a frame not yet sent - and with room left for a block that goes in at
+ * once, as YIELD left it.  A block's number is given here, in the order it
+ * enters the stream, which is the order the far end reads it.  Lock held.
+ */
+static bool lanes_feed(wlink_t *s)
+{
+    if (!lanes_on(s) || !s->blocks) {
+        return false;
+    }
+    const uint32_t pay = s->frame - WL_HDR;
+    const uint32_t keep =
+        (s->txcap / 3u < WL_YIELD_ROOM) ? s->txcap / 3u : WL_YIELD_ROOM;
+    bool moved = false;
+    for (;;) {
+        if (s->tx.count - s->sent_off >= pay) {
+            break;
+        }
+        int      best = -1;
+        uint32_t best_due = 0, best_len = 0;
+        uint8_t  best_rel = 0;
+        for (unsigned k = 0; k < WL_LANES; k++) {
+            ring_t *const L = &s->lane[k];
+            if (L->count < WL_REC) {
+                continue;
+            }
+            uint8_t h[WL_REC];
+            (void)ring_peek(L, h, WL_REC);
+            const uint32_t due = get32(h + 2);
+            if (best < 0 || (int32_t)(due - best_due) < 0) {
+                best = (int)k;
+                best_due = due;
+                best_len = get16(h);
+                best_rel = h[6];
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        if (ring_space(&s->tx) < WL_REC + best_len + keep) {
+            s->pr_lane_blocked++;
+            break;
+        }
+        {
+            const int32_t late =
+                (int32_t)((uint32_t)(ag_port_us() / 1000) - best_due);
+            s->pr_lane_fed[best]++;
+            if (late > 0) {
+                s->pr_lane_late[best]++;
+                if ((uint32_t)late > s->pr_lane_late_ms[best]) {
+                    s->pr_lane_late_ms[best] = (uint32_t)late;
+                }
+            }
+        }
+        ring_t *const L = &s->lane[best];
+        ring_commit(L, WL_REC);
+        uint8_t        hdr[WL_REC];
+        const uint16_t no = s->next_block++;
+        put16(hdr, best_len);
+        put16(hdr + 2, no);
+        hdr[4] = best_rel;
+        hdr[5] = 0;
+        put16(hdr + 6, no);
+        (void)ring_put(&s->tx, hdr, WL_REC);
+        for (uint32_t left = best_len; left > 0u;) {
+            uint8_t        piece[256];
+            const uint32_t n = ring_take(
+                L, piece, (left < sizeof(piece)) ? left : (uint32_t)sizeof(piece));
+            (void)ring_put(&s->tx, piece, n);
+            left -= n;
+        }
+        moved = true;
+    }
+    return moved;
+}
+
+bool wl_feed(wlink_t *s)
+{
+    if (s->lock == NULL) {
+        return false;
+    }
+    lock(s);
+    const bool moved = lanes_feed(s);
+    const bool unsent = s->tx.count > s->sent_off;
+    unlock(s);
+    if (moved) {
+        (void)ag_port_sem_give(s->space_sem); /* a lane has room again */
+    }
+    return unsent;
 }
 
 uint32_t wl_sum(const uint8_t *f, uint32_t len)
@@ -301,7 +433,10 @@ uint32_t wl_build(wlink_t *s, uint8_t *f, uint32_t allow,
     uint32_t       body = 0;  /* payload bytes after the header */
     s->undo.kind = 0;
 
+    wt_note(WT_LOCKING, 0u);
     lock(s);
+    wt_note(WT_LOCKED, 0u);
+    const bool fed = lanes_feed(s);
     if (s->resend) {
         s->resend = false;
         for (uint32_t k = 0; k < s->infl_n; k++) {
@@ -370,6 +505,7 @@ uint32_t wl_build(wlink_t *s, uint8_t *f, uint32_t allow,
             s->infl[s->infl_n].off = start;
             s->infl[s->infl_n].blk = blk;
             s->infl[s->infl_n].n = (uint16_t)n;
+            s->infl[s->infl_n].at = ag_port_us();
             s->infl_n++;
             s->sent_off += n;
             flags = WL_F_DATA;
@@ -401,7 +537,20 @@ uint32_t wl_build(wlink_t *s, uint8_t *f, uint32_t allow,
     if (space > s->rxcap) {
         space = s->rxcap;
     }
+    if (space < pay) {
+        /* the probe: less than a frame of room told, and why */
+        if (held > 0u) {
+            s->pr_small_ooo++;
+        } else if (hole) {
+            s->pr_small_hole++;
+        } else {
+            s->pr_small_full++;
+        }
+    }
     unlock(s);
+    if (fed) {
+        (void)ag_port_sem_give(s->space_sem); /* a lane has room again */
+    }
 
     if (flags == 0u) {
         s->starve_data += (s->tx.count > s->sent_off) ? 0u : 1u;
@@ -598,6 +747,11 @@ uint32_t wl_rx(wlink_t *s, const uint8_t *f, uint32_t got)
     s->peer_room = room;
     s->peer_ack = ack;
     s->peer_known = true;
+    s->pr_room_sum += room;
+    if (s->pr_room_n == 0u || room < s->pr_room_min) {
+        s->pr_room_min = room;
+    }
+    s->pr_room_n++;
     bool freed = false;
     const uint32_t d = ack - s->tx_base;
     if ((int32_t)d > 0 && d <= s->sent_off) {
@@ -606,6 +760,12 @@ uint32_t wl_rx(wlink_t *s, const uint8_t *f, uint32_t got)
         s->tx_base = ack;
         while (s->infl_n > 0u &&
                (int32_t)(s->infl[0].off + s->infl[0].n - ack) <= 0) {
+            const int64_t rtt = now - s->infl[0].at;
+            s->pr_acked++;
+            s->pr_rtt_us += rtt;
+            if (rtt > (int64_t)s->pr_rtt_max_us) {
+                s->pr_rtt_max_us = (uint32_t)rtt;
+            }
             for (uint32_t k = 1; k < s->infl_n; k++) {
                 s->infl[k - 1] = s->infl[k];
             }
@@ -615,6 +775,10 @@ uint32_t wl_rx(wlink_t *s, const uint8_t *f, uint32_t got)
     }
     unlock(s);
     if (freed) {
+        wt_note(WT_ACK, d);
+        if (lanes_waiting(s) && s->kick_writes) {
+            (void)ag_port_sem_give(s->tx_sem); /* room for a lane's block */
+        }
         s->ack_at = now;
         (void)ag_port_sem_give(s->space_sem);
     }
@@ -711,6 +875,9 @@ uint32_t wl_rx(wlink_t *s, const uint8_t *f, uint32_t got)
         s->refused = false; /* the frame thrown away has come again */
     }
     unlock(s);
+    if (delivered > 0u) {
+        wt_note(WT_RX, delivered);
+    }
     if (delivered > 0u) {
         s->nak_sent = false;
         wl_rx_wake(s);
@@ -886,7 +1053,6 @@ int32_t wl_send(wlink_t *s, const void *buf, size_t len, uint32_t flags,
  * the driver needs no buffer of its own to join them: NODELINK and LINKSPI
  * each kept 4 KB a wire for nothing else (25 Sep 2026).
  */
-#define WL_YIELD_ROOM 1280u
 
 int32_t wl_send2(wlink_t *s, const void *head, size_t hlen, const void *body,
                  size_t blen, uint32_t flags, uint32_t timeout_ms)
@@ -904,6 +1070,7 @@ int32_t wl_send2(wlink_t *s, const void *head, size_t hlen, const void *body,
     if (!s->blocks || need > s->txcap) {
         return -AG_EINVAL;
     }
+    const int64_t t_in = ag_port_us();
     for (;;) {
         lock(s);
         if (!s->open) {
@@ -921,8 +1088,56 @@ int32_t wl_send2(wlink_t *s, const void *head, size_t hlen, const void *body,
              * bursts that overflowed the far queue, a click each (26 Sep
              * 2026).  Asked this way, nothing is begun that cannot be ended.
              */
+            const uint32_t budget = AG_SPILINK_BUDGET_OF(flags);
+            if (s->blocks && lanes_on(s) && budget >= WL_NOW_MS &&
+                (flags & AG_SPILINK_IDLE) == 0u &&
+                s->lane[lane_of(budget)].cap >= need) {
+                /*
+                 * INTO ITS LANE, BY WHEN IT IS DUE (2 Oct 2026).  The stream
+                 * takes it when it is the soonest due of what waits, so a
+                 * block that may wait 50 ms queued 16 ms deep in front of one
+                 * that may wait 10 does not hold that one up.
+                 */
+                ring_t *const L = &s->lane[lane_of(budget)];
+                if (ring_space(L) < need) {
+                    unlock(s);
+                    if (timeout_ms == 0u) {
+                        return -AG_EAGAIN;
+                    }
+                    const int64_t w0 = ag_port_us();
+                    wt_note(WT_ROOM_IN, L->count);
+                    const bool got = ag_port_sem_take(
+                        s->space_sem, ticks_at_least(timeout_ms));
+                    wt_note(WT_ROOM_OUT, 0u);
+                    s->pr_space_waits++;
+                    s->pr_lane_waits[lane_of(budget)]++;
+                    s->pr_space_us += ag_port_us() - w0;
+                    if (!got) {
+                        return -AG_EAGAIN;
+                    }
+                    continue;
+                }
+                uint8_t h[WL_REC];
+                put16(h, (uint32_t)len);
+                put32(h + 2, (uint32_t)(ag_port_us() / 1000) + budget);
+                h[6] = reliable ? AG_SPILINK_RELIABLE : 0u;
+                h[7] = 0;
+                (void)ring_put(L, h, WL_REC);
+                (void)put2(L, (const uint8_t *)head, (uint32_t)hlen,
+                           (const uint8_t *)body, (uint32_t)blen, 0u);
+                (void)lanes_feed(s); /* at once, if the stream is short */
+                unlock(s);
+                if (s->kick_writes) {
+                    (void)ag_port_sem_give(s->tx_sem);
+                }
+                wt_note(WT_WRITE, (uint32_t)len);
+                s->pr_sends++;
+                s->pr_send_us += ag_port_us() - t_in;
+                return (int32_t)len;
+            }
             uint32_t want = need;
-            if ((flags & AG_SPILINK_YIELD) != 0u) {
+            if ((flags & AG_SPILINK_YIELD) != 0u ||
+                budget > WL_YIELD_BUDGET_MS) {
                 /* room for one message of sound (a 1 KB period and its
                  * heads, 1 054 bytes): a third of the ring left the wire to
                  * the CYD at 447 KB/s of its 748 */
@@ -930,10 +1145,36 @@ int32_t wl_send2(wlink_t *s, const void *head, size_t hlen, const void *body,
                                                         : WL_YIELD_ROOM;
             }
             if (ring_space(&s->tx) < want) {
+                /* for the trace: what fills the ring - sent and not
+                 * answered, and not sent yet */
+                const uint32_t ring_sent = s->sent_off;
+                const uint32_t ring_unsent = s->tx.count - s->sent_off;
                 unlock(s);
-                return -AG_EAGAIN;
+                /*
+                 * AND WAITED FOR, when the caller can wait (1 Oct 2026): the
+                 * room comes back with the next acknowledgement, and the
+                 * writer that slept a tick for it instead - NODELINK, for
+                 * every message of a picture - left a 16 Mbaud wire 1.6 KB
+                 * of silence each time: 70% of it used.  Nothing is begun
+                 * here, so nobody waits inside a half-written block.
+                 */
+                if (timeout_ms == 0u || (flags & AG_SPILINK_IDLE) != 0u) {
+                    return -AG_EAGAIN; /* background takes its one attempt */
+                }
+                const int64_t w0 = ag_port_us();
+                wt_note(WT_ROOM_IN, (ring_sent & 0xFFFFu) | (ring_unsent << 16));
+                const bool    got =
+                    ag_port_sem_take(s->space_sem, ticks_at_least(timeout_ms));
+                wt_note(WT_ROOM_OUT, 0u);
+                s->pr_space_waits++;
+                s->pr_space_us += ag_port_us() - w0;
+                if (!got) {
+                    return -AG_EAGAIN;
+                }
+                continue;
             }
-            if ((flags & AG_SPILINK_IDLE) != 0u && s->tx.count > s->sent_off) {
+            if ((flags & AG_SPILINK_IDLE) != 0u &&
+                (s->tx.count > s->sent_off || lanes_waiting(s))) {
                 unlock(s);
                 return -AG_EAGAIN; /* bytes still waiting: not idle */
             }
@@ -964,12 +1205,18 @@ int32_t wl_send2(wlink_t *s, const void *head, size_t hlen, const void *body,
                     (void)ag_port_sem_give(s->tx_sem);
                 }
                 if (done >= len) {
+                    wt_note(WT_WRITE, (uint32_t)len);
+                    s->pr_sends++;
+                    s->pr_send_us += ag_port_us() - t_in;
                     return (int32_t)len;
                 }
                 /* the header is in: the rest of the block has to follow,
                  * however long room takes, or the stream would be cut */
+                const int64_t w0 = ag_port_us();
                 (void)ag_port_sem_take(s->space_sem,
                                        ticks_at_least(timeout_ms));
+                s->pr_space_waits++;
+                s->pr_space_us += ag_port_us() - w0;
                 lock(s);
                 if (!s->open) {
                     unlock(s);
@@ -1079,6 +1326,7 @@ int32_t wl_recv2(wlink_t *s, void *head, size_t hcap, void *buf, size_t cap,
                            (uint8_t *)buf, (uint32_t)cap, done, have);
                 done += have;
                 unlock(s);
+                wt_note(WT_TAKE, have);
                 room_made(s);
                 if (done >= len) {
                     return (int32_t)n;

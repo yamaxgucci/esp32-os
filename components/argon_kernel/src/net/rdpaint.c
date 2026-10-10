@@ -14,9 +14,27 @@
  * went in two, and a picture of any kind with many rows changed the same.
  * Sent only to a screen that says it draws them (rdp_far_rects).
  *
+ * OR INDICES (30 Sep 2026): with RDP_IDX_BIT in the count as well, the
+ * packing is of a byte a pixel (rdc_pack8), each an index into a palette
+ * the far screen keeps; a run with the row 0xFFFF sets entries of it - the
+ * column is the first index, the count how many, and the packing their
+ * colours, two bytes each.  A colour is always set before a run uses it,
+ * in the same stream.  Fallout's map scrolling is every pixel of the
+ * screen changing in at most 256 colours, and in RGB565 it packed to 93%
+ * of itself: the byte halves what crosses.  Sent only to a screen that
+ * says it takes them (rdp_far_idx).
+ *
+ * OR COPIES (3 Oct 2026): with RDP_Z_BIT besides RDP_RECT_BIT and
+ * RDP_IDX_BIT, a rectangle of indices is packed with copies of what the
+ * rectangle already holds (rdc_pack8z): a row above, a tile to the left.
+ * The far screen undoes it from the pixels it has just unpacked, so it
+ * needs no memory of the last frame.  Sent only to a screen that says it
+ * takes them (rdp_far_z).
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "net/rdpaint.h"
+#include "net/wtrace.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -38,6 +56,9 @@
 #define RDP_RUN_HDR 8u
 #define RDP_RECT_HDR 10u
 #define RDP_RECT_BIT 0x8000u
+#define RDP_IDX_BIT  0x4000u
+#define RDP_Z_BIT    0x2000u
+#define RDP_PAL_ROW  0xFFFFu
 #define RDP_HDR 4u
 /* how long a pass waits for the wire before it gives the screen up as
  * unknown and sends the whole of it next time */
@@ -197,6 +218,28 @@ static void row_add(span_t *r, uint32_t x0, uint32_t x1)
  * "the latest" - would have made the comparing simpler and cost another
  * 150 KB at 320x240, which most boards do not have to give.
  */
+/*
+ * THE PAINTER'S PALETTE: colour to index, by a hash of the colour, and what
+ * the far screen has been told.  Entries are handed out in order and never
+ * moved, so the untold ones are always [told, n).  Full, a colour goes in
+ * RGB565 and the table starts again with the next frame; a frame that
+ * missed again turns indices off for a while (noise has 65 536 colours).
+ */
+#define RDP_PAL_SLOTS 512u
+#define RDP_PAL_REST  30u /* frames without indices after two that missed */
+typedef struct {
+    uint16_t col[256];
+    uint16_t key[RDP_PAL_SLOTS];
+    int16_t  slot[RDP_PAL_SLOTS]; /* the key's index, or -1 */
+    uint16_t n, told;
+    bool     missed;
+    uint8_t  misses_in_row, rest;
+    bool     last_ok;
+    uint16_t last_c;
+    uint8_t  last_i;
+    uint8_t  ix[]; /* one row's indices */
+} rpal_t;
+
 static struct {
     ag_port_mutex_t lock;
     ag_port_sem_t   wake;
@@ -210,7 +253,19 @@ static struct {
     uint16_t  w, h;      /* the surface now; the buffers hold cap pixels  */
     uint32_t  cap_px;
     uint16_t  cap_rows;
-    uint16_t *pic;       /* the one picture */
+    uint16_t *pic;       /* the one picture, when presents are copied */
+    /*
+     * WHAT A PASS READS (1 Oct 2026): pic, or the screen's own framebuffer
+     * (rdp_stable_surface) when that is where the presents come from.  A
+     * game drawing into it and flushing handed the painter every frame to
+     * copy, 150 KB read and 150 KB written in PSRAM in the game's own
+     * thread - 4-5 ms a frame while its map scrolled - into a picture that
+     * was the framebuffer again.  Read where it is, and the 150 KB of pic
+     * are free: under Fallout, the snapshot fits in them.
+     */
+    const uint16_t *src;
+    const uint16_t *st_px; /* the screen's framebuffer, or NULL */
+    uint16_t        st_w, st_h;
     uint16_t *snap;      /* a pass's rows, copied at one instant (or NULL) */
     volatile bool    frame_end;  /* a present reached the bottom row      */
     volatile int64_t present_us; /* when the last present came            */
@@ -232,6 +287,7 @@ static struct {
     bool     pass_whole;    /* the pass just sent ended a frame */
     uint32_t pass_msgs;     /* messages this pass has sent so far */
     bool     rects;         /* the far screen draws a rectangle as one run */
+    uint16_t rect_px;       /* the most it holds in one, 0 if never said */
     uint32_t rect_at;       /* where the open rectangle's header is, or 0 */
     uint16_t rect_x, rect_y, rect_w, rect_h, rect_plen;
     uint32_t cuts_inside;   /* passes cut inside a rectangle, for tests */
@@ -240,6 +296,47 @@ static struct {
      * sends only what differs from it (trim_to_far) */
     bool     snap_is_far;
     uint32_t redraws;       /* times every row had to go again */
+    /* the program let the screen go: said by a marker once what it drew
+     * has gone (rdp_screen_done), and the marker carrying it */
+    volatile bool done_asked;
+    bool          pass_done;
+    volatile bool done_sent; /* ...and the far screen was told */
+    /* the last pass was cut with no snapshot to go on from: the rest is in
+     * dirty, and goes at once like the rest of a snapshot */
+    volatile bool more;
+    bool          far_idx;     /* the far screen takes indices */
+    rpal_t       *pal;         /* or NULL: no memory for it */
+    volatile bool pal_forget;  /* start the palette again */
+    bool          rect_idx;    /* the open rectangle is of indices */
+    bool          far_z;       /* the far screen undoes copies */
+    bool          rect_z;      /* the open rectangle is packed with copies */
+    rdc_zstate_t *z;           /* its hash, made when first wanted */
+    uint8_t      *zhist;       /* its indices so far, RDC_Z_WIN */
+    uint32_t      zn;
+    /* what copies saved this frame, and frames to go without them */
+    uint32_t      z_px, z_bytes, z_rest, z_rest_len;
+    uint32_t      idx_px, rgb_px; /* pixels sent each way, for tests */
+    /* this second's time: taking a pass's snapshot, packing and sending
+     * it, and the program's own presents marking what changed */
+    int64_t t_snap_us, t_send_us, t_damage_us, t_damage_wait_us;
+    int64_t t_wire_us;  /* of t_send_us: inside send(), its sleeps included */
+    /* of t_send_us: colours to indices, and the search for copies (6 Oct
+     * 2026, to see where a scrolled frame's 46 ms of packing go) */
+    int64_t t_pal_us, t_z_us;
+    /* how many colours a frame really has (6 Oct 2026: the palette was off
+     * under Fallout's scroll and nobody could say why) - a bit a colour */
+    uint8_t *cbits;
+    uint32_t colours, colours_max;
+    uint32_t eagains;   /* sends the wire refused for want of room */
+    /* since the board started, for `link`: passes, send() inside them, sends */
+    int64_t  tot_pass_us, tot_wire_us;
+    uint32_t tot_sends;
+    /* ...and between passes: for the program's frame, for the least pass */
+    int64_t  tot_frame_wait_us, tot_min_wait_us;
+    /* ...for anything to be marked at all, and the presents that marked */
+    int64_t  tot_wake_wait_us;
+    uint32_t tot_presents;
+    uint32_t damages;
 } s_p;
 
 static uint16_t get16(const uint8_t *p)
@@ -267,15 +364,20 @@ static bool flush(uint32_t handle, rdp_send_fn send)
     if (s_p.len <= RDP_HDR) {
         return true;
     }
-    const int64_t until = ag_port_us() + (int64_t)RDP_SEND_PATIENCE_MS * 1000;
+    const int64_t t0 = ag_port_us();
+    const int64_t until = t0 + (int64_t)RDP_SEND_PATIENCE_MS * 1000;
     ag_err_t      r;
     for (;;) {
         r = send(handle, s_p.msg, (uint16_t)s_p.len);
         if (r != -AG_EAGAIN || ag_port_us() >= until) {
             break;
         }
+        s_p.eagains++;
         ag_port_task_delay(1);
     }
+    s_p.t_wire_us += ag_port_us() - t0;
+    s_p.tot_wire_us += ag_port_us() - t0;
+    s_p.tot_sends++;
     if (r == AG_OK) {
         s_p.bytes_out += s_p.len;
         s_p.pass_msgs++;
@@ -285,8 +387,178 @@ static bool flush(uint32_t handle, rdp_send_fn send)
     return r == AG_OK;
 }
 
-/* The rectangle rdp_draw can hold: its pixels are unpacked there whole. */
-#define RDP_RECT_PX 4096u
+/* The rectangle rdp_draw can hold: its pixels are unpacked there whole.
+ * RDP_RECT_MAX where there is slow memory for it and RDP_RECT_MIN where there
+ * is not - the CYD, a neighbour's screen and its speaker at once with no
+ * PSRAM, had not 8 KB in one piece (2 Oct 2026) - and the painter cuts to
+ * what the far screen says it holds (rdp_far_rect_px): a fixed 2048 for
+ * everyone made a screen of noise 80 windows where 37 had done. */
+#define RDP_RECT_MAX 4096u
+#define RDP_RECT_MIN 2048u
+
+static void pal_reset(rpal_t *pl)
+{
+    pl->n = pl->told = 0u;
+    pl->missed = false;
+    pl->last_ok = false;
+    for (uint32_t i = 0; i < RDP_PAL_SLOTS; i++) {
+        pl->slot[i] = -1;
+    }
+}
+
+/* n pixels as indices into pl->ix, new colours given the next entries;
+ * NULL when the palette is full (and it says so for the frame's end). */
+static const uint8_t *pal_index(rpal_t *pl, const uint16_t *px, uint32_t n)
+{
+    for (uint32_t k = 0; k < n; k++) {
+        const uint16_t c = px[k];
+        if (pl->last_ok && c == pl->last_c) {
+            pl->ix[k] = pl->last_i;
+            continue;
+        }
+        uint32_t h = ((uint32_t)c * 40503u >> 7) & (RDP_PAL_SLOTS - 1u);
+        while (pl->slot[h] >= 0 && pl->key[h] != c) {
+            h = (h + 1u) & (RDP_PAL_SLOTS - 1u);
+        }
+        if (pl->slot[h] < 0) {
+            if (pl->n >= 256u) {
+                pl->missed = true;
+                return NULL;
+            }
+            pl->key[h] = c;
+            pl->slot[h] = (int16_t)pl->n;
+            pl->col[pl->n] = c;
+            pl->n++;
+        }
+        pl->last_c = c;
+        pl->last_i = (uint8_t)pl->slot[h];
+        pl->last_ok = true;
+        pl->ix[k] = pl->last_i;
+    }
+    return pl->ix;
+}
+
+static const uint8_t *pal_index_timed(rpal_t *pl, const uint16_t *px,
+                                      uint32_t n)
+{
+    const int64_t        t0 = ag_port_us();
+    const uint8_t *const r = pal_index(pl, px, n);
+    s_p.t_pal_us += ag_port_us() - t0;
+    return r;
+}
+
+/* The entries the far screen has not been told, ahead of what uses them. */
+static bool pal_tell(rpal_t *pl, uint16_t room, uint32_t handle,
+                     rdp_send_fn send)
+{
+    while (pl->told < pl->n) {
+        s_p.rect_at = 0; /* a palette between rows ends the rectangle */
+        uint32_t fit = (s_p.len + RDP_RUN_HDR + 2u <= room)
+                           ? (room - s_p.len - RDP_RUN_HDR) / 2u
+                           : 0u;
+        const uint32_t want = (uint32_t)(pl->n - pl->told);
+        if (fit == 0u) {
+            if (!flush(handle, send)) {
+                return false;
+            }
+            continue;
+        }
+        const uint32_t k = (want < fit) ? want : fit;
+        uint8_t *const at = s_p.msg + s_p.len;
+        put16(at, RDP_PAL_ROW);
+        put16(at + 2, pl->told);
+        put16(at + 4, (uint16_t)k);
+        put16(at + 6, (uint16_t)(k * 2u));
+        for (uint32_t i = 0; i < k; i++) {
+            put16(at + RDP_RUN_HDR + i * 2u, pl->col[pl->told + i]);
+        }
+        s_p.len += RDP_RUN_HDR + k * 2u;
+        pl->told = (uint16_t)(pl->told + k);
+    }
+    return true;
+}
+
+/*
+ * A row of indices onto the rectangle's own history and packed with copies of
+ * it, whole or not at all (0).  `fresh` starts the rectangle's history again.
+ * The history and its hash are made the first time; with no memory for them
+ * a rectangle goes as before.
+ */
+/*
+ * COPIES ONLY WHILE THEY PAY (6 Oct 2026).  On Fallout's scrolled map they
+ * saved nothing over the bare indices - the picture went at half its RGB565
+ * size either way - and the search cost the S3 a third of every second.  A
+ * frame whose copies saved under a tenth turns them off for RDP_Z_REST
+ * frames; then they are tried again, since another picture may want them.
+ * A try that fails again doubles the rest, up to RDP_Z_REST_MAX: the try
+ * itself cost 134 ms of a second on the scroll; one that pays starts over.
+ */
+#define RDP_Z_REST     30u
+#define RDP_Z_REST_MAX 960u
+
+static bool z_ready(void)
+{
+    if (!s_p.far_z || s_p.z_rest != 0u) {
+        return false;
+    }
+    if (s_p.z == NULL) {
+        /* PSRAM first: 14 KB of internal memory held for good was what a
+         * mouse plugged in during Fallout did not have (6 Oct 2026), and
+         * copies rest most of the time now (RDP_Z_REST) */
+        s_p.z = (rdc_zstate_t *)ag_port_alloc(sizeof(rdc_zstate_t),
+                                              AG_MEM_SLOW | AG_MEM_BYTE);
+        if (s_p.z == NULL) {
+            s_p.z = (rdc_zstate_t *)ag_port_alloc(sizeof(rdc_zstate_t),
+                                                  AG_MEM_FAST | AG_MEM_BYTE);
+        }
+    }
+    if (s_p.zhist == NULL) {
+        s_p.zhist = (uint8_t *)ag_port_alloc(RDC_Z_WIN,
+                                             AG_MEM_SLOW | AG_MEM_BYTE);
+        if (s_p.zhist == NULL) {
+            s_p.zhist = (uint8_t *)ag_port_alloc(RDC_Z_WIN,
+                                                 AG_MEM_FAST | AG_MEM_BYTE);
+        }
+    }
+    return s_p.z != NULL && s_p.zhist != NULL;
+}
+
+static uint32_t pack_whole_z(const uint8_t *ix, uint32_t n, uint8_t *out,
+                             uint32_t cap, bool fresh)
+{
+    if (fresh) {
+        rdc_z_reset(s_p.z);
+        s_p.zn = 0;
+    }
+    if (s_p.zn + n > RDC_Z_WIN) {
+        return 0u;
+    }
+    memcpy(s_p.zhist + s_p.zn, ix, n);
+    uint32_t       taken = 0;
+    const int64_t  t0 = ag_port_us();
+    const uint32_t at =
+        rdc_pack8z_some(s_p.z, s_p.zhist, s_p.zn, n, out, cap, &taken);
+    s_p.t_z_us += ag_port_us() - t0;
+    if (taken != n) {
+        return 0u;
+    }
+    s_p.zn += n;
+    s_p.z_px += n;
+    s_p.z_bytes += at;
+    return at;
+}
+
+/* n pixels packed whole, as indices when ix is given: 0 if they do not fit. */
+static uint32_t pack_whole(const uint16_t *px, const uint8_t *ix, uint32_t n,
+                           uint8_t *out, uint32_t cap)
+{
+    if (ix == NULL) {
+        return rdc_pack(px, n, out, cap);
+    }
+    uint32_t       taken = 0;
+    const uint32_t at = rdc_pack8_some(ix, n, out, cap, &taken);
+    return (taken == n) ? at : 0u;
+}
 
 /*
  * A row of a rectangle into the payload: onto the rectangle open there when
@@ -297,17 +569,29 @@ static bool flush(uint32_t handle, rdp_send_fn send)
  * messages half full (30 Sep 2026): 643 bytes do not fit in 640, and the
  * 64 pixels over went alone.
  */
-static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
-                        uint16_t room, uint32_t handle, rdp_send_fn send)
+/* The largest rectangle the far screen holds; an image that never said holds
+ * the smaller size. */
+static uint32_t far_rect_px(void)
+{
+    return (s_p.rect_px != 0u) ? s_p.rect_px : RDP_RECT_MIN;
+}
+
+static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px,
+                        const uint8_t *ix, uint32_t n, uint16_t room,
+                        uint32_t handle, rdp_send_fn send)
 {
     (void)handle;
     (void)send;
     {
         if (s_p.rect_at != 0u && s_p.rect_x == x && s_p.rect_w == n &&
+            s_p.rect_idx == (ix != NULL) &&
             (uint32_t)s_p.rect_y + s_p.rect_h == y &&
-            ((uint32_t)s_p.rect_h + 1u) * n <= RDP_RECT_PX) {
+            ((uint32_t)s_p.rect_h + 1u) * n <= far_rect_px()) {
             const uint32_t packed =
-                rdc_pack(px, n, s_p.msg + s_p.len, room - s_p.len);
+                s_p.rect_z
+                    ? pack_whole_z(ix, n, s_p.msg + s_p.len, room - s_p.len,
+                                   false)
+                    : pack_whole(px, ix, n, s_p.msg + s_p.len, room - s_p.len);
             if (packed > 0u) {
                 s_p.len += packed;
                 s_p.rect_h++;
@@ -320,12 +604,19 @@ static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
         s_p.rect_at = 0;
         if (s_p.len + RDP_RECT_HDR < room) {
             uint8_t *const at = s_p.msg + s_p.len;
-            const uint32_t packed = rdc_pack(px, n, at + RDP_RECT_HDR,
-                                             room - s_p.len - RDP_RECT_HDR);
+            const bool     zz = ix != NULL && z_ready();
+            const uint32_t packed =
+                zz ? pack_whole_z(ix, n, at + RDP_RECT_HDR,
+                                  room - s_p.len - RDP_RECT_HDR, true)
+                   : pack_whole(px, ix, n, at + RDP_RECT_HDR,
+                                room - s_p.len - RDP_RECT_HDR);
             if (packed > 0u) {
+                s_p.rect_z = zz;
                 put16(at, (uint16_t)y);
                 put16(at + 2, (uint16_t)x);
-                put16(at + 4, (uint16_t)(n | RDP_RECT_BIT));
+                put16(at + 4, (uint16_t)(n | RDP_RECT_BIT |
+                                         ((ix != NULL) ? RDP_IDX_BIT : 0u) |
+                                         (zz ? RDP_Z_BIT : 0u)));
                 put16(at + 6, (uint16_t)packed);
                 put16(at + 8, 1u);
                 s_p.rect_at = s_p.len;
@@ -333,6 +624,7 @@ static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
                 s_p.rect_y = (uint16_t)y;
                 s_p.rect_w = (uint16_t)n;
                 s_p.rect_h = 1u;
+                s_p.rect_idx = (ix != NULL);
                 s_p.rect_plen = (uint16_t)packed;
                 s_p.len += RDP_RECT_HDR + packed;
                 return 1;
@@ -344,23 +636,30 @@ static int put_rect_row(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
 
 /* A run of the row into the payload: as much of it as there is room for,
  * and the rest in the next payload after sending this one. */
-static bool put_run(uint32_t y, uint32_t x, const uint16_t *px, uint32_t n,
-                    uint16_t room, uint32_t handle, rdp_send_fn send)
+static bool put_run(uint32_t y, uint32_t x, const uint16_t *px,
+                    const uint8_t *ix, uint32_t n, uint16_t room,
+                    uint32_t handle, rdp_send_fn send)
 {
     s_p.rect_at = 0; /* what follows is not the open rectangle's */
     while (n != 0u) {
         uint32_t taken = 0;
         if (s_p.len + RDP_RUN_HDR < room) {
             uint8_t *const at = s_p.msg + s_p.len;
-            const uint32_t packed = rdc_pack_some(
-                px, n, at + RDP_RUN_HDR, room - s_p.len - RDP_RUN_HDR, &taken);
+            const uint32_t cap = room - s_p.len - RDP_RUN_HDR;
+            const uint32_t packed =
+                (ix != NULL)
+                    ? rdc_pack8_some(ix, n, at + RDP_RUN_HDR, cap, &taken)
+                    : rdc_pack_some(px, n, at + RDP_RUN_HDR, cap, &taken);
             if (taken != 0u) {
                 put16(at, (uint16_t)y);
                 put16(at + 2, (uint16_t)x);
-                put16(at + 4, (uint16_t)taken);
+                put16(at + 4, (uint16_t)(taken | ((ix != NULL) ? RDP_IDX_BIT : 0u)));
                 put16(at + 6, (uint16_t)packed);
                 s_p.len += RDP_RUN_HDR + packed;
                 px += taken;
+                if (ix != NULL) {
+                    ix += taken;
+                }
                 x += taken;
                 n -= taken;
             }
@@ -414,6 +713,25 @@ static void report(void)
            (unsigned)kout,
            (unsigned)(passes ? s_p.sync_us / 1000 / passes : 0),
            (unsigned)(s_p.sync_max_us / 1000), (unsigned)(s_p.gap_max_us / 1000));
+    /* apart: a journal line has a length, and the end of one line was lost */
+    ag_log(AG_LOG_INFO, TAG,
+           "the painter's second: %u ms snapshots, %u ms packing and sending "
+           "(%u in send, %u colours to indices, %u copies, %u refused; a "
+           "frame had up to %u colours); the program's: %u ms in %u presents, "
+           "%u of it waiting for the lock",
+           (unsigned)(s_p.t_snap_us / 1000), (unsigned)(s_p.t_send_us / 1000),
+           (unsigned)(s_p.t_wire_us / 1000), (unsigned)(s_p.t_pal_us / 1000),
+           (unsigned)(s_p.t_z_us / 1000), (unsigned)s_p.eagains,
+           (unsigned)s_p.colours_max,
+           (unsigned)(s_p.t_damage_us / 1000), (unsigned)s_p.damages,
+           (unsigned)(s_p.t_damage_wait_us / 1000));
+    s_p.t_damage_wait_us = 0;
+    s_p.t_wire_us = 0;
+    s_p.t_pal_us = s_p.t_z_us = 0;
+    s_p.colours_max = 0;
+    s_p.eagains = 0;
+    s_p.t_snap_us = s_p.t_send_us = s_p.t_damage_us = 0;
+    s_p.damages = 0;
     s_p.sync_us = 0;
     s_p.sync_max_us = 0;
     s_p.gap_max_us = 0;
@@ -521,7 +839,7 @@ static void trim_to_far(uint16_t w, uint16_t h)
         span_t was[RDP_SPANS];
         memcpy(was, r, sizeof(was));
         row_clear(r);
-        const uint16_t *const pic = s_p.pic + (size_t)y * w;
+        const uint16_t *const pic = s_p.src + (size_t)y * w;
         const uint16_t *const far = s_p.snap + (size_t)y * w;
         for (uint32_t i = 0; i < RDP_SPANS; i++) {
             uint32_t       x = was[i].x0;
@@ -541,6 +859,13 @@ static void trim_to_far(uint16_t w, uint16_t h)
                     e++;
                 }
                 row_add(r, x, e - same);
+                /* and into the snapshot as it is found: the pixels that
+                 * differ are the ones it has to take, and this is the one
+                 * pass over them (1 Oct 2026: compared here, then copied
+                 * again below - the frame through PSRAM twice more than
+                 * needed, under a game that wanted the bus) */
+                memcpy(s_p.snap + (size_t)y * w + x, pic + x,
+                       (size_t)(e - same - x) * 2u);
                 x = e;
             }
         }
@@ -561,9 +886,43 @@ static bool work_is_all(uint16_t w, uint16_t h)
 
 /* One pass: every row marked since the last, out of the picture and into
  * the wire.  Apart from the loop so the host test can make passes itself. */
+/*
+ * THE SNAPSHOT ONLY WHILE MEMORY IS PLENTIFUL (1 Oct 2026).  It is 150 KB of
+ * the same picture again, taken at the first present - at boot, before any
+ * program - and a game started after it found that much less for itself:
+ * Fallout could not open a script and faulted.  So it is taken when a new
+ * frame starts and there is RDP_SNAP_SPARE left beside it, and given back
+ * when the free memory falls under RDP_SNAP_FLOOR.  Without it a frame goes
+ * out of the picture as it is (s_p.more), which a game under memory
+ * pressure can afford and 150 KB it cannot.
+ */
+#define RDP_SNAP_SPARE (1024u * 1024u)
+#define RDP_SNAP_FLOOR (384u * 1024u)
+static void snap_mind(void)
+{
+    const size_t bytes = (size_t)s_p.cap_px * 2u;
+    const size_t free_slow = ag_port_mem_free(AG_MEM_SLOW | AG_MEM_BYTE);
+    if (s_p.snap == NULL) {
+        if (ag_port_mem_largest(AG_MEM_SLOW | AG_MEM_BYTE) >= bytes + RDP_SNAP_SPARE) {
+            s_p.snap = ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+            s_p.snap_is_far = false;
+        }
+    } else if (free_slow < RDP_SNAP_FLOOR) {
+        ag_port_free(s_p.snap);
+        s_p.snap = NULL;
+        s_p.snap_is_far = false;
+        s_p.cont = false;
+        ag_log(AG_LOG_INFO, TAG, "memory short (%u KB free): the snapshot "
+                                 "given back",
+               (unsigned)(free_slow / 1024u));
+    }
+}
+
 static void pass(void)
 {
     {
+        const int64_t t_in = ag_port_us();
+        wt_note(WT_PASS_IN, s_p.passes);
         lock();
         const uint16_t w = s_p.w;
         const uint16_t h = s_p.h;
@@ -575,13 +934,62 @@ static void pass(void)
          * tear Maxim still saw with the snapshot in.  Now what is left goes on
          * from this snapshot, and the next is taken when all of it has gone.
          */
+        if (!s_p.cont && !s_p.more) {
+            snap_mind(); /* between frames: take it, or give it back */
+        }
         const bool cont = s_p.cont && s_p.snap != NULL;
         s_p.cont = false;
+        rpal_t *const pl = (s_p.far_idx && s_p.pal != NULL) ? s_p.pal : NULL;
+        if (s_p.pal != NULL && s_p.pal_forget) {
+            s_p.pal_forget = false;
+            pal_reset(s_p.pal);
+        }
+        if (!cont && !s_p.more) {
+            if (s_p.z_rest != 0u) {
+                s_p.z_rest--;
+            } else if (s_p.z_px >= 4096u && s_p.z_bytes * 10u > s_p.z_px * 9u) {
+                if (s_p.z_rest_len < RDP_Z_REST) {
+                    s_p.z_rest_len = RDP_Z_REST;
+                }
+                s_p.z_rest = s_p.z_rest_len;
+                if (s_p.z_rest_len < RDP_Z_REST_MAX) {
+                    s_p.z_rest_len *= 2u;
+                }
+            } else if (s_p.z_px >= 4096u) {
+                s_p.z_rest_len = RDP_Z_REST; /* they paid */
+            }
+            s_p.z_px = s_p.z_bytes = 0;
+        }
+        if (!cont && !s_p.more && s_p.cbits != NULL && s_p.colours != 0u) {
+            if (s_p.colours > s_p.colours_max) {
+                s_p.colours_max = s_p.colours;
+            }
+            s_p.colours = 0;
+            memset(s_p.cbits, 0, 8192u);
+        }
+        if (pl != NULL && !cont && !s_p.more && pl->missed) {
+            /* a new frame: the colours that did not fit, a table again -
+             * and after two frames that missed, a rest from indices */
+            pal_reset(pl);
+            if (++pl->misses_in_row >= 2u) {
+                pl->misses_in_row = 0;
+                pl->rest = RDP_PAL_REST;
+            }
+        } else if (pl != NULL && !cont && !s_p.more) {
+            pl->misses_in_row = 0;
+            if (pl->rest != 0u) {
+                pl->rest--;
+            }
+        }
+        /* asked before this snapshot: it holds the program's last frame */
+        const bool done = s_p.done_asked;
         if (!cont) {
         memcpy(s_p.work, s_p.dirty, (size_t)h * RDP_SPANS * sizeof(span_t));
         memset(s_p.dirty, 0, (size_t)h * RDP_SPANS * sizeof(span_t));
+        bool taken = false; /* the snapshot has what goes already */
         if (s_p.snap != NULL && s_p.snap_is_far) {
             trim_to_far(w, h);
+            taken = true;
         } else if (s_p.snap != NULL && work_is_all(w, h)) {
             s_p.snap_is_far = true; /* this snapshot is the whole screen */
         }
@@ -593,13 +1001,13 @@ static void pass(void)
          * its bottom in the next - "the bottom lags the top", Maxim.  What
          * this pass sends is copied here, under the lock the presents take.
          */
-        if (s_p.snap != NULL) {
+        if (s_p.snap != NULL && !taken) {
             for (uint32_t y = 0; y < h; y++) {
                 const span_t *const r = row_of(s_p.work, y);
                 for (uint32_t i = 0; i < RDP_SPANS; i++) {
                     if (r[i].x1 > r[i].x0) {
                         memcpy(s_p.snap + (size_t)y * w + r[i].x0,
-                               s_p.pic + (size_t)y * w + r[i].x0,
+                               s_p.src + (size_t)y * w + r[i].x0,
                                (size_t)(r[i].x1 - r[i].x0) * 2u);
                     }
                 }
@@ -610,6 +1018,9 @@ static void pass(void)
         const uint16_t    room = s_p.room;
         const rdp_send_fn send = s_p.send;
         unlock();
+        const int64_t t_snapped = ag_port_us();
+        wt_note(WT_SNAP_OUT, (uint32_t)(t_snapped - t_in));
+        s_p.t_snap_us += t_snapped - t_in;
 
         bool     any = false;
         bool     ok = true;
@@ -654,12 +1065,47 @@ static void pass(void)
                     }
                     any = true;
                     const uint16_t *row =
-                        ((s_p.snap != NULL) ? s_p.snap : s_p.pic) +
+                        ((s_p.snap != NULL) ? s_p.snap : s_p.src) +
                         (size_t)yy * w;
+                    /* counted only while the report is asked for: a pass
+                     * over every pixel is not free */
+                    if (s_report && s_p.cbits == NULL) {
+                        s_p.cbits = (uint8_t *)ag_port_alloc(
+                            8192u, AG_MEM_SLOW | AG_MEM_BYTE);
+                        if (s_p.cbits != NULL) {
+                            memset(s_p.cbits, 0, 8192u);
+                        }
+                    }
+                    if (s_report && s_p.cbits != NULL) {
+                        for (uint32_t k = x0; k < x1; k++) {
+                            const uint16_t c = row[k];
+                            const uint8_t  bit = (uint8_t)(1u << (c & 7u));
+                            if ((s_p.cbits[c >> 3] & bit) == 0u) {
+                                s_p.cbits[c >> 3] |= bit;
+                                s_p.colours++;
+                            }
+                        }
+                    }
+                    const uint8_t *ix =
+                        (pl != NULL && pl->rest == 0u)
+                            ? pal_index_timed(pl, row + x0, (uint32_t)(x1 - x0))
+                            : NULL;
+                    if (ix != NULL && pl->told < pl->n) {
+                        ok = pal_tell(pl, room, handle, send);
+                        if (!ok) {
+                            break;
+                        }
+                    }
+                    if (ix != NULL) {
+                        s_p.idx_px += (uint32_t)(x1 - x0);
+                    } else {
+                        s_p.rgb_px += (uint32_t)(x1 - x0);
+                    }
                     const int rr =
-                        (s_p.rects && (uint32_t)(x1 - x0) <= RDP_RECT_PX)
-                            ? put_rect_row(yy, x0, row + x0, (uint32_t)(x1 - x0), room,
-                                           handle, send)
+                        (s_p.rects && (uint32_t)(x1 - x0) <= far_rect_px())
+                            ? put_rect_row(yy, x0, row + x0, ix,
+                                           (uint32_t)(x1 - x0), room, handle,
+                                           send)
                             : -1;
                     if (rr >= 0) {
                         ok = rr > 0;
@@ -669,7 +1115,9 @@ static void pass(void)
                          x += RDP_CHUNK) {
                         const uint32_t n = (x1 - x < RDP_CHUNK) ? x1 - x
                                                                 : RDP_CHUNK;
-                        ok = put_run(yy, x, row + x, n, room, handle, send);
+                        ok = put_run(yy, x, row + x,
+                                     (ix != NULL) ? ix + (x - x0) : NULL, n, room,
+                                     handle, send);
                         changed += n;
                     }
                     p->x0 = p->x1 = 0; /* sent: not again if continued */
@@ -679,6 +1127,7 @@ static void pass(void)
                 }
             }
         }
+        s_p.more = cut && ok && s_p.snap == NULL;
         if (cut && ok) {
             if (s_p.snap != NULL) {
                 /* the rest stays in work, out of the snapshot */
@@ -702,6 +1151,7 @@ static void pass(void)
         if (ok) {
             ok = flush(handle, send);
         }
+        s_p.t_send_us += ag_port_us() - t_snapped;
         if (s_p.pass_msgs > s_p.pass_msgs_max) {
             s_p.pass_msgs_max = s_p.pass_msgs;
         }
@@ -710,6 +1160,7 @@ static void pass(void)
              * all of it again, next time */
             s_p.cont = false;
             s_p.redraws++;
+            s_p.pal_forget = true;
             lock();
             s_p.snap_is_far = false;
             for (uint32_t y = 0; y < s_p.h; y++) {
@@ -719,6 +1170,11 @@ static void pass(void)
         } else if (any) {
             s_p.passes++;
             s_p.pass_whole = !cut;
+            s_p.pass_done = done && !cut;
+            if (s_p.pass_done) {
+                s_p.done_asked = false;
+                s_p.done_sent = true;
+            }
             if (!cut) {
                 s_p.frames++; /* nothing of it left: a whole frame went */
             }
@@ -739,8 +1195,19 @@ static void pass(void)
                 s_p.gap_max_us = now - s_p.last_pass_us;
             }
             s_p.last_pass_us = now;
+            s_p.pass_done = false;
+        } else if (ok && done && s_sync != NULL) {
+            /* nothing left to draw: the marker alone, and it is no frame */
+            s_p.done_asked = false;
+            s_p.done_sent = true;
+            s_p.pass_whole = false;
+            s_p.pass_done = true;
+            s_sync(handle);
+            s_p.pass_done = false;
         }
         report();
+        wt_note(WT_PASS_OUT, s_p.pass_msgs);
+        s_p.tot_pass_us += ag_port_us() - t_in;
     }
 }
 
@@ -749,7 +1216,11 @@ static void painter(void *arg)
     (void)arg;
     int64_t began = 0;
     for (;;) {
+        const int64_t ww0 = ag_port_us();
+        wt_note(WT_WAKE_IN, 0u);
         (void)ag_port_sem_take(s_p.wake, ag_port_ms_to_ticks(1000));
+        wt_note(WT_WAKE_OUT, 0u);
+        s_p.tot_wake_wait_us += ag_port_us() - ww0;
         /*
          * A WHOLE FRAME, then a pass: a program presents a frame in bands
          * from the top, and a pass taken while it is half way down is half
@@ -758,23 +1229,53 @@ static void painter(void *arg)
          * reaches it, so a pause of RDP_FRAME_QUIET_US in the presents ends
          * one too.
          */
-        while (!s_p.cont && !s_p.frame_end &&
+        /*
+         * AND WITHOUT A SNAPSHOT TOO (30 Sep 2026).  Under Fallout there is no
+         * memory for the second picture, and the rest of a cut pass went back
+         * to the dirty rows to wait - for the program's next frame, and the
+         * pause between passes after it: one pass of eight messages a frame
+         * while the map scrolled, 45 passes and a third of the wire a second,
+         * a picture Maxim saw at two frames a second.
+         */
+        const int64_t fw0 = ag_port_us();
+        while (!s_p.cont && !s_p.more && !s_p.frame_end &&
                ag_port_us() - s_p.present_us < RDP_FRAME_QUIET_US) {
             (void)ag_port_sem_take(s_p.wake, ag_port_ms_to_ticks(2));
         }
+        s_p.tot_frame_wait_us += ag_port_us() - fw0;
         /* the rest of a frame goes at once: it is the same frame */
-        const bool rest = s_p.cont;
+        const bool rest = s_p.cont || s_p.more;
         if (!rest) {
             s_p.frame_end = false;
         }
         const int64_t since = ag_port_us() - began;
         if (!rest && began != 0 && since < RDP_MIN_PASS_US) {
+            const int64_t mw0 = ag_port_us();
             ag_port_task_delay(ag_port_ms_to_ticks(
                 (uint32_t)((RDP_MIN_PASS_US - since) / 1000) + 1u));
+            s_p.tot_min_wait_us += ag_port_us() - mw0;
         }
         began = ag_port_us();
         pass();
     }
+}
+
+void rdp_times(uint32_t *pass_ms, uint32_t *send_ms, uint32_t *sync_ms,
+               uint32_t *sends)
+{
+    *pass_ms = (uint32_t)(s_p.tot_pass_us / 1000);
+    *send_ms = (uint32_t)(s_p.tot_wire_us / 1000);
+    *sync_ms = (uint32_t)(s_p.sync_total_us / 1000);
+    *sends = s_p.tot_sends;
+}
+
+void rdp_waits(uint32_t *frame_ms, uint32_t *min_ms, uint32_t *wake_ms,
+               uint32_t *presents)
+{
+    *frame_ms = (uint32_t)(s_p.tot_frame_wait_us / 1000);
+    *min_ms = (uint32_t)(s_p.tot_min_wait_us / 1000);
+    *wake_ms = (uint32_t)(s_p.tot_wake_wait_us / 1000);
+    *presents = s_p.tot_presents;
 }
 
 void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us)
@@ -791,9 +1292,63 @@ void rdp_far_rects(bool yes)
     s_p.rects = yes;
 }
 
+void rdp_far_rect_px(uint32_t px)
+{
+    s_p.rect_px = (uint16_t)((px > RDP_RECT_MAX) ? RDP_RECT_MAX : px);
+}
+
+void rdp_stable_surface(const uint16_t *px, uint16_t w, uint16_t h)
+{
+    s_p.st_px = px;
+    s_p.st_w = w;
+    s_p.st_h = h;
+}
+
+void rdp_far_z(bool yes)
+{
+    s_p.far_z = yes;
+}
+
+void rdp_far_idx(bool yes)
+{
+    if (yes && !s_p.far_idx) {
+        s_p.pal_forget = true; /* whatever it had, it has from us no more */
+    }
+    s_p.far_idx = yes;
+}
+
+void rdp_idx_counts(uint32_t *idx_px, uint32_t *rgb_px)
+{
+    *idx_px = s_p.idx_px;
+    *rgb_px = s_p.rgb_px;
+}
+
 bool rdp_pass_whole(void)
 {
     return s_p.pass_whole;
+}
+
+bool rdp_pass_done(void)
+{
+    return s_p.pass_done;
+}
+
+void rdp_screen_done(void)
+{
+    if (s_p.task == NULL || s_p.src == NULL) {
+        return; /* nothing was ever sent: nothing to say */
+    }
+    s_p.done_asked = true;
+    (void)ag_port_sem_give(s_p.wake);
+}
+
+void rdp_screen_taken(void)
+{
+    s_p.done_asked = false; /* taken again before the marker went: no marker */
+    if (s_p.done_sent) {
+        s_p.done_sent = false;
+        rdp_forget(); /* its console has the glass: all of it again */
+    }
 }
 
 uint32_t rdp_redraws(void)
@@ -803,10 +1358,11 @@ uint32_t rdp_redraws(void)
 
 void rdp_forget(void)
 {
-    if (s_p.task == NULL || s_p.pic == NULL) {
+    if (s_p.task == NULL || s_p.src == NULL) {
         return;
     }
     s_p.redraws++;
+    s_p.pal_forget = true;
     lock();
     s_p.snap_is_far = false;
     for (uint32_t y = 0; y < s_p.h; y++) {
@@ -818,21 +1374,26 @@ void rdp_forget(void)
 
 /* The buffers, once, for the first surface's size; false if there is no
  * memory for them - then the proxy sends raw, as it did. */
-static bool buffers(uint16_t w, uint16_t h, uint16_t room)
+static bool buffers(uint16_t w, uint16_t h, uint16_t room, bool stable)
 {
     s_p.cap_px = (uint32_t)w * h;
     s_p.cap_rows = h;
-    s_p.pic = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_BYTE);
-    /* the snapshot is worth having, not worth failing for */
-    s_p.snap = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_SLOW | AG_MEM_BYTE);
-    if (s_p.snap == NULL) {
-        s_p.snap = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_BYTE);
-    }
+    s_p.pic = stable ? NULL : ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_BYTE);
+    s_p.src = stable ? s_p.st_px : s_p.pic;
+    /* the snapshot is taken later, when there is memory to spare for it
+     * (snap_mind) */
+    s_p.snap = NULL;
     s_p.known = ag_port_alloc(h, AG_MEM_BYTE);
     s_p.dirty = ag_port_alloc((size_t)h * RDP_SPANS * sizeof(span_t), AG_MEM_BYTE);
     s_p.work = ag_port_alloc((size_t)h * RDP_SPANS * sizeof(span_t), AG_MEM_BYTE);
     s_p.msg = ag_port_alloc(room, AG_MEM_BYTE);
-    if (s_p.pic == NULL || s_p.known == NULL || s_p.dirty == NULL ||
+    /* the palette is worth having, not worth failing for */
+    s_p.pal = ag_port_alloc(sizeof(rpal_t) + w, AG_MEM_BYTE);
+    if (s_p.pal != NULL) {
+        memset(s_p.pal, 0, sizeof(rpal_t));
+        pal_reset(s_p.pal);
+    }
+    if (s_p.src == NULL || s_p.known == NULL || s_p.dirty == NULL ||
         s_p.work == NULL || s_p.msg == NULL) {
         ag_port_free(s_p.pic);
         ag_port_free(s_p.snap);
@@ -842,6 +1403,7 @@ static bool buffers(uint16_t w, uint16_t h, uint16_t room)
         ag_port_free(s_p.work);
         ag_port_free(s_p.msg);
         s_p.pic = NULL;
+        s_p.src = NULL;
         return false;
     }
     memset(s_p.known, 0, h);
@@ -859,6 +1421,11 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
         room < RDP_HDR + RDP_RUN_HDR + RDC_PACK_MAX(RDP_CHUNK)) {
         return false;
     }
+    const bool stable =
+        s_p.st_px != NULL && b->surf_w == s_p.st_w && b->surf_h == s_p.st_h &&
+        b->stride == (uint32_t)s_p.st_w * 2u &&
+        (const uint16_t *)b->px >= s_p.st_px &&
+        (const uint16_t *)b->px < s_p.st_px + (size_t)s_p.st_w * s_p.st_h;
     if (s_p.task == NULL) {
         if (s_p.failed) {
             return false;
@@ -873,7 +1440,7 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
          * rate, and below the application it would only paint when the
          * application waited. */
         if (s_p.lock == NULL || s_p.wake == NULL ||
-            !buffers(b->surf_w, b->surf_h, room) ||
+            !buffers(b->surf_w, b->surf_h, room, stable) ||
             !ag_port_task_create(painter, "rdpaint", 3072, NULL, 5,
                                  AG_PORT_ANY_CORE, 0, &s_p.task)) {
             s_p.failed = true;
@@ -885,11 +1452,16 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
         }
         s_p.said_us = ag_port_us();
     }
+    const int64_t t_dmg = ag_port_us();
     lock();
+    s_p.t_damage_wait_us += ag_port_us() - t_dmg;
     if (b->surf_w != s_p.w || b->surf_h != s_p.h) {
         if ((uint32_t)b->surf_w * b->surf_h > s_p.cap_px ||
             b->surf_h > s_p.cap_rows || room > s_p.room) {
             unlock();
+            s_p.t_damage_us += ag_port_us() - t_dmg;
+            s_p.damages++;
+            s_p.tot_presents++;
             return false; /* bigger than the picture was made for */
         }
         /* another shape: nothing of the far screen is known any more */
@@ -904,7 +1476,33 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
     const uint32_t y1 = ((uint32_t)b->y + b->h < s_p.h) ? b->y + b->h : s_p.h;
     const uint32_t xe = ((uint32_t)b->x + b->w < s_p.w) ? b->x + b->w : s_p.w;
     bool           marked = false;
-    for (uint32_t y = b->y; y < y1 && b->x < xe; y++) {
+    if (stable != (s_p.src == s_p.st_px && s_p.st_px != NULL)) {
+        /* the presents changed where they come from: a picture of our own
+         * (taken now, if it never was), or the screen's again - and the
+         * far screen known from neither */
+        if (!stable && s_p.pic == NULL) {
+            s_p.pic = ag_port_alloc((size_t)s_p.cap_px * 2u, AG_MEM_BYTE);
+            if (s_p.pic == NULL) {
+                unlock();
+                return false; /* no memory for it: raw */
+            }
+        }
+        s_p.src = stable ? s_p.st_px : s_p.pic;
+        s_p.snap_is_far = false;
+        memset(s_p.known, 0, s_p.h);
+        for (uint32_t y = 0; y < s_p.h && stable; y++) {
+            row_whole(row_of(s_p.dirty, y), s_p.w);
+        }
+        marked = stable;
+    }
+    if (stable) {
+        /* the pixels are where the painter will read them: only mark */
+        for (uint32_t y = b->y; y < y1 && b->x < xe; y++) {
+            row_add(row_of(s_p.dirty, y), b->x, xe);
+        }
+        marked = marked || (b->y < y1 && b->x < xe);
+    }
+    for (uint32_t y = b->y; y < y1 && b->x < xe && !stable; y++) {
         const uint16_t *in = (const uint16_t *)(const void *)(
             (const uint8_t *)b->px + (size_t)(y - b->y) * b->stride);
         uint16_t *row = s_p.pic + (size_t)y * s_p.w;
@@ -916,6 +1514,23 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
             memcpy(row + b->x, in, (size_t)(xe - b->x) * 2u);
             row_add(r, b->x, xe);
             marked = true;
+            continue;
+        }
+        /*
+         * ALREADY GOING WHOLE: a copy, and nothing to compare (30 Sep 2026).
+         * While the far screen is behind a picture that changes everywhere,
+         * the row is still marked from the last present, and comparing it
+         * pixel by pixel found what was already known - the program spent
+         * 360 ms of every second doing it, scrolling at 26 frames a second
+         * where noise went at 52.
+         */
+        bool covered = false;
+        for (uint32_t i = 0; i < RDP_SPANS && !covered; i++) {
+            covered = r[i].x0 <= b->x && r[i].x1 >= xe && r[i].x1 > r[i].x0;
+        }
+        if (covered) {
+            memcpy(row + b->x, in, (size_t)(xe - b->x) * 2u);
+            marked = true; /* and the painter woken: it may be waiting */
             continue;
         }
         /* what differs from what the far screen will show, and only that,
@@ -948,6 +1563,9 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
         s_p.frame_end = true;
     }
     unlock();
+    s_p.t_damage_us += ag_port_us() - t_dmg;
+    s_p.damages++;
+    s_p.tot_presents++;
     if (marked) {
         (void)ag_port_sem_give(s_p.wake);
     }
@@ -994,7 +1612,7 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
  * windows - since a pass of noise ends in the middle of a row.
  */
 #define RDP_SLOTS   2u
-#define RDP_SLOT_PX (RDP_RECT_PX / RDP_SLOTS)
+#define RDP_SLOT_PX ((uint32_t)s_dr->cap / RDP_SLOTS)
 typedef struct {
     uint16_t x, y, w; /* where the strip is, and its width                */
     uint16_t h;       /* whole rows held                                  */
@@ -1013,7 +1631,9 @@ typedef struct {
     uint8_t                 next;
     uint32_t                t_unpack_us, t_blit_us, blits;
     uint32_t                fl[RDP_FL_N]; /* why a strip went to the glass */
-    uint16_t                px[RDP_RECT_PX];
+    uint16_t                pal[256];     /* the painter's palette, as told */
+    uint16_t                cap; /* pixels px holds */
+    uint16_t                px[];
 } rdraw_t;
 static rdraw_t *s_dr;
 static uint32_t s_draw_faults;
@@ -1037,6 +1657,9 @@ void rdp_draw_times(uint32_t *unpack_us, uint32_t *blit_us, uint32_t *blits,
 }
 
 bool rdp_draws_rects(void) { return s_dr != NULL; }
+uint32_t rdp_draw_rect_px(void) { return (s_dr != NULL) ? s_dr->cap : 0u; }
+
+bool rdp_draws_idx(void) { return s_dr != NULL; }
 
 static void blit_px(const ag_display_ops_t *d, uint16_t sw, uint16_t sh,
                     const uint16_t *px, uint16_t x, uint16_t y, uint16_t w,
@@ -1220,16 +1843,62 @@ static uint16_t *slot_take(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh)
     return slot_px((unsigned)pick);
 }
 
+/*
+ * The strips, made at start-up on a board with a screen (2 Oct 2026): 9 KB in
+ * one piece, and on the CYD, once sound had its places, the largest piece
+ * left was 4 KB - the neighbour's picture could not be drawn at all.  In the
+ * slow memory where there is one.
+ */
+static rdraw_t *rdraw_make(void)
+{
+    uint32_t cap = RDP_RECT_MAX;
+    rdraw_t *r = ag_port_alloc(sizeof(rdraw_t) + cap * sizeof(uint16_t),
+                               AG_MEM_SLOW | AG_MEM_BYTE);
+    if (r == NULL) {
+        cap = RDP_RECT_MIN;
+        r = ag_port_alloc(sizeof(rdraw_t) + cap * sizeof(uint16_t),
+                          AG_MEM_BYTE);
+    }
+    if (r != NULL) {
+        memset(r, 0, sizeof(rdraw_t));
+        r->cap = (uint16_t)cap;
+    }
+    return r;
+}
+
+bool rdp_draw_prepare(void)
+{
+    if (s_dr != NULL) {
+        return true;
+    }
+    s_dr = rdraw_make();
+    return s_dr != NULL;
+}
+
 uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
 {
-    static uint16_t line[RDP_CHUNK];
     if (d == NULL || d->blit_rect == NULL || len < RDP_HDR) {
         return 0u;
     }
     if (s_dr == NULL) {
-        s_dr = ag_port_alloc(sizeof(rdraw_t), AG_MEM_BYTE);
-        if (s_dr != NULL) {
-            memset(s_dr, 0, offsetof(rdraw_t, px));
+        s_dr = rdraw_make();
+        if (s_dr == NULL) {
+            /*
+             * No block, no drawing: there used to be a row of 256 pixels in
+             * static memory to fall back on, and the emulated S3 had 64 bytes
+             * too few of it for anything else (30 Sep 2026).  A screen that
+             * cannot find 8 KB is not drawing a neighbour's picture anyway.
+             */
+            s_draw_faults++;
+            static bool said;
+            if (!said) {
+                said = true;
+                ag_log(AG_LOG_WARN, TAG, "no memory to draw a neighbour's "
+                                         "picture (%u bytes)",
+                       (unsigned)(sizeof(rdraw_t) +
+                                  RDP_RECT_MIN * sizeof(uint16_t)));
+            }
+            return 0u;
         }
     }
     rdraw_t *const r = s_dr;
@@ -1251,44 +1920,66 @@ uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len)
         const uint16_t x = get16(pay + at + 2);
         const uint16_t n = get16(pay + at + 4);
         const uint16_t plen = get16(pay + at + 6);
-        uint16_t       rw = n, rh = 1;
+        if (y == RDP_PAL_ROW) {
+            /* palette entries: x the first, n how many */
+            at += RDP_RUN_HDR;
+            if (r == NULL || n == 0u || (uint32_t)x + n > 256u ||
+                plen != (uint32_t)n * 2u || at + plen > len) {
+                s_draw_faults++;
+                break;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                r->pal[x + i] = get16(pay + at + i * 2u);
+            }
+            at += plen;
+            continue;
+        }
+        const bool     idx = (n & RDP_IDX_BIT) != 0u;
+        uint16_t       rw = (uint16_t)(n & ~RDP_IDX_BIT), rh = 1;
+        if (idx && r == NULL) {
+            s_draw_faults++;
+            break;
+        }
         if ((n & RDP_RECT_BIT) != 0u) {
             /* a rectangle: its width, and its height in a fifth word */
             if (at + RDP_RECT_HDR > len) {
                 s_draw_faults++;
                 break;
             }
-            rw = (uint16_t)(n & ~RDP_RECT_BIT);
+            rw = (uint16_t)(n & ~(RDP_RECT_BIT | RDP_IDX_BIT | RDP_Z_BIT));
             rh = get16(pay + at + 8);
             at += RDP_RECT_HDR;
             if (r == NULL || rw == 0u || rh == 0u ||
-                (uint32_t)rw * rh > RDP_RECT_PX || at + plen > len ||
+                (uint32_t)rw * rh > r->cap || at + plen > len ||
                 (uint32_t)y + rh > h || (uint32_t)x + rw > w) {
                 s_draw_faults++;
                 break;
             }
         } else {
             at += RDP_RUN_HDR;
-            if (n == 0u || n > RDP_CHUNK || at + plen > len || y >= h ||
-                (uint32_t)x + n > w) {
+            if (rw == 0u || rw > RDP_CHUNK || at + plen > len || y >= h ||
+                (uint32_t)x + rw > w) {
                 s_draw_faults++;
                 break; /* not a run: the rest cannot be trusted either */
             }
         }
         const uint32_t px = (uint32_t)rw * rh;
-        uint16_t      *into = (r != NULL) ? slot_take(x, y, rw, rh) : NULL;
+        uint16_t      *into = slot_take(x, y, rw, rh);
         bool           now = false;
         if (into == NULL) {
-            /* bigger than a slot, or no buffer: drawn at once, alone */
+            /* bigger than a slot: drawn at once, alone */
             rdp_draw_flush(RDP_FL_OTHER);
-            into = (r != NULL) ? r->px : line;
+            into = r->px;
             now = true;
         }
         const int64_t  t0 = ag_port_us();
-        const uint32_t took = rdc_unpack(pay + at, plen, into, px);
-        if (r != NULL) {
-            r->t_unpack_us += (uint32_t)(ag_port_us() - t0);
-        }
+        const uint32_t took =
+            !idx                     ? rdc_unpack(pay + at, plen, into, px)
+            : ((n & RDP_Z_BIT) != 0u) ? rdc_unpack8z(pay + at, plen, r->pal,
+                                                     into, px)
+                                      : rdc_unpack8(pay + at, plen, r->pal,
+                                                    into, px);
+        r->t_unpack_us += (uint32_t)(ag_port_us() - t0);
         if (took != plen) {
             s_draw_faults++;
             break;

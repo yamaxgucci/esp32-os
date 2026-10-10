@@ -190,6 +190,19 @@ void   ag_proc_free(void *ptr);
 size_t ag_proc_usable_size(const void *ptr);
 void   ag_proc_meminfo(ag_meminfo_t *out);
 
+/*
+ * INTERNAL MEMORY KEPT FOR WHAT MAY ARRIVE (6 Oct 2026).  A driver whose
+ * device can turn up at any moment - a USB host waiting for a plug - says how
+ * much internal memory that arrival costs, and applications are not given
+ * that much: an application's internal-memory request that would leave less
+ * than the sum is refused, and its task stacks go to PSRAM instead.  Fallout
+ * took the S3's internal memory down to 2 KB and a mouse plugged in during
+ * the game was noticed and never opened (the pipe allocation failed).  `who`
+ * is any stable pointer naming the claim; 0 bytes withdraws it.
+ */
+void   ag_proc_keep_internal(const void *who, size_t bytes);
+size_t ag_proc_kept_internal(void);
+
 /* The calling process's working directory, or the shell's outside a process. */
 const char *ag_proc_cwd(void);
 ag_err_t    ag_proc_set_cwd(const char *absolute_path);

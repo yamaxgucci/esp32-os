@@ -8,6 +8,7 @@
 #include <setjmp.h>
 #include <string.h>
 
+#include <argon/budget.h>
 #include <argon/clu.h>
 #include <argon/console.h>
 #include <argon/device.h>
@@ -22,6 +23,7 @@
 #include <argon/log.h>
 #include <argon/net.h>
 #include <argon/path.h>
+#include <argon/place.h>
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
@@ -966,10 +968,131 @@ bool ag_proc_task_create(ag_port_task_fn fn, const char *name,
 #endif
 }
 
+/* ---- internal memory kept for what may arrive (see proc.h) ---- */
+
+#define KEEP_SLOTS 4u
+static const void *s_keep_who[KEEP_SLOTS];
+static size_t      s_keep_bytes[KEEP_SLOTS];
+
+void ag_proc_keep_internal(const void *who, size_t bytes)
+{
+    int free_slot = -1;
+    for (uint32_t i = 0; i < KEEP_SLOTS; i++) {
+        if (s_keep_who[i] == who) {
+            s_keep_bytes[i] = bytes;
+            if (bytes == 0u) {
+                s_keep_who[i] = NULL;
+            }
+            return;
+        }
+        if (s_keep_who[i] == NULL && free_slot < 0) {
+            free_slot = (int)i;
+        }
+    }
+    if (bytes != 0u && free_slot >= 0) {
+        s_keep_bytes[free_slot] = bytes;
+        s_keep_who[free_slot] = who;
+    }
+}
+
+size_t ag_proc_kept_internal(void)
+{
+    size_t sum = 0;
+    for (uint32_t i = 0; i < KEEP_SLOTS; i++) {
+        if (s_keep_who[i] != NULL) {
+            sum += s_keep_bytes[i];
+        }
+    }
+    return sum;
+}
+
+/* Whether an application may take `bytes` of internal memory and still leave
+ * what is kept. */
+static bool app_internal_room(size_t bytes)
+{
+    return ag_port_mem_free(AG_MEM_FAST) >= bytes + ag_proc_kept_internal();
+}
+
+bool ag_proc_task_create_app(ag_port_task_fn fn, const char *name,
+                             uint32_t stack_bytes, void *arg, unsigned prio,
+                             int core, ag_port_task_t *out)
+{
+#if AG_PORT_TASK_STACK_CAPS
+    /*
+     * [memory] app.stack: iram, psram by default.  Internal SRAM only above
+     * what is kept for arriving devices (ag_proc_keep_internal).
+     */
+    ag_place_kind_t kinds[AG_PLACE_KINDS];
+    const unsigned  n = ag_place_order("app.stack", kinds);
+    ag_port_task_t  local = NULL;
+    ag_port_task_t *t = (out != NULL) ? out : &local;
+    for (unsigned k = 0; k < n; k++) {
+        if (kinds[k] == AG_PLACE_IRAM && app_internal_room(stack_bytes) &&
+            ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                                AG_MEM_FAST | AG_MEM_BYTE, t)) {
+            ag_place_adopt("app.stack", (void *)*t);
+            return true;
+        }
+        if (kinds[k] == AG_PLACE_PSRAM &&
+            ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                                AG_MEM_SLOW | AG_MEM_BYTE, t)) {
+            ag_place_adopt("app.stack", (void *)*t);
+            if (k > 0) {
+                ag_log(AG_LOG_INFO, "proc",
+                       "%s: task stack in PSRAM (%u bytes; internal SRAM is "
+                       "kept for devices, %u bytes)",
+                       name != NULL ? name : "?", (unsigned)stack_bytes,
+                       (unsigned)ag_proc_kept_internal());
+            }
+            return true;
+        }
+    }
+    return false;
+#else
+    return ag_proc_task_create(fn, name, stack_bytes, arg, prio, core, out);
+#endif
+}
+
+/*
+ * The other way round, for a task that lives as long as the board and is
+ * not in a hurry: PSRAM first, internal SRAM only where there is none
+ * (6 Oct 2026, the standing request worker - a 4 KB internal stack held for
+ * good cost the emulated S3 a program's thread stacks).
+ */
+bool ag_proc_task_create_slow(ag_port_task_fn fn, const char *name,
+                              uint32_t stack_bytes, void *arg, unsigned prio,
+                              int core, ag_port_task_t *out)
+{
+#if AG_PORT_TASK_STACK_CAPS
+    if (ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                            AG_MEM_SLOW | AG_MEM_BYTE, out)) {
+        return true;
+    }
+    return ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                               AG_MEM_FAST | AG_MEM_BYTE, out);
+#else
+    return ag_port_task_create(fn, name, stack_bytes, arg, prio, core, 0, out);
+#endif
+}
+
 static uint32_t clamp_stack_bytes(uint32_t want)
 {
     if (want == 0) {
         want = (uint32_t)CONFIG_ARGON_APP_STACK_KB * 1024u;
+        /*
+         * A DEFAULT SIZED BY THE KIND OF MACHINE (6 Oct 2026).  On a board
+         * with no PSRAM every stack is the internal memory everything else
+         * lives in, and 16 KB of it for a program that named no size was the
+         * C3's undoing: a 440 Hz tone held 16 KB of stack with 12 KB never
+         * touched, and the next program on that board was refused an 8 KB
+         * one.  The CYD's sdkconfig already said 8 for the same reason; the
+         * kind of memory says it for every such board.  A program that needs
+         * more names it (AG_APP_SIZED) and gets it.
+         */
+        if (ag_port_mem_free(AG_MEM_SLOW) == 0u &&
+            want > AG_PROC_LOAD_STACK_MIN) {
+            want = AG_PROC_LOAD_STACK_MIN;
+        }
     }
     if (want < AG_PROC_STACK_MIN) {
         want = AG_PROC_STACK_MIN;
@@ -1004,7 +1127,13 @@ static void apply_task_priority(proc_t *p)
     if (p == NULL || p->task == NULL) {
         return;
     }
+    /* watched for fairness at the ordinary priority only: low asked to be
+     * last, high asked by name to be first (ag_budget_fair) */
+    ag_budget_forget(p->task);
     ag_port_task_prio_set(p->task, prio_for(p->sched_class));
+    if (prio_for(p->sched_class) == AG_BUDGET_FAIR_PRIO) {
+        (void)ag_budget_fair(p->task, p->name);
+    }
 }
 
 static void name_from_path(char *dst, size_t dst_len, const char *path)
@@ -1200,6 +1329,7 @@ static void proc_finished(proc_t *p)
     p->state = AG_PS_ZOMBIE;
     ag_port_sem_give(p->done);
     unlock();
+    ag_budget_forget(ag_port_task_self());
     ag_port_task_delete(NULL);
 }
 
@@ -1366,8 +1496,8 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
      * needs reporting.
      */
     ag_port_task_t started = NULL;
-    if (!ag_proc_task_create(proc_task, p->name, p->stack_bytes, p, prio, core,
-                             &started)) {
+    if (!ag_proc_task_create_app(proc_task, p->name, p->stack_bytes, p, prio,
+                                 core, &started)) {
         /*
          * Tried internal SRAM, then PSRAM (when enabled).  Failure here means
          * both are exhausted or the TCB (always internal) could not be taken.
@@ -1907,6 +2037,7 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
 
     crash_record(p, reason, true);
 
+    ag_budget_forget(task);
     ag_port_task_delete(task);
     p->task = NULL;
     p->exit_code = -AG_EKILLED;
@@ -2114,6 +2245,17 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
             want |= AG_MEM_SLOW;
         }
 
+        /* an application's internal memory stops above what is kept for
+         * arriving devices (see ag_proc_keep_internal) */
+        if (p != NULL && (want & AG_MEM_SLOW) == 0u &&
+            (want & AG_MEM_EXEC) == 0u && !app_internal_room(bytes)) {
+            ag_log(AG_LOG_INFO, "proc",
+                   "%s: %u bytes of internal memory refused - %u are kept for "
+                   "devices",
+                   p->name, (unsigned)bytes,
+                   (unsigned)ag_proc_kept_internal());
+            return NULL;
+        }
         void *ptr = ag_port_alloc(bytes, want);
         if (ptr == NULL && (want & AG_MEM_SLOW)) {
             ptr = ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
@@ -2319,6 +2461,7 @@ void ag_proc_fault_exit(void)
      */
     ag_thread_mark_self_finished();
     ag_supervisor_kill_request(p->pid);
+    ag_budget_forget(ag_port_task_self());
     ag_port_task_delete(NULL);
 }
 

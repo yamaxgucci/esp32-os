@@ -617,6 +617,8 @@ ag_err_t ag_session_focus(int slot)
         enter_shell_view(slot);
     } else if (proc_is_loading(next_pid)) {
         enter_loading_view(slot, next_pid);
+    } else {
+        ag_display_focus_back(next_pid); /* its screen, if it was taken */
     }
     /* Ready apps own the screen — no console banner over them. */
 

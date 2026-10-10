@@ -48,6 +48,10 @@ bool rdp_damage(const ag_blit_t *b, uint32_t handle, uint16_t room,
 
 /* One payload onto a local screen; the pixels drawn, 0 if it was not one. */
 uint32_t rdp_draw(const ag_display_ops_t *d, const uint8_t *pay, uint16_t len);
+/* The receiving side's strips, made now rather than at the first piece. */
+bool rdp_draw_prepare(void);
+/* The most pixels one rectangle may carry to this screen: 0 if it draws none. */
+uint32_t rdp_draw_rect_px(void);
 /* Payloads rdp_draw could not draw to the end: a run it could not read.  The
  * rest of such a payload is lost, and the screen with it until repainted. */
 uint32_t rdp_draw_faults(void);
@@ -80,10 +84,46 @@ void rdp_counts(uint32_t *frames, uint32_t *passes, uint32_t *wait_us);
  * far end counts the frames it has drawn whole, which is what a person sees. */
 bool rdp_pass_whole(void);
 
+/* Since the board started: time in passes, of it inside send() and waiting
+ * for the far end, and the payloads sent. */
+void rdp_times(uint32_t *pass_ms, uint32_t *send_ms, uint32_t *sync_ms,
+               uint32_t *sends);
+/* the painter's time between passes: waiting for the program's frame, for
+ * the least time a pass may take (RDP_MIN_PASS_US), and for anything marked
+ * at all; and the presents that marked something */
+void rdp_waits(uint32_t *frame_ms, uint32_t *min_ms, uint32_t *wake_ms,
+               uint32_t *presents);
+
+/*
+ * The program drawing on the far screen let it go (the display was
+ * released).  The painter says so in a marker behind the last of what it
+ * drew, and the far screen takes its glass back then - not when a picture
+ * has stood still for a while, which a game's menu does for minutes.
+ * rdp_pass_done: for the sync, whether this pass carries it.
+ */
+void rdp_screen_done(void);
+bool rdp_pass_done(void);
+/* A program took the display again: if the far screen was told it was let
+ * go, it shows its own console now, and every row goes again - a picture
+ * that does not change would otherwise never be sent. */
+void rdp_screen_taken(void);
+
 /* The far screen said it draws a rectangle sent as one run; this screen
  * does (it has the buffer to unpack one into).  See rdpaint.c. */
 void rdp_far_rects(bool yes);
+/* ... and the most pixels it holds in one rectangle (0: it never said). */
+void rdp_far_rect_px(uint32_t px);
 bool rdp_draws_rects(void);
+/* The same for indices into a palette (see rdpaint.c, OR INDICES), and the
+ * pixels the painter sent each way since it began. */
+void rdp_far_idx(bool yes);
+/* ... and that it undoes copies in a rectangle of indices (rdc_pack8z). */
+void rdp_far_z(bool yes);
+/* The screen's own framebuffer (w x h, rows back to back): presents out of
+ * it are read there by the painter instead of copied.  NULL for none. */
+void rdp_stable_surface(const uint16_t *px, uint16_t w, uint16_t h);
+bool rdp_draws_idx(void);
+void rdp_idx_counts(uint32_t *idx_px, uint32_t *rgb_px);
 /* Whether rdp_draw holds pixels not yet on the glass. */
 bool rdp_draw_holds(void);
 /* Why a strip gathered by rdp_draw went to the glass. */

@@ -20,6 +20,7 @@
 #include <argon/display.h>
 #include <argon/log.h>
 #include <argon/module.h>
+#include <argon/place.h>
 #include <argon/power.h>
 #include <argon/recovery.h>
 #include <argon/shell.h>
@@ -349,6 +350,17 @@ static void print_summary(void)
     }
 }
 
+/* The prompt's own task, when it has one: the main task's stack and priority
+ * (sdkconfig.defaults CONFIG_ESP_MAIN_TASK_STACK_SIZE; IDF runs main at 1). */
+#define AG_SHELL_STACK    12288u
+#define AG_SHELL_PRIORITY 1u
+
+static void shell_task(void *arg)
+{
+    (void)arg;
+    ag_shell_run();
+}
+
 void ag_kernel_main(void)
 {
     AG_TRACE("kernel entry\n");
@@ -433,6 +445,22 @@ void ag_kernel_main(void)
         }
     }
 
+    /*
+     * [memory] shell.stack (argon/place.h).  The boot runs on the main task's
+     * internal stack and needs it - every stage runs there - but the prompt
+     * that follows is not in a hurry.  Asked for PSRAM, it moves to a task of
+     * its own with the same stack there, and returning from here ends the
+     * main task, so IDF frees its internal stack.  Flash from a PSRAM stack
+     * goes through the port's relay (flashop_hw.c): copy and dir slower by a
+     * sixth and a half, measured on the S3-Zero (9 Oct 2026), which a prompt
+     * can afford.  Otherwise it stays where it is.
+     */
+    if (ag_place_first("shell.stack") == AG_PLACE_PSRAM &&
+        ag_place_task("shell.stack", shell_task, "shell", AG_SHELL_STACK,
+                      NULL, AG_SHELL_PRIORITY, 0, NULL, NULL)) {
+        return;
+    }
+    ag_place_adopt("shell.stack", (void *)ag_port_task_self());
     ag_shell_run();
 }
 

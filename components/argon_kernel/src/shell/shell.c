@@ -29,6 +29,7 @@
 #include <argon/module.h>
 #include <argon/netmsg.h>
 #include <argon/path.h>
+#include <argon/place.h>
 #include <argon/probe.h>
 #include <argon/power.h>
 #include <argon/proc.h>
@@ -59,6 +60,9 @@
 #include <argon/port/sys.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/place.h>
+
+#include "core/place_bss.h"
 
 #include "boot/platform.h"
 #include "core/sysconfig.h"
@@ -121,7 +125,24 @@ typedef struct {
     int           slot;
 } shell_ctx_t;
 
-static shell_ctx_t s_ctx0 = { .cwd = "/", .slot = AG_SESSION_FOLLOW };
+/*
+ * The first prompt's context: 3 KB, in PSRAM where there is some (8 Oct
+ * 2026).  PSRAM statics start as zeroes, not as an initialiser, so the two
+ * fields that are not zero are set the first time anybody asks for it.
+ */
+static shell_ctx_t s_ctx0 AG_KERNEL_STATIC;
+static volatile bool s_ctx0_ready;
+
+static shell_ctx_t *ctx0(void)
+{
+    if (!s_ctx0_ready) {
+        s_ctx0.cwd[0] = '/';
+        s_ctx0.cwd[1] = '\0';
+        s_ctx0.slot = AG_SESSION_FOLLOW;
+        s_ctx0_ready = true;
+    }
+    return &s_ctx0;
+}
 
 /*
  * Which prompt is speaking, keyed by task.
@@ -146,7 +167,7 @@ static shell_ctx_t *sh(void)
             return s_ctxs[i].ctx;
         }
     }
-    return &s_ctx0;
+    return ctx0();
 }
 
 #define s_cwd          (sh()->cwd)
@@ -434,18 +455,28 @@ static int mem_tasks(void)
         }
         t[k] = x;
     }
-    uint32_t sum = 0, unused = 0;
-    ag_console_puts("  task              stack   unused  prio\n");
+    /*
+     * Where each stack lives, too (8 Oct 2026): a stack in PSRAM costs the
+     * internal memory nothing, and without the column the list read as if
+     * every kilobyte in it came out of the 512.
+     */
+    uint32_t sum = 0, unused = 0, internal = 0;
+    ag_console_puts(" task             stack unused prio in\n");
     for (uint32_t i = 0; i < n; i++) {
-        ag_console_printf("  %-16s %6u  %6u  %4u\n", t[i].name,
+        ag_console_printf(" %-15s %6u %6u %4u %s\n", t[i].name,
                           (unsigned)t[i].stack_bytes,
-                          (unsigned)t[i].stack_unused, t[i].prio);
+                          (unsigned)t[i].stack_unused, t[i].prio,
+                          t[i].stack_slow ? "ext" : "int");
         sum += t[i].stack_bytes;
         unused += t[i].stack_unused;
+        if (!t[i].stack_slow) {
+            internal += t[i].stack_bytes;
+        }
     }
-    ag_console_printf("  %u tasks, %u KB of stacks, %u KB of it never used\n",
+    ag_console_printf("  %u tasks, %u KB of stacks (%u KB internal), %u KB of "
+                      "it never used\n",
                       (unsigned)all, (unsigned)(sum / 1024),
-                      (unsigned)(unused / 1024));
+                      (unsigned)(internal / 1024), (unsigned)(unused / 1024));
     ag_port_free(t);
     return 0;
 }
@@ -473,7 +504,7 @@ static int cmd_cpu(int argc, char **argv)
     if (t == NULL) {
         t = ag_port_alloc(sizeof(*t) * MAX_TASKS, AG_MEM_BYTE);
     } else {
-        before = ag_port_task_list(t + MAX_TASKS, MAX_TASKS);
+        before = ag_port_task_names(t + MAX_TASKS, MAX_TASKS);
         if (before > MAX_TASKS) {
             before = MAX_TASKS;
         }
@@ -485,7 +516,7 @@ static int cmd_cpu(int argc, char **argv)
     ag_cpu_sample(true);
     ag_port_task_delay(ag_port_ms_to_ticks(((secs == 0u) ? 1u : secs) * 1000u));
     ag_cpu_sample(false);
-    uint32_t n = ag_port_task_list(t, MAX_TASKS);
+    uint32_t n = ag_port_task_names(t, MAX_TASKS);
     if (n > MAX_TASKS) {
         n = MAX_TASKS;
     }
@@ -550,6 +581,12 @@ static int cmd_cpu(int argc, char **argv)
     return 0;
 }
 
+static void mem_place_line(const char *line, void *ctx)
+{
+    (void)ctx;
+    ag_console_puts(line);
+}
+
 /*
  * mem /x: extended memory in address order.
  *
@@ -608,7 +645,7 @@ static void mem_map_block(void *ctx, const void *addr, size_t bytes, int used)
 
 static int mem_map(void)
 {
-    static mem_map_t m;   /* 1.5 KB: not on the shell's stack */
+    static mem_map_t m AG_KERNEL_STATIC;   /* 1.5 KB: not on the shell's stack */
     memset(&m, 0, sizeof(m));
     ag_port_mem_walk(AG_MEM_SLOW, mem_map_block, &m);
     if (m.n == 0) {
@@ -644,6 +681,13 @@ static int cmd_mem(int argc, char **argv)
     if (argc > 1 && (strcmp(argv[1], "/t") == 0 ||
                      strcmp(argv[1], "tasks") == 0)) {
         return mem_tasks();
+    }
+    /* `mem /p`: where each piece of [memory] was asked to go and where it
+     * went (argon/place.h). */
+    if (argc > 1 && (strcmp(argv[1], "/p") == 0 ||
+                     strcmp(argv[1], "place") == 0)) {
+        ag_place_report(mem_place_line, NULL);
+        return 0;
     }
 
     const size_t int_free = ag_port_mem_free(AG_MEM_FAST);
@@ -2017,17 +2061,18 @@ static int cmd_ps(int argc, char **argv)
     for (uint32_t i = 0;; i++) {
         const char *name = NULL;
         uint32_t    used = 0, budget = 0;
-        bool        demoted = false;
-        if (!ag_budget_report(i, &name, &used, &budget, &demoted)) {
+        int         standing = 0;
+        if (!ag_budget_report(i, &name, &used, &budget, &standing)) {
             break;
         }
         if (i == 0) {
-            ag_console_puts(
-                "  driver tasks above applications, per 100 ms window:\n");
+            ag_console_puts("  tasks on a budget, per 100 ms window:\n");
         }
         ag_console_printf("  %-17s used %3u ms of %3u%s\n", name,
                           (unsigned)used, (unsigned)budget,
-                          demoted ? "  (held down)" : "");
+                          (standing < 0)   ? "  (held down)"
+                          : (standing > 0) ? "  (raised: light)"
+                                           : "");
     }
 
     return 0;
@@ -5314,6 +5359,7 @@ static int cmd_usb(int argc, char **argv)
     if (argc >= 2 && ag_path_icmp(argv[1], "off") == 0) {
         const size_t before = ag_port_mem_free(AG_MEM_FAST);
         (void)ag_port_usb_stop();
+        ag_usbinput_off();
         const size_t after = ag_port_mem_free(AG_MEM_FAST);
         ag_console_printf("usb host off, %u KB back\n",
                           (unsigned)((after - before) / 1024u));
@@ -6134,8 +6180,8 @@ static int cmd_uartbridge(int argc, char **argv)
      * 256 bytes is far more than a 2 ms window holds at these rates, so nothing
      * is dropped for want of buffer here.
      */
-    static uint8_t from_pc[256];
-    static uint8_t from_chip[256];
+    static uint8_t from_pc[256] AG_KERNEL_STATIC;
+    static uint8_t from_chip[256] AG_KERNEL_STATIC;
     for (;;) {
         const int32_t n =
             ag_port_uart_read(AG_PORT_UART_CONSOLE, from_pc, sizeof(from_pc), 2);
@@ -6191,7 +6237,7 @@ static int cmd_guard(int argc, char **argv)
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
-    {"mem", "[/t|/x]", "memory usage; /t: every task and its stack; /x: extended memory block by block", cmd_mem},
+    {"mem", "[/t|/p|/x]", "memory usage; /t: every task and its stack; /p: [memory] placement; /x: extended memory block by block", cmd_mem},
     {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
     {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",

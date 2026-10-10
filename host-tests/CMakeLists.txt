@@ -21,6 +21,7 @@ set(ARGON_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/core/path.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cfg.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/core/place_parse.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cmdline.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/codepage.c"
     "${ARGON_ROOT}/components/argon_kernel/src/dev/hidrep.c"
@@ -110,6 +111,7 @@ add_executable(argon_tests
     main.c
     test_path.c
     test_cfg.c
+    test_place.c
     test_screen.c
     test_vtout.c
     test_vtin.c
@@ -422,6 +424,7 @@ if(MSVC)
 else()
     target_compile_options(wlink_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
+target_compile_definitions(wlink_tests PRIVATE ARGON_NO_WTRACE)
 add_test(NAME wlink_tests COMMAND wlink_tests)
 
 # A neighbour's screen end to end: the painter's passes drawn into a
@@ -441,4 +444,5 @@ if(MSVC)
 else()
     target_compile_options(rdpaint_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
+target_compile_definitions(rdpaint_tests PRIVATE ARGON_NO_WTRACE)
 add_test(NAME rdpaint_tests COMMAND rdpaint_tests)

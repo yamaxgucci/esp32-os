@@ -431,7 +431,9 @@ static void switches(void)
             /* a screen of noise comes in pieces cut anywhere along a row;
              * gathered in strips it is a few dozen windows, not hundreds */
             printf("  rdpaint noise: %u windows\n", (unsigned)(s_rects - r0));
-            CHECK(s_rects - r0 <= 60u);
+            /* at most three times the fewest windows of the receiver's
+             * strips that could carry it (rdp_draw_rect_px, 2 Oct 2026) */
+            CHECK(s_rects - r0 <= 3u * (W * H / rdp_draw_rect_px()));
         }
         printf("  rdpaint switch %u: %u messages, %u px wrong\n",
                (unsigned)k, (unsigned)(s_sends - m0), (unsigned)n);
@@ -440,6 +442,132 @@ static void switches(void)
     /* a flat screen is 240 rows of one colour: a few messages, one pass,
      * where the rows alone were some twenty */
     CHECK(flat_msgs <= 15u);
+}
+
+
+/*
+ * A PAINTED MAP SCROLLING (30 Sep 2026): every pixel changes every frame in
+ * at most 256 colours, as when a game moves its map.  Sent as indices it must
+ * end on the glass exactly and in fewer messages than in RGB565; a frame of
+ * noise between - more colours than a palette holds - must end exactly too,
+ * and the map after it as well.
+ */
+static uint16_t s_mpal[256];
+static uint8_t  s_mtex[64 * 64];
+
+static void map_frame(uint32_t sx)
+{
+    for (uint32_t y = 0; y < H; y++) {
+        for (uint32_t x = 0; x < W; x++) {
+            const uint32_t mx = x + sx, my = y + sx / 2u;
+            s_frame[y * W + x] = s_mpal[s_mtex[(my % 64u) * 64u + mx % 64u] ^
+                                        (uint8_t)((mx / 64u) * 37u)];
+        }
+    }
+}
+
+static uint32_t frame_out(void)
+{
+    const uint32_t m0 = s_sends;
+    present_frame();
+    uint32_t guard = 0;
+    do {
+        rdpaint_stub_now_us += 16000;
+        pass();
+    } while (dirty_left() && ++guard < 400u);
+    return s_sends - m0;
+}
+
+static void palette_scroll(void)
+{
+    for (uint32_t i = 0; i < 256u; i++) {
+        s_mpal[i] = noise();
+    }
+    uint8_t v = 0;
+    for (uint32_t i = 0; i < 64u * 64u; i++) {
+        if ((noise() % 3u) != 0u) {
+            v = (uint8_t)noise();
+        }
+        s_mtex[i] = v;
+    }
+    uint32_t msgs[3] = {0, 0, 0};
+    uint32_t bad = 0;
+    /* RGB565, indices, indices with copies (rdc_pack8z) */
+    for (int with = 0; with < 3; with++) {
+        rdp_far_idx(with != 0);
+        rdp_far_z(with == 2);
+        for (uint32_t f = 0; f < 6u; f++) {
+            map_frame(f * 4u + (uint32_t)with * 1000u);
+            msgs[with] += frame_out();
+            uint32_t at = 0;
+            bad += (diff(&at) != 0u) ? 1u : 0u;
+        }
+    }
+    /* more colours than a palette: noise, exactly - then the map again */
+    for (uint32_t i = 0; i < W * H; i++) {
+        s_frame[i] = noise();
+    }
+    (void)frame_out();
+    uint32_t at = 0;
+    bad += (diff(&at) != 0u) ? 1u : 0u;
+    for (uint32_t f = 0; f < 3u; f++) {
+        map_frame(3000u + f * 4u);
+        (void)frame_out();
+        bad += (diff(&at) != 0u) ? 1u : 0u;
+    }
+    uint32_t ipx = 0, rpx = 0;
+    rdp_idx_counts(&ipx, &rpx);
+    printf("  rdpaint palette map: %u messages in RGB565, %u as indices, %u "
+           "with copies; %u frames wrong; %u px as indices, %u as RGB565\n",
+           (unsigned)msgs[0], (unsigned)msgs[1], (unsigned)msgs[2],
+           (unsigned)bad, (unsigned)ipx, (unsigned)rpx);
+    CHECK(bad == 0u);
+    CHECK(msgs[1] * 10u < msgs[0] * 7u); /* at least 30% fewer */
+    CHECK(msgs[2] < msgs[1]);            /* and copies fewer again */
+    rdp_far_idx(false);
+    rdp_far_z(false);
+}
+
+/*
+ * OUT OF THE SCREEN'S OWN FRAMEBUFFER (1 Oct 2026): presents that come out
+ * of the registered surface are only marked, and the painter reads them
+ * there.  The glass must end exactly like the frame, whatever changes -
+ * a map scrolling, then a small square on a still picture.
+ */
+static void stable_surface(void)
+{
+    rdp_stable_surface(s_frame, W, H);
+    uint32_t bad = 0, at = 0;
+    for (uint32_t f = 0; f < 5u; f++) {
+        map_frame(5000u + f * 4u);
+        (void)frame_out();
+        bad += (diff(&at) != 0u) ? 1u : 0u;
+    }
+    for (uint32_t f = 0; f < 5u; f++) {
+        for (uint32_t y = 100; y < 120; y++) {
+            for (uint32_t x = 10u * f; x < 10u * f + 20u; x++) {
+                s_frame[y * W + x] = 0xFFFFu;
+            }
+        }
+        (void)frame_out();
+        bad += (diff(&at) != 0u) ? 1u : 0u;
+    }
+    printf("  rdpaint out of the framebuffer: %u frames wrong\n", (unsigned)bad);
+    CHECK(bad == 0u);
+    /* memory short: the snapshot is given back, and frames still end exact */
+    CHECK(s_p.snap != NULL);
+    rdpaint_stub_mem_free = 100u * 1024u;
+    for (uint32_t f = 0; f < 4u; f++) {
+        map_frame(7000u + f * 4u);
+        (void)frame_out();
+        bad += (diff(&at) != 0u) ? 1u : 0u;
+    }
+    printf("  rdpaint memory short: snapshot %s, %u frames wrong\n",
+           (s_p.snap == NULL) ? "given back" : "KEPT", (unsigned)bad);
+    CHECK(s_p.snap == NULL);
+    CHECK(bad == 0u);
+    rdpaint_stub_mem_free = 64u * 1024u * 1024u;
+    rdp_stable_surface(NULL, 0, 0);
 }
 
 int main(void)
@@ -462,6 +590,14 @@ int main(void)
     balls();
     long_way();
     switches();
+    /* a far screen with the memory for the larger window says so, and the
+     * same picture goes in fewer of them */
+    rdp_far_rect_px(rdp_draw_rect_px());
+    printf("  rdpaint far window: %u px\n", (unsigned)far_rect_px());
+    CHECK(far_rect_px() == RDP_RECT_MAX);
+    switches();
+    palette_scroll();
+    stable_surface();
     printf("rdpaint_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails == 0 ? 0 : 1;
 }

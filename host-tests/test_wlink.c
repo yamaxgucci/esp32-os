@@ -456,8 +456,74 @@ static void idle_waits_for_the_wire(void)
     end_close(&b);
 }
 
+/*
+ * A block that may wait 10 ms goes ahead of blocks that may wait 50 queued
+ * before it (2 Oct 2026): the sender's lanes feed the stream the soonest due
+ * first, and the far end, which knows nothing of lanes, reads it in that
+ * order, every block whole.
+ */
+static void budget_goes_first(void)
+{
+    static wlink_t a, b;
+    end_open(&a, AG_SPILINK_BLOCKS);
+    end_open(&b, AG_SPILINK_BLOCKS);
+    static uint8_t lanes[2048u + 8192u + 2048u];
+    const uint32_t caps[WL_LANES] = {2048u, 8192u, 2048u};
+    wl_lanes(&a, lanes, caps);
+    const uint32_t how = AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE;
+    /* two blocks and their heads to a frame exactly: none is cut, so the
+     * reader below never waits inside one for the rest */
+    uint8_t        body[PAY / 2u - WL_REC];
+    for (uint32_t i = 0; i < 8u; i++) {
+        memset(body, (int)('0' + i), sizeof(body));
+        CHECK(wl_send2(&a, NULL, 0u, body, sizeof(body),
+                       how | AG_SPILINK_BUDGET(50u), 0u) == (int32_t)sizeof(body));
+    }
+    memset(body, 'S', sizeof(body));
+    CHECK(wl_send2(&a, NULL, 0u, body, sizeof(body),
+                   how | AG_SPILINK_BUDGET(10u), 0u) == (int32_t)sizeof(body));
+    char     order[16];
+    uint32_t got = 0, whole = 0, steps = 0;
+    uint8_t  buf[512];
+    while (got < 9u && steps++ < 4000u) {
+        tick();
+        (void)wl_feed(&a);
+        one_frame(&a, &b, 0u, 0u);
+        one_frame(&b, &a, 0u, 0u);
+        for (;;) {
+            ag_spilink_block_t bi;
+            memset(&bi, 0, sizeof(bi));
+            const int32_t n = wl_recv2(&b, NULL, 0u, buf, sizeof(buf), &bi, 0u);
+            if (n <= 0) {
+                break;
+            }
+            bool same = n == (int32_t)sizeof(body);
+            for (int32_t k = 1; k < n && same; k++) {
+                same = buf[k] == buf[0];
+            }
+            whole += same ? 1u : 0u;
+            if (got < sizeof(order)) {
+                order[got] = (char)buf[0];
+            }
+            got++;
+        }
+    }
+    CHECK(got == 9u);
+    CHECK(whole == 9u);
+    /* what fitted into the empty stream went at once (one block before the
+     * frame size is agreed, two after); the 10 ms block is next, ahead of
+     * every 50 ms block still waiting when it came */
+    CHECK(got >= 3u && (order[1] == 'S' || order[2] == 'S'));
+    order[(got < sizeof(order)) ? got : sizeof(order) - 1u] = '\0';
+    printf("  wlink budget: read in the order %s (%u steps)\n", order,
+           (unsigned)steps);
+    end_close(&a);
+    end_close(&b);
+}
+
 int main(void)
 {
+    budget_goes_first();
     bytes_through_a_bad_wire();
     blocks_through_a_bad_wire();
     a_restart_starts_the_stream_over();

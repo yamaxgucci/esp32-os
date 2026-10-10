@@ -33,11 +33,14 @@
 
 
 /*
- * Eight, because a module gets two tasks and the machine does not carry four
- * drivers doing real work at once.  Overflowing this is not an error: a task
- * nobody is watching is a task that behaves the way it always did.
+ * Twenty-four: eight for drivers, as before - a module gets two tasks and the
+ * machine does not carry four drivers doing real work at once - and the rest
+ * for applications' tasks, watched for fairness (2 Oct 2026).  Taken from the
+ * heap at start-up: the S3's static memory has no 700 bytes to spare.
+ * Overflowing this is not an error: a task nobody is watching is a task that
+ * behaves the way it always did.
  */
-#define AG_BUDGET_SLOTS 8u
+#define AG_BUDGET_SLOTS 24u
 
 /* Above this and a task can starve an ordinary application, so above this is
  * what gets watched.  It is AG_PRIO_NORMAL's number in proc.c. */
@@ -54,9 +57,12 @@ typedef struct {
     uint32_t volatile       over;       /* the tick says: it has overrun    */
     bool volatile           fresh;      /* the tick says: a new window      */
     bool                    demoted;
+    bool                    fair;      /* an application's: next window by the last */
+    uint8_t volatile        level;     /* a fair one's: 0 down, 1 ordinary, 2 up */
 } slot_t;
 
-static slot_t   s_slots[AG_BUDGET_SLOTS];
+static slot_t  *s_slots;
+static uint32_t s_nslots; /* 0 until the table is made */
 
 /*
  * `cpu`: every task that was running when a tick landed, counted, per core.
@@ -116,7 +122,7 @@ static void AG_PORT_IRAM budget_tick(int core, ag_port_task_t running)
     if (core == 0) {
         if (++s_window_tick >= AG_BUDGET_WINDOW_MS) {
             s_window_tick = 0;
-            for (uint32_t i = 0; i < AG_BUDGET_SLOTS; i++) {
+            for (uint32_t i = 0; i < s_nslots; i++) {
                 if (s_slots[i].task != NULL) {
                     s_slots[i].last_ms = s_slots[i].used_ms;
                     s_slots[i].used_ms = 0;
@@ -159,12 +165,20 @@ static void AG_PORT_IRAM budget_tick(int core, ag_port_task_t running)
     if (running == NULL) {
         return;
     }
-    for (uint32_t i = 0; i < AG_BUDGET_SLOTS; i++) {
+    for (uint32_t i = 0; i < s_nslots; i++) {
         if (s_slots[i].task != running) {
             continue;
         }
         s_slots[i].used_ms++;
-        if (s_slots[i].used_ms > s_slots[i].budget_ms && s_slots[i].over == 0u) {
+        /* a fair one raised for being light loses the step the moment it is
+         * not: the supervisor brings it down within the window */
+        if (s_slots[i].fair && s_slots[i].level == 2u &&
+            s_slots[i].used_ms > AG_BUDGET_LIGHT_MS && s_slots[i].over == 0u) {
+            s_slots[i].over = s_slots[i].used_ms;
+            return;
+        }
+        if (!s_slots[i].fair && s_slots[i].used_ms > s_slots[i].budget_ms &&
+            s_slots[i].over == 0u) {
             /* The figure is kept here rather than read later: by the time the
              * supervisor looks, the window may have turned and the counter
              * gone back to zero, which is how the first version of this came
@@ -180,6 +194,12 @@ void ag_budget_init(void)
     if (s_hooked) {
         return;
     }
+    s_slots = (slot_t *)ag_port_alloc(AG_BUDGET_SLOTS * sizeof(slot_t),
+                                      AG_MEM_FAST | AG_MEM_BYTE);
+    if (s_slots != NULL) {
+        memset(s_slots, 0, AG_BUDGET_SLOTS * sizeof(slot_t));
+        s_nslots = AG_BUDGET_SLOTS;
+    }
     s_idle_task[0] = ag_port_task_idle_of(0);
     s_idle_task[1] = ag_port_task_idle_of(1);
     s_hooked = ag_port_tick_hook(budget_tick);
@@ -189,14 +209,23 @@ void ag_budget_init(void)
     }
 }
 
-void ag_budget_watch(ag_port_task_t task, const char *name, unsigned base_prio,
+static bool slot_take(ag_port_task_t task, const char *name, unsigned base_prio,
+                      uint32_t budget_ms, bool fair);
+
+bool ag_budget_watch(ag_port_task_t task, const char *name, unsigned base_prio,
                      uint32_t budget_ms)
 {
     if (task == NULL || base_prio <= AG_BUDGET_WATCH_ABOVE) {
-        return; /* it cannot outrank an application, so it cannot starve one */
+        return false; /* it cannot outrank an application, so cannot starve one */
     }
 
-    for (uint32_t i = 0; i < AG_BUDGET_SLOTS; i++) {
+    return slot_take(task, name, base_prio, budget_ms, false);
+}
+
+static bool slot_take(ag_port_task_t task, const char *name, unsigned base_prio,
+                      uint32_t budget_ms, bool fair)
+{
+    for (uint32_t i = 0; i < s_nslots; i++) {
         if (s_slots[i].task != NULL) {
             continue;
         }
@@ -216,13 +245,34 @@ void ag_budget_watch(ag_port_task_t task, const char *name, unsigned base_prio,
         s->over = 0;
         s->fresh = false;
         s->demoted = false;
+        s->fair = fair;
+        s->level = 1u;
         s->last_log = 0;
         s->task = task; /* last: this is what makes the slot live */
-        return;
+        return true;
     }
 
     ag_log(AG_LOG_WARN, "budget", "no slot for %s; it runs unwatched",
            (name != NULL) ? name : "a driver task");
+    return false;
+}
+
+bool ag_budget_fair(ag_port_task_t task, const char *name)
+{
+    if (task == NULL || ag_budget_watched(task)) {
+        return false;
+    }
+    return slot_take(task, name, AG_BUDGET_FAIR_PRIO, AG_BUDGET_FAIR_MS, true);
+}
+
+bool ag_budget_watched(ag_port_task_t task)
+{
+    for (uint32_t i = 0; task != NULL && i < s_nslots; i++) {
+        if (s_slots[i].task == task) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ag_budget_forget(ag_port_task_t task)
@@ -230,7 +280,7 @@ void ag_budget_forget(ag_port_task_t task)
     if (task == NULL) {
         return;
     }
-    for (uint32_t i = 0; i < AG_BUDGET_SLOTS; i++) {
+    for (uint32_t i = 0; i < s_nslots; i++) {
         if (s_slots[i].task == task) {
             s_slots[i].task = NULL; /* first: this is what makes it dead */
             s_slots[i].over = 0;
@@ -243,7 +293,7 @@ void ag_budget_forget(ag_port_task_t task)
 
 bool ag_budget_watching(void)
 {
-    for (uint32_t i = 0; i < AG_BUDGET_SLOTS; i++) {
+    for (uint32_t i = 0; i < s_nslots; i++) {
         if (s_slots[i].task != NULL) {
             return true;
         }
@@ -255,7 +305,7 @@ bool ag_budget_service(void)
 {
     bool changed = false;
 
-    for (uint32_t i = 0; i < AG_BUDGET_SLOTS; i++) {
+    for (uint32_t i = 0; i < s_nslots; i++) {
         slot_t *s = &s_slots[i];
         ag_port_task_t task = s->task;
         if (task == NULL) {
@@ -282,6 +332,28 @@ bool ag_budget_service(void)
                        s->name, (unsigned)spent,
                        (unsigned)AG_BUDGET_WINDOW_MS, (unsigned)s->budget_ms);
             }
+        }
+
+        if (s->fair) {
+            uint8_t want = s->level;
+            if (s->fresh) {
+                s->fresh = false;
+                s->over = 0;
+                want = (s->last_ms > s->budget_ms)         ? 0u
+                       : (s->last_ms <= AG_BUDGET_LIGHT_MS) ? 2u
+                                                           : 1u;
+            } else if (s->over != 0u && s->level == 2u) {
+                want = 1u; /* light no longer: back to the ordinary */
+            }
+            if (want != s->level) {
+                s->level = want;
+                s->demoted = (want != 1u);
+                ag_port_task_prio_set(task, (want == 0u)   ? AG_BUDGET_FAIR_LOW
+                                            : (want == 2u) ? AG_BUDGET_FAIR_HIGH
+                                                           : s->base_prio);
+                changed = true;
+            }
+            continue;
         }
 
         if (s->fresh) {
@@ -347,11 +419,11 @@ uint32_t ag_cpu_sampled_total(int core, uint32_t *lost)
 }
 
 bool ag_budget_report(uint32_t index, const char **name, uint32_t *used_ms,
-                      uint32_t *budget_ms, bool *demoted)
+                      uint32_t *budget_ms, int *standing)
 {
     uint32_t seen = 0;
 
-    for (uint32_t i = 0; i < AG_BUDGET_SLOTS; i++) {
+    for (uint32_t i = 0; i < s_nslots; i++) {
         if (s_slots[i].task == NULL) {
             continue;
         }
@@ -367,8 +439,9 @@ bool ag_budget_report(uint32_t index, const char **name, uint32_t *used_ms,
         if (budget_ms != NULL) {
             *budget_ms = s_slots[i].budget_ms;
         }
-        if (demoted != NULL) {
-            *demoted = s_slots[i].demoted;
+        if (standing != NULL) {
+            *standing = s_slots[i].fair ? (int)s_slots[i].level - 1
+                                        : (s_slots[i].demoted ? -1 : 0);
         }
         return true;
     }

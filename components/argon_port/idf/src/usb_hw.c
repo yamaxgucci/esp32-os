@@ -38,6 +38,7 @@
 
 #include <argon/port/usb.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -803,18 +804,66 @@ static void client_cb(const usb_host_client_event_msg_t *msg, void *arg)
     }
 }
 
+/*
+ * ARGON: the library's own task runs on past the stop until the library has
+ * let every device go (1 Oct 2026).  It left as soon as s_running fell, and
+ * nothing handled the events that freeing the devices needs: the uninstall
+ * refused (ESP_ERR_INVALID_STATE) for good, every start after it failed, and
+ * a host that tried again once with nothing plugged in stayed off - the mouse
+ * plugged in later was never seen.  IDF's order: the last client gone
+ * (NO_CLIENTS), free_all, the library says ALL_FREE, then uninstall.
+ */
+static volatile bool s_lib_free;
+
 static void lib_task(void *arg)
 {
     (void)arg;
-    while (s_running) {
+    s_lib_free = false;
+    uint32_t after = 0; /* events handled since the stop, a bound on it */
+    while (s_running || (!s_lib_free && after++ < 30u)) {
         uint32_t flags = 0;
-        usb_host_lib_handle_events(portMAX_DELAY, &flags);
+        /* not for ever: with nothing plugged in no event comes */
+        (void)usb_host_lib_handle_events(pdMS_TO_TICKS(100), &flags);
         if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
-            (void)usb_host_device_free_all();
+            if (usb_host_device_free_all() == ESP_OK) {
+                s_lib_free = true; /* nothing was allocated */
+            }
+        }
+        if (flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
+            s_lib_free = true;
         }
     }
     s_lib_task = NULL;
     vTaskDelete(NULL);
+}
+
+/*
+ * ARGON: what a device's arrival costs in internal memory (6 Oct 2026).  The
+ * mouse plugged in during Fallout was noticed and never opened - "HCD Pipe
+ * alloc error: ESP_ERR_NO_MEM" with 2 KB of internal memory left - so the
+ * cost of an arrival is measured from the host's coming up to the device's
+ * being open: the lowest internal free in between, against what was free at
+ * the start.  That difference is what the host has to have kept for it.
+ */
+static size_t s_free_at_up;
+
+static void arrival_watch_start(void)
+{
+    (void)heap_caps_monitor_local_minimum_free_size_stop();
+    s_free_at_up = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    (void)heap_caps_monitor_local_minimum_free_size_start();
+}
+
+static void arrival_said(void)
+{
+    const size_t low = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    const size_t now = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG, "the arrival took internal memory from %u bytes free down "
+                  "to %u at its lowest (%u), %u held now",
+             (unsigned)s_free_at_up, (unsigned)low,
+             (unsigned)(s_free_at_up > low ? s_free_at_up - low : 0u),
+             (unsigned)(s_free_at_up > now ? s_free_at_up - now : 0u));
+    arrival_watch_start();
 }
 
 static void cli_task(void *arg)
@@ -835,11 +884,13 @@ static void cli_task(void *arg)
              */
             ESP_LOGI(TAG, "connect on address %u", addr);
             attach(addr);
+            arrival_said();
         }
         usb_device_handle_t gone = s_pending_gone;
         if (gone != NULL) {
             s_pending_gone = NULL;
             detach(gone);
+            arrival_watch_start(); /* the next arrival counted from here */
         }
 
         /* ARGON: and any endpoint that stopped answering.  See pipe_recover. */
@@ -946,8 +997,16 @@ static void cli_task(void *arg)
 static void restart_task(void *arg)
 {
     (void)arg;
-    (void)ag_port_usb_stop();
-    const ag_err_t rc = ag_port_usb_start();
+    ag_err_t rc = -AG_EIO;
+    for (int i = 0; i < 3 && rc != AG_OK; i++) {
+        if (i > 0) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        rc = ag_port_usb_stop();
+        if (rc == AG_OK) {
+            rc = ag_port_usb_start();
+        }
+    }
     if (rc != AG_OK) {
         ESP_LOGE(TAG, "the host would not come back up (%d)", (int)rc);
     } else {
@@ -960,6 +1019,21 @@ static void restart_task(void *arg)
 
 void ag_port_usb_on_report(ag_port_usb_report_fn fn) { s_on_report = fn; }
 void ag_port_usb_on_descriptor(ag_port_usb_desc_fn fn) { s_on_desc = fn; }
+
+/*
+ * What an arrival costs, measured on the S3 on 6 Oct 2026 by arrival_said():
+ * a mouse (046d:c542) plugged into a waiting host took internal free memory
+ * 11600 bytes down at its lowest, three times out of three, and held 11340
+ * of it while open.  Kept with room for what the measurement cannot see: the
+ * pipes' descriptor lists are 512-byte aligned, and a free total of 11600 in
+ * scattered pieces would not give them a block.
+ */
+#define USB_ARRIVAL_BYTES (16u * 1024u)
+
+size_t ag_port_usb_arrival_bytes(void)
+{
+    return USB_ARRIVAL_BYTES;
+}
 
 ag_err_t ag_port_usb_start(void)
 {
@@ -988,6 +1062,7 @@ ag_err_t ag_port_usb_start(void)
         return -AG_EIO;
     }
 
+    arrival_watch_start();
     s_running = true;
     s_state = AG_USB_IDLE;
     s_up_at_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -1015,14 +1090,36 @@ ag_err_t ag_port_usb_stop(void)
     }
     /* The tasks wake from their handle_events within a tick or two and delete
      * themselves; give them that before tearing the host down under them. */
-    for (int i = 0; i < 25 && (s_lib_task != NULL || s_cli_task != NULL); i++) {
-        vTaskDelay(pdMS_TO_TICKS(20));
+    for (int i = 0; i < 25 && s_cli_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20)); /* the client's task goes first */
     }
     if (s_client != NULL) {
         (void)usb_host_client_deregister(s_client);
         s_client = NULL;
     }
-    (void)usb_host_uninstall();
+    for (int i = 0; i < 200 && s_lib_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20)); /* it frees the devices, then goes */
+    }
+    /*
+     * ARGON: and only OFF once the library has really gone (1 Oct 2026).  It
+     * was torn down while its task was still inside handle_events, the
+     * uninstall refused, the state said OFF anyway - and every start after
+     * it failed to install (-5): a host that tried again once with nothing
+     * plugged in stayed off for good, and the mouse plugged in later was
+     * never seen.
+     */
+    esp_err_t un = ESP_FAIL;
+    for (int i = 0; i < 20; i++) {
+        un = usb_host_uninstall();
+        if (un == ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (un != ESP_OK) {
+        ESP_LOGE(TAG, "the host library would not uninstall (%d)", (int)un);
+        return -AG_EBUSY;
+    }
 
     s_state = AG_USB_OFF;
     s_reports = 0;

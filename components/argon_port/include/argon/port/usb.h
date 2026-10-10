@@ -124,6 +124,10 @@ ag_err_t ag_port_usb_start(void);
 ag_err_t ag_port_usb_stop(void);
 ag_err_t ag_port_usb_status(ag_port_usb_status_t *out);
 void     ag_port_usb_on_report(ag_port_usb_report_fn fn);
+/* The internal memory a device's arrival takes (the host's pipes and the
+ * enumeration's transfers), measured on the board: what the kernel keeps
+ * away from applications while the host waits for a plug. */
+size_t   ag_port_usb_arrival_bytes(void);
 void     ag_port_usb_on_descriptor(ag_port_usb_desc_fn fn);
 
 #endif /* AG_PORT_HAS_USB_HID */

@@ -20,6 +20,11 @@
 #include <argon/port/time.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
+#include <argon/port/place.h>
+
+#include "core/place_bss.h"
+
+#include <argon/place.h>
 
 /*
  * A lone ESC only becomes the Escape key once nothing follows it.  30 ms is
@@ -142,7 +147,13 @@ static struct {
 static ag_con_endpoint_t  s_endpoints[AG_CON_MAX_ENDPOINTS];
 static ag_port_mutex_t         s_lock;
 static ag_port_queue_t s_events;
+/* The painter's stack. */
+#define AG_CON_STACK 3072u
+
 static ag_port_task_t       s_task;
+static ag_place_kind_t      s_task_kind;     /* where its stack is          */
+static volatile bool        s_painter_stop;  /* asked to end, for a move    */
+static volatile bool        s_painter_gone;  /* and it has                  */
 static bool               s_ready;
 static ag_con_sink_fn     s_redirect;
 static void              *s_redirect_ctx;
@@ -155,7 +166,7 @@ static bool (*s_hotkeys)(ag_event_t *ev);
 /* HID usage page 0x07 keycodes fit in a byte; sticky TTL covers auto-repeat. */
 #define AG_KEY_STICKY_MS 150u
 static uint8_t  s_key_down[32];
-static uint32_t s_key_stamp[256];
+static uint32_t s_key_stamp[256] AG_KERNEL_STATIC;
 
 /* ---------------------------------------------------------------------- */
 
@@ -221,6 +232,15 @@ const ag_screen_t *ag_console_screen_of_slot(int slot)
 }
 
 /*
+ * A screen's cells, where [memory] console says (argon/place.h).  Eighty by
+ * twenty-five is 8 KB per slot, held for the life of the board - on a headless
+ * S3-Zero nobody ever looks at, PSRAM is the place for it.  Only tasks read it
+ * - the painter, the prompt, a program's output - never an interrupt or a
+ * flash write.
+ */
+static void *screen_alloc(size_t need) { return ag_place_alloc("console", need); }
+
+/*
  * Give a slot its own screen if it has not got one, at the size the console
  * is now.
  *
@@ -236,7 +256,7 @@ static ag_err_t ensure_screen(int want)
 
     const size_t need = ag_screen_memsize(s_screens[s_active].cols,
                                           s_screens[s_active].rows);
-    void        *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+    void        *mem = screen_alloc(need);
     if (mem == NULL) {
         ag_log(AG_LOG_WARN, "console", "no memory for screen %d; sharing",
                want);
@@ -244,7 +264,7 @@ static ag_err_t ensure_screen(int want)
     }
     if (ag_screen_init(&s_screens[want], mem, need, s_screens[s_active].cols,
                        s_screens[s_active].rows) != AG_OK) {
-        ag_port_free(mem);
+        ag_place_free("console", mem);
         return -AG_ENOMEM;
     }
     s_screen_up[want] = true;
@@ -969,6 +989,13 @@ static void console_task(void *arg)
         ag_console_unlock();
 
         ag_port_task_delay(ag_port_ms_to_ticks(AG_CON_TICK_MS));
+
+        /* Asked to make way for a painter whose stack is elsewhere
+         * (ag_console_place): end here, between two paints, holding nothing. */
+        if (s_painter_stop) {
+            s_painter_gone = true;
+            ag_port_task_delete(NULL);
+        }
     }
 }
 
@@ -979,7 +1006,7 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
     }
 
     const size_t need = ag_screen_memsize(cols, rows);
-    void *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+    void *mem = screen_alloc(need);
     if (mem == NULL) {
         return -AG_ENOMEM;
     }
@@ -988,14 +1015,14 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
     const ag_err_t err = ag_screen_init(&s_screens[0], mem, need, cols, rows);
     s_screen_up[0] = (err == AG_OK);
     if (err != AG_OK) {
-        ag_port_free(mem);
+        ag_place_free("console", mem);
         return err;
     }
 
     s_lock = ag_port_mutex_new_recursive();
     s_events = ag_port_queue_new(AG_CON_EVENT_QUEUE, sizeof(ag_event_t));
     if (s_lock == NULL || s_events == NULL) {
-        ag_port_free(mem);
+        ag_place_free("console", mem);
         return -AG_ENOMEM;
     }
 
@@ -1003,16 +1030,80 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
 
     /*
      * The console task lives on the system core: the application core is
-     * meant to stay free for the application.
+     * meant to stay free for the application.  Its stack goes to PSRAM where
+     * there is some (8 Oct 2026): it paints text, and nothing it does wants
+     * internal memory held for the life of the board.
      */
-    if (!ag_port_task_create(console_task, "ag_con", 3072, NULL, 10, 0, 0,
-                             &s_task)) {
+    if (!ag_place_task("console", console_task, "ag_con", AG_CON_STACK, NULL,
+                       10, 0, (void **)&s_task, &s_task_kind)) {
         s_ready = false;
-        ag_port_free(mem);
+        ag_place_free("console", mem);
         return -AG_ENOMEM;
     }
 
     return AG_OK;
+}
+
+/*
+ * After the configuration is read (ag_place_configure), the console moves to
+ * where [memory] console says - it was made in the console stage, before any
+ * file could be read, by the default.  The screens are copied under the lock;
+ * the painter is asked to end between two paints and a new one is started
+ * with its stack in the new place, never two at once (two painters hung the
+ * CYD's console once, 29 Sep 2026).
+ */
+void ag_console_place(void)
+{
+    if (!s_ready) {
+        return;
+    }
+    const ag_place_kind_t want = ag_place_first("console");
+
+    ag_console_lock();
+    for (int i = 0; i < CON_SCREENS; i++) {
+        if (!s_screen_up[i]) {
+            continue;
+        }
+        ag_screen_t *const s = &s_screens[i];
+        void *const        old = (void *)s->dirty; /* the block's start */
+        const bool old_slow = ag_port_ptr_is_slow(old);
+        if ((want == AG_PLACE_PSRAM) == old_slow) {
+            continue;
+        }
+        const size_t need = ag_screen_memsize(s->cols, s->rows);
+        uint8_t *const nm = (uint8_t *)ag_place_alloc("console", need);
+        if (nm == NULL) {
+            continue;
+        }
+        if (ag_port_ptr_is_slow(nm) == old_slow) {
+            ag_place_free("console", nm); /* nothing better to be had */
+            continue;
+        }
+        memcpy(nm, old, need);
+        s->cells = (ag_cell_t *)(nm + ((uint8_t *)s->cells - (uint8_t *)old));
+        s->dirty = (uint32_t *)nm;
+        ag_place_free("console", old);
+    }
+    ag_console_unlock();
+
+    if (want == s_task_kind || want == AG_PLACE_NONE) {
+        return;
+    }
+    s_painter_gone = false;
+    s_painter_stop = true;
+    for (int waited = 0; !s_painter_gone && waited < 100; waited++) {
+        ag_port_task_delay(ag_port_ms_to_ticks(5));
+    }
+    s_painter_stop = false;
+    if (!s_painter_gone) {
+        ag_log(AG_LOG_WARN, "console", "the painter did not stop; it stays");
+        return;
+    }
+    if (!ag_place_task("console", console_task, "ag_con", AG_CON_STACK, NULL,
+                       10, 0, (void **)&s_task, &s_task_kind)) {
+        ag_log(AG_LOG_ERROR, "console", "no room for a new painter");
+        return;
+    }
 }
 
 /*
@@ -1059,7 +1150,7 @@ ag_err_t ag_console_resize(uint16_t cols, uint16_t rows)
             continue;
         }
         const size_t need = ag_screen_memsize(cols, rows);
-        void *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+        void *mem = screen_alloc(need);
         if (mem == NULL) {
             ag_console_unlock();
             return -AG_ENOMEM;
@@ -1069,7 +1160,7 @@ ag_err_t ag_console_resize(uint16_t cols, uint16_t rows)
                                                 &s_screens[i]);
         if (err != AG_OK) {
             ag_console_unlock();
-            ag_port_free(mem);
+            ag_place_free("console", mem);
             return err;
         }
         void *was = s_screens[i].dirty;
@@ -1078,7 +1169,7 @@ ag_err_t ag_console_resize(uint16_t cols, uint16_t rows)
         if (i == s_active) {
             old = was;
         } else {
-            ag_port_free(was);
+            ag_place_free("console", was);
         }
     }
 
@@ -1098,7 +1189,7 @@ ag_err_t ag_console_resize(uint16_t cols, uint16_t rows)
     }
 
     ag_console_unlock();
-    ag_port_free(old);
+    ag_place_free("console", old);
     return AG_OK;
 }
 

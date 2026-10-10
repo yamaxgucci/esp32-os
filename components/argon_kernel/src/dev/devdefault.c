@@ -34,6 +34,9 @@
 #include <argon/linkprov.h>
 #include <argon/log.h>
 #include <argon/nodename.h>
+#include <argon/port/place.h>
+
+#include "core/place_bss.h"
 
 #include "core/sysconfig.h"
 
@@ -68,7 +71,7 @@ static const char *cfg_key(ag_dev_class_t cls)
 #define DEFAULT_CLASSES 4
 /* room for a group: `zero.pcm0+cyd.pcm0+c6.pcm0` */
 #define DEFAULT_CHOICE_MAX 64
-static char s_chosen[DEFAULT_CLASSES][DEFAULT_CHOICE_MAX];
+static char s_chosen[DEFAULT_CLASSES][DEFAULT_CHOICE_MAX] AG_KERNEL_STATIC;
 
 /*
  * A GROUP: several devices of one class chosen at once, joined by '+'.  For

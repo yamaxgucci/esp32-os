@@ -59,8 +59,10 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 #include <argon/port/uart.h>
+#include <argon/place.h>
 
 #include "core/sysconfig.h"
+#include "net/wtrace.h"
 #include "net/wlink.h"
 
 #define UL_PORTS     3
@@ -83,6 +85,19 @@
  * to the CYD fell from 748 KB/s to 422.  6 KB holds two and the sound.
  */
 #define UL_TX_MIN_BYTES 6144u
+/*
+ * THE DEPTH IS IN THE LANES, BY TIME (2 Oct 2026).  A ring of 16 ms of a
+ * 16 Mbaud wire kept it full while the S3's painter took a frame's snapshot
+ * - 84% -> 91% - and the sound behind the picture in that one queue waited as
+ * long: 83 periods dropped at the CYD in 40 s against 9.  So the stream stays
+ * shallow and what may wait waits in its lane (wlink.c, by its budget): the
+ * middle lane holds UL_LANE_MS of the wire, the others UL_LANE_SMALL each,
+ * and only with UL_LANE_SPARE beside them - the CYD has not, and sends in
+ * order as before.
+ */
+#define UL_LANE_MS    16u
+#define UL_LANE_SMALL 4096u
+#define UL_LANE_SPARE (64u * 1024u)
 /* what one DMA read takes at most; the frame finder holds a frame and this */
 #define UL_READ      1024u
 #define UL_READ_MS   20u
@@ -106,6 +121,17 @@
  * none at 8 or 10 Mbaud, none with the C3 silent.  92% of the wire became 97%
  * (25 Sep 2026).
  */
+/*
+ * THE RECEIVER'S ROOM, IN FRAMES: what the other end may send ahead of what
+ * this one has read (1 Oct 2026).  Three was a window of 3 KB at 1 KB frames
+ * - two milliseconds of a 16 Mbaud wire - and the S3 painting on the CYD sat
+ * in its send for 346 us of every 640-byte message, the wire 70% used at any
+ * window of its own; with 2 KB frames, room for twice as much, 77%.
+ */
+#define UL_RX_FRAMES 3u
+/* ...doubled, both of them, for frames under 2 KB: a 2 KB frame carries the
+ * window it needs already, and the C3 has no memory for more of them */
+#define UL_SMALL_FRAME 2048u
 #define UL_ACK_FRAMES 2u
 #define UL_ACK_US    2000
 /*
@@ -133,6 +159,7 @@ typedef struct {
      * of internal memory it did not fit beside the port's receive rings */
     uint8_t *dmem;
     uint8_t *mem;
+    uint8_t *lmem; /* the lanes of blocks waiting to go (wlink_t.lane) */
     uint8_t *txf[UL_TXBUF];
     unsigned txk;
     uint8_t *pbuf;
@@ -382,6 +409,7 @@ static void tx_task(void *arg)
         (void)ag_port_sem_take(w->tx_sem, ticks_at_least(wait_ms));
         while (!u->stop) {
             wl_rto_check(w);
+            (void)wl_feed(w); /* the lanes into the stream, what fits */
             const int64_t now = ag_port_us();
             lock(u);
             uint32_t allow = 0;
@@ -397,6 +425,7 @@ static void tx_task(void *arg)
             const bool again = w->resend || w->nak_pending;
             const uint32_t pay = w->frame - WL_HDR;
             const uint32_t unacked = w->rx_next - u->ack_sent;
+            wt_note(WT_TXWAKE, unacked);
             const bool     ack = unacked >= UL_ACK_FRAMES * pay ||
                              (unacked > 0u && now - u->last_tx >= UL_ACK_US);
             const uint32_t space = ring_space(&w->rx);
@@ -429,13 +458,28 @@ static void tx_task(void *arg)
             const bool quiet = (now - u->last_tx) >=
                                (w->peer_known ? UL_KEEP_US : UL_HELLO_US);
             if (!data && !again && !ack && !roomy && !retell && !quiet) {
+                /* for the trace: the leave it had, and what was unsent */
+                wt_note(WT_NOTHING,
+                        (allow & 0xFFFFu) |
+                            ((w->tx.count - w->sent_off) << 16));
+                if (w->tx.count <= w->sent_off) {
+                    w->pr_stop_empty++;
+                } else if (allow == 0u) {
+                    w->pr_stop_credit++;
+                } else {
+                    w->pr_stop_win++;
+                }
                 break;
             }
             /* the older transmit buffer back: the other may still be on
              * the wire */
             if (u->dma_tx) {
+                const int64_t  s0 = ag_port_us();
                 const ag_err_t e =
                     ag_port_uart_dma_settle(u->port, UL_TXBUF - 1u);
+                w->pr_settles++;
+                w->pr_settle_us += ag_port_us() - s0;
+                wt_note(WT_SETTLED, 0u);
                 if (e != AG_OK) {
                     note_error(u, e);
                     break;
@@ -445,6 +489,7 @@ static void tx_task(void *arg)
             bool           nak_was = false;
             uint32_t       wire = 0;
             const uint32_t n = wl_build(w, f, allow, 0u, &nak_was, &wire);
+            wt_note(WT_BUILT, n);
             const int32_t  rc = put_out(u, f, wire);
             if (rc < 0) {
                 wl_unbuild(w, n, nak_was);
@@ -460,6 +505,14 @@ static void tx_task(void *arg)
             }
             u->txk = u->dma_tx ? (u->txk + 1u) % UL_TXBUF : 0u;
             u->frames_tx++;
+            w->pr_wire_bytes += wire;
+            if (u->dma_tx) {
+                const uint32_t q = ag_port_uart_dma_last_quiet(u->port);
+                if (q != 0u) {
+                    wt_note(WT_QUIET, q);
+                }
+            }
+            wt_note(WT_SUBMIT, wire);
         }
     }
     if (u->dma_tx) {
@@ -484,7 +537,8 @@ uint32_t ag_uartlink_frame(uint32_t frame)
     return (frame > WL_FRAME_MAX) ? WL_FRAME_MAX : frame;
 }
 
-ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
+ag_err_t ag_uartlink_open(int port, uint32_t baud, uint32_t frame,
+                          uint32_t flags)
 {
     if (port < 0 || port >= UL_PORTS) {
         return -AG_ERANGE;
@@ -521,23 +575,20 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
     /* the port's receive rings first, which it keeps: allocated after this
      * link's memory they sat in the middle of its hole when it was freed,
      * and the next open on a C3 found no 21 KB in one piece */
-    const bool dma = (flags & AG_UARTLINK_DMA) != 0u;
+    /*
+     * Each way by DMA where the chip does it without loss (1 Oct 2026): the
+     * receive only by the ring that is never stopped, and where there is
+     * none - the S3 - through the driver, while it still sends by DMA.  The
+     * S3's own DMA receive lost whole frames; a board's `dma = no` written
+     * for that turned its sending off too, and the S3 then spent 234 us of
+     * its processor on every frame it sent through the driver.
+     */
+    const bool want = (flags & AG_UARTLINK_DMA) != 0u;
+    const bool dma = want && ag_port_uart_dma_can_receive();
     if (dma) {
-        ag_err_t le = -AG_ENOTSUP;
-        if (flags & AG_UARTLINK_RING) {
-            /* what the other end may have in flight is our room, three
-             * frames: four, and the reader's moment on top */
-            le = ag_port_uart_dma_listen_ring(port, 4u * frame);
-            if (le == -AG_ENOTSUP) {
-                /* not on this chip (the S3): the DMA's receive as it is */
-                ag_log(AG_LOG_WARN, "uartlink",
-                       "uart%d: no never-stopped receive here; plain DMA",
-                       port);
-            }
-        }
-        if (le == -AG_ENOTSUP) {
-            le = ag_port_uart_dma_listen(port);
-        }
+        /* what the other end may have in flight is our room, three
+         * frames: four, and the reader's moment on top */
+        const ag_err_t le = ag_port_uart_dma_listen_ring(port, 4u * frame);
         if (le != AG_OK) {
             return le;
         }
@@ -549,17 +600,99 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
         return -AG_EBUSY;
     }
     const uint32_t pay = frame - WL_HDR;
-    /* UL_TX_FRAMES frames of what is sent and not yet acknowledged */
+    /*
+     * UL_TX_FRAMES frames of what is sent and not yet acknowledged - twice
+     * that under 2 KB a frame (1 Oct 2026, S3 -> CYD picture at 16 Mbaud,
+     * 1 KB frames): 69.6% of the wire -> 77.2%.  The rule is small frames and
+     * more of them, never bigger frames; x4 gave 78.2% and left the CYD 6 KB.
+     */
+    const uint32_t more = (frame < UL_SMALL_FRAME) ? 2u : 1u;
+    /* the receive room doubled, not the send ring (2 Oct 2026): what may be
+     * on the way is the far end's room, and what waits to go waits in the
+     * lanes now - eight frames to send cost the CYD, which sends answers of
+     * thirty bytes, 2 KB it had not got */
     w->txcap = (UL_TX_FRAMES * pay < UL_TX_MIN_BYTES)
                    ? UL_TX_MIN_BYTES
                    : ((UL_TX_FRAMES * pay + 3u) & ~3u);
-    w->rxcap = (3u * pay + 3u) & ~3u;
+    w->rxcap = (UL_RX_FRAMES * more * pay + 3u) & ~3u;
     u->pcap = frame + UL_READ;
-    const bool   dma_tx = dma && ag_port_uart_dma_ready(port);
+    /* lanes only with memory to spare beside them (UL_LANE_SPARE), and then
+     * a send ring that holds all the far end's room - which is this end's,
+     * the same rule both ways - a frame not yet sent, and the room left for a
+     * block that goes at once */
+    const uint32_t lane_deep =
+        (uint32_t)(((uint64_t)baud / 10u * UL_LANE_MS / 1000u + 3u) & ~3u);
+    const uint32_t lane_bytes = UL_LANE_SMALL + lane_deep + UL_LANE_SMALL;
+    /*
+     * IN SLOW MEMORY, OR NOT AT ALL (2 Oct 2026).  Counted against all the
+     * memory there is, the CYD - no PSRAM, and at start-up still most of its
+     * 270 KB free - took 34 KB of lanes and a larger send ring for a link on
+     * which it sends acknowledgements, and then had 1 KB left: no task to
+     * attach its neighbour's devices, no 4 KB worker for a request.  A board
+     * without slow memory sends as it did before the lanes.
+     */
+    const bool     plenty =
+        ag_port_mem_free(AG_MEM_SLOW) >= lane_bytes + UL_LANE_SPARE;
+    if (plenty && w->txcap < w->rxcap + pay + 1280u) {
+        w->txcap = (w->rxcap + pay + 1280u + 3u) & ~3u;
+    }
+    const bool   dma_tx = want && ag_port_uart_dma_can_send() &&
+                        ag_port_uart_dma_ready(port);
     const size_t dbytes = (size_t)(dma_tx ? UL_TXBUF : 1u) * frame;
     const size_t bytes = (size_t)u->pcap + w->txcap + w->rxcap;
-    u->dmem = ag_port_alloc_aligned(4u, dbytes, AG_MEM_DMA);
-    u->mem = (u->dmem != NULL) ? ag_port_alloc(bytes, AG_MEM_BYTE) : NULL;
+    /*
+     * THE TRANSMIT BUFFERS IN INTERNAL MEMORY (1 Oct 2026).  "Reachable by
+     * DMA" includes the S3's PSRAM, and there the DMA shares the external
+     * bus with every program drawing in PSRAM: a 1 KB frame took 2.5 ms
+     * instead of 0.64 to go out while the painter copied a frame, and the
+     * wire stood still behind it.  PSRAM only if there is nothing else.
+     */
+    u->dmem = ag_port_alloc_aligned(4u, dbytes, AG_MEM_DMA | AG_MEM_FAST);
+    if (u->dmem == NULL) {
+        u->dmem = ag_port_alloc_aligned(4u, dbytes, AG_MEM_DMA);
+    }
+    if (u->dmem != NULL) {
+        ag_log(AG_LOG_INFO, "uartlink", "uart%d: %u B of transmit buffers at %p",
+               port, (unsigned)dbytes, (void *)u->dmem);
+    }
+    /* the rings are the processor's, never the DMA's: with memory to spare
+     * (and so the larger send ring) in the slow memory where there is one -
+     * in internal memory the larger ring left the emulated S3 2.5 KB short
+     * of a program's thread stacks (nodetest, 2 Oct 2026) */
+    u->mem = NULL;
+    if (u->dmem != NULL && plenty) {
+        u->mem = ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+    }
+    if (u->dmem != NULL && u->mem == NULL) {
+        u->mem = ag_port_alloc(bytes, AG_MEM_BYTE);
+    }
+    uint32_t lanes[WL_LANES] = {0u, 0u, 0u};
+    {
+        const uint32_t deep = lane_deep;
+        const uint32_t want = lane_bytes;
+        if (u->mem != NULL && u->lmem == NULL && plenty) {
+            /* in the slow memory where there is one: the S3's internal
+             * memory is the game's and the radio's */
+            u->lmem = ag_port_alloc(want, AG_MEM_SLOW | AG_MEM_BYTE);
+            if (u->lmem == NULL) {
+                u->lmem = ag_port_alloc(want, AG_MEM_BYTE);
+            }
+        }
+        if (u->lmem != NULL) {
+            lanes[0] = UL_LANE_SMALL;
+            lanes[1] = deep;
+            lanes[2] = UL_LANE_SMALL;
+        }
+    }
+    if (u->mem != NULL) {
+        ag_log(AG_LOG_INFO, "uartlink",
+               "uart%d: rings at %p, %u B to send, %u B to receive; lanes "
+               "%u/%u/%u B (%u ms of the wire in the middle one)",
+               port, (void *)u->mem, (unsigned)w->txcap, (unsigned)w->rxcap,
+               (unsigned)lanes[0], (unsigned)lanes[1], (unsigned)lanes[2],
+               (unsigned)(baud >= 10u ? (uint64_t)lanes[1] * 10000u / baud
+                                      : 0u));
+    }
     if (u->mem == NULL) {
         ag_port_free(u->dmem);
         u->dmem = NULL;
@@ -578,6 +711,7 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
     w->tx = (ring_t){.mem = p, .cap = w->txcap};
     p += w->txcap;
     w->rx = (ring_t){.mem = p, .cap = w->rxcap};
+    wl_lanes(w, u->lmem, lanes);
 
     w->framed = true;
     w->master = false;
@@ -614,11 +748,14 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
     unlock(u);
 
     const int core = (int)ag_sysinfo()->app_core;
-    const bool ok_rx = ag_port_task_create(rx_task, "uartlink", UL_STACK, u,
-                                           UL_PRIO, core, 0, &u->rx_task);
-    const bool ok_tx = ok_rx && ag_port_task_create(tx_task, "uartltx",
-                                                    UL_STACK, u, UL_PRIO, core,
-                                                    0, &u->tx_task);
+    /* [memory] link.tasks: internal first by default - these two carry the
+     * wire's every frame. */
+    const bool ok_rx = ag_place_task("link.tasks", rx_task, "uartlink",
+                                     UL_STACK, u, UL_PRIO, core,
+                                     (void **)&u->rx_task, NULL);
+    const bool ok_tx = ok_rx && ag_place_task("link.tasks", tx_task, "uartltx",
+                                              UL_STACK, u, UL_PRIO, core,
+                                              (void **)&u->tx_task, NULL);
     if (!ok_tx) {
         u->stop = true;
         if (ok_rx) {
@@ -633,6 +770,71 @@ ag_err_t ag_uartlink_open(int port, uint32_t frame, uint32_t flags)
         unlock(u);
         return -AG_ENOMEM;
     }
+    return AG_OK;
+}
+
+ag_err_t ag_uartlink_probe(int port, ag_uartlink_probe_t *out)
+{
+    uartlink_t *const u = ul_of(port);
+    if (u == NULL || out == NULL || u->w.lock == NULL) {
+        return -AG_ENODEV;
+    }
+    static int64_t s_at[UL_PORTS];
+    static uint32_t s_frames[UL_PORTS], s_rx[UL_PORTS], s_subs[UL_PORTS];
+    wlink_t *const w = &u->w;
+    const int64_t  now = ag_port_us();
+    lock(u);
+    out->sends = w->pr_sends;
+    out->space_waits = w->pr_space_waits;
+    out->send_us = (uint32_t)w->pr_send_us;
+    out->space_us = (uint32_t)w->pr_space_us;
+    out->stop_empty = w->pr_stop_empty;
+    out->stop_credit = w->pr_stop_credit;
+    out->stop_win = w->pr_stop_win;
+    out->settles = w->pr_settles;
+    out->settle_us = (uint32_t)w->pr_settle_us;
+    out->wire_bytes = (uint32_t)w->pr_wire_bytes;
+    out->frames = u->frames_tx - s_frames[port];
+    out->frames_rx = u->frames_rx - s_rx[port];
+    out->elapsed_us = (s_at[port] != 0) ? (uint32_t)(now - s_at[port]) : 0u;
+    uint32_t subs = 0;
+    ag_port_uart_dma_tx_gaps(port, &subs, &out->dma_idle, &out->dma_idle_us);
+    out->dma_subs = subs - s_subs[port];
+    s_subs[port] = subs;
+    w->pr_sends = w->pr_space_waits = 0;
+    w->pr_send_us = w->pr_space_us = 0;
+    w->pr_stop_empty = w->pr_stop_credit = w->pr_stop_win = 0;
+    w->pr_settles = 0;
+    w->pr_settle_us = 0;
+    w->pr_wire_bytes = 0;
+    out->acked = w->pr_acked;
+    out->rtt_avg_us = w->pr_acked ? (uint32_t)(w->pr_rtt_us / w->pr_acked) : 0u;
+    out->rtt_max_us = w->pr_rtt_max_us;
+    out->room_avg =
+        w->pr_room_n ? (uint32_t)(w->pr_room_sum / w->pr_room_n) : 0u;
+    out->room_min = w->pr_room_min;
+    out->rxcap_peer = w->txcap;
+    out->small_ooo = w->pr_small_ooo;
+    out->small_hole = w->pr_small_hole;
+    out->small_full = w->pr_small_full;
+    w->pr_small_ooo = w->pr_small_hole = w->pr_small_full = 0;
+    for (unsigned k = 0; k < 3u; k++) {
+        out->lane_fed[k] = w->pr_lane_fed[k];
+        out->lane_late[k] = w->pr_lane_late[k];
+        out->lane_late_ms[k] = w->pr_lane_late_ms[k];
+        out->lane_waits[k] = w->pr_lane_waits[k];
+        w->pr_lane_fed[k] = w->pr_lane_late[k] = 0;
+        w->pr_lane_late_ms[k] = w->pr_lane_waits[k] = 0;
+    }
+    out->lane_blocked = w->pr_lane_blocked;
+    w->pr_lane_blocked = 0;
+    w->pr_acked = w->pr_rtt_max_us = w->pr_room_n = w->pr_room_min = 0;
+    w->pr_rtt_us = 0;
+    w->pr_room_sum = 0;
+    s_frames[port] = u->frames_tx;
+    s_rx[port] = u->frames_rx;
+    s_at[port] = now;
+    unlock(u);
     return AG_OK;
 }
 
@@ -697,8 +899,14 @@ ag_err_t ag_uartlink_close(int port, ag_spilink_stats_t *out)
     lock(u);
     ag_port_free(u->mem);
     ag_port_free(u->dmem);
+    ag_port_free(u->lmem);
     u->mem = NULL;
     u->dmem = NULL;
+    u->lmem = NULL;
+    {
+        const uint32_t none[WL_LANES] = {0u, 0u, 0u};
+        wl_lanes(&u->w, NULL, none);
+    }
     memset(&u->w.tx, 0, sizeof(u->w.tx));
     memset(&u->w.rx, 0, sizeof(u->w.rx));
     unlock(u);

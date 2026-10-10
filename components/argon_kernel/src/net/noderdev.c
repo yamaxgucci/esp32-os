@@ -28,22 +28,30 @@
 #include <string.h>
 
 #include <argon/device.h>
+#include <argon/display.h>
+#include <argon/port/audio.h>
 #include <argon/port/mem.h>
 
 #include "proc/proc_internal.h"
 
 #include "net/rdpaint.h"
+#include "net/wtrace.h"
 #include <argon/libc.h>
 #include <argon/linkprov.h>
 #include <argon/log.h>
 #include <argon/nodedev.h>
 #include <argon/nodename.h>
+#include <argon/power.h>
 #include <argon/proc.h>
 #include <argon/textpanel.h>
 
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/place.h>
+#include <argon/place.h>
+
+#include "core/place_bss.h"
 
 #define TAG "rdev"
 
@@ -168,7 +176,7 @@ static volatile bool     s_busy;
 static volatile uint16_t s_tag;
 static volatile bool     s_have;
 static volatile int32_t  s_status;
-static uint8_t           s_rbuf[RD_MAX_PAYLOAD];
+static uint8_t           s_rbuf[RD_MAX_PAYLOAD] AG_KERNEL_STATIC;
 static volatile uint16_t s_rlen;
 
 /*
@@ -342,6 +350,10 @@ struct rdev {
     uint8_t  in_ch, wire_ch;
     /* when the sound written so far is due to have played (see pace_audio) */
     int64_t  due_us;
+    /* a far open that failed: not asked again before this (ensure_open) */
+    int64_t  open_again_us;
+    uint32_t open_backoff_ms;
+    int32_t  open_err;
 };
 
 static int32_t proxy_wire(const rdev_t *p)
@@ -474,7 +486,7 @@ static uint32_t s_sent_said_n, s_sent_said_drop;
  */
 static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
 {
-    static uint8_t buf2[RD_HDR + RD_POUR_CAP];
+    static uint8_t buf2[RD_HDR + RD_POUR_CAP] AG_KERNEL_STATIC;
     if (len > RD_POUR_CAP) {
         len = RD_POUR_CAP;
     }
@@ -535,7 +547,7 @@ static int32_t pour(rdev_t *p, const void *buf, size_t len, uint64_t off)
  * caller writes what it always wrote; on a wire that can carry it, nothing is
  * changed at all.
  */
-static uint8_t s_fit_buf[RD_SND_CAP];
+static uint8_t s_fit_buf[RD_SND_CAP] AG_KERNEL_STATIC;
 
 /*
  * THE WRITE IS THE CLOCK, and a proxy had none.
@@ -771,16 +783,40 @@ static rdev_t *proxy_of(ag_handle_t h)
  * not open anything - see the note on why proxies do not appear at `link use`
  * - and a screen is used by the graphics layer, which never opens a device.
  */
+/*
+ * A FAR OPEN THAT FAILED IS NOT ASKED AGAIN AT ONCE (2 Oct 2026).  Every write
+ * to a device whose session is gone opens it first, and the mixer writes a
+ * period every few milliseconds: with the CYD answering -12 to every open the
+ * S3 asked hundreds of times a second, each time under the device's own lock
+ * and the one request in flight that every proxy shares, until nothing else
+ * on the board got an answer - no console, not even Ctrl+C.  Now a failure
+ * waits 250 ms before the next try, doubling to 8 s, and a success forgets it.
+ */
+#define RD_OPEN_BACKOFF_MIN_MS 250u
+#define RD_OPEN_BACKOFF_MAX_MS 8000u
+
 static ag_err_t ensure_open(rdev_t *p)
 {
     if (p->far_handle >= 0) {
         return AG_OK;
     }
+    const int64_t now = ag_port_us();
+    if (p->open_backoff_ms != 0u && now < p->open_again_us) {
+        return (ag_err_t)p->open_err;
+    }
     const int32_t r = ask(p, RD_OPEN, 0, 0, 0, AG_LINK_CONTROL, p->name,
                           (uint16_t)strlen(p->name), NULL, NULL);
     if (r < 0) {
+        p->open_backoff_ms =
+            (p->open_backoff_ms == 0u) ? RD_OPEN_BACKOFF_MIN_MS
+            : (p->open_backoff_ms * 2u > RD_OPEN_BACKOFF_MAX_MS)
+                ? RD_OPEN_BACKOFF_MAX_MS
+                : p->open_backoff_ms * 2u;
+        p->open_again_us = ag_port_us() + (int64_t)p->open_backoff_ms * 1000;
+        p->open_err = r;
         return (ag_err_t)r;
     }
+    p->open_backoff_ms = 0u;
     p->far_handle = r;
     return AG_OK;
 }
@@ -907,8 +943,10 @@ static uint32_t msgs_in_flight(uint16_t seq, uint16_t acked)
 }
 
 #define RD_PAINT_WAIT_MS 1000u
-/* in a marker's last word: this pass ended its frame */
+/* in a marker's last word: this pass ended its frame; the program that drew
+ * it let the screen go (older receivers ignore both) */
 #define RD_PASS_WHOLE 1u
+#define RD_PASS_DONE  2u
 #define RD_PAINT_LEGACY  3u
 
 /*
@@ -922,9 +960,29 @@ static uint32_t msgs_in_flight(uint16_t seq, uint16_t acked)
  * picture queue (RD_SCR slots) takes without its reader waiting for room.
  * (Four and twenty filled it: the reader waited 33 times, and the sound
  * behind the picture came 218 ms late.)
+ *
+ * EIGHT AND SIXTY-FOUR NOW THAT THE WIRE ORDERS BY BUDGET (2 Oct 2026).
+ * 8/64 with a send ring of 16 ms of the wire took a 16 Mbaud wire from 84% to
+ * 91-94% under noise - and the sound behind the picture in that one queue
+ * came in bursts: 83 periods dropped at the CYD in 40 s against 9 at 2/12.
+ * The picture now waits in its own lane and sound (a shorter budget) goes
+ * past it (wlink.c); this window is what lets the picture fill that lane.
  */
-#define RD_PAINT_AHEAD 2u
-#define RD_PAINT_MSGS  12u
+#define RD_PAINT_AHEAD 8u
+#define RD_PAINT_MSGS  64u
+/* the window as it is now: `link window <passes> <messages>` measures others */
+static uint8_t s_paint_ahead = RD_PAINT_AHEAD, s_paint_msgs = RD_PAINT_MSGS;
+
+void ag_noderdev_paint_window(uint8_t *ahead, uint8_t *msgs, bool set)
+{
+    if (set) {
+        /* at least one, and fewer than the passes counted (s_pass_msgs) */
+        s_paint_ahead = (*ahead < 1u) ? 1u : (*ahead > 15u) ? 15u : *ahead;
+        s_paint_msgs = (*msgs >= 4u) ? *msgs : 4u;
+    }
+    *ahead = s_paint_ahead;
+    *msgs = s_paint_msgs;
+}
 
 static void rd_sync_z(uint32_t handle)
 {
@@ -959,7 +1017,8 @@ static void rd_sync_z(uint32_t handle)
     put32(msg + 8, 0);
     /* the last pass of its frame: the far end counts the frames it drew
      * whole (older receivers leave this word alone) */
-    put32(msg + 12, rdp_pass_whole() ? RD_PASS_WHOLE : 0u);
+    put32(msg + 12, (rdp_pass_whole() ? RD_PASS_WHOLE : 0u) |
+                        (rdp_pass_done() ? RD_PASS_DONE : 0u));
     if (link_send(p->wire, p->node, AG_LINK_BULK, msg, RD_HDR) < 0) {
         s_paint_unsent++;
         return;
@@ -980,9 +1039,9 @@ static void rd_sync_z(uint32_t handle)
     const int64_t t0 = ag_port_us();
     const int64_t until = t0 + (int64_t)RD_PAINT_WAIT_MS * 1000;
     bool          out = false;
-    while ((uint16_t)(seq - s_paint_acked) > RD_PAINT_AHEAD ||
+    while ((uint16_t)(seq - s_paint_acked) > s_paint_ahead ||
            ((uint16_t)(seq - s_paint_acked) > 1u &&
-            msgs_in_flight(seq, s_paint_acked) > RD_PAINT_MSGS)) {
+            msgs_in_flight(seq, s_paint_acked) > s_paint_msgs)) {
         if (ag_port_us() >= until) {
             out = true;
             break;
@@ -996,7 +1055,7 @@ static void rd_sync_z(uint32_t handle)
         s_paint_wait_max = ag_port_us() - t0;
     }
     if (s_paint_acked != 0u &&
-        (uint16_t)(seq - s_paint_acked) <= RD_PAINT_AHEAD) {
+        (uint16_t)(seq - s_paint_acked) <= s_paint_ahead) {
         s_paint_heard = true;
         s_paint_silent = 0;
     } else if (s_paint_silent < 255u) {
@@ -1088,18 +1147,49 @@ static void rd_blit_raw(rdev_t *p, const ag_blit_t *b)
  * raw.  Nothing is packed there - noise does not pack - so that number is
  * the floor this has to keep.
  */
+/*
+ * Blits handed to the neighbour's screen, and the ones that went nowhere:
+ * no screen chosen, or the far end would not open it (the last error).  A
+ * game's picture reached nothing and nothing here said so (30 Sep 2026).
+ */
+static uint32_t s_blit_calls, s_blit_noproxy, s_blit_noopen, s_blit_raw;
+static int32_t  s_blit_open_err;
+
+void ag_noderdev_blit_counts(uint32_t *calls, uint32_t *noproxy,
+                             uint32_t *noopen, int32_t *open_err,
+                             uint32_t *raw)
+{
+    *calls = s_blit_calls;
+    *noproxy = s_blit_noproxy;
+    *noopen = s_blit_noopen;
+    *open_err = s_blit_open_err;
+    *raw = s_blit_raw;
+}
+
 static void rd_blit(ag_handle_t h, const ag_blit_t *b)
 {
     rdev_t *p = proxy_of(h);
-    if (p == NULL || b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
+    if (b == NULL || b->px == NULL || b->w == 0 || b->h == 0) {
         return;
     }
-    if (ensure_open(p) != AG_OK) {
+    s_blit_calls++;
+    if (p == NULL) {
+        s_blit_noproxy++;
+        return;
+    }
+    const ag_err_t oe = ensure_open(p);
+    if (oe != AG_OK) {
+        if (s_blit_noopen++ == 0u) {
+            ag_log(AG_LOG_WARN, TAG, "%s would not open (%d): the picture "
+                   "goes nowhere until it does", p->name, (int)oe);
+        }
+        s_blit_open_err = (int32_t)oe;
         return;
     }
     rdp_set_sync(rd_sync_z);
     if (!rdp_damage(b, (uint32_t)p->far_handle, rd_pour_payload(p),
                     rd_send_z)) {
+        s_blit_raw++;
         rd_blit_raw(p, b); /* no memory for the painter: every pixel, raw */
     }
 }
@@ -1260,10 +1350,25 @@ static uint16_t s_session_from[RD_MAX_SESSIONS];
 static uint8_t s_session_ch[RD_MAX_SESSIONS];
 
 /* The request being served, and the worker serving it. */
-static uint8_t        s_req[RD_HDR + RD_MAX_PAYLOAD];
+static uint8_t        s_req[RD_HDR + RD_MAX_PAYLOAD] AG_KERNEL_STATIC;
 static volatile uint16_t s_req_len;
 static volatile bool  s_working;
 static ag_port_task_t s_worker;
+/*
+ * ONE WORKER, MADE AT START-UP (2 Oct 2026).  It was made for each request
+ * and gone after it - 4 KB of stack asked for at the moment a neighbour
+ * wanted something, and on the CYD, once its picture and sound had their
+ * places, the largest piece left was 4 KB or less: every open from the S3
+ * answered -12, sound and screen alike, until a restart.  Made once while
+ * there is memory, it waits on s_req_sem; a board where it could not be made
+ * falls back to one a request.  Its stack is in PSRAM where there is any
+ * (ag_proc_task_create_slow): in internal memory it held 4 KB for good and
+ * the emulated S3 then had too little left for a program's threads.  Where
+ * there is no PSRAM, only on a board that is a screen or a speaker to its
+ * neighbours (the emulated C3 held the 4 KB for nothing).
+ */
+static ag_port_sem_t  s_req_sem;
+static bool           s_standing;
 
 /* ---- receiving what was poured ------------------------------------------ */
 
@@ -1303,9 +1408,23 @@ static ag_port_task_t s_worker;
  * sound.  Now each has its own queue out of the same slots, and the task
  * draws whatever picture there is whenever the converter has no room.
  */
-#define RD_SND  18
-#define RD_SCR  28
-#define RD_RING (RD_SND + RD_SCR)
+/* 14 periods of sound, 40 ms at 44.1 kHz - the sender keeps 30 ms ahead -
+ * not 18: the CYD, which has no PSRAM, had no room left for its picture
+ * once sound had its places (2 Oct 2026) */
+#define RD_SND  14
+/*
+ * 8 pieces of picture, not 28 (2 Oct 2026): 28 of 640 bytes on the CYD,
+ * which has no PSRAM, left it no room for its own picture's strips nor for
+ * the worker a request from the S3 is served in ("lcd0 would not open (-12)")
+ * once sound had its places too.  The CYD draws faster than the wire brings
+ * a picture: its reader waited for room 0-2 times in 16 s with 28.
+ */
+#define RD_SCR  8
+/* Where there is PSRAM for them, the places the pair had before 2 Oct: 45 ms
+ * of sound and 28 pieces of picture.  Chosen by what the board has at
+ * start-up (ring_make), never by which board it is. */
+#define RD_SND_BIG 18
+#define RD_SCR_BIG 28
 
 typedef struct {
     /*
@@ -1350,6 +1469,7 @@ static uint32_t s_scr_raw, s_scr_text, s_scr_asked;
 static uint32_t serve_poured_class(ag_device_t *dev,
                                    const rd_period_t *pd);
 static void     glass_back_if_quiet(void);
+static void     glass_back(const char *why);
 static void     screen_report(void);
 static void     screen_lost(void);
 
@@ -1441,8 +1561,52 @@ static uint32_t s_scr_nodev, s_scr_nopx;
 static uint8_t  s_scr_last_op;
 static uint16_t s_scr_last_len;
 
+/*
+ * A NEIGHBOUR THAT RESTARTED LEAVES ITS SESSIONS HERE (6 Oct 2026).  Every
+ * handle it held died with it, and nothing closed them on this side: three
+ * restarts of the S3 against a CYD left up for 79 minutes filled all eight
+ * slots, and the S3's screen open came back -ENFILE 2575 times - Fallout ran
+ * blind.  Only an exclusive device opened again by the same node was caught
+ * (A SESSION ITS ASKER HAS LOST, below).  Now a neighbour saying its name anew
+ * marks its node here, and the worker closes all it had before its next
+ * request - on the worker, as RD_CLOSE does, not on the reader that heard it.
+ */
+/* one slot a wire, then one a node beyond a neighbour (far_heard) */
+#define RD_REBORN_SLOTS 32
+static volatile uint16_t s_reborn[RD_REBORN_SLOTS];
+static volatile uint32_t s_reborn_bits;
+
+static void reborn_mark(int32_t slot, uint16_t node)
+{
+    if (slot < 0 || slot >= RD_REBORN_SLOTS) {
+        return;
+    }
+    s_reborn[slot] = node;
+    s_reborn_bits |= 1u << (uint32_t)slot;
+}
+
+static void close_reborn(void)
+{
+    while (s_reborn_bits != 0u) {
+        const uint32_t w = (uint32_t)__builtin_ctz(s_reborn_bits);
+        const uint16_t node = s_reborn[w];
+        s_reborn_bits &= ~(1u << w);
+        for (int i = 0; i < RD_MAX_SESSIONS; i++) {
+            ag_device_t *const dev = s_session[i];
+            if (dev != NULL && s_session_from[i] == node) {
+                ag_log(AG_LOG_INFO, TAG,
+                       "%s: its asker restarted - closing the session it had",
+                       dev->name);
+                s_session[i] = NULL;
+                (void)ag_dev_close(dev);
+            }
+        }
+    }
+}
+
 static void serve_one(const uint8_t *b, uint16_t n)
 {
+    close_reborn();
     const uint8_t  op = b[0];
     const uint16_t tag = get16(b + 2);
     const uint32_t h = get32(b + 4);
@@ -1657,6 +1821,37 @@ static void worker(void *arg)
     ag_port_task_delete(NULL);
 }
 
+static void standing_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (!ag_port_sem_take(s_req_sem, ag_port_ms_to_ticks(1000))) {
+            continue;
+        }
+        if (s_working) {
+            serve_one(s_req, s_req_len);
+            s_working = false;
+        }
+    }
+}
+
+static void worker_make(void)
+{
+    if (s_standing) {
+        return;
+    }
+    if (s_req_sem == NULL) {
+        s_req_sem = ag_port_sem_new_binary();
+    }
+    if (s_req_sem == NULL) {
+        return;
+    }
+    /* PSRAM first where there is any: it lives as long as the board */
+    s_standing = ag_proc_task_create_slow(standing_worker, "rdevsrv", 4096,
+                                          NULL, 1, AG_PORT_ANY_CORE,
+                                          &s_worker);
+}
+
 /*
  * Says what arrived, once per spell of sound rather than once per period.
  *
@@ -1769,7 +1964,7 @@ static uint32_t keep_pace(rd_period_t *pd)
                            ? s_session_ch[pd->handle]
                            : 0u;
     if (ch == 0u || ch > 2u || pd->op != RD_WRITE ||
-        q_used(&s_snd) * 4u < (RD_SND - 1u) * 3u) {
+        q_used(&s_snd) * 4u < (s_snd.n - 1u) * 3u) {
         return pd->len;
     }
     const uint32_t frames = pd->len / (ch * 2u);
@@ -1831,11 +2026,14 @@ static void pour_screen_one(void)
 {
     rd_period_t *pd = &s_scr.e[s_scr.r];
     if (pd->op == RD_PAINTED) {
-        if ((pd->off & RD_PASS_WHOLE) != 0u) {
+        if ((pd->off & (RD_PASS_WHOLE | RD_PASS_DONE)) != 0u) {
             /* a frame is on the glass whole when it says so */
             rdp_draw_flush(RDP_FL_FRAME);
         }
         pour_pass_drawn(pd);
+        if ((pd->off & RD_PASS_DONE) != 0u) {
+            glass_back("the neighbour's program let it go");
+        }
         s_scr.r = (s_scr.r + 1u) % s_scr.n;
         return;
     }
@@ -2088,8 +2286,16 @@ static void pour_task(void *arg)
  * painting the rows that changed over the picture, and when the neighbour's
  * program ended the glass kept whatever was last on it - Maxim found the CYD
  * showing a white screen with nothing wrong with it (26 Sep 2026).  So while
- * pictures arrive the console keeps off the panel, and after RD_GLASS_QUIET_US
- * without one it has the glass back and repaints all of it.
+ * pictures arrive the console keeps off the panel, and it has the glass back
+ * and repaints all of it when the neighbour's program lets the screen go
+ * (a marker with RD_PASS_DONE), when the neighbour starts over, or after
+ * RD_GLASS_QUIET_US with neither a picture nor the link.
+ *
+ * NOT WHEN THE PICTURE STANDS STILL (30 Sep 2026).  It went back after
+ * RD_GLASS_QUIET_US without a picture, and Fallout's main menu does not
+ * move: a second and a half after it was drawn the CYD showed its own
+ * console, and the game - drawing nothing, because nothing had changed -
+ * never learned it had to draw again.  Maxim: the game is not running.
  */
 #define RD_GLASS_QUIET_US 1500000
 static bool    s_glass_lent;
@@ -2122,6 +2328,12 @@ static int64_t s_glass_last_us;
  * leaves the word 0.
  */
 #define RD_CAN_RECTS 1u
+#define RD_CAN_IDX   2u
+/* undoes copies in a rectangle of indices (rdc_pack8z, 3 Oct 2026) */
+#define RD_CAN_Z     4u
+/* bits 16..31: the most pixels one rectangle may carry, in 256s (2 Oct
+ * 2026); 0 from an image before that, which holds the smaller size */
+#define RD_CAN_RECT_SHIFT 16u
 static volatile bool s_glass_owed;
 /*
  * AND ANY PIECE OF THE PICTURE NOT DRAWN owes the same: a message dropped
@@ -2164,6 +2376,15 @@ static uint32_t s_all_passes, s_all_snd_q_max;
  */
 static volatile bool s_report;
 
+void ag_noderdev_screen_done(void) { rdp_screen_done(); }
+
+void ag_noderdev_screen_taken(void) { rdp_screen_taken(); }
+
+void ag_noderdev_stable_surface(const uint16_t *px, uint16_t w, uint16_t h)
+{
+    rdp_stable_surface(px, w, h);
+}
+
 void ag_noderdev_report(bool on)
 {
     s_report = on;
@@ -2178,7 +2399,7 @@ void ag_noderdev_screen_counts(uint32_t *passes, uint32_t *lost,
     *gap_ms = (uint32_t)(s_all_gap_max / 1000);
     *snd_gap_ms = (uint32_t)(s_all_snd_gap_max / 1000);
     *snd_q_max = s_all_snd_q_max;
-    *snd_q_cap = RD_SND - 1u;
+    *snd_q_cap = s_snd.n - 1u;
 }
 
 void ag_noderdev_draw_misses(uint32_t *nodev, uint32_t *nopx, uint32_t *op,
@@ -2225,7 +2446,10 @@ static void paint_answer(int32_t wire, uint16_t from, uint16_t tag,
 {
     const ag_err_t e = send_raw(
         wire, from, (uint8_t)(RD_PAINTED | RD_REPLY), 0, tag, status,
-        rdp_draws_rects() ? RD_CAN_RECTS : 0u, handle, AG_LINK_CONTROL, NULL,
+        (rdp_draws_rects() ? RD_CAN_RECTS : 0u) |
+            (rdp_draws_idx() ? (RD_CAN_IDX | RD_CAN_Z) : 0u) |
+            ((rdp_draw_rect_px() / 256u) << RD_CAN_RECT_SHIFT),
+        handle, AG_LINK_CONTROL, NULL,
         0);
     if (e != AG_OK) {
         ag_log(AG_LOG_WARN, TAG, "a pass's answer did not go out: %d", (int)e);
@@ -2245,15 +2469,28 @@ static void acker_task(void *arg)
     }
 }
 
+/* The task the painter's answers go out from: at start-up on a board with a
+ * screen (2 Oct 2026), for the same reason as pour_tasks_make. */
+static bool acker_make(void)
+{
+    return s_acker != NULL ||
+           ag_place_task("cluster.tasks", acker_task, "rdevack", 2048, NULL, 6,
+                         AG_PORT_ANY_CORE, (void **)&s_acker, NULL);
+}
+
 /* frames drawn whole here, and the waits between them (ag_noderdev_frames_seen) */
 #define RD_SEEN_SLOW_US  250000
 #define RD_SEEN_STALL_US 1000000
 static uint32_t s_seen_frames, s_seen_slow, s_seen_stalls;
+/* the frame that ended the longest wait: an early one is a program starting */
+static uint32_t s_seen_gap_nr;
 static int64_t  s_seen_at, s_seen_slow_us, s_seen_gap_max;
 
 void ag_noderdev_frames_seen(uint32_t *frames, uint32_t *slow, uint32_t *stalls,
-                             uint32_t *slow_ms, uint32_t *gap_max_ms)
+                             uint32_t *slow_ms, uint32_t *gap_max_ms,
+                             uint32_t *gap_max_nr)
 {
+    *gap_max_nr = s_seen_gap_nr;
     *frames = s_seen_frames;
     *slow = s_seen_slow;
     *stalls = s_seen_stalls;
@@ -2286,6 +2523,7 @@ static void pour_pass_drawn(const rd_period_t *pd)
         }
         if (gap > s_seen_gap_max) {
             s_seen_gap_max = gap;
+            s_seen_gap_nr = s_seen_frames;
         }
         s_seen_at = now;
     }
@@ -2303,9 +2541,7 @@ static void pour_pass_drawn(const rd_period_t *pd)
                       s_session[pd->handle] == NULL;
     const uint8_t status = gone ? RD_PAINTED_GONE
                                 : (lost ? RD_PAINTED_LOST : 0u);
-    if (s_acker == NULL &&
-        !ag_proc_task_create(acker_task, "rdevack", 2048, NULL, 6,
-                             AG_PORT_ANY_CORE, &s_acker)) {
+    if (s_acker == NULL && !acker_make()) {
         /* no task: answered here, as it was, rather than not at all */
         paint_answer(pd->wire, pd->from, pd->tag, status, pd->handle);
         return;
@@ -2353,7 +2589,7 @@ static void screen_report(void)
                "drawing, queue up to %u of %u, %u not drawn so far",
                (unsigned)s_scr_passes, (unsigned)ms, (unsigned)s_scr_msgs,
                (unsigned)s_scr_px, (unsigned)(s_scr_us / 1000),
-               (unsigned)s_scr_ring_max, (unsigned)(RD_SCR - 1u),
+               (unsigned)s_scr_ring_max, (unsigned)(s_scr.n - 1u),
                (unsigned)s_scr_lost);
     }
     /* apart, because a journal line has a length and the first one had
@@ -2364,7 +2600,7 @@ static void screen_report(void)
                "its queue up to %u of %u; besides the picture %u raw, %u "
                "text, %u asked",
                (unsigned)(s_scr_gap_max / 1000), (unsigned)(s_snd_gap_max / 1000),
-               (unsigned)s_snd_q_max, (unsigned)(RD_SND - 1u),
+               (unsigned)s_snd_q_max, (unsigned)(s_snd.n - 1u),
                (unsigned)s_scr_raw, (unsigned)s_scr_text,
                (unsigned)s_scr_asked);
     }
@@ -2393,18 +2629,36 @@ static void glass_lend(void)
         ag_dev_lock_hold();
         ag_textpanel_enable(false);
         ag_dev_lock_release();
+        ag_power_kernel_full(true); /* drawn at the full clock, not in cruise */
         ag_log(AG_LOG_INFO, TAG, "a neighbour is drawing on this screen");
     }
 }
 
+static void glass_back(const char *why)
+{
+    if (!s_glass_lent) {
+        return;
+    }
+    s_glass_lent = false;
+    ag_power_kernel_full(false);
+    ag_textpanel_enable(true);
+    s_glass_owed = true;
+    ag_log(AG_LOG_INFO, TAG, "%s; the screen is this board's again", why);
+}
+
+/* the neighbour started over: what it drew is nobody's (pour task's to act on) */
+static volatile bool s_glass_orphaned;
+
 static void glass_back_if_quiet(void)
 {
-    if (s_glass_lent && ag_port_us() - s_glass_last_us > RD_GLASS_QUIET_US) {
-        s_glass_lent = false;
-        ag_textpanel_enable(true);
-        s_glass_owed = true;
-        ag_log(AG_LOG_INFO, TAG, "the neighbour stopped drawing; the screen "
-                                 "is this board's again");
+    if (s_glass_orphaned) {
+        s_glass_orphaned = false;
+        glass_back("the neighbour started over");
+        return;
+    }
+    if (s_glass_lent && ag_port_us() - s_glass_last_us > RD_GLASS_QUIET_US &&
+        !ag_linkprov_up()) {
+        glass_back("the neighbour is not heard");
     }
 }
 
@@ -2440,8 +2694,10 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
     }
     case RD_BLITZ: {
         glass_lend();
+        wt_note(WT_DRAW_IN, plen);
         const int64_t  t0 = ag_port_us();
         const uint32_t px = rdp_draw(d, pay, plen);
+        wt_note(WT_DRAW_OUT, px);
         s_scr_us += ag_port_us() - t0;
         s_scr_msgs++;
         s_scr_px += px;
@@ -2483,55 +2739,105 @@ static uint32_t serve_poured_class(ag_device_t *dev, const rd_period_t *pd)
     }
 }
 
-static void take_period(const uint8_t *b, uint16_t n)
+/*
+ * The places sound and picture are poured into, made once.  At start-up on a
+ * board with a converter of its own (ag_noderdev_serve, 2 Oct 2026): made on
+ * the first period instead, the CYD found its 27 KB taken by the neighbour's
+ * picture by then, and every period of sound was lost for want of it ("no
+ * memory") while the picture went on.  Still made late where it was not made
+ * at the start.
+ */
+static bool ring_make(void)
 {
-    if (s_pour_first_us == 0) {
-        s_pour_first_us = ag_port_us();
+    if (s_ring_mem != NULL) {
+        return true;
     }
-    if (s_ring_mem == NULL) {
-        /*
-         * Twenty kilobytes, out of PSRAM where there is any.  Taken from
-         * internal memory on the Zero it was the last of it, and the
-         * converter these periods are for could then not have the 4 KB its
-         * DMA descriptors need: sound arrived and nothing played (26 Sep
-         * 2026).  A period is copied out of here once; PSRAM is fast enough.
-         */
-        const size_t bytes = (size_t)RD_SND * RD_SND_CAP +
-                             (size_t)RD_SCR * RD_SCR_CAP;
+    /*
+     * Twenty kilobytes, out of PSRAM where there is any.  Taken from
+     * internal memory on the Zero it was the last of it, and the
+     * converter these periods are for could then not have the 4 KB its
+     * DMA descriptors need: sound arrived and nothing played (26 Sep
+     * 2026).  A period is copied out of here once; PSRAM is fast enough.
+     */
+    static const uint8_t sizes[2][2] = {{RD_SND_BIG, RD_SCR_BIG},
+                                        {RD_SND, RD_SCR}};
+    for (unsigned k = 0; k < 2u && s_ring == NULL; k++) {
+        const uint32_t nsnd = sizes[k][0], nscr = sizes[k][1];
+        const size_t   bytes =
+            (size_t)nsnd * RD_SND_CAP + (size_t)nscr * RD_SCR_CAP;
+        /* the larger set only in PSRAM: in internal memory it would be the
+         * CYD's picture and its converter that went without */
         s_ring_mem = (uint8_t *)ag_port_alloc(bytes,
                                               AG_MEM_SLOW | AG_MEM_BYTE);
-        if (s_ring_mem == NULL) {
+        if (s_ring_mem == NULL && k == 1u) {
             s_ring_mem = (uint8_t *)ag_port_alloc(bytes, AG_MEM_BYTE);
         }
         if (s_ring_mem == NULL) {
-            pour_lost(RD_LOST_NOMEM);
-            return;
+            continue;
         }
         /* and its places beside it: 46 of them are 1.3 KB, and on an
          * emulated S3 that was the internal memory the next request's
          * worker could not then be made in - the far end answered -12 and
          * the mixer had nowhere to send sound (nodetest, 29 Sep 2026) */
-        s_ring = (rd_period_t *)ag_port_alloc(RD_RING * sizeof(rd_period_t),
+        const size_t places = (size_t)(nsnd + nscr) * sizeof(rd_period_t);
+        s_ring = (rd_period_t *)ag_port_alloc(places,
                                               AG_MEM_SLOW | AG_MEM_BYTE);
-        if (s_ring == NULL) {
-            s_ring = (rd_period_t *)ag_port_alloc(
-                RD_RING * sizeof(rd_period_t), AG_MEM_BYTE);
+        if (s_ring == NULL && k == 1u) {
+            s_ring = (rd_period_t *)ag_port_alloc(places, AG_MEM_BYTE);
         }
         if (s_ring == NULL) {
             ag_port_free(s_ring_mem);
             s_ring_mem = NULL;
-            pour_lost(RD_LOST_NOMEM);
-            return;
+            continue;
         }
-        memset(s_ring, 0, RD_RING * sizeof(rd_period_t));
+        memset(s_ring, 0, places);
+        s_snd.n = nsnd;
+        s_scr.n = nscr;
         s_snd.e = s_ring;
-        s_scr.e = s_ring + RD_SND;
-        for (uint32_t i = 0; i < RD_RING; i++) {
+        s_scr.e = s_ring + nsnd;
+        for (uint32_t i = 0; i < nsnd + nscr; i++) {
             s_ring[i].data =
-                (i < RD_SND) ? s_ring_mem + (size_t)i * RD_SND_CAP
-                             : s_ring_mem + (size_t)RD_SND * RD_SND_CAP +
-                                   (size_t)(i - RD_SND) * RD_SCR_CAP;
+                (i < nsnd) ? s_ring_mem + (size_t)i * RD_SND_CAP
+                           : s_ring_mem + (size_t)nsnd * RD_SND_CAP +
+                                 (size_t)(i - nsnd) * RD_SCR_CAP;
         }
+    }
+    if (s_ring == NULL) {
+        return false;
+    }
+    return true;
+}
+
+static void pour_task(void *arg);
+static void sound_task(void *arg);
+
+/* The tasks that draw and play what is poured here (2 Oct 2026: at start-up
+ * on a board with a converter, as ring_make - made on the first period, the
+ * CYD had no 3 KB left for the converter's one once a picture was drawing). */
+static bool pour_tasks_make(void)
+{
+    if (s_pour_task == NULL &&
+        !ag_place_task("cluster.tasks", pour_task, "rdevpour", 4096, NULL, 1,
+                       AG_PORT_ANY_CORE, (void **)&s_pour_task, NULL)) {
+        return false;
+    }
+    /* the converter's task, above the drawing: without it the pour task
+     * feeds the converter as before */
+    if (s_snd_task == NULL) {
+        (void)ag_proc_task_create(sound_task, "rdevsnd", 3072, NULL, 7,
+                                  AG_PORT_ANY_CORE, &s_snd_task);
+    }
+    return true;
+}
+
+static void take_period(const uint8_t *b, uint16_t n)
+{
+    if (s_pour_first_us == 0) {
+        s_pour_first_us = ag_port_us();
+    }
+    if (!ring_make()) {
+        pour_lost(RD_LOST_NOMEM);
+        return;
     }
     if (s_pour_task == NULL) {
         /*
@@ -2544,15 +2850,10 @@ static void take_period(const uint8_t *b, uint16_t n)
         /* internal memory, else PSRAM, as the server's workers: on an
          * emulated S3 there were not 4 KB inside, the task was never made,
          * and every period poured at it was lost (nodetest, 27 Sep 2026) */
-        if (!ag_proc_task_create(pour_task, "rdevpour", 4096, NULL, 1,
-                                 AG_PORT_ANY_CORE, &s_pour_task)) {
+        if (!pour_tasks_make()) {
             pour_lost(RD_LOST_NOMEM);
             return;
         }
-        /* the converter's task, above the drawing: without it the pour
-         * task feeds the converter as before */
-        (void)ag_proc_task_create(sound_task, "rdevsnd", 3072, NULL, 7,
-                                  AG_PORT_ANY_CORE, &s_snd_task);
         ag_log(AG_LOG_INFO, TAG, "sound is being poured at us from %s",
                ag_node_peer_name() != NULL ? ag_node_peer_name() : "the wire");
     }
@@ -2576,6 +2877,7 @@ static void take_period(const uint8_t *b, uint16_t n)
         if (q_used(q) > s_snd_q_max) {
             s_snd_q_max = q_used(q);
         }
+        wt_note(WT_SND_Q, q_used(q));
     }
     uint32_t      next = (q->w + 1u) % q->n;
     /*
@@ -2596,10 +2898,13 @@ static void take_period(const uint8_t *b, uint16_t n)
          * being slower than the wire, said as back-pressure.
          */
         s_scr_waits++;
-        for (int k = 0; k < 1000 && next == q->r; k++) {
+        wt_note(WT_SCR_FULL, q_used(q));
+        int k = 0;
+        for (; k < 1000 && next == q->r; k++) {
             ag_port_task_delay(1);
             next = (q->w + 1u) % q->n;
         }
+        wt_note(WT_SCR_ROOM, (uint32_t)k);
     }
     if (next == q->r) {
         pour_lost(RD_LOST_FULL); /* full: this one missed its moment */
@@ -2682,6 +2987,9 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
         s_paint_acked = get16(b + 2);
         s_paint_heard = true; /* this screen answers: wait for it from now */
         rdp_far_rects((get32(b + 8) & RD_CAN_RECTS) != 0u);
+        rdp_far_rect_px((get32(b + 8) >> RD_CAN_RECT_SHIFT) * 256u);
+        rdp_far_idx((get32(b + 8) & RD_CAN_IDX) != 0u);
+        rdp_far_z((get32(b + 8) & RD_CAN_Z) != 0u);
         rdev_t *const dp = s_display_proxy;
         if ((int32_t)get32(b + 4) == RD_PAINTED_GONE && dp != NULL &&
             dp->far_handle >= 0 && (uint32_t)dp->far_handle == get32(b + 12)) {
@@ -2745,6 +3053,10 @@ static void on_msg(uint8_t chan, const void *data, uint16_t n, void *ctx)
     s_req_wire = wire;
     s_req_from = from;
     s_working = true;
+    if (s_standing) {
+        (void)ag_port_sem_give(s_req_sem);
+        return;
+    }
     /* As nodeproc's worker: internal stack, else PSRAM (see there). */
     if (!ag_proc_task_create(worker, "rdevsrv", 4096, NULL, 1,
                              AG_PORT_ANY_CORE, &s_worker)) {
@@ -2766,6 +3078,41 @@ ag_err_t ag_noderdev_serve(void)
         return e;
     }
     s_serving = true;
+    /*
+     * AT START-UP ONLY WHERE THERE IS NO PSRAM (2 Oct 2026).  Without it what
+     * is not taken now is not there later - the CYD - and then the screen
+     * first, the sound after: a board that is a neighbour's screen needs its
+     * 9 KB in one piece, and once sound has taken its places there is no such
+     * piece left.  With it everything here can be had when first wanted, and
+     * made at start-up the tasks' stacks took 2.5 KB of the emulated S3's
+     * internal memory that a program's threads then did not find (nodetest).
+     */
+    if (ag_port_mem_free(AG_MEM_SLOW) > 0u) {
+        /*
+         * ONE REQUEST WORKER HERE TOO, ITS STACK IN PSRAM (6 Oct 2026).  A
+         * worker made for each request and deleted after it gives its stack
+         * back only when the idle task gets round to it; a busy emulated S3
+         * serving its sound while a neighbour drew on it had the next
+         * request's 4 KB refused (-12) while the last one's was still
+         * waiting to be freed - nodetest's far sound failed twice in three
+         * runs.  Standing, in PSRAM, it costs no internal memory.
+         */
+        worker_make();
+        return AG_OK;
+    }
+    if (ag_display_ready()) {
+        (void)rdp_draw_prepare();
+        (void)acker_make();
+    }
+    /* before the sound - and only on a board that is a screen or a speaker
+     * to its neighbours: the emulated C3, neither, held 4 KB for good and a
+     * program's 32 KB arena then did not fit (xclutest, 3 Oct 2026) */
+    if (ag_display_ready() || ag_port_audio_present()) {
+        worker_make();
+    }
+    if (ag_port_audio_present() && ring_make()) {
+        (void)pour_tasks_make(); /* now, while there is memory for them */
+    }
     return AG_OK;
 }
 
@@ -3057,7 +3404,18 @@ static int32_t attach_locked(int32_t src, uint32_t timeout_ms)
             .priv = p,
             .owner = (const void *)&s_owner_tok[src],
         };
-        const ag_err_t re = ag_dev_register(&desc, NULL);
+        ag_err_t re = ag_dev_register(&desc, NULL);
+        /*
+         * THE OLD ONE OF THIS NAME, REVOKED AND STILL HELD (2 Oct 2026).  The
+         * neighbour restarted and its devices were revoked a moment ago; one
+         * still open keeps its name until its holder closes it, which the
+         * mixer does on its next period.  Registered at once, the CYD's
+         * converter came back -17 and the sound stayed on pcmnull for good.
+         */
+        for (int t = 0; re == -AG_EEXIST && t < 50; t++) {
+            ag_port_task_delay(ag_port_ms_to_ticks(20));
+            re = ag_dev_register(&desc, NULL);
+        }
         if (re != AG_OK) {
             /*
              * SAID OUT LOUD.  This used to be a bare `continue`, and a device
@@ -3204,6 +3562,15 @@ static void want_src(int32_t src);
 
 void ag_noderdev_peer_named(int32_t wire, bool again)
 {
+    if (again) {
+        s_glass_orphaned = true; /* whatever it drew here, it drew before */
+        const char *const pn = (wire >= 0 && wire < (int32_t)AG_LINK_WIRES)
+                                   ? ag_node_peer_name_at(wire)
+                                   : NULL;
+        if (pn != NULL) {
+            reborn_mark(wire, ag_node_hash(pn));
+        }
+    }
     if (!s_auto || wire < 0 || wire >= (int32_t)AG_LINK_WIRES) {
         return;
     }
@@ -3228,16 +3595,51 @@ static void want_src(int32_t src)
     }
     s_att_running = true;
     /* As the other cluster workers: an internal stack, else PSRAM. */
-    if (!ag_proc_task_create(attach_task, "rdevatt", 4096, NULL, 1,
-                             AG_PORT_ANY_CORE, &s_att_task)) {
+    if (!ag_place_task("cluster.tasks", attach_task, "rdevatt", 4096, NULL, 1,
+                       AG_PORT_ANY_CORE, (void **)&s_att_task, NULL)) {
         s_att_running = false;
         ag_log(AG_LOG_WARN, TAG, "no task to attach the neighbour's devices; "
                                  "`link devs` does it by hand");
     }
 }
 
+/*
+ * AND A NODE BEYOND A NEIGHBOUR THAT RESTARTED (6 Oct 2026).  Its hello does
+ * not reach this board, but its count of starts does, relayed with its name:
+ * a count that changed is a restart, and its sessions here go the way a
+ * neighbour's do (A NEIGHBOUR THAT RESTARTED, above).  Kept apart from the
+ * attach slots below, which only exist when docking is on - sessions are
+ * served either way.
+ */
+static char    s_heard_name[RD_FAR][AG_NODE_NAME_MAX];
+static uint8_t s_heard_starts[RD_FAR];
+
+static void far_heard(const char *name, uint8_t starts)
+{
+    int free_slot = -1;
+    for (int k = 0; k < RD_FAR; k++) {
+        if (strcmp(s_heard_name[k], name) == 0) {
+            if (s_heard_starts[k] != starts) {
+                s_heard_starts[k] = starts;
+                reborn_mark((int32_t)AG_LINK_WIRES + k, ag_node_hash(name));
+            }
+            return;
+        }
+        if (free_slot < 0 && s_heard_name[k][0] == '\0') {
+            free_slot = k;
+        }
+    }
+    if (free_slot >= 0) {
+        ag_strlcpy(s_heard_name[free_slot], name, sizeof(s_heard_name[0]));
+        s_heard_starts[free_slot] = starts;
+    }
+}
+
 void ag_noderdev_far_named(int32_t via, const char *name, uint8_t starts)
 {
+    if (name != NULL && name[0] != '\0' && strlen(name) < AG_NODE_NAME_MAX) {
+        far_heard(name, starts);
+    }
     if (!s_auto || via < 0 || via >= (int32_t)AG_LINK_WIRES || name == NULL ||
         name[0] == '\0' || strlen(name) >= AG_NODE_NAME_MAX) {
         return;

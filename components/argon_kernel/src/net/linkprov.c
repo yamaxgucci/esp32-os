@@ -17,6 +17,7 @@
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/place.h>
 
 #include "net/wlink.h"
 #include "proc/proc_internal.h"
@@ -309,6 +310,7 @@ typedef struct {
 } relay_q_t;
 
 static void reader_wake(void);
+static uint16_t budget_of(uint8_t cls);
 static bool credit_hold(int32_t to, uint8_t chan, const ag_link_addr_t *a,
                         const uint8_t *buf, uint16_t len);
 
@@ -424,6 +426,10 @@ static bool bg_pend_try(int i)
         relay_drop(2, p->a.dst, "the wire out of here has gone");
         p->on = false;
         return true;
+    }
+    if (p->a.budget_ms == 0u) {
+        /* the far end's budget does not cross the wire; its class does */
+        p->a.budget_ms = budget_of(p->a.cls);
     }
     const int32_t r = h.ops->send_a(h.dev, p->chan, p->buf, p->len, &p->a);
     let_go(&h);
@@ -1186,6 +1192,10 @@ static volatile int64_t s_rd_window;  /* when the current window began   */
 static volatile int64_t s_rd_used;    /* spent in it                     */
 static volatile bool    s_rd_low;     /* dropped for the rest of it      */
 static uint32_t         s_rd_drops;   /* how many windows it overran     */
+/* the probe (1 Oct 2026): the longest one message took to route, and on
+ * which channel; how many took a millisecond or more, and how long in all */
+static uint32_t         s_rd_route_max_us, s_rd_route_slow, s_rd_route_slow_us;
+static uint8_t          s_rd_route_max_chan;
 
 static void reader_charge(int64_t began)
 {
@@ -1205,6 +1215,18 @@ static void reader_charge(int64_t began)
 uint32_t ag_linkprov_reader_overruns(void)
 {
     return s_rd_drops;
+}
+
+void ag_linkprov_reader_slow(uint32_t *max_us, uint8_t *max_chan,
+                             uint32_t *slow, uint32_t *slow_us)
+{
+    *max_us = s_rd_route_max_us;
+    *max_chan = s_rd_route_max_chan;
+    *slow = s_rd_route_slow;
+    *slow_us = s_rd_route_slow_us;
+    s_rd_route_max_us = 0;
+    s_rd_route_slow = 0;
+    s_rd_route_slow_us = 0;
 }
 
 
@@ -1333,6 +1355,15 @@ static void reader_task(void *arg)
                 const int64_t began = ag_port_us();
                 route(w, chan, &from, buf, (uint16_t)n);
                 reader_charge(began);
+                const int64_t took = ag_port_us() - began;
+                if (took > (int64_t)s_rd_route_max_us) {
+                    s_rd_route_max_us = (uint32_t)took;
+                    s_rd_route_max_chan = chan;
+                }
+                if (took >= 1000) {
+                    s_rd_route_slow++;
+                    s_rd_route_slow_us += (uint32_t)took;
+                }
             }
         }
         bg_answer(s_rd_low, s_rd_window);
@@ -1470,6 +1501,7 @@ typedef struct {
     uint32_t              ms;
     uint32_t              size;
     uint8_t              *frame;
+    uint8_t               cls;
     ag_linkprov_flood_t  *out;
     ag_port_sem_t         done;
 } flood_job_t;
@@ -1503,8 +1535,8 @@ static void flood_task(void *arg)
         for (uint32_t k = 5; k < j->size; k++) {
             j->frame[k] = sink_byte(seq, k);
         }
-        const int32_t r = ag_linkprov_send(LINK_CHAN_SINK, AG_LINK_BACKGROUND,
-                                           j->frame, j->size);
+        const int32_t r =
+            ag_linkprov_send(LINK_CHAN_SINK, j->cls, j->frame, j->size);
         if (r >= 0) {
             o->sent_bytes += j->size;
             o->sent_frames++;
@@ -1522,7 +1554,7 @@ static void flood_task(void *arg)
 }
 
 ag_err_t ag_linkprov_flood(uint32_t ms, uint32_t size, unsigned prio,
-                           ag_linkprov_flood_t *out)
+                           uint8_t cls, ag_linkprov_flood_t *out)
 {
     memset(out, 0, sizeof(*out));
     if (!ag_linkprov_bound()) {
@@ -1536,7 +1568,9 @@ ag_err_t ag_linkprov_flood(uint32_t ms, uint32_t size, unsigned prio,
     if (size == 0u || size > info.mtu) {
         size = info.mtu;
     }
-    flood_job_t j = {ms, size, NULL, out, NULL};
+    flood_job_t j = {ms, size, NULL,
+                     (cls == AG_LINK_BULK) ? cls : (uint8_t)AG_LINK_BACKGROUND,
+                     out, NULL};
     j.frame = (uint8_t *)ag_port_alloc(size, AG_MEM_BYTE);
     j.done = ag_port_sem_new_binary();
     ag_port_task_t t = NULL;
@@ -1635,8 +1669,8 @@ static void reader_start(void)
      * both nodes sent into a wire nobody read ("no reader task" in the
      * journal, 0 of 24 pings back).
      */
-    if (!ag_proc_task_create(reader_task, "ag_link", 8192, NULL,
-                             READER_PRIO_HIGH, 0, &s_reader)) {
+    if (!ag_place_task("link.tasks", reader_task, "ag_link", 8192, NULL,
+                       READER_PRIO_HIGH, 0, (void **)&s_reader, NULL)) {
         ag_log(AG_LOG_ERROR, "link", "no reader task: nothing will be heard");
     }
 }
@@ -1771,6 +1805,28 @@ int32_t ag_linkprov_index_of(const char *name)
  * The relay does NOT come through this function - it must keep the source it
  * received, and it calls send_a directly for that reason (see relay()).
  */
+/*
+ * HOW LONG A MESSAGE MAY WAIT, BY ITS CLASS, FOR A SENDER THAT SAID NOTHING
+ * (2 Oct 2026).  The wire sends the soonest due first (AG_SPILINK_BUDGET) and
+ * knows nothing about the bytes; the class is what the sender said about
+ * them, so this is where it becomes a number: an answer or a command at once,
+ * a stream (sound) within a period, bulk (a picture, a device's data) within
+ * a frame, background (a file) within a second.
+ */
+static uint16_t budget_of(uint8_t cls)
+{
+    switch (cls) {
+    case AG_LINK_STREAM:
+        return 10u;
+    case AG_LINK_BULK:
+        return 50u;
+    case AG_LINK_BACKGROUND:
+        return 1000u;
+    default:
+        return 0u;
+    }
+}
+
 static int32_t send_addressed(int32_t wire, uint16_t dst, uint8_t chan,
                               uint8_t cls, const void *buf, size_t len)
 {
@@ -1807,7 +1863,8 @@ static int32_t send_addressed(int32_t wire, uint16_t dst, uint8_t chan,
     if (bo != NULL) {
         bo->sent += (uint32_t)len;
     }
-    const ag_link_addr_t to = {dst, ag_linkprov_here(), cls};
+    const ag_link_addr_t to = {dst, ag_linkprov_here(), cls, 0,
+                               budget_of(cls)};
     const int32_t r = h.ops->send_a(h.dev, chan, buf, len, &to);
     let_go(&h);
     if (r < 0 && bo != NULL) {
@@ -1822,12 +1879,45 @@ int32_t ag_linkprov_send_on(int32_t wire, uint8_t chan, uint8_t cls,
     return send_addressed(wire, ag_linkprov_target(), chan, cls, buf, len);
 }
 
+/*
+ * THE WIRE THAT REACHES dst, not the one that happens to be selected (6 Oct
+ * 2026).  On the reader an answer goes back the way the question came, which
+ * current() already knew.  Off it - a remote run's output and its EXIT, sent
+ * from the task the program runs on - the answer went down the SELECTED wire,
+ * and on the board in the middle that is whichever its shell last used: with
+ * the C3 pointed at the Zero, a run the CYD asked of it was never answered and
+ * the CYD reported -60 a minute later.  So: the wire this node last wrote to
+ * us on, or the wire it is the neighbour on, and the selected one only when
+ * neither says.
+ */
+static int32_t wire_toward(uint16_t dst)
+{
+    if (s_reader != NULL && ag_port_task_self() == s_reader &&
+        s_reading != NULL && s_reading->ops != NULL) {
+        return wire_slot(s_reading);
+    }
+    if (dst != 0u) {
+        for (unsigned i = 0; i < LINK_WIRES; i++) {
+            if (s_wire[i].dev != NULL && s_from[i] == dst) {
+                return (int32_t)i;
+            }
+        }
+        for (unsigned i = 0; i < LINK_WIRES; i++) {
+            const char *peer = ag_node_peer_name_at((int32_t)i);
+            if (s_wire[i].dev != NULL && peer != NULL &&
+                ag_node_hash(peer) == dst) {
+                return (int32_t)i;
+            }
+        }
+    }
+    const wire_t *w = current();
+    return (w != NULL) ? wire_slot(w) : -1;
+}
+
 int32_t ag_linkprov_send_to(uint16_t dst, uint8_t chan, uint8_t cls,
                             const void *buf, size_t len)
 {
-    const wire_t *w = current();
-    return send_addressed((w != NULL) ? wire_slot(w) : -1, dst, chan, cls, buf,
-                          len);
+    return send_addressed(wire_toward(dst), dst, chan, cls, buf, len);
 }
 
 int32_t ag_linkprov_send_to_on(int32_t wire, uint16_t dst, uint8_t chan,

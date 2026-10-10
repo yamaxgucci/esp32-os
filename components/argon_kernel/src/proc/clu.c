@@ -19,6 +19,9 @@
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
+#include <argon/port/place.h>
+
+#include "core/place_bss.h"
 
 #include "proc_internal.h"
 
@@ -101,7 +104,7 @@ static ag_pid_t              s_tab_pid;
 
 /* Worker side: the process started to serve another node's job. */
 static ag_pid_t s_worker_pid;
-static char     s_worker_image[AG_CLU_IMAGE_MAX];
+static char     s_worker_image[AG_CLU_IMAGE_MAX] AG_KERNEL_STATIC;
 
 static const ag_clu_transport_t *s_tr;
 

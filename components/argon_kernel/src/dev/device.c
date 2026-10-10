@@ -8,8 +8,20 @@
 #include <string.h>
 
 #include <argon/path.h>
+#include <argon/port/place.h>
 
-static ag_device_t  s_devices[AG_DEV_MAX];
+#include "core/place_bss.h"
+
+/*
+ * [memory] dev.table, a build-time piece (argon/place.h).  Internal unless the
+ * board pack asks otherwise, though it is the largest table the kernel has
+ * (5 KB at the Zero's 56 devices): every device call reads it - each frame on
+ * a wire, each paint of the console - and in PSRAM those reads came from the
+ * other core while a program on this one worked through tables of its own the
+ * size of the data cache.  TUBEBENCH lost 2% of a core to it, measured on the
+ * S3-Zero (9 Oct 2026); every other table moved to PSRAM together cost 0.
+ */
+static ag_device_t  s_devices[AG_DEV_MAX] AG_DEV_TABLE_BSS;
 static ag_dev_lock_t s_lock;
 static bool          s_initialised;
 

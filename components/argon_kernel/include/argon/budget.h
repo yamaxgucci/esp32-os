@@ -62,9 +62,33 @@ void ag_budget_init(void);
  * below the ordinary application priority is not watched at all - it cannot
  * starve what it does not outrank - and watching one is harmless and ignored.
  */
-void ag_budget_watch(ag_port_task_t task, const char *name, unsigned base_prio,
+bool ag_budget_watch(ag_port_task_t task, const char *name, unsigned base_prio,
                      uint32_t budget_ms);
 void ag_budget_forget(ag_port_task_t task);
+bool ag_budget_watched(ag_port_task_t task);
+
+/*
+ * FAIRNESS AMONG APPLICATIONS (2 Oct 2026).  An application's task at the
+ * ordinary priority is watched too, and the window it just had decides the
+ * next: more than AG_BUDGET_FAIR_MS of the core and it runs a step lower;
+ * under AG_BUDGET_LIGHT_MS and it runs a step higher - until it uses more
+ * than that within the window, when it comes straight back down.  So a
+ * program that never sleeps gives way to one that wakes now and then, and
+ * the one that wakes cannot keep the step by spinning.  A tone beside a
+ * picture that spun, both ordinary, got 2% of the core and its sound came
+ * 127 times too late in 10 s; one step down for the spinner alone left 3,
+ * the step up as well left none beyond the tone's own start and end.
+ * Light is the drivers' budget: above applications costs at most that much
+ * of every window, whoever it is (10 ms was a guess, and a tone through the
+ * mixer takes 9-11 - it kept losing the step, Maxim heard the gaps).
+ * Nothing here knows what a program does - only how much of the core it took.
+ */
+#define AG_BUDGET_FAIR_MS   50u
+#define AG_BUDGET_LIGHT_MS  AG_BUDGET_DEFAULT_MS
+#define AG_BUDGET_FAIR_PRIO 5u
+#define AG_BUDGET_FAIR_LOW  4u
+#define AG_BUDGET_FAIR_HIGH 6u
+bool ag_budget_fair(ag_port_task_t task, const char *name);
 
 /*
  * Apply what the tick decided: demote whoever overran, restore whoever has a
@@ -83,9 +107,11 @@ bool ag_budget_watching(void);
 bool ag_budget_service(void);
 
 /* For `ps`-like reporting: how much of its budget each watched task used in
- * the window that just closed.  Returns false when `index` is past the end. */
+ * the window that just closed, and where it stands now: -1 held down, 0 as
+ * asked, +1 raised for being light (an application's, AG_BUDGET_FAIR_*).
+ * Returns false when `index` is past the end. */
 bool ag_budget_report(uint32_t index, const char **name, uint32_t *used_ms,
-                      uint32_t *budget_ms, bool *demoted);
+                      uint32_t *budget_ms, int *standing);
 
 /*
  * `cpu`: count, on every tick of every core, the task that was running.

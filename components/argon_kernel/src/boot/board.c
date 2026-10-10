@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/log.h>
 #include <argon/path.h>
 
 #include <argon/port/config.h>
@@ -380,28 +381,51 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
             snprintf(s_board.audio.driver, sizeof(s_board.audio.driver), "%s",
                      adrv);
         }
-        s_board.audio.bclk = cfg_pin(cfg, "audio.bclk", s_board.audio.bclk);
-        s_board.audio.ws = cfg_pin(cfg, "audio.ws", s_board.audio.ws);
-        s_board.audio.dout = cfg_pin(cfg, "audio.dout", s_board.audio.dout);
-        s_board.audio.din = cfg_pin(cfg, "audio.din", s_board.audio.din);
-        s_board.audio.mclk = cfg_pin(cfg, "audio.mclk", s_board.audio.mclk);
         /*
-         * Not a pin, which is why it does not go through cfg_pin: `audio.i2c`
-         * is a bus number, and 0 is a perfectly good one.  A board with a
-         * codec says which bus programs it; a board with a bare converter
-         * leaves it out and nothing is opened on its behalf.
+         * `fitted = no`: the wiring is written down and nothing is on the end
+         * of it (2 Oct 2026).  The S3-CAM's amplifier was taken off its I2S
+         * pins, its /dev/pcm0 kept coming up and playing into the air, and
+         * as a real converter it beat the CYD's speaker next door: no sound
+         * on the pair, ever, Fallout's included.  Unfitted, there is no
+         * converter here, and the neighbour's is the one (devdefault.c).
          */
-        const int32_t again = ag_cfg_get_int(cfg, "audio.ingain", -1);
-        if (again >= 0 && again <= 24) {
-            s_board.audio.ingain = (int16_t)again;
-        }
-        const int32_t adma = ag_cfg_get_int(cfg, "audio.dma_frames", 0);
-        if (adma >= 64 && adma <= 4096) {
-            s_board.audio.dma_frames = (uint16_t)adma;
-        }
-        const int32_t ai2c = ag_cfg_get_int(cfg, "audio.i2c", -1);
-        if (ai2c >= 0 && ai2c < AG_I2C_BUSES) {
-            s_board.audio.i2c = (int16_t)ai2c;
+        const char *fitted = ag_cfg_get(cfg, "audio.fitted", "yes");
+        if (fitted != NULL && strcmp(fitted, "no") == 0) {
+            ag_log(AG_LOG_INFO, "board",
+                   "audio: nothing fitted on its pins - no converter here");
+        } else {
+            s_board.audio.bclk =
+                cfg_pin(cfg, "audio.bclk", s_board.audio.bclk);
+            s_board.audio.ws = cfg_pin(cfg, "audio.ws", s_board.audio.ws);
+            s_board.audio.dout =
+                cfg_pin(cfg, "audio.dout", s_board.audio.dout);
+            s_board.audio.din = cfg_pin(cfg, "audio.din", s_board.audio.din);
+            s_board.audio.mclk =
+                cfg_pin(cfg, "audio.mclk", s_board.audio.mclk);
+            /*
+             * Not a pin, which is why it does not go through cfg_pin:
+             * `audio.i2c` is a bus number, and 0 is a perfectly good one.  A
+             * board with a codec says which bus programs it; a board with a
+             * bare converter leaves it out and nothing is opened on its
+             * behalf.
+             */
+            const int32_t again = ag_cfg_get_int(cfg, "audio.ingain", -1);
+            if (again >= 0 && again <= 24) {
+                s_board.audio.ingain = (int16_t)again;
+            }
+            /*
+             * The ceiling on the converter's ring, not the ring itself: it is
+             * cut to twice the block an application declares, and this only
+             * says how far that may go on this board.
+             */
+            const int32_t adma = ag_cfg_get_int(cfg, "audio.dma_frames", 0);
+            if (adma >= 64 && adma <= 4096) {
+                s_board.audio.dma_frames = (uint16_t)adma;
+            }
+            const int32_t ai2c = ag_cfg_get_int(cfg, "audio.i2c", -1);
+            if (ai2c >= 0 && ai2c < AG_I2C_BUSES) {
+                s_board.audio.i2c = (int16_t)ai2c;
+            }
         }
         const int32_t ar = ag_cfg_get_int(cfg, "audio.rate",
                                           (int32_t)s_board.audio.rate);

@@ -138,6 +138,13 @@ uint32_t ag_port_audio_period(uint32_t frames);
 void    ag_port_audio_close(void);
 int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames);
 int32_t ag_port_audio_space(void);
+/* How many times the converter ran out and stopped since the start: each is a
+ * click.  0 where it is not counted. */
+uint32_t ag_port_audio_stops(void);
+/* The rate the converter really plays at, in millihertz of the samples it was
+ * given, measured by its own clock since the last call - 0 where it is not
+ * measured or nothing played. */
+uint32_t ag_port_audio_rate_mhz(void);
 
 /*
  * SOUND COMING IN

@@ -43,6 +43,10 @@ typedef struct {
 } ag_con_transport_t;
 
 ag_err_t ag_console_init(uint16_t cols, uint16_t rows);
+
+/* Moves the screens and the painter to where [memory] console says; called
+ * once the configuration has been read. */
+void ag_console_place(void);
 bool     ag_console_ready(void);
 
 /*

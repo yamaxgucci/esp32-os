@@ -27,10 +27,10 @@ CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 
-# The code arena is internal SRAM, so it stays small: an app's code fits here
-# (DX7 is 29 KB) while its big heap comes from PSRAM.  192 KB here overflowed
-# DRAM once PSRAM's own management took its share.
-CONFIG_ARGON_APP_ARENA_KB=64
+# The code arena is internal SRAM, so it stays small: 192 KB here overflowed
+# DRAM once PSRAM's own management took its share.  It was 64 KB until 8 Oct
+# 2026; now 16 KB for the drivers, and a program that does not fit takes its
+# code from the internal heap while it runs - see the end of this file.
 
 # No host helper: H: is the emulator's, and on this board UART1 is the wire to
 # the C3.  Left on, HostFS opened it at 115200 for three seconds after boot,
@@ -62,3 +62,18 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # would refuse the second neighbour's registry part way through, once per
 # device.  See CONFIG_ARGON_DEV_MAX and net/noderdev.c.
 CONFIG_ARGON_DEV_MAX=56
+
+# ---------------------------------------------------------------------------
+# WHERE CODE AND TABLES LIVE IS NOT HERE ANY MORE (9 Oct 2026): it is the
+# [memory] section of boards/esp32s3-zero/BOARD.CFG, which `argon target` and
+# `argon build` turn into the IDF switches that used to be listed here
+# (tools/argon.ps1, Sync-BoardMemory).  What each choice was measured to cost
+# is in docs/13-memory.md, "S3-Zero: 512 KB".
+#
+# What stays here is size, not place: a 16 KB code arena for the drivers - a
+# program whose code does not fit takes it from the internal heap while it
+# runs (loader.c, place_heap) - and a 256 KB PSRAM arena behind it.
+# ---------------------------------------------------------------------------
+CONFIG_ARGON_APP_ARENA_KB=16
+CONFIG_ARGON_APP_ARENA_PSRAM=y
+CONFIG_ARGON_APP_ARENA_PSRAM_KB=256

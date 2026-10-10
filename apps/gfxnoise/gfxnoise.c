@@ -24,6 +24,10 @@
  *   balls  `count` solid balls (eight by default, sixteen at most) on a plain
  *          ground, bouncing off the walls and off each other: a few small
  *          regions changing in every band, and flat rows between them
+ *   scroll a map of painted tiles in 256 colours sliding under the screen,
+ *          `count` pixels a frame (four by default): every pixel changes
+ *          every frame, as when a game moves its whole map - short runs, no
+ *          flat ground, and never more than 256 colours
  *
  * `rows` is the height of one presented band, eight by default, which is what
  * REMDISP cuts a frame into.  The run reports the frames it pushed and the
@@ -51,6 +55,49 @@ static uint16_t s_pool[NOISE_W_MAX * NOISE_BAND_MAX + POOL_SLACK];
 static uint16_t s_band[NOISE_W_MAX * NOISE_BAND_MAX];
 
 #define BOX 48u
+
+/*
+ * THE MAP FOR `scroll`: eight tiles of 64x64 palette indices, laid out by a
+ * hash of where they are, in 256 fixed colours.  A painted game's art is not
+ * noise and not flat: it has short runs, dithering, and a palette - so that is
+ * what this is, and it is cheap enough to make every frame.
+ */
+#define TILE      64u
+#define TILES     8u
+static uint8_t  s_tile[TILES][TILE * TILE];
+static uint16_t s_pal[256];
+static uint32_t xorshift(void);
+
+static void map_start(void)
+{
+    for (uint32_t i = 0; i < 256u; i++) {
+        s_pal[i] = (uint16_t)xorshift();
+    }
+    for (uint32_t t = 0; t < TILES; t++) {
+        uint8_t v = (uint8_t)xorshift();
+        for (uint32_t k = 0; k < TILE * TILE; k++) {
+            /* a third of the time the pixel repeats its left neighbour */
+            if ((xorshift() % 3u) != 0u) {
+                v = (uint8_t)xorshift();
+            }
+            s_tile[t][k] = v;
+        }
+    }
+}
+
+static void map_band(uint16_t *band, uint16_t w, uint16_t y0, uint16_t n,
+                     uint32_t sx, uint32_t sy)
+{
+    for (uint32_t r = 0; r < n; r++) {
+        const uint32_t my = y0 + r + sy;
+        const uint32_t ty = my / TILE;
+        for (uint32_t x = 0; x < w; x++) {
+            const uint32_t mx = x + sx;
+            const uint32_t t = ((mx / TILE) * 73856093u ^ ty * 19349663u) % TILES;
+            band[r * w + x] = s_pal[s_tile[t][(my % TILE) * TILE + mx % TILE]];
+        }
+    }
+}
 
 static uint32_t s_rng = 0x2545F491u;
 
@@ -298,7 +345,7 @@ int ag_main(int argc, char **argv)
 
     uint32_t secs = (argc >= 2) ? number(argv[1]) : 10u;
     uint32_t rows = (argc >= 3) ? number(argv[2]) : 8u;
-    char mode = (argc >= 4) ? argv[3][0] : 'n'; /* n, b, f or o */
+    char mode = (argc >= 4) ? argv[3][0] : 'n'; /* n, b, f, o or s */
     /* box and balls share their first letter; the second tells them apart */
     if (mode == 'b' && argv[3][1] == 'a') {
         mode = 'o';
@@ -337,6 +384,11 @@ int ag_main(int argc, char **argv)
     /* a ball a sixteenth of the short side across in radius, 12 to 20 px */
     uint32_t rad = ((w < h) ? w : h) / 16u;
     rad = (rad < 12u) ? 12u : (rad > BALL_R_MAX) ? BALL_R_MAX : rad;
+    uint32_t sx = 0, sy = 0;
+    const uint32_t step = (argc >= 5) ? count : 4u;
+    if (mode == 's') {
+        map_start();
+    }
     if (mode == 'o') {
         if (count == 0u || count > BALLS_MAX) {
             count = (count == 0u) ? 8u : BALLS_MAX;
@@ -400,6 +452,9 @@ int ag_main(int argc, char **argv)
             } else if (mode == 'o') {
                 balls_band(s_band, w, y0, n, count, rad);
                 src = s_band;
+            } else if (mode == 's') {
+                map_band(s_band, w, y0, n, sx, sy);
+                src = s_band;
             } else {
                 off += 61u; /* prime-ish, so the window does not fall into step */
                 if (off > POOL_SLACK) {
@@ -433,6 +488,9 @@ int ag_main(int argc, char **argv)
             box_x = (uint32_t)((int32_t)box_x + box_dx);
         } else if (mode == 'o') {
             balls_step(w, h, count, rad);
+        } else if (mode == 's') {
+            sx += step; /* right and a little down, like a map walked across */
+            sy += step / 2u;
         }
         /*
          * Nothing sleeps here on purpose: the point is to keep the wire as

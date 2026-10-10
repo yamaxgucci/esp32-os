@@ -132,7 +132,7 @@ static bool nd_up(ag_device_t *dev)
 
 static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
                            const void *buf, size_t len, uint16_t dst,
-                           uint16_t src)
+                           uint16_t src, uint16_t budget_ms)
 {
     node_t *nd = (node_t *)ag_dev_priv(dev);
     if (nd == NULL) {
@@ -157,18 +157,19 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
      * WHOLE, AND WAITED FOR WITHOUT THE LOCK.  The lock is held only while a
      * message is copied in, never while room is awaited, so a sender of
      * sound is not stood behind a picture that is waiting for the wire to
-     * drain (see AG_SPILINK_WHOLE).  Bulk yields: it goes only when room for
-     * somebody else's message is left behind it.  Stream is one attempt, as
-     * it always was: late sound is worse than none.
+     * drain (see AG_SPILINK_WHOLE).  What goes first is not decided here
+     * (2 Oct 2026): the message's budget, said by its sender, goes to the
+     * wire, and the wire sends the soonest due first.  Here only what the
+     * class says about delivery: a stream is not sent again and is one
+     * attempt - late sound is worse than none - and background waits for an
+     * idle wire.
      */
     const uint32_t how =
-        stream ? AG_SPILINK_WHOLE
-        : (cls == AG_LINK_BACKGROUND)
-            ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_YIELD |
-               AG_SPILINK_IDLE)
-        : (cls == AG_LINK_BULK)
-            ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_YIELD)
-            : (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE);
+        (stream ? AG_SPILINK_WHOLE
+         : (cls == AG_LINK_BACKGROUND)
+             ? (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE | AG_SPILINK_IDLE)
+             : (AG_SPILINK_RELIABLE | AG_SPILINK_WHOLE)) |
+        AG_SPILINK_BUDGET(budget_ms);
     /* background is one attempt too: its caller has other things to send
      * while the wire is busy, and waiting here would be waiting in front of
      * them */
@@ -177,7 +178,11 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
     int32_t        w;
     for (;;) {
         TASK->mutex_lock(nd->txlock, UINT32_MAX);
-        w = IO->uart_link_send2(nd->uart, head, ND_HEAD, buf, len, how, 0u);
+        /* the link waits for the room itself, woken by the acknowledgement
+         * that makes it: a tick's sleep here was 1.6 KB of a 16 Mbaud wire
+         * left silent each time (1 Oct 2026) */
+        w = IO->uart_link_send2(nd->uart, head, ND_HEAD, buf, len, how,
+                                once ? 0u : ND_SEND_MS);
         TASK->mutex_unlock(nd->txlock);
         if (w != -AG_EAGAIN || once || (int32_t)(now_ms() - until) >= 0) {
             break;
@@ -208,7 +213,7 @@ static int32_t send_common(ag_device_t *dev, uint8_t chan, uint8_t cls,
 static int32_t nd_send(ag_device_t *dev, uint8_t chan, uint8_t cls,
                        const void *buf, size_t len)
 {
-    return send_common(dev, chan, cls, buf, len, 0u, 0u);
+    return send_common(dev, chan, cls, buf, len, 0u, 0u, 0u);
 }
 
 static int32_t nd_send_a(ag_device_t *dev, uint8_t chan, const void *buf,
@@ -217,7 +222,8 @@ static int32_t nd_send_a(ag_device_t *dev, uint8_t chan, const void *buf,
     if (to == NULL) {
         return -AG_EINVAL;
     }
-    return send_common(dev, chan, to->cls, buf, len, to->dst, to->src);
+    return send_common(dev, chan, to->cls, buf, len, to->dst, to->src,
+                       to->budget_ms);
 }
 
 static int32_t recv_common(ag_device_t *dev, uint8_t *chan, void *buf,
@@ -416,8 +422,14 @@ static ag_err_t wire_up(uint32_t i)
     if (AG_HAS(ag_api()->cfg, get_str)) {
         (void)ag_api()->cfg->get_str(k_dma_key[i], how, sizeof(how));
     }
-    const bool ring = (ag_strcmp(how, "ring") == 0);
-    const bool dma = ring || (ag_strcmp(how, "yes") == 0);
+    /*
+     * `auto` (and the old `yes` and `ring`): by DMA each way the chip does it
+     * without loss, which the kernel knows and a board's file does not (1 Oct
+     * 2026).  `no`, and no line at all, keep the driver both ways - the
+     * emulator has no UHCI, and a link there must not wait on one.
+     */
+    const bool dma = ag_strcmp(how, "auto") == 0 ||
+                     ag_strcmp(how, "ring") == 0 || ag_strcmp(how, "yes") == 0;
     const int32_t  frame = cfg_int(k_frame_key[i], 0);
 
     node_t *nd = (node_t *)ag_malloc_caps(sizeof(node_t), AG_MEM_DEFAULT);
@@ -440,8 +452,7 @@ static ag_err_t wire_up(uint32_t i)
 
     const ag_err_t le = IO->uart_link_open(
         uart, baud, (frame > 0) ? (uint32_t)frame : 0u,
-        AG_SPILINK_BLOCKS | (dma ? AG_UARTLINK_DMA : 0u) |
-            (ring ? AG_UARTLINK_RING : 0u));
+        AG_SPILINK_BLOCKS | (dma ? AG_UARTLINK_DMA : 0u));
     if (le != AG_OK) {
         ag_log(AG_LOG_ERROR, "nodelink",
                "uart%d would not open as a link at %u baud%s: %d (its pins "
@@ -473,7 +484,7 @@ static ag_err_t wire_up(uint32_t i)
     s_wires++;
     ag_log(AG_LOG_INFO, "nodelink",
            "/dev/%s on uart%d at %u baud%s - bind with `link use %s`", name,
-           uart, (unsigned)baud, ring ? " by DMA, ring" : dma ? " by DMA" : "",
+           uart, (unsigned)baud, dma ? " by DMA where the chip can" : "",
            name);
     return AG_OK;
 }

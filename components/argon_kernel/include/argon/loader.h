@@ -80,6 +80,13 @@ typedef struct {
      */
     void *cold_scratch;
     void *cold_slot;
+
+    /*
+     * Code in a block of the internal heap rather than the link-time arena
+     * (ag_port_execmem_alloc): what to hand back to the heap on release.
+     * place.code is inside it, rounded up to 16.  NULL otherwise.
+     */
+    void *code_heap;
 } ag_loaded_app_t;
 
 /*

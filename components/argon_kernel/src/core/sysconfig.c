@@ -11,12 +11,17 @@
 
 #include <argon/board.h>
 #include <argon/codepage.h>
+#include <argon/console.h>
+#include <argon/place.h>
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/nodename.h>
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
+#include <argon/port/place.h>
+
+#include "core/place_bss.h"
 
 #define TAG "cfg"
 
@@ -33,7 +38,7 @@
  */
 #define AG_CFG_TEXT_BYTES 4096
 
-static ag_cfg_t s_cfg;
+static ag_cfg_t s_cfg AG_KERNEL_STATIC;
 static char    *s_text;
 static size_t   s_text_used;
 static char     s_sources[64];
@@ -246,5 +251,11 @@ ag_err_t ag_sysconfig_init(void)
 
     /* Hardware description reaches the board layer even if nothing was read:
      * it is then a no-op, and the defaults stand. */
-    return ag_board_apply_config(&s_cfg);
+    const ag_err_t err = ag_board_apply_config(&s_cfg);
+
+    /* Where things live ([memory], argon/place.h) - and the console, made in
+     * an earlier stage by the default, moves there now. */
+    ag_place_configure();
+    ag_console_place();
+    return err;
 }

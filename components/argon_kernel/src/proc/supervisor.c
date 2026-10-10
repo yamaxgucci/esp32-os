@@ -23,6 +23,7 @@
 #include <argon/keys.h>
 #include <argon/log.h>
 #include <argon/power.h>
+#include <argon/place.h>
 #include <argon/proc.h>
 #include <argon/session.h>
 #include <argon/vfs.h>
@@ -625,8 +626,12 @@ ag_err_t ag_supervisor_init(void)
         }
     }
 
-    if (!ag_port_task_create(supervisor_task, "ag_super", AG_SUP_STACK, NULL,
-                             AG_SUP_PRIORITY, 0, 0, &s_task)) {
+    /* [memory] supervisor, `only iram` unless the configuration says
+     * otherwise: it writes the crash record, and a stack in PSRAM would make
+     * that write depend on the flash relay (flashop_hw.c) a crashed program
+     * may have left holding its lock. */
+    if (!ag_place_task("supervisor", supervisor_task, "ag_super", AG_SUP_STACK,
+                       NULL, AG_SUP_PRIORITY, 0, (void **)&s_task, NULL)) {
         return -AG_ENOMEM;
     }
 

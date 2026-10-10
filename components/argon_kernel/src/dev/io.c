@@ -933,23 +933,43 @@ static ag_err_t io_uart_link_open(int port, uint32_t baud, uint32_t frame,
      * in flight - this end's room, three frames - and not the 8 KB a reader
      * with no flow control needs: the link's own task empties it at once.
      */
-    const bool     dma = (flags & AG_UARTLINK_DMA) != 0u;
-    /* a chip that receives by DMA may still send through the driver (the
-     * ESP32, 29 Sep 2026): then the driver has its transmit ring */
+    bool dma = (flags & AG_UARTLINK_DMA) != 0u;
+    /*
+     * AND ONLY WHERE THE DMA IS THIS PORT'S TO HAVE (6 Oct 2026).  The C3 in
+     * the middle of three boards has one UHCI and two wires: the wire to the
+     * CYD took it, the wire to the Zero asked for it as well and was refused
+     * outright - "uart0 would not open as a link at 8000000 baud by DMA: -45"
+     * - so the Zero was never in the cluster.  `dma = auto` means by DMA
+     * where the chip can, and through the driver where it cannot; a channel
+     * that is another wire's is a "cannot".
+     */
+    if (dma && !ag_port_uart_dma_available(port)) {
+        ag_log(AG_LOG_INFO, "io",
+               "uart%d: the chip's DMA is another wire's; this one goes "
+               "through the driver",
+               port);
+        dma = false;
+        flags &= ~(uint32_t)AG_UARTLINK_DMA;
+    }
+    /*
+     * EACH WAY AS THE CHIP DOES IT BEST, not as a board's file says (1 Oct
+     * 2026).  The ESP32 receives by DMA and sends through the driver; the S3
+     * sends by DMA and receives through the driver; the C3 does both by DMA.
+     * Whatever goes through the driver has its ring there.
+     */
     const bool     dma_tx = dma && ag_port_uart_dma_can_send();
+    const bool     dma_rx = dma && ag_port_uart_dma_can_receive();
     const uint32_t f = ag_uartlink_frame(frame);
     lock();
-    ag_err_t err = dma ? uart_bring_up_sized(port, &cfg, AG_IO_UART_DMA_RX_BUF,
-                                             dma_tx ? AG_IO_UART_DMA_TX_BUF
-                                                    : AG_IO_UART_TX_BUF)
-                       : uart_bring_up_sized(port, &cfg, 4u * f,
-                                             AG_IO_UART_TX_BUF);
+    ag_err_t err = uart_bring_up_sized(
+        port, &cfg, dma_rx ? AG_IO_UART_DMA_RX_BUF : 4u * f,
+        dma_tx ? AG_IO_UART_DMA_TX_BUF : AG_IO_UART_TX_BUF);
     unlock();
     if (err == AG_OK && dma_tx && !ag_port_uart_dma_ready(port)) {
         err = -AG_ENOTSUP; /* asked for DMA on a port that has none */
     }
     if (err == AG_OK) {
-        err = ag_uartlink_open(port, frame, flags);
+        err = ag_uartlink_open(port, baud, frame, flags);
     }
     if (err != AG_OK) {
         ag_log(AG_LOG_WARN, "io", "uart%d link open failed: %d", port,

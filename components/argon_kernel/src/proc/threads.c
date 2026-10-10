@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/budget.h>
 #include <argon/kernel.h>
 #include <argon/log.h>
 #include <argon/service.h>
@@ -126,6 +127,7 @@ void ag_thread_release(void *record)
             return;
         }
 
+        ag_budget_forget(rec->task);
         ag_port_task_delete(rec->task);
     }
     ag_port_free(rec);
@@ -151,6 +153,7 @@ static void thread_entry(void *arg)
      * race with a joiner reading the flag.
      */
     rec->finished = true;
+    ag_budget_forget(ag_port_task_self());
     ag_port_task_delete(NULL);
 }
 
@@ -240,8 +243,8 @@ static ag_thread_t thread_create_in(proc_t *p, void (*fn)(void *), void *arg,
     snprintf(label, sizeof(label), "%.11s/t", (name != NULL) ? name : p->name);
 
     ag_port_task_t task = NULL;
-    if (!ag_proc_task_create(thread_entry, label, (uint32_t)want, rec,
-                             (unsigned)prio, core, &task)) {
+    if (!ag_proc_task_create_app(thread_entry, label, (uint32_t)want, rec,
+                                 (unsigned)prio, core, &task)) {
         (void)ag_reslist_remove(&p->res, AG_RES_THREAD, rec, NULL);
         ag_port_free(rec);
         ag_proc_table_unlock();
@@ -250,6 +253,17 @@ static ag_thread_t thread_create_in(proc_t *p, void (*fn)(void *), void *arg,
         return NULL;
     }
     rec->task = task;
+    /*
+     * A thread says what it needs by its priority, and pays for it (2 Oct
+     * 2026): one above applications is charged a budget like a driver's
+     * task and held below them once it overruns; one at the ordinary
+     * priority is watched for fairness like the process's own task.
+     */
+    if ((unsigned)prio > AG_BUDGET_FAIR_PRIO) {
+        (void)ag_budget_watch(task, label, (unsigned)prio, 0u);
+    } else if ((unsigned)prio == AG_BUDGET_FAIR_PRIO) {
+        (void)ag_budget_fair(task, label);
+    }
 
     ag_proc_table_unlock();
     return (ag_thread_t)rec;
@@ -310,6 +324,7 @@ static void api_exit(void)
      * simply returned takes.
      */
     ag_thread_mark_self_finished();
+    ag_budget_forget(ag_port_task_self());
     ag_port_task_delete(NULL);
 }
 

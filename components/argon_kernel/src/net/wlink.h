@@ -115,8 +115,17 @@
 #define WL_F_MASTER 16u
 #define WL_F_SEG  4u
 #define WL_SEG_SKIP 0x8000u
+/* the lanes of blocks waiting to go (see wlink_t.lane), by budget in ms; a
+ * budget under WL_NOW_MS goes in at once, and with no lanes a budget over
+ * WL_YIELD_BUDGET_MS leaves room behind it as AG_SPILINK_YIELD does */
+#define WL_LANES           3u
+#define WL_LANE0_MS        20u
+#define WL_LANE1_MS        200u
+#define WL_NOW_MS          2u
+#define WL_YIELD_BUDGET_MS 20u
 /* frames a sender may have out and unacknowledged, and the out-of-order
- * frames a receiver will hold beyond its hole */
+ * frames a receiver will hold beyond its hole (24 tried 1 Oct 2026 for the
+ * S3's 530-byte picture frames: no change - the window was never full) */
 #define WL_WIN 8u
 /* no acknowledgement for this long with frames out: send the first again */
 #define WL_RTO_US 50000
@@ -240,6 +249,16 @@ typedef struct {
     uint32_t rxcap;
     ring_t   tx;
     ring_t   rx;
+    /*
+     * Blocks waiting to go into the stream, by how long they may wait (2 Oct
+     * 2026, AG_SPILINK_BUDGET): a lane each for budgets up to WL_LANE0_MS,
+     * up to WL_LANE1_MS and beyond.  The stream (tx) is kept to less than a
+     * frame not yet sent, and fed from the lanes, the soonest due first - so
+     * what may not wait goes past what may, and the wire knows nothing of
+     * what either is.  Capacity 0: no lanes, blocks go straight in (a board
+     * with no memory for them).
+     */
+    ring_t   lane[WL_LANES];
 
     /* the other end's room as its last frame said, and its ack in that frame */
     bool     peer_known;
@@ -255,6 +274,7 @@ typedef struct {
         uint32_t off;
         uint32_t blk; /* block mode: its first record header, >= off */
         uint16_t n;
+        int64_t  at;  /* when it was built, for the probe's round trip */
     } infl[WL_WIN];
     uint32_t infl_n;
     bool     resend;
@@ -311,6 +331,26 @@ typedef struct {
     uint32_t peer_restarts;
     uint32_t starve_data;
     uint32_t starve_credit;
+    /* the probe (`link probe`, 1 Oct 2026): a writer's waits for room, the
+     * sending task's reasons to stop, its waits for a transmit buffer */
+    uint32_t pr_sends, pr_space_waits;
+    int64_t  pr_send_us, pr_space_us;
+    uint32_t pr_stop_credit, pr_stop_win, pr_stop_empty;
+    uint32_t pr_settles;
+    int64_t  pr_settle_us;
+    uint64_t pr_wire_bytes;
+    /* frames acknowledged, the time they took in all and the longest, and
+     * the far end's room at each acknowledgement, in all and the least */
+    uint32_t pr_acked, pr_rtt_max_us, pr_room_n, pr_room_min;
+    /* room told under a frame: frames held past a hole, a hole, a full ring */
+    uint32_t pr_small_ooo, pr_small_hole, pr_small_full;
+    /* the lanes (2 Oct 2026): records fed to the stream from each, those fed
+     * after they were due and by how much at most, writers that waited for
+     * a lane's room; and feeds stopped by a full stream with a lane waiting */
+    uint32_t pr_lane_fed[3], pr_lane_late[3], pr_lane_late_ms[3];
+    uint32_t pr_lane_waits[3], pr_lane_blocked;
+    int64_t  pr_rtt_us;
+    uint64_t pr_room_sum;
     uint32_t frames_bad;
     uint32_t seq_gaps;
     uint32_t bytes_dropped;
@@ -330,6 +370,11 @@ uint32_t wl_allowance(const wlink_t *w, uint32_t in_flight);
 /* The next frame into `f`: a frame to send again first, then new data up to
  * `allow`.  Returns its data bytes; *wire_len (if asked) is the length of
  * the frame, header included. */
+/* The lanes' memory, caps[k] bytes each in turn from mem (0: no lane). */
+void wl_lanes(wlink_t *w, uint8_t *mem, const uint32_t caps[WL_LANES]);
+/* Into the stream from the lanes what fits; whether the stream has bytes to
+ * send.  For the sending task, before it looks for something to send. */
+bool wl_feed(wlink_t *w);
 uint32_t wl_build(wlink_t *w, uint8_t *f, uint32_t allow, uint32_t room_less,
                   bool *nak_was, uint32_t *wire_len);
 /* Take back what wl_build did, for a frame that never went out. */

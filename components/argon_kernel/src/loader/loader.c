@@ -18,10 +18,13 @@
 #include <argon/module.h>
 #include <argon/proc.h>
 #include <argon/path.h>
+#include <argon/place.h>
+#include <argon/port/place.h>
 #include <argon/libc.h>
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
+#include <argon/port/execmem.h>
 #include "loader/appfs.h"
 
 /*
@@ -274,14 +277,26 @@ static void *data_alloc(size_t bytes)
     /* Room for the guard, and the guard written into it: see guard_arm. */
     const size_t want = bytes + AG_APP_GUARD_BYTES;
 
-    void *p = ag_port_alloc_aligned(16, want, AG_MEM_SLOW | AG_MEM_BYTE);
-    if (p == NULL) {
-        p = ag_port_alloc_aligned(16, want, AG_MEM_IRAM8);
+    /* [memory] app.data: psram, iram by default.  "iram" means the D/IRAM
+     * the DMA path does not use first, then ordinary internal RAM. */
+    ag_place_kind_t kinds[AG_PLACE_KINDS];
+    const unsigned  n = ag_place_order("app.data", kinds);
+    for (unsigned k = 0; k < n; k++) {
+        void *p = NULL;
+        if (kinds[k] == AG_PLACE_PSRAM) {
+            p = ag_port_alloc_aligned(16, want, AG_MEM_SLOW | AG_MEM_BYTE);
+        } else if (kinds[k] == AG_PLACE_IRAM) {
+            p = ag_port_alloc_aligned(16, want, AG_MEM_IRAM8);
+            if (p == NULL) {
+                p = ag_port_alloc_aligned(16, want, AG_MEM_FAST | AG_MEM_BYTE);
+            }
+        }
+        if (p != NULL) {
+            ag_place_note("app.data", kinds[k], (int32_t)want);
+            return p;
+        }
     }
-    if (p == NULL) {
-        p = ag_port_alloc_aligned(16, want, AG_MEM_FAST | AG_MEM_BYTE);
-    }
-    return p;
+    return NULL;
 }
 
 /*
@@ -346,8 +361,21 @@ static void *scratch_alloc(size_t bytes)
 static void release_image(ag_loaded_app_t *app)
 {
     if (app->data_owned != NULL) {
+        ag_place_note("app.data",
+                      ag_port_ptr_is_slow(app->data_owned) ? AG_PLACE_PSRAM
+                                                           : AG_PLACE_IRAM,
+                      -(int32_t)(app->header.data.size + AG_APP_GUARD_BYTES));
         ag_port_free(app->data_owned);
         app->data_owned = NULL;
+    }
+    if (app->place.code != NULL) {
+        ag_place_note("app.code",
+                      app->code_from_xip     ? AG_PLACE_FLASH
+                      : app->code_from_psram ? AG_PLACE_PSRAM
+                                             : AG_PLACE_IRAM,
+                      app->code_from_xip
+                          ? -(int32_t)app->header.code.size
+                          : -(int32_t)app->place.code_capacity);
     }
     if (app->code_scratch != NULL) {
         ag_port_free(app->code_scratch);
@@ -368,7 +396,10 @@ static void release_image(ag_loaded_app_t *app)
         }
     } else
 #endif
-    if (app->place.code != NULL && !app->code_from_xip) {
+    if (app->code_heap != NULL) {
+        ag_port_execmem_free(app->code_heap);
+        app->code_heap = NULL;
+    } else if (app->place.code != NULL && !app->code_from_xip) {
         if (!ag_arena_free(&s_code, app->place.code)) {
             ag_log(AG_LOG_ERROR, "loader", "arena does not own %p",
                    app->place.code);
@@ -391,6 +422,9 @@ static void release_image(ag_loaded_app_t *app)
     app->place.cold_capacity = 0;
     app->code_from_psram = false;
 }
+
+static ag_err_t place_data(const ag_axe_header_t *header, ag_loaded_app_t *out,
+                           void *code, size_t code_bytes);
 
 /*
  * IRAM arena path: code is writable and executable in place.
@@ -416,6 +450,24 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
                (unsigned)ag_arena_largest_free(&s_code, 16));
         return -AG_ENOMEM;
     }
+
+    const ag_err_t err = place_data(header, out, code, code_bytes);
+    if (err != AG_OK) {
+        (void)ag_arena_free(&s_code, code);
+    }
+    return err;
+}
+
+/*
+ * The half of placing an image that does not depend on where its code went:
+ * the code block is given, and the data goes inside it (contiguous) or into
+ * an allocation of its own.  On failure `out->place` is cleared and the code
+ * block is the caller's to give back.
+ */
+static ag_err_t place_data(const ag_axe_header_t *header, ag_loaded_app_t *out,
+                           void *code, size_t code_bytes)
+{
+    const bool contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
 
     out->place.code = code;
     out->place.code_capacity = code_bytes;
@@ -450,7 +502,6 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
                (unsigned)(ag_port_mem_free(AG_MEM_SLOW) +
                           ag_port_mem_free(AG_MEM_FAST)),
                (unsigned)ag_port_mem_largest(AG_MEM_FAST));
-        (void)ag_arena_free(&s_code, code);
         memset(&out->place, 0, sizeof(out->place));
         return -AG_ENOMEM;
     }
@@ -459,6 +510,66 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
     out->place.data_capacity = header->data.size;
     out->data_owned = data;
     guard_arm(out, (uint8_t *)data + header->data.size);
+    return AG_OK;
+}
+
+/*
+ * CODE FROM THE INTERNAL HEAP (9 Oct 2026).
+ *
+ * The link-time arena is internal SRAM reserved for code whether a program
+ * runs or not.  On the S3-Zero it was cut to 16 KB to give that memory back -
+ * and then DX7, 29 KB of code, went to the PSRAM arena while 250 KB of
+ * internal SRAM stood free, which is the memory that had been freed for
+ * exactly such programs (Maxim, 9 Oct).  So a program that does not fit the
+ * arena takes its code from the internal heap when the port can make heap
+ * memory executable (the S3), and gives it back when it ends.
+ *
+ * Only while that leaves what is kept for arriving devices
+ * (ag_proc_keep_internal) and AG_LOADER_HEAP_CODE_FLOOR on top: a radio
+ * brought up later wants one ~36 KB contiguous block of the same memory, and
+ * a program's code must not be what refuses it.  Past that the PSRAM arena,
+ * then flash, as before.
+ */
+#define AG_LOADER_HEAP_CODE_FLOOR (40u * 1024u)
+
+static bool heap_code_room(size_t bytes)
+{
+    /* The ESP32's instruction RAM is nobody's data memory: the heap's own
+     * answer is the only one that matters there. */
+    if (!ag_port_execmem_from_data()) {
+        return true;
+    }
+    return ag_port_mem_free(AG_MEM_FAST) >=
+           bytes + 16u + AG_LOADER_HEAP_CODE_FLOOR + ag_proc_kept_internal();
+}
+
+static ag_err_t place_heap(const ag_axe_header_t *header, ag_loaded_app_t *out)
+{
+    const bool   contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
+    /* A contiguous image's data lives in the code block, and the ESP32's
+     * instruction RAM takes no byte stores. */
+    if (contiguous && !ag_port_execmem_from_data()) {
+        return -AG_ENOTSUP;
+    }
+    const size_t code_bytes =
+        contiguous ? (size_t)header->code.size + header->data.size +
+                         AG_APP_GUARD_BYTES
+                   : (size_t)header->code.size;
+
+    void *raw = NULL;
+    void *writable = NULL;
+    void *code = ag_port_execmem_alloc(code_bytes, &writable, &raw);
+    if (code == NULL) {
+        return -AG_ENOMEM;
+    }
+    const ag_err_t err = place_data(header, out, code, code_bytes);
+    if (err != AG_OK) {
+        ag_port_execmem_free(raw);
+        return err;
+    }
+    /* Filled through the data bus, run through the instruction bus. */
+    out->place.code_writable = writable;
+    out->code_heap = raw;
     return AG_OK;
 }
 
@@ -885,38 +996,76 @@ static ag_err_t place_parts(const ag_axe_header_t *header,
         contiguous ? (size_t)header->code.size + header->data.size
                    : (size_t)header->code.size;
 
-    if (!want_xip && ag_arena_largest_free(&s_code, 16) >= want) {
-        /* place_arena says which of its two allocations failed; there is no
-         * one sentence that covers both, and guessing produced the wrong one. */
-        return place_arena(header, out);
-    }
-
-#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
     /*
-     * S-1: the internal arena did not take it (on this board it is deliberately
-     * tiny, so that is the common case), so try the PSRAM arena before flash.
-     * PSRAM execution is slower than internal SRAM but far faster than flash for
-     * a working set that does not fit the cache, and it leaves the internal
-     * memory to the radios - which is the whole reason the arena moved.
-     *
-     * And the arena is mapped only for code that can go into it.  It maps
-     * once for the life of the system, 64 KB-aligned, so it lands low in
-     * PSRAM with a hole under it - and on 8 Oct 2026 Fallout, whose 788 KB of
-     * code never goes there, lost it anyway: its 6000 KB arena was refused
-     * next to a free block of 6003, because the heap rounds a request that
-     * large up to 6016.  The 102 KB of arena and hole was the difference.
+     * [memory] app.code (argon/place.h): iram, psram, flash by default.  iram
+     * is the link-time arena, then the internal heap for as long as the
+     * program runs; psram the PSRAM arena where this build has one; flash is
+     * XIP from the appfs partition.  An image that asked for flash XIP goes
+     * straight there, as it always did.
      */
-    if (!want_xip && !contiguous &&
-        (size_t)header->code.size <= AG_PSRAM_ARENA_BYTES && psram_ready() &&
-        ag_arena_largest_free(&s_psram, 16) >= (size_t)header->code.size) {
-        const ag_err_t perr = place_psram(header, out);
-        if (perr == AG_OK) {
-            return AG_OK;
-        }
-        /* Out of PSRAM-arena or data memory: fall through to flash XIP, which
-         * needs neither. */
-    }
+    ag_place_kind_t kinds[AG_PLACE_KINDS];
+    const unsigned  n = want_xip ? 0u : ag_place_order("app.code", kinds);
+    bool            flash_allowed = want_xip;
+    for (unsigned k = 0; k < n && !flash_allowed; k++) {
+        switch (kinds[k]) {
+        case AG_PLACE_IRAM:
+            if (ag_arena_largest_free(&s_code, 16) >= want) {
+                /* place_arena says which of its two allocations failed; there
+                 * is no one sentence that covers both, and guessing produced
+                 * the wrong one. */
+                const ag_err_t aerr = place_arena(header, out);
+                if (aerr == AG_OK) {
+                    ag_place_note("app.code", AG_PLACE_IRAM,
+                                  (int32_t)out->place.code_capacity);
+                }
+                return aerr;
+            }
+            /* Internal SRAM the program can have for as long as it runs. */
+            if (heap_code_room(want) && place_heap(header, out) == AG_OK) {
+                ag_place_note("app.code", AG_PLACE_IRAM,
+                              (int32_t)out->place.code_capacity);
+                return AG_OK;
+            }
+            break;
+        case AG_PLACE_PSRAM:
+#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
+            /*
+             * S-1: the PSRAM arena, mapped into the instruction window.
+             * Slower than internal SRAM, far faster than flash for a working
+             * set that does not fit the cache.
+             */
+            /* Mapped only for code that can go into it: the arena maps
+             * once for the life of the system, 64 KB-aligned, and on
+             * 8 Oct 2026 the hole under it kept Fallout's 6000 KB arena
+             * from starting although its 788 KB of code never goes there
+             * (the heap rounds a request that large up to 6016). */
+            if (!contiguous &&
+                (size_t)header->code.size <= AG_PSRAM_ARENA_BYTES &&
+                psram_ready() &&
+                ag_arena_largest_free(&s_psram, 16) >=
+                    (size_t)header->code.size &&
+                place_psram(header, out) == AG_OK) {
+                ag_place_note("app.code", AG_PLACE_PSRAM,
+                              (int32_t)out->place.code_capacity);
+                return AG_OK;
+            }
 #endif
+            break;
+        case AG_PLACE_FLASH:
+            flash_allowed = true;
+            break;
+        default:
+            break;
+        }
+    }
+    if (!flash_allowed) {
+        char wanted[32];
+        ag_place_format(ag_place_policy("app.code"), wanted, sizeof(wanted));
+        ag_log(AG_LOG_ERROR, "loader",
+               "%u bytes of code: app.code = %s, and none of them has room",
+               (unsigned)want, wanted);
+        return -AG_ENOMEM;
+    }
 
     if (want_xip && ag_arena_largest_free(&s_code, 16) >= want) {
         ag_log(AG_LOG_INFO, "loader",
@@ -953,6 +1102,9 @@ static ag_err_t place_parts(const ag_axe_header_t *header,
     }
 
     const ag_err_t err = place_xip(header, out);
+    if (err == AG_OK) {
+        ag_place_note("app.code", AG_PLACE_FLASH, (int32_t)header->code.size);
+    }
     if (err != AG_OK) {
         /*
          * The heap, not the arena.  Flash XIP has already given up on the arena
