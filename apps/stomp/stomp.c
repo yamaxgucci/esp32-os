@@ -241,6 +241,9 @@ static uint32_t     s_us_fx;   /* what a borrowed effect costs a block */
 static uint32_t     s_us_total;
 static uint32_t     s_us_blocks;
 static uint32_t     s_in_starved;  /* blocks the converter had nothing for */
+/* Frames of silence padded into the live input since the last status line,
+ * which is the size of the hole a listener hears. */
+static uint32_t     s_in_holes;
 static int16_t      s_mono[CHUNK];
 static int16_t      s_stereo[CHUNK * 2];
 static float        s_peak;     /* of the last block at the converter */
@@ -751,20 +754,50 @@ static void gear_target(int *x, int *y, int *w, int *h, int sw)
     *h = TOP_H + 10;
 }
 
-#define MENU_ROW 30
-#define MENU_N   3
+#define MENU_ROW  26 /* a value, and a finger can hit it */
+#define MENU_HEAD 17 /* a heading, which nothing taps */
 
-static const uint32_t k_menu_blk[MENU_N] = { 256u, 128u, 64u };
+enum { MROW_HEAD, MROW_BLK, MROW_OS };
+
+static const struct {
+    uint8_t     kind;
+    uint16_t    val;
+    const char *label;
+    const char *note;
+} k_menu[] = {
+    { MROW_HEAD, 0u, "LATENCY", "" },
+    { MROW_BLK, 256u, "256", "about 58 ms" },
+    { MROW_BLK, 128u, "128", "about 29 ms" },
+    { MROW_BLK, 64u, "64", "about 14 ms" },
+    { MROW_HEAD, 0u, "VALVES", "" },
+    { MROW_OS, 1u, "1x", "cheapest" },
+    { MROW_OS, 2u, "2x", "the usual" },
+    { MROW_OS, 4u, "4x", "too dear here" },
+};
+#define MENU_N ((int)(sizeof(k_menu) / sizeof(k_menu[0])))
+
+/* Where row i starts, measured from the top of the menu's box. */
+static int menu_row_y(int i)
+{
+    int y = 8, k;
+    for (k = 0; k < i; k++) {
+        y += (k_menu[k].kind == MROW_HEAD) ? MENU_HEAD : MENU_ROW;
+    }
+    return y;
+}
 
 static void menu_box(int *x, int *y, int *w, int *h, int sw, int sh)
 {
     const int bw = (sw < 220) ? sw - 24 : 196;
     *w = bw;
-    *h = 34 + MENU_N * MENU_ROW + 10;
+    *h = menu_row_y(MENU_N) + 8;
     *x = sw - bw - 6;
     *y = TOP_H + 2;
     if (*y + *h > sh) {
         *y = sh - *h; /* a short screen keeps it on the glass */
+    }
+    if (*y < 0) {
+        *y = 0;
     }
 }
 
@@ -884,26 +917,30 @@ static void draw_menu(int sw, int sh)
     ag_gfx_fill_round_rect((int16_t)(x + 2), (int16_t)(y + 2),
                            (uint16_t)(w - 4), (uint16_t)(h - 4), 7,
                            rgb(24, 26, 33));
-    ag_gfx_text((int16_t)(x + 12), (int16_t)(y + 9), "LATENCY",
-                rgb(240, 210, 130), AG_GFX_TRANS);
 
     for (i = 0; i < MENU_N; i++) {
-        const uint32_t blk = k_menu_blk[i];
-        const int      ry = y + 34 + i * MENU_ROW;
-        const int      here = (blk == s_chunk);
-        uint32_t       ink = here ? rgb(245, 220, 150) : rgb(210, 215, 230);
-        /* In and out through the converter's rings plus the block itself. */
-        const unsigned trip = (unsigned)(blk * 5u * 1000u / RATE);
+        const int ry = y + menu_row_y(i);
+        int       here;
 
+        if (k_menu[i].kind == MROW_HEAD) {
+            ag_gfx_text((int16_t)(x + 12), (int16_t)(ry + 3), k_menu[i].label,
+                        rgb(240, 210, 130), AG_GFX_TRANS);
+            continue;
+        }
+        here = (k_menu[i].kind == MROW_BLK)
+                   ? ((uint32_t)k_menu[i].val == s_chunk)
+                   : ((int)k_menu[i].val == s_cfg.os);
         if (i == s_msel) {
-            ag_gfx_fill_round_rect((int16_t)(x + 8), (int16_t)(ry - 4),
+            ag_gfx_fill_round_rect((int16_t)(x + 8), (int16_t)ry,
                                    (uint16_t)(w - 16), MENU_ROW - 2, 4,
                                    rgb(48, 54, 72));
         }
-        (void)snprintf(line, sizeof(line), "%s%u   about %u ms",
-                       here ? "> " : "  ", (unsigned)blk, trip);
-        (void)ag_gfx_text_fit((int16_t)(x + 14), (int16_t)(ry + 2),
-                              (uint16_t)(w - 28), line, ink, AG_GFX_TRANS);
+        (void)snprintf(line, sizeof(line), "%s%-4s %s",
+                       here ? "> " : "  ", k_menu[i].label, k_menu[i].note);
+        (void)ag_gfx_text_fit((int16_t)(x + 14), (int16_t)(ry + 5),
+                              (uint16_t)(w - 28), line,
+                              here ? rgb(245, 220, 150) : rgb(210, 215, 230),
+                              AG_GFX_TRANS);
     }
 }
 
@@ -2017,6 +2054,44 @@ static int cabinet_load(const int16_t *mono, uint32_t frames, uint32_t rate)
  */
 static int cabinet_from_wav(const char *path);
 
+/*
+ * Change the oversampling while the amplifier plays.
+ *
+ * It is the largest single lever on what this chain costs - the valves are
+ * run that many times per sample - and therefore on whether it fits.  On this
+ * board, with the take at drive 9 where they work hardest: 1x leaves the
+ * pedal at 71% of its core and 2x at 95%.  At 95% there is nothing left for
+ * the radio, and what a listener hears is the sound breaking up when he plays
+ * hard.
+ *
+ * What it costs in sound is the other half, and that is a listening question,
+ * which is why it is a knob and not a number chosen here.
+ *
+ * ag_amp_set_voicing rather than set_knobs: the oversampling is the one
+ * setting whose filter state cannot survive the change, so the chain is
+ * cleared.  That is a click, once, and it is honest.
+ */
+static void os_apply(int os)
+{
+    if (s_amp == NULL || os == s_cfg.os || os < 1 || os > 8) {
+        return;
+    }
+    {
+        const int was = s_cfg.os;
+        s_cfg.os = os;
+        s_fit.os = os;
+        if (ag_amp_set_voicing(s_amp, &s_cfg) != 0) {
+            s_cfg.os = was;
+            s_fit.os = was;
+            ag_printf("stomp: %dx is not an oversampling this chain has\n", os);
+            return;
+        }
+    }
+    ag_amp_reset(s_amp);
+    ag_printf("stomp: valves at %dx\n", os);
+    dirty_all();
+}
+
 static void block_apply(uint32_t frames)
 {
     char path[sizeof(s_cab)];
@@ -2283,6 +2358,7 @@ static AG_HOT void audio_block(void)
         if (have < s_chunk) {
             memset(s_in + have * s_in_ch, 0,
                    (s_chunk - have) * s_in_ch * sizeof(int16_t));
+            s_in_holes += s_chunk - have;
             if (got < 0) {
                 s_in_starved++;
             }
@@ -2774,6 +2850,10 @@ static void on_key(uint16_t k, int *quit)
          * a setting you can only walk one way is not an A/B. */
         block_apply((s_chunk > 128u) ? 128u : (s_chunk > 64u ? 64u : 256u));
         break;
+    case AG_KEY_O:
+        /* And O walks the oversampling, for whoever has a keyboard. */
+        os_apply(s_cfg.os >= 4 ? 1 : (s_cfg.os * 2));
+        break;
     case AG_KEY_LEFT:
         if (s_editing) {
             nudge(-1);
@@ -2833,12 +2913,22 @@ static void on_tap(int px, int py)
             dirty_all();
             return;
         }
-        i = (py - (my + 30)) / MENU_ROW;
-        if (i >= 0 && i < MENU_N) {
+        for (i = 0; i < MENU_N; i++) {
+            const int ry = my + menu_row_y(i);
+            const int rh = (k_menu[i].kind == MROW_HEAD) ? MENU_HEAD
+                                                         : MENU_ROW;
+            if (k_menu[i].kind == MROW_HEAD || py < ry || py >= ry + rh) {
+                continue;
+            }
             s_msel = i;
             s_menu = 0;
             dirty_all();
-            block_apply(k_menu_blk[i]);
+            if (k_menu[i].kind == MROW_BLK) {
+                block_apply(k_menu[i].val);
+            } else {
+                os_apply((int)k_menu[i].val);
+            }
+            break;
         }
         return;
     }
@@ -3503,17 +3593,19 @@ int ag_main(int argc, char **argv)
                          * wraps at forty columns and a number that falls off
                          * the end is a number nobody reads. */
                         ag_printf("stomp: %u blocks, %u%% cpu, rail %u, "
-                                  "%u late, %u drop, %u resync, "
+                                  "hole %u, %u late, %u drop, %u resync, "
                                   "amp %u%%, out %u%%%s\n",
                                   (unsigned)s_blocks,
                                   (unsigned)s_out.load_pct,
                                   (unsigned)s_clipped_win,
+                                  (unsigned)s_in_holes,
                                   (unsigned)s_out.late, (unsigned)s_out.drop,
                                   (unsigned)s_out.resync,
                                   (unsigned)(s_amp_peak * 100.0f),
                                   (unsigned)(s_peak * 100.0f),
                                   s_out_clipped > 0u ? " CLIP" : "");
                         s_clipped_win = 0;
+                        s_in_holes = 0;
                     }
                 }
             }

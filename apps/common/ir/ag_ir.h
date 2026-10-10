@@ -189,6 +189,21 @@ typedef struct ag_ir {
      * because that shift is on the per-block path.
      */
     uint8_t  fft_log2;
+
+    /*
+     * The scale the held-over tail was written at, in bits below the output
+     * word, so that the next block can bring it to its own.
+     *
+     * The tail is stored after one block's output shift and consumed after
+     * the next one's, and those two shifts differ whenever the signal's level
+     * moves - which is precisely at an attack.  Without this the whole second
+     * half of a convolution arrives at the wrong level for one block.
+     */
+    uint8_t  ovl_tail;
+    /* Blocks where it had to move, and the largest move: a diagnostic, and
+     * the answer to "does this ever actually happen". */
+    uint32_t ovl_moves;
+    uint8_t  ovl_worst;
 } ag_ir_t;
 
 int ag_ir_init(ag_ir_t *ir, uint32_t rate);

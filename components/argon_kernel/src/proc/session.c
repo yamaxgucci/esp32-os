@@ -611,14 +611,28 @@ ag_err_t ag_session_focus(int slot)
         ag_console_flush_input();
     }
 
+    /*
+     * The screen first, and the news afterwards.
+     *
+     * An application that paints on its own thread redraws the moment it
+     * hears FOCUS_GAINED - on the other core, immediately - and if the screen
+     * is still nobody's at that moment every one of those flushes is dropped.
+     * Nothing is dirty afterwards, so nothing is drawn again: the application
+     * runs on, believing it has painted, into a panel that never changes.  A
+     * framebuffer panel hides it, because the kernel restores its own
+     * snapshot; a surfaceless one has no snapshot, and the slot simply cannot
+     * be returned to.
+     */
+    if (next_pid != AG_PID_KERNEL && !proc_is_loading(next_pid)) {
+        ag_display_focus_back(next_pid); /* its screen, if it was taken */
+    }
+
     notify_focus(prev_pid, next_pid);
 
     if (next_pid == AG_PID_KERNEL) {
         enter_shell_view(slot);
     } else if (proc_is_loading(next_pid)) {
         enter_loading_view(slot, next_pid);
-    } else {
-        ag_display_focus_back(next_pid); /* its screen, if it was taken */
     }
     /* Ready apps own the screen — no console banner over them. */
 

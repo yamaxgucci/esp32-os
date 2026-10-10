@@ -1274,6 +1274,18 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
         return -AG_ENODEV;
     }
     if (s_acquired) {
+        /*
+         * Unless it is already yours.
+         *
+         * An application re-acquires when it hears that the focus came back,
+         * which is the right thing to do and what the event is for - and the
+         * session has just handed it the screen, so the honest answer is yes.
+         * Saying -AG_EBUSY to the owner made the one safe habit look like a
+         * failure and left applications guessing whether they could draw.
+         */
+        if (s_owner != AG_PID_KERNEL && s_owner == ag_proc_self()) {
+            return disp_info(0, out);
+        }
         return -AG_EBUSY;
     }
 

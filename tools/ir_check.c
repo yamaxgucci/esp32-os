@@ -607,6 +607,8 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
             eng[k * blk + i] = stereo[i * 2u];
         }
     }
+    printf("  the tail's scale moved in %u of %u blocks, by up to %u bits\n",
+           (unsigned)ir.ovl_moves, (unsigned)blocks, (unsigned)ir.ovl_worst);
     ag_ir_free(&ir);
 
     /*
