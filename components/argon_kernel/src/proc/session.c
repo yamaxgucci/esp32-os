@@ -567,6 +567,17 @@ ag_err_t ag_session_focus(int slot)
     const ag_pid_t next_pid = slot_pid(slot);
 
     /*
+     * What is in the slot being asked for, before anything is done about it.
+     * A slot whose process has gone shows pid 0 here, and that alone is the
+     * difference between "it will not come back" and "there is nothing to
+     * come back to".
+     */
+    ag_log(AG_LOG_INFO, "session", "focus asked: slot %d holds pid %u (from "
+           "slot %d, pid %u)",
+           ag_session_display_number(slot), (unsigned)next_pid,
+           ag_session_display_number(prev_slot), (unsigned)prev_pid);
+
+    /*
      * Same user slot after bind_to(app): index unchanged but the occupant went
      * from shell → process.  Still need foreground + FOCUS_GAINED.
      */

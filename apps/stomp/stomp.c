@@ -3437,6 +3437,9 @@ int ag_main(int argc, char **argv)
         while (drained++ < 32 && ag_poll_event(&ev, s_sound ? 0 : 100)) {
             switch (ev.type) {
             case AG_EV_QUIT:
+                /* Said out loud while it is being found out who asks a pedal
+                 * to stop, and why it happens when a slot is merely left. */
+                ag_printf("stomp: QUIT received, leaving\n");
                 quit = 1;
                 break;
             case AG_EV_FOCUS_GAINED:
@@ -3447,7 +3450,10 @@ int ag_main(int argc, char **argv)
                  * comes back to whatever the console left there.
                  */
                 if (!s_headless) {
-                    (void)ag_gfx_acquire(&s_info);
+                    const ag_err_t got = ag_gfx_acquire(&s_info);
+                    ag_printf("stomp: focus back, screen %d (%ux%u)\n",
+                              (int)got, (unsigned)s_info.width,
+                              (unsigned)s_info.height);
                 }
                 draw(); /* somebody else had the panel: none of it is ours */
                 break;
