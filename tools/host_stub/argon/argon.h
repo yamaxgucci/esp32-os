@@ -10,6 +10,16 @@
 #define ag_malloc malloc
 #define ag_free   free
 
+/* The board has memory of two speeds and asks for the fast one by name;
+ * a desktop has one, so the capability is dropped. */
+#define AG_MEM_FAST 1u
+static inline void *ag_malloc_caps(size_t n, unsigned caps)
+{
+    (void)caps;
+    return malloc(n);
+}
+
+
 /*
  * The markers that decide where a function or a constant lives in a .AXE.
  * Nothing on the host: there is no code arena here and no flash to divide it

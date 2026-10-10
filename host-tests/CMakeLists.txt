@@ -393,6 +393,15 @@ foreach(smoke engine_smoke synth_smoke ckt_smoke ckt_play ir_check)
         "${ARGON_ROOT}/apps/common/ir")
 endforeach()
 
+# The valve stages keep their counts for the tools that read them: a fitting
+# pass asks whether a stage's axis covered the signal.  The firmware does not
+# define this, because on the board they are five read-modify-writes inside
+# the loop that has to finish within the block and nothing there reads them.
+foreach(target argon_tests ckt_smoke ckt_play ir_check ckt_exact tube_render
+        engine_smoke synth_smoke)
+    target_compile_definitions(${target} PRIVATE AG_TUBE_STATS=1)
+endforeach()
+
 foreach(target argon_tests vtdump cchost pixband_sample engine_smoke
         synth_smoke ckt_smoke ckt_play ir_check wavdiff wavrate ckt_exact
         tube_render)

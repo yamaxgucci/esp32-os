@@ -672,7 +672,12 @@ static float integ_inside(const ag_tube_t *tb, float a, float b)
         return (b - a) * lin(tb, i0, (a + b) * 0.5f - (float)i0);
     }
     if (i1 - i0 > tb->walk_max && tb->h != 0) {
+        AG_TUBE_COUNT(((ag_tube_t *)tb)->hats++);
         return hat(tb, b) - hat(tb, a);
+    }
+    if (i1 > i0) {
+        AG_TUBE_COUNT(((ag_tube_t *)tb)->walks++);
+        AG_TUBE_COUNT(((ag_tube_t *)tb)->walked += (uint32_t)(i1 - i0));
     }
     fa = a - (float)i0;
     fb = b - (float)i1;
@@ -735,6 +740,7 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
      */
     if (a >= 0.0f && b <= last) {
         int i0 = (int)a, i1 = (int)b;
+        AG_TUBE_COUNT(((ag_tube_t *)tb)->one_cell += (i0 == i1) ? 1u : 0u);
         if (i0 > tb->n - 2) {
             i0 = tb->n - 2;
         }
@@ -754,7 +760,8 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
         lenr = b - (a > last ? a : last);
     }
     if (lenl > 0.0f || lenr > 0.0f) {
-        (*clamped)++;
+        AG_TUBE_COUNT((*clamped)++);
+        AG_TUBE_COUNT(((ag_tube_t *)tb)->outside++);
     }
     ia = a < 0.0f ? 0.0f : (a > last ? last : a);
     ib = b < 0.0f ? 0.0f : (b > last ? last : b);
@@ -774,21 +781,13 @@ static AG_HOT float tick_at(ag_tube_t *tb, float x, float p)
 {
     float y;
 
-    tb->samples++;
-    if (x < tb->seen_lo) {
-        tb->seen_lo = x;
-    }
-    if (x > tb->seen_hi) {
-        tb->seen_hi = x;
-    }
-
-    if (p <= 0.0f) {
-        tb->cut++;
-    }
+    AG_TUBE_COUNT(tb->samples++);
+    AG_TUBE_COUNT(x < tb->seen_lo ? (tb->seen_lo = x) : 0.0f);
+    AG_TUBE_COUNT(x > tb->seen_hi ? (tb->seen_hi = x) : 0.0f);
+    AG_TUBE_COUNT(p <= 0.0f ? (tb->cut++) : 0u);
     if (!tb->adaa) {
-        if (p <= 0.0f || p >= (float)(tb->n - 1)) {
-            tb->clamped++;
-        }
+        AG_TUBE_COUNT((p <= 0.0f || p >= (float)(tb->n - 1)) ? (tb->clamped++)
+                                                             : 0u);
         return read_at(tb, p);
     }
     if (!tb->have_prev) {

@@ -2249,10 +2249,14 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
          * arriving devices (see ag_proc_keep_internal) */
         if (p != NULL && (want & AG_MEM_SLOW) == 0u &&
             (want & AG_MEM_EXEC) == 0u && !app_internal_room(bytes)) {
+            /* With what was free at the time: "refused, 0 kept" over a
+             * hundred kilobytes of free SRAM is a question nobody can answer
+             * without this number. */
             ag_log(AG_LOG_INFO, "proc",
-                   "%s: %u bytes of internal memory refused - %u are kept for "
-                   "devices",
+                   "%s: %u bytes of internal memory refused - %u free, %u are "
+                   "kept for devices",
                    p->name, (unsigned)bytes,
+                   (unsigned)ag_port_mem_free(AG_MEM_FAST),
                    (unsigned)ag_proc_kept_internal());
             return NULL;
         }

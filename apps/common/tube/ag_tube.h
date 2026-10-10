@@ -85,6 +85,22 @@
  * ceiling below are there so that a very small table still subtracts sometimes
  * and a very large one does not walk for a thousand iterations.
  */
+/*
+ * Whether a stage keeps count of what passed through it.
+ *
+ * The counts answer one question - does this stage's axis cover the signal -
+ * and that question is asked by a fitting tool on a desktop, once, after a
+ * render.  On the board they are five read-modify-writes inside the loop that
+ * must finish within the block, taken four times a sample at four times
+ * oversampling, and nothing there ever reads them.  The host tools define
+ * AG_TUBE_STATS; the firmware does not.
+ */
+#ifdef AG_TUBE_STATS
+#define AG_TUBE_COUNT(x) (x)
+#else
+#define AG_TUBE_COUNT(x) ((void)0)
+#endif
+
 #ifndef AG_TUBE_WALK_MIN
 #define AG_TUBE_WALK_MIN 16
 #endif
@@ -275,6 +291,17 @@ typedef struct ag_tube {
      */
     uint32_t cut;
     uint32_t samples;
+    /*
+     * Where the sample interval went, counted so that "it costs more when it
+     * is driven harder" can be answered rather than guessed at.  One cell is
+     * the cheap case, a walk costs per cell it steps, the hat is flat, and
+     * the off-the-end case is the long one.
+     */
+    uint32_t one_cell;  /* the span stayed inside a single cell          */
+    uint32_t walked;    /* cells stepped, summed over all the walks      */
+    uint32_t walks;     /* how many spans were walked at all             */
+    uint32_t hats;      /* spans done by subtracting two running sums    */
+    uint32_t outside;   /* spans with a part beyond either end           */
     float    seen_lo, seen_hi;
 
     /* From the bake: grid points where Newton hit its iteration limit. */

@@ -275,6 +275,7 @@ static uint32_t     s_say_ms;  /* when the console last heard how it goes */
 static char         s_hdr_shown[96]; /* what the top strip last said */
 static int          s_tab_n;   /* points the curve buffer is sized for */
 static int          s_tab_fast; /* and whether it got internal SRAM */
+static int          s_tab_inside; /* how many stages' curves are in SRAM */
 static int          s_tab_stages; /* and for how many stages */
 static char         s_status[64]; /* one line about the sound, or empty */
 static ag_amp_cfg_t s_cfg;
@@ -1676,6 +1677,28 @@ static void bench_line(const char *label, uint64_t us, uint32_t n)
  *
  * Each piece separately, so that "it does not fit" can be pointed at something.
  */
+/*
+ * A sine out of two parabolas, to within two per cent, because there is no
+ * sine in the application ABI and this one is only here to move a curve.
+ * Phase in turns; anything is folded back into one.
+ */
+static float bench_wave(float turns)
+{
+    float t = turns - (float)(int)turns;
+    float v;
+    if (t < 0.0f) {
+        t += 1.0f;
+    }
+    if (t < 0.5f) {
+        const float u = t * 4.0f - 1.0f; /* -1..1 over the first half */
+        v = 1.0f - u * u;
+    } else {
+        const float u = (t - 0.5f) * 4.0f - 1.0f;
+        v = u * u - 1.0f;
+    }
+    return v;
+}
+
 static void bench_audio(void)
 {
     static const int oss[] = { 1, 2, 4 };
@@ -1709,6 +1732,54 @@ static void bench_audio(void)
         ag_printf("  valves %dx%s %6u us  %3u%% of the block\n", oss[k],
                   s_cfg.adaa ? " + adaa" : "        ", (unsigned)us,
                   (unsigned)(us * 100u / budget_us));
+    }
+
+    /*
+     * And the same chain at five levels, because what a guitarist reports is
+     * that it costs more the harder he plays - jcm800 playable, bogner worse,
+     * slo worse again, which is the order of their gain.  The probe is a
+     * plucked note with harmonics that die faster the higher they are, so the
+     * slew between samples is a guitar's and not a ramp's.
+     */
+    {
+        static const uint8_t amp_pc[5] = {2u, 6u, 20u, 60u, 100u};
+        uint32_t             k2;
+        s_cfg.os = 2;
+        s_fit.os = 2;
+        (void)ag_amp_set_voicing(s_amp, &s_cfg);
+        ag_printf("  the same chain at 2x, by how hard it is played:\n");
+        for (k2 = 0; k2 < 5u; k2++) {
+            const float amp = (float)amp_pc[k2] / 100.0f;
+            uint32_t    us, j;
+            float       peak = 0.0f;
+            ag_amp_reset(s_amp);
+            t0 = ag_micros();
+            for (b = 0; b < blocks; b++) {
+                for (i = 0; i < s_chunk; i++) {
+                    /* Two decaying harmonics and a little of the third: a
+                     * note, not a ramp, and the same shape at every level. */
+                    const uint32_t t = b * s_chunk + i;
+                    const float    ph = (float)(t % 269u) / 269.0f;
+                    const float    e = 1.0f - (float)(t % 8192u) / 8192.0f;
+                    const float    x =
+                        amp * e *
+                        (bench_wave(ph) + 0.5f * bench_wave(ph * 2.0f) +
+                         0.25f * bench_wave(ph * 4.0f));
+                    const float y = ag_amp_tick(s_amp, x);
+                    if (y > peak) {
+                        peak = y;
+                    }
+                    s_mono[i] = (int16_t)(y * 8192.0f);
+                }
+            }
+            t1 = ag_micros();
+            us = (uint32_t)((t1 - t0) / blocks);
+            (void)j;
+            ag_printf("    in %3u%%  %6u us  %3u%% of the block  peak %u%%\n",
+                      (unsigned)amp_pc[k2], (unsigned)us,
+                      (unsigned)(us * 100u / budget_us),
+                      (unsigned)(peak * 100.0f));
+        }
     }
 
     if (s_ir_ready) {
@@ -1904,19 +1975,36 @@ static int tab_reserve(int want, int stages)
      * of those fit where one 96 KB block does not.  ag_amp_build_split takes
      * them separately; the floats and their order are identical either way.
      */
+    s_tab_inside = 0;
     for (i = 0; i < stages; i++) {
         s_tabs[i] = (float *)ag_malloc_caps(per_stage, AG_MEM_FAST);
+        if (s_tabs[i] != NULL) {
+            s_tab_inside++;
+            continue;
+        }
+        /*
+         * Not all of it fits, and that is no reason to put the rest outside.
+         *
+         * This used to be all-or-nothing: one stage that could not find its
+         * 24 KB sent every stage to external memory.  With 117 KB free and a
+         * largest block of 76, three of SLO's four fit - and three quarters
+         * of the win was thrown away to keep the placement uniform, which
+         * nothing needs it to be.  ag_amp_build_split takes a pointer per
+         * stage and does not ask where it came from.
+         */
+        s_tabs[i] = (float *)ag_malloc(per_stage);
         if (s_tabs[i] == NULL) {
             break;
         }
     }
     s_tab_split = (i == stages);
-    s_tab_fast = s_tab_split;
+    s_tab_fast = (s_tab_inside == stages);
     if (!s_tab_split) {
         while (i-- > 0) {
             ag_free(s_tabs[i]);
             s_tabs[i] = NULL;
         }
+        s_tab_inside = 0;
         s_tab = (float *)ag_malloc_caps(bytes, AG_MEM_FAST);
         s_tab_fast = s_tab != NULL;
         if (s_tab == NULL) {
@@ -1949,10 +2037,9 @@ static int tab_reserve(int want, int stages)
                 try_bytes -= 4096u;
             }
         }
-        ag_printf("stomp: %u KB of curves in %s memory, %s (%u KB fast free, "
-                  "largest %u KB)\n",
-                  (unsigned)(bytes / 1024u),
-                  s_tab_fast ? "internal" : "extended",
+        ag_printf("stomp: %u KB of curves, %d of %d stages in internal "
+                  "memory, %s (%u KB fast free, largest %u KB)\n",
+                  (unsigned)(bytes / 1024u), s_tab_inside, stages,
                   s_tab_split ? "one block a stage" : "one block",
                   (unsigned)(mem.fast_free / 1024u),
                   (unsigned)((s_tab_fast ? bytes : probe) / 1024u));
@@ -2299,13 +2386,25 @@ static int amp_from_model(int model)
     const int     probe_n = 4096;
     int           rc;
 
-    /* All the stages, because ag_amp_build fills whatever the model has and
-     * nothing has told us how many that is until it has run. */
-    if (amp_reserve() != 0 || tab_reserve(AG_AMP_TAB_N, AG_AMP_STAGES) != 0) {
+    /*
+     * The model first, because it says how many stages it has - and that is
+     * how much of the curve table is wanted.
+     *
+     * It used to reserve for AG_AMP_STAGES whatever the model was, on the
+     * grounds that nothing had said how many there were yet.  Something had:
+     * this call, one line further down.  Four stages is 96 KB and the Audio
+     * Kit had 98 139 bytes of internal memory free, so the whole table missed
+     * by a hundred and sixty-five bytes and went to external memory - where
+     * every lookup, on every oversampled sample, goes through the cache.  The
+     * JCM800 has two stages and wants 48 KB.
+     */
+    ag_amp_model(&cfg, model, (float)RATE);
+    if (amp_reserve() != 0 ||
+        tab_reserve(AG_AMP_TAB_N,
+                    cfg.n_stages > 0 ? cfg.n_stages : AG_AMP_STAGES) != 0) {
         status("no room for the chain");
         return -1;
     }
-    ag_amp_model(&cfg, model, (float)RATE);
     scratch = (ag_ckt_t *)ag_malloc(sizeof(ag_ckt_t));
     probe = (float *)ag_malloc((size_t)probe_n * sizeof(float));
     if (scratch == NULL || probe == NULL) {
