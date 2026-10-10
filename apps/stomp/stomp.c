@@ -342,6 +342,12 @@ static ag_thread_t  s_painter;
 static ag_sem_t     s_paint_wake;
 static ag_mutex_t   s_paint_lock; /* the dirty marks, and nothing else */
 static volatile int s_paint_stop;
+/*
+ * Whether anybody is looking.  Cleared when the slot is left and set when it
+ * comes back; while it is clear the picture is not drawn and not sent, and
+ * the marks that would have been drawn are simply kept until it returns.
+ */
+static volatile int s_on_screen = 1;
 
 /*
  * The marks are shared, so they are locked - and the lock is held for the
@@ -1452,7 +1458,7 @@ static void present(void)
  */
 static void present_now(void)
 {
-    if (s_painter == NULL) {
+    if (s_painter == NULL && s_on_screen) {
         present();
     }
 }
@@ -1477,7 +1483,9 @@ static void paint_thread(void *arg)
     (void)arg;
     while (!s_paint_stop) {
         (void)ag_sem_take(s_paint_wake, 100u);
-        while (!s_paint_stop && (s_dirty_all || s_ndirty > 0)) {
+        /* Nobody is looking: the marks keep, and the core goes to the sound. */
+        while (!s_paint_stop && s_on_screen &&
+               (s_dirty_all || s_ndirty > 0)) {
             present();
         }
     }
@@ -3442,7 +3450,15 @@ int ag_main(int argc, char **argv)
                 ag_printf("stomp: QUIT received, leaving\n");
                 quit = 1;
                 break;
+            case AG_EV_FOCUS_LOST:
+                /* The slot was left.  Stop painting into a screen that is
+                 * about to drop every frame - in the journal that was 13
+                 * flushes dropped every two seconds and a seventh of the
+                 * sound gone with them. */
+                s_on_screen = 0;
+                break;
             case AG_EV_FOCUS_GAINED:
+                s_on_screen = 1;
                 /*
                  * The kernel took the screen away when the slot was left
                  * (ag_session_focus force-releases it); a draw without

@@ -85,6 +85,11 @@ typedef struct {
 static cpu_table_t *volatile s_cpu;
 static volatile bool         s_cpu_on;
 static uint32_t s_window_tick; /* ticks into the current window            */
+/*
+ * How many of the watched application tasks actually ran in the window that
+ * just closed.  One of them is nobody to be fair to.
+ */
+static uint32_t volatile s_fair_ran;
 static bool     s_hooked;
 
 /*
@@ -121,14 +126,19 @@ static void AG_PORT_IRAM budget_tick(int core, ag_port_task_t running)
      */
     if (core == 0) {
         if (++s_window_tick >= AG_BUDGET_WINDOW_MS) {
+            uint32_t ran = 0;
             s_window_tick = 0;
             for (uint32_t i = 0; i < s_nslots; i++) {
                 if (s_slots[i].task != NULL) {
                     s_slots[i].last_ms = s_slots[i].used_ms;
+                    if (s_slots[i].fair && s_slots[i].used_ms != 0u) {
+                        ran++;
+                    }
                     s_slots[i].used_ms = 0;
                     s_slots[i].fresh = true;
                 }
             }
+            s_fair_ran = ran;
         }
     }
 
@@ -312,7 +322,15 @@ bool ag_budget_service(void)
             continue;
         }
 
-        if (s->over != 0u && !s->demoted) {
+        /*
+         * The punishment below is the drivers' - for a task above the
+         * applications that does not give the core back - and an
+         * application's task has its own branch further down.  Falling into
+         * this one on the way there dropped a program that had been raised
+         * for being light, and then became busy, to the drivers' punishment
+         * priority: two steps below ordinary rather than back to ordinary.
+         */
+        if (!s->fair && s->over != 0u && !s->demoted) {
             const uint32_t spent = s->over;
             s->demoted = true;
             ag_port_task_prio_set(task, AG_BUDGET_DEMOTED_PRIO);
@@ -339,9 +357,10 @@ bool ag_budget_service(void)
             if (s->fresh) {
                 s->fresh = false;
                 s->over = 0;
-                want = (s->last_ms > s->budget_ms)         ? 0u
+                want = (s->last_ms > s->budget_ms && s_fair_ran > 1u)
+                           ? 0u
                        : (s->last_ms <= AG_BUDGET_LIGHT_MS) ? 2u
-                                                           : 1u;
+                                                            : 1u;
             } else if (s->over != 0u && s->level == 2u) {
                 want = 1u; /* light no longer: back to the ordinary */
             }
