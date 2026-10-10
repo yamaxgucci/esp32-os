@@ -183,6 +183,12 @@ typedef struct ag_ir {
      */
     uint32_t blk;
     uint32_t fft;
+    /*
+     * log2(fft), which is the gain the unnormalised inverse transform applies
+     * and therefore part of the output shift.  Kept rather than computed
+     * because that shift is on the per-block path.
+     */
+    uint8_t  fft_log2;
 } ag_ir_t;
 
 int ag_ir_init(ag_ir_t *ir, uint32_t rate);

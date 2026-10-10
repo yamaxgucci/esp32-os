@@ -28,6 +28,16 @@
 static uint32_t s_trace;
 #endif
 
+/* How many times the unnormalised inverse multiplies, as a shift. */
+static uint8_t fft_log2_of(uint32_t n)
+{
+    uint8_t k = 0;
+    while ((1u << k) < n && k < 31u) {
+        k++;
+    }
+    return k;
+}
+
 static uint32_t ir_frames_for(uint32_t rate, uint32_t ms)
 {
     uint32_t n = (rate * ms) / 1000u;
@@ -107,6 +117,7 @@ int ag_ir_init(ag_ir_t *ir, uint32_t rate)
     ir->gain = 64u;
     ir->blk = AG_IR_BLOCK;
     ir->fft = AG_IR_FFT;
+    ir->fft_log2 = fft_log2_of(AG_IR_FFT);
     return 0;
 }
 
@@ -142,6 +153,7 @@ int ag_ir_set_block(ag_ir_t *ir, uint32_t frames)
     memset(ir->overlap, 0, sizeof(ir->overlap));
     ir->blk = frames;
     ir->fft = frames * 2u;
+    ir->fft_log2 = fft_log2_of(ir->fft);
     return 0;
 }
 
@@ -969,8 +981,18 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
      * end, instead of once here and once again on the way back in.
      */
     {
+        /*
+         * ...and 24 was log2(512) + 15, with the transform's size written
+         * into it as a number.  At any other block that is wrong by the
+         * difference of the logs, and wrong by four bits is not a worse
+         * cabinet, it is a different signal: measured against an honest
+         * convolution, the engine went from -75 dB of error at 256 frames to
+         * -6 dB at 128 and -2.5 dB at 64, which is an error the size of the
+         * music.  The size of the transform belongs in a variable.
+         */
         const int base = (int)ir->h_shift - (int)ir->h_pre + xref +
-                         (int)ir->p_shift - ygain - 24;
+                         (int)ir->p_shift - ygain -
+                         ((int)ir->fft_log2 + 15);
         /*
          * As many tail bits as the scale has room for, which in practice is
          * all of them: `base` runs about -13 to -26 on real material.  Taking
@@ -1055,7 +1077,7 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
                pre, (int)ir->x_sh[ir->x_pos], xref, ir->h_pre, ir->h_shift,
                ir->p_shift, ymax, ygain, omax,
                (int)ir->h_shift - (int)ir->h_pre + xref + (int)ir->p_shift -
-                   ygain - 24);
+                   ygain - ((int)ir->fft_log2 + 15));
     }
 #endif
 

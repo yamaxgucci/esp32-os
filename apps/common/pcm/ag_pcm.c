@@ -199,7 +199,19 @@ void ag_pcm_set_chunk(ag_pcm_t *o, uint32_t frames)
      */
     if (o->fd >= 0 && o->sink == AG_PCM_SINK_DEV) {
         uint32_t want = o->chunk;
-        (void)ag_dev_ioctl(o->fd, AG_IOC_AUDIO_SETPERIOD, &want, sizeof(want));
+        if (ag_dev_ioctl(o->fd, AG_IOC_AUDIO_SETPERIOD, &want,
+                         sizeof(want)) == AG_OK) {
+            /*
+             * A device that cuts a ring to a block is a device that will hold
+             * the loop to its own clock - it cannot take the next block until
+             * it has played one.  That is true whichever way the sound is
+             * going, so a take played out of a file through a converter is
+             * paced by the converter too, and the wall clock below would be a
+             * second one.  A sink that discards (pcmnull) answers -ENOTSUP
+             * and keeps the pacing, because nothing else would hold it.
+             */
+            o->clocked_by_in = 1;
+        }
     }
 }
 
@@ -306,7 +318,29 @@ void ag_pcm_pace_wait(ag_pcm_t *o)
      * a second of audio to catch up.
      */
     if (o->clocked_by_in) {
-        o->next_due = ag_micros() + (ag_time_t)o->chunk_us;
+        /*
+         * Measured against the previous turn rather than against a deadline.
+         *
+         * An absolute deadline kept here drifts against the codec's crystal
+         * and marks every block late for no reason - which it did, 37870
+         * resyncs in one run.  The relative measure has no clock of its own:
+         * it only asks whether a turn of the loop took appreciably longer
+         * than a block, which is the thing that empties a converter's ring.
+         * Half a block of slop, because a turn that is a little long is
+         * absorbed by the ring and is not a fault.
+         */
+        const ag_time_t now = ag_micros();
+        if (o->paced_at != 0) {
+            const uint32_t took = (uint32_t)(now - o->paced_at);
+            if (took > o->chunk_us + o->chunk_us / 2u) {
+                o->late++;
+                if (took > o->chunk_us * 2u) {
+                    o->resync++;
+                }
+            }
+        }
+        o->paced_at = now;
+        o->next_due = now + (ag_time_t)o->chunk_us;
         return;
     }
     now = ag_micros();

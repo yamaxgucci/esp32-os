@@ -45,6 +45,8 @@ typedef struct ag_pcm {
      * against a schedule nothing is actually keeping.
      */
     uint8_t     clocked_by_in;
+    /* The last time the pacing was asked, for measuring a turn of the loop. */
+    ag_time_t   paced_at;
     ag_audio_stats_t stats;
     int         stats_ok;
 } ag_pcm_t;

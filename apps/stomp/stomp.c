@@ -137,6 +137,32 @@ enum { BROWSE_OFF, BROWSE_CAB, BROWSE_PRESET };
 #define CHUNK AG_IR_BLOCK
 
 /*
+ * HOW FAR PAST FULL SCALE THE VALVES ARE ALLOWED TO GO.
+ *
+ * The cabinet works in int16, so the valves' output has to become int16 to
+ * reach it - and a valve amplifier with the drive up is not a unity-gain
+ * thing.  Measured on this board with the take, jcm800 at drive 9 and master
+ * 8: the chain peaks at 2.3 to 3.7 times full scale, and every sample above
+ * 1.0 was flattened against the rail on its way into the loudspeaker.  Twelve
+ * thousand samples a second of it - about a third of them - all of it
+ * audible, and worse the harder the playing, which is exactly how it was
+ * described.
+ *
+ * That clipping is not a sound anybody chose.  The valve model does its own
+ * clipping, on its own curve, which is the amplifier's voice; this one was a
+ * word size.  So the valves are given two bits of room before the conversion
+ * and the room is taken back after the cabinet, where the trim already
+ * saturates and already says CLIP.
+ *
+ * It costs two bits of the sixteen going into the convolution.  Against the
+ * engine's measured error - about a quarter of one least significant bit -
+ * that is noise at -63 dB instead of -75 dB, which is still far below a
+ * loudspeaker's own floor, and the cabinet now gets the signal the valves
+ * actually made rather than a square-topped copy of it.
+ */
+#define AMP_HEAD 4
+
+/*
  * How many frames the loop actually does at a time, which is latency.
  *
  * CHUNK above is only the size of the buffers - the most this will ever ask
@@ -226,6 +252,20 @@ static uint32_t     s_out_clipped;
 static uint32_t     s_cab_ms;  /* how much of the impulse to keep, 0 = all */
 static uint32_t     s_hdr_ms;  /* when the meter was last redrawn */
 static uint32_t     s_clipped;
+/*
+ * And the same, counted since the last status line rather than since the
+ * start.
+ *
+ * The total was only ever printed when the run ended, and a pedal does not
+ * end - so the one number that says "what you are hearing is not the
+ * amplifier, it is the rail" was invisible for exactly as long as it
+ * mattered.  The valves hand their output to the cabinet as int16, and a
+ * valve amplifier with the drive up goes past full scale long before it runs
+ * out of anything else: louder in, harder against the rail, and the harshness
+ * grows with the playing, which is what a listener describes as artefacts
+ * that get worse the louder it gets.
+ */
+static uint32_t     s_clipped_win;
 static uint32_t     s_blocks;  /* blocks written since the sink opened */
 static uint32_t     s_short;   /* writes the sink would not take whole */
 static uint32_t     s_say_ms;  /* when the console last heard how it goes */
@@ -2295,13 +2335,16 @@ static AG_HOT void audio_block(void)
         } else if (-y > peak) {
             peak = -y;
         }
-        v = (int)(y * 32767.0f + (y >= 0.0f ? 0.5f : -0.5f));
+        v = (int)(y * (32767.0f / (float)AMP_HEAD) +
+                  (y >= 0.0f ? 0.5f : -0.5f));
         if (v > 32767) {
             v = 32767;
             s_clipped++;
+            s_clipped_win++;
         } else if (v < -32768) {
             v = -32768;
             s_clipped++;
+            s_clipped_win++;
         }
         s_mono[i] = (int16_t)v;
     }
@@ -2341,10 +2384,17 @@ static AG_HOT void audio_block(void)
     {
         int      hi = 0;
         uint32_t n = s_chunk * 2u;
+        /*
+         * The trim and the headroom in one multiply: the room the valves were
+         * given is taken back here, where going over the rail is the
+         * converter's business, counted, and shown as CLIP - rather than in
+         * the middle of the chain where nothing could see it.
+         */
+        const int num = s_vol_num * AMP_HEAD;
         for (i = 0; i < n; i++) {
             int v = s_stereo[i];
-            if (s_vol_num != 64) {
-                v = (v * s_vol_num) >> 6;
+            {
+                v = (v * num) >> 6;
                 if (v > 32767) {
                     v = 32767;
                     s_out_clipped++;
@@ -3449,15 +3499,21 @@ int ag_main(int argc, char **argv)
                      * and `drop` that one was thrown away.
                      */
                     if (!s_text) {
-                        ag_printf("stomp: %u blocks, %u%% cpu, %u late, "
-                                  "%u drop, %u resync, amp %u%%, out %u%%%s\n",
+                        /* The rail early in the line, because the console
+                         * wraps at forty columns and a number that falls off
+                         * the end is a number nobody reads. */
+                        ag_printf("stomp: %u blocks, %u%% cpu, rail %u, "
+                                  "%u late, %u drop, %u resync, "
+                                  "amp %u%%, out %u%%%s\n",
                                   (unsigned)s_blocks,
                                   (unsigned)s_out.load_pct,
+                                  (unsigned)s_clipped_win,
                                   (unsigned)s_out.late, (unsigned)s_out.drop,
                                   (unsigned)s_out.resync,
                                   (unsigned)(s_amp_peak * 100.0f),
                                   (unsigned)(s_peak * 100.0f),
                                   s_out_clipped > 0u ? " CLIP" : "");
+                        s_clipped_win = 0;
                     }
                 }
             }
