@@ -351,6 +351,28 @@ static volatile int s_paint_stop;
 static volatile int s_on_screen = 1;
 
 /*
+ * THE LOUDSPEAKER ON THE OTHER CORE.
+ *
+ * It is the second half of the chain and it does not need to be in the same
+ * thread as the first: the valves make a block, hand it over, and send out
+ * the block the loudspeaker finished while they were working.  One block of
+ * latency, which at 64 frames is 2.9 ms, and a fifth to a third of the audio
+ * thread's time given back.
+ *
+ * One buffer each way and two semaphores.  Nothing is shared except those:
+ * once the convolution thread is running it is the only one that touches
+ * ag_ir, which is why it is stopped around anything that rebuilds the
+ * cabinet.
+ */
+static ag_thread_t  s_cab_thread;
+static ag_sem_t     s_cab_go;
+static ag_sem_t     s_cab_done;
+static volatile int s_cab_quit;
+static int          s_cab_primed; /* the first block has nothing to send yet */
+static int16_t      s_cab_in[CHUNK];
+static int16_t      s_cab_out[CHUNK * 2];
+
+/*
  * The marks are shared, so they are locked - and the lock is held for the
  * length of an append or a snapshot, never for the length of a paint.
  *
@@ -778,8 +800,8 @@ static const struct {
     { MROW_BLK, 64u, "64", "about 14 ms" },
     { MROW_HEAD, 0u, "VALVES", "" },
     { MROW_OS, 1u, "1x", "cheapest" },
-    { MROW_OS, 2u, "2x", "the usual" },
-    { MROW_OS, 4u, "4x", "too dear here" },
+    { MROW_OS, 2u, "2x", "all four models" },
+    { MROW_OS, 4u, "4x", "ts9, jcm800" },
 };
 #define MENU_N ((int)(sizeof(k_menu) / sizeof(k_menu[0])))
 
@@ -2166,6 +2188,82 @@ static int cabinet_from_wav(const char *path);
  * setting whose filter state cannot survive the change, so the chain is
  * cleared.  That is a click, once, and it is honest.
  */
+static void cab_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        (void)ag_sem_take(s_cab_go, 1000u);
+        if (s_cab_quit) {
+            break;
+        }
+        if (s_ir_ready) {
+            ag_ir_process_n(&s_ir, s_cab_in, s_cab_out, s_chunk);
+        }
+        ag_sem_give(s_cab_done);
+    }
+    ag_thread_exit();
+}
+
+/*
+ * Started when there is a loudspeaker to run and a core to run it on.
+ *
+ * On a machine with one core this is a loss - two context switches a block
+ * for nothing - so it is only taken when the system core is somewhere else,
+ * which on this chip it always is.
+ */
+static void cab_start(void)
+{
+    if (s_cab_thread != NULL || !s_ir_ready) {
+        return;
+    }
+    s_cab_quit = 0;
+    s_cab_primed = 0;
+    s_cab_go = ag_sem_create(1, 0);
+    s_cab_done = ag_sem_create(1, 0);
+    if (s_cab_go == NULL || s_cab_done == NULL) {
+        goto fail;
+    }
+    s_cab_thread = ag_thread_create(cab_thread, NULL, "stomp.cab", 4096, 4,
+                                    (uint32_t)AG_THREAD_SYS_CORE);
+    if (s_cab_thread == NULL) {
+        goto fail;
+    }
+    ag_printf("stomp: the loudspeaker runs on the system core\n");
+    return;
+fail:
+    if (s_cab_go != NULL) {
+        ag_sem_delete(s_cab_go);
+        s_cab_go = NULL;
+    }
+    if (s_cab_done != NULL) {
+        ag_sem_delete(s_cab_done);
+        s_cab_done = NULL;
+    }
+    ag_printf("stomp: no thread for the loudspeaker; it runs in line\n");
+}
+
+static void cab_stop(void)
+{
+    if (s_cab_thread == NULL) {
+        return;
+    }
+    /* Whatever it is holding is finished first: the convolution's state is
+     * about to be rebuilt and a reader inside it would read a half-built
+     * partition. */
+    if (s_cab_primed) {
+        (void)ag_sem_take(s_cab_done, 1000u);
+        s_cab_primed = 0;
+    }
+    s_cab_quit = 1;
+    ag_sem_give(s_cab_go);
+    (void)ag_thread_join(s_cab_thread, 1000u);
+    s_cab_thread = NULL;
+    ag_sem_delete(s_cab_go);
+    ag_sem_delete(s_cab_done);
+    s_cab_go = NULL;
+    s_cab_done = NULL;
+}
+
 static void os_apply(int os)
 {
     if (s_amp == NULL || os == s_cfg.os || os < 1 || os > 8) {
@@ -2196,6 +2294,7 @@ static void block_apply(uint32_t frames)
     }
     status("changing the block");
     present_now();
+    cab_stop(); /* the partitions are about to be rebuilt under it */
 
     ag_pcm_set_chunk(&s_out, frames);
     {
@@ -2219,6 +2318,7 @@ static void block_apply(uint32_t frames)
                       (unsigned)s_chunk);
         }
     }
+    cab_start();
     ag_printf("stomp: block %u frames, %u.%u ms\n", (unsigned)s_chunk,
               (unsigned)(s_chunk * 1000u / RATE),
               (unsigned)((s_chunk * 10000u / RATE) % 10u));
@@ -2534,7 +2634,35 @@ static AG_HOT void audio_block(void)
     s_amp_peak = peak;
     s_us_valves += (uint32_t)(ag_micros() - t_valves);
     const ag_time_t t_ir = ag_micros();
-    if (s_ir_ready) {
+    if (s_cab_thread != NULL) {
+        /*
+         * The loudspeaker is a block behind, on the other core.
+         *
+         * Take what it finished while the valves were working, then give it
+         * this block and let go.  The wait is the only place the two threads
+         * meet, and in a chain that fits it is over before it starts: the
+         * other core had a whole block period for work that takes a fifth of
+         * one.
+         */
+        uint32_t k;
+        if (s_cab_primed) {
+            (void)ag_sem_take(s_cab_done, 100u);
+            for (k = 0; k < s_chunk * 2u; k++) {
+                s_stereo[k] = s_cab_out[k];
+            }
+        } else {
+            /* The first block has nothing behind it: silence rather than
+             * whatever the buffer held. */
+            for (k = 0; k < s_chunk * 2u; k++) {
+                s_stereo[k] = 0;
+            }
+        }
+        for (k = 0; k < s_chunk; k++) {
+            s_cab_in[k] = s_mono[k];
+        }
+        s_cab_primed = 1;
+        ag_sem_give(s_cab_go);
+    } else if (s_ir_ready) {
         ag_ir_process_n(&s_ir, s_mono, s_stereo, s_chunk);
     } else {
         for (i = 0; i < s_chunk; i++) {
@@ -3502,6 +3630,7 @@ int ag_main(int argc, char **argv)
         /* The rate and the block are settled, which is what an effect has
          * to be told before it can take whatever memory it needs. */
         fx_start(RATE, s_chunk, 2u);
+        cab_start();
         if (want_live) {
             /* Ask for one block before promising anything.  A device with no
              * line in answers -AG_ENOSYS, and finding that out now is better
@@ -3779,6 +3908,7 @@ int ag_main(int argc, char **argv)
             present_now();
         }
     }
+    cab_stop();
     fx_stop();
     painter_stop();
     if (s_text) {
