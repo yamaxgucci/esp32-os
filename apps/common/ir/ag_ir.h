@@ -161,7 +161,28 @@ typedef struct ag_ir {
      * clipped.  Held AG_IR_TAIL_BITS below the output word, so that handing
      * it to the next block does not round it.
      */
-    int32_t overlap[AG_IR_BLOCK];
+    int32_t overlap[AG_IR_BLOCK]; /* cut for the largest block; blk is used */
+
+    /*
+     * The block this convolution works in, and its transform, which is twice
+     * that.  AG_IR_BLOCK is the largest - the scratch arrays are cut for it -
+     * and the default, because 256 is where the transform earns its
+     * arithmetic.
+     *
+     * It is not the convolution's choice to make.  An overlap-add cabinet
+     * cannot answer until a whole block has arrived, so its block IS the
+     * latency a guitarist feels in the hands: 256 frames at 22050 Hz is
+     * 11.6 ms before the chain has done anything.  The converter's ring sets
+     * what the stream can work in, and the cabinet follows it rather than the
+     * other way round - a cabinet that insists on 256 simply switches itself
+     * off on a short block, which is what it used to do, silently.
+     *
+     * A shorter block is not free: the same impulse becomes more partitions
+     * of a smaller transform, so it costs more arithmetic per sample.  That
+     * is the trade - cycles for latency - and it is the caller's to make.
+     */
+    uint32_t blk;
+    uint32_t fft;
 } ag_ir_t;
 
 int ag_ir_init(ag_ir_t *ir, uint32_t rate);
@@ -191,6 +212,15 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset);
 void ag_ir_set_wet(ag_ir_t *ir, uint8_t wet);
 void ag_ir_set_gain(ag_ir_t *ir, uint8_t gain);
 void ag_ir_set_bypass(ag_ir_t *ir, int on);
+
+/*
+ * Work in blocks of `frames` from here on.  A power of two, 32..AG_IR_BLOCK;
+ * anything else is refused and the block stays as it was.
+ *
+ * Say it before loading an impulse: the partitioning is cut for the block, so
+ * an impulse already loaded would have to be loaded again to follow.
+ */
+int  ag_ir_set_block(ag_ir_t *ir, uint32_t frames);
 
 /*
  * One block: mono_in[AG_IR_BLOCK] → stereo interleaved out[AG_IR_BLOCK*2].

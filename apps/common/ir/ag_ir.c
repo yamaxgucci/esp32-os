@@ -89,7 +89,7 @@ void ag_ir_reset(ag_ir_t *ir)
     memset(ir->overlap, 0, sizeof(ir->overlap));
     if (ir->X != NULL && ir->parts > 0u) {
         memset(ir->X, 0,
-               ir->parts * AG_IR_FFT * 2u * (uint32_t)sizeof(int16_t));
+               ir->parts * ir->fft * 2u * (uint32_t)sizeof(int16_t));
     }
     if (ir->x_sh != NULL && ir->parts > 0u) {
         memset(ir->x_sh, AG_IR_EMPTY, ir->parts);
@@ -105,6 +105,43 @@ int ag_ir_init(ag_ir_t *ir, uint32_t rate)
     ir->rate = rate;
     ir->wet = AG_IR_WET_REVERB;
     ir->gain = 64u;
+    ir->blk = AG_IR_BLOCK;
+    ir->fft = AG_IR_FFT;
+    return 0;
+}
+
+/*
+ * Work in a shorter block, because the stream does.
+ *
+ * Refused rather than rounded: a block that is not a power of two has no
+ * transform, and one larger than AG_IR_BLOCK would walk off the scratch
+ * arrays, which are cut once for the largest.  Saying no and leaving the
+ * block alone is better than a cabinet quietly working in something other
+ * than what the caller believes.
+ *
+ * Whatever was loaded is dropped - the partitioning was cut for the old block
+ * and nothing about it survives - but the voicing is not: rate, mix and gain
+ * are the caller's settings and are none of this call's business.
+ */
+int ag_ir_set_block(ag_ir_t *ir, uint32_t frames)
+{
+    if (ir == NULL || frames < 32u || frames > AG_IR_BLOCK) {
+        return -1;
+    }
+    if ((frames & (frames - 1u)) != 0u) {
+        return -1;
+    }
+    if (frames == ir->blk) {
+        return 0;
+    }
+    free_spectra(ir);
+    ir->ready = 0;
+    ir->parts = 0u;
+    ir->n_dir = 0u;
+    ir->x_pos = 0u;
+    memset(ir->overlap, 0, sizeof(ir->overlap));
+    ir->blk = frames;
+    ir->fft = frames * 2u;
     return 0;
 }
 
@@ -259,21 +296,21 @@ static int fft_headroom(uint32_t asum)
 
 /* Forward FFT of partition p of mono[], lifted by `pre`, into re/im. */
 static int part_fft(const int16_t *mono, uint32_t frames, uint32_t p, int pre,
-                    int32_t *re, int32_t *im)
+                    int32_t *re, int32_t *im, uint32_t blk, uint32_t fft)
 {
-    const uint32_t off = p * AG_IR_BLOCK;
+    const uint32_t off = p * blk;
     uint32_t       i;
 
-    for (i = 0; i < AG_IR_FFT; i++) {
+    for (i = 0; i < fft; i++) {
         re[i] = 0;
         im[i] = 0;
     }
-    for (i = 0; i < AG_IR_BLOCK; i++) {
+    for (i = 0; i < blk; i++) {
         const uint32_t idx = off + i;
         re[i] = (idx < frames) ? ((int32_t)mono[idx] << pre) : 0;
     }
     /* Real input, so half a transform does it; same bins, same scale. */
-    return ag_fft_real_fwd(re, im, (int)AG_IR_FFT);
+    return ag_fft_real_fwd(re, im, (int)fft);
 }
 
 /*
@@ -342,7 +379,7 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
     if (frames < 4u) {
         return -1;
     }
-    parts = (frames + AG_IR_BLOCK - 1u) / AG_IR_BLOCK;
+    parts = (frames + ir->blk - 1u) / ir->blk;
     if (parts < 1u) {
         parts = 1u;
     }
@@ -356,8 +393,8 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
         uint32_t worst = 1;
         for (p = 0; p < parts; p++) {
             uint32_t sum = 0;
-            for (i = 0; i < AG_IR_BLOCK; i++) {
-                const uint32_t idx = p * AG_IR_BLOCK + i;
+            for (i = 0; i < ir->blk; i++) {
+                const uint32_t idx = p * ir->blk + i;
                 if (idx < frames) {
                     sum += (uint32_t)(mono[idx] < 0 ? -(int32_t)mono[idx]
                                                     : (int32_t)mono[idx]);
@@ -372,10 +409,11 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
 
     /* Pass one: how big do the bins actually get for this IR? */
     for (p = 0; p < parts; p++) {
-        if (part_fft(mono, frames, p, (int)ir->h_pre, re, im) != 0) {
+        if (part_fft(mono, frames, p, (int)ir->h_pre, re, im,
+                     ir->blk, ir->fft) != 0) {
             return -1;
         }
-        for (i = 0; i < AG_IR_FFT; i++) {
+        for (i = 0; i < ir->fft; i++) {
             const int32_t a = re[i] < 0 ? -re[i] : re[i];
             const int32_t b = im[i] < 0 ? -im[i] : im[i];
             if (a > biggest) {
@@ -391,7 +429,7 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
         shift++;
     }
 
-    bytes = parts * AG_IR_FFT * 2u * (uint32_t)sizeof(int16_t);
+    bytes = parts * ir->fft * 2u * (uint32_t)sizeof(int16_t);
     ir->H = (int16_t *)ag_malloc(bytes);
     ir->X = (int16_t *)ag_malloc(bytes);
     ir->x_sh = (int8_t *)ag_malloc(parts);
@@ -405,12 +443,13 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
 
     /* Pass two: store, using the whole of int16. */
     for (p = 0; p < parts; p++) {
-        int16_t *Hp = ir->H + p * AG_IR_FFT * 2u;
-        if (part_fft(mono, frames, p, (int)ir->h_pre, re, im) != 0) {
+        int16_t *Hp = ir->H + p * ir->fft * 2u;
+        if (part_fft(mono, frames, p, (int)ir->h_pre, re, im,
+                     ir->blk, ir->fft) != 0) {
             free_spectra(ir);
             return -1;
         }
-        for (i = 0; i < AG_IR_FFT; i++) {
+        for (i = 0; i < ir->fft; i++) {
             Hp[i * 2u] = ag_sat16(re[i] >> shift);
             Hp[i * 2u + 1u] = ag_sat16(im[i] >> shift);
         }
@@ -613,12 +652,12 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
  */
 AG_IR_NOINLINE static void mac_part(int32_t *yre, int32_t *yim,
                                     const int16_t *Xp, const int16_t *Hp,
-                                    uint32_t sh)
+                                    uint32_t sh, uint32_t fft)
 {
     const int32_t rnd = (int32_t)1 << (sh - 1u);
     uint32_t      i;
 
-    for (i = 0; i < AG_IR_FFT; i++) {
+    for (i = 0; i < fft; i++) {
         const int32_t xr = Xp[0], xii = Xp[1];
         const int32_t hr = Hp[0], hi = Hp[1];
         *yre += (xr * hr - xii * hi + rnd) >> sh;
@@ -708,7 +747,7 @@ AG_HOT void ag_ir_process_n(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo
         return;
     }
     /* Partitioned: whole blocks only, and the caller is expected to know. */
-    for (i = 0; i + AG_IR_BLOCK <= frames; i += AG_IR_BLOCK) {
+    for (i = 0; i + ir->blk <= frames; i += ir->blk) {
         ag_ir_process_block(ir, mono_in + i, stereo_out + i * 2u);
     }
 }
@@ -729,11 +768,11 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
     }
 
     if (ir->n_dir > 0u && ir->ready && !ir->bypass) {
-        process_direct(ir, mono_in, stereo_out, AG_IR_BLOCK);
+        process_direct(ir, mono_in, stereo_out, ir->blk);
         return;
     }
     if (!ir->ready || ir->bypass || ir->parts == 0u) {
-        for (i = 0; i < AG_IR_BLOCK; i++) {
+        for (i = 0; i < ir->blk; i++) {
             stereo_out[i * 2u] = mono_in[i];
             stereo_out[i * 2u + 1u] = mono_in[i];
         }
@@ -755,16 +794,16 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
     memset(re, 0, sizeof(re));
     {
         uint32_t asum = 0;
-        for (i = 0; i < AG_IR_BLOCK; i++) {
+        for (i = 0; i < ir->blk; i++) {
             asum += (uint32_t)(mono_in[i] < 0 ? -(int32_t)mono_in[i]
                                               : (int32_t)mono_in[i]);
         }
         pre = fft_headroom(asum);
-        for (i = 0; i < AG_IR_BLOCK; i++) {
+        for (i = 0; i < ir->blk; i++) {
             re[i] = (int32_t)mono_in[i] << pre;
         }
     }
-    (void)ag_fft_real_fwd(re, im, (int)AG_IR_FFT);
+    (void)ag_fft_real_fwd(re, im, (int)ir->fft);
 
     /*
      * Store this block's spectrum with a shift of its own, picked from what
@@ -787,7 +826,7 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
         int32_t xmax = 1;
         int     xs = 0;
         int32_t half;
-        for (i = 0; i < AG_IR_FFT; i++) {
+        for (i = 0; i < ir->fft; i++) {
             const int32_t a = re[i] < 0 ? -re[i] : re[i];
             const int32_t b = im[i] < 0 ? -im[i] : im[i];
             if (a > xmax) {
@@ -802,8 +841,8 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
             xs++;
         }
         half = xs > 0 ? ((int32_t)1 << (xs - 1)) : 0;
-        slot = ir->X + ir->x_pos * AG_IR_FFT * 2u;
-        for (i = 0; i < AG_IR_FFT; i++) {
+        slot = ir->X + ir->x_pos * ir->fft * 2u;
+        for (i = 0; i < ir->fft; i++) {
             slot[i * 2u] = ag_sat16((re[i] + half) >> xs);
             slot[i * 2u + 1u] = ag_sat16((im[i] + half) >> xs);
         }
@@ -839,8 +878,8 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
     memset(yim, 0, sizeof(yim));
     for (p = 0; p < parts; p++) {
         uint32_t xi = (ir->x_pos + parts - p) % parts;
-        const int16_t *Hp = ir->H + p * AG_IR_FFT * 2u;
-        const int16_t *Xp = ir->X + xi * AG_IR_FFT * 2u;
+        const int16_t *Hp = ir->H + p * ir->fft * 2u;
+        const int16_t *Xp = ir->X + xi * ir->fft * 2u;
         uint32_t sh;
         if (ir->x_sh[xi] == AG_IR_EMPTY) {
             continue;
@@ -849,7 +888,7 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
         if (sh > 31u) {
             continue; /* older than the scale can express: it is inaudible */
         }
-        mac_part(yre, yim, Xp, Hp, sh);
+        mac_part(yre, yim, Xp, Hp, sh, ir->fft);
     }
 
     /*
@@ -871,7 +910,7 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
          * back in the output shift, which is written in terms of ygain.
          */
         uint64_t ysum = 0;
-        for (i = 0; i < AG_IR_FFT; i++) {
+        for (i = 0; i < ir->fft; i++) {
             const int32_t a = yre[i] < 0 ? -yre[i] : yre[i];
             const int32_t b = yim[i] < 0 ? -yim[i] : yim[i];
             ysum += (uint64_t)a + (uint64_t)b;
@@ -892,25 +931,25 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
          * works them out for itself rather than reading them. */
         if (ygain > 0) {
             const uint32_t g = (uint32_t)ygain;
-            for (i = 0; i <= AG_IR_FFT / 2u; i++) {
+            for (i = 0; i <= ir->fft / 2u; i++) {
                 re[i] = yre[i] << g;
                 im[i] = yim[i] << g;
             }
         } else if (ygain < 0) {
             const uint32_t g = (uint32_t)(-ygain);
             const int32_t  r = (int32_t)1 << (g - 1u);
-            for (i = 0; i <= AG_IR_FFT / 2u; i++) {
+            for (i = 0; i <= ir->fft / 2u; i++) {
                 re[i] = (yre[i] + r) >> g;
                 im[i] = (yim[i] + r) >> g;
             }
         } else {
-            for (i = 0; i <= AG_IR_FFT / 2u; i++) {
+            for (i = 0; i <= ir->fft / 2u; i++) {
                 re[i] = yre[i];
                 im[i] = yim[i];
             }
         }
     }
-    (void)ag_fft_real_inv(re, im, (int)AG_IR_FFT);
+    (void)ag_fft_real_inv(re, im, (int)ir->fft);
 
     /*
      * X is scaled by 2^xref, H by 2^h_shift and the product by 2^p_shift; the
@@ -960,11 +999,11 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
         rsh = osh < 0 ? (uint32_t)(-osh) : 0u;
         rnd = rsh > 0u ? ((int32_t)1 << (rsh - 1u)) : 0;
         thalf = tail > 0u ? ((int32_t)1 << (tail - 1u)) : 0;
-        for (i = 0; i < AG_IR_BLOCK; i++) {
+        for (i = 0; i < ir->blk; i++) {
             int32_t fine = (((re[i] << lsh) + rnd) >> rsh) + ir->overlap[i];
             int32_t dry = (int32_t)mono_in[i];
             int32_t wet, m;
-            ir->overlap[i] = ((re[i + AG_IR_BLOCK] << lsh) + rnd) >> rsh;
+            ir->overlap[i] = ((re[i + ir->blk] << lsh) + rnd) >> rsh;
             /*
              * The gain applied before the rounding, and the whole of it
              * rounded once.  Written the other way round - round to the output
@@ -998,7 +1037,7 @@ AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *st
     if ((s_trace++ % 900u) == 5u) {
         int32_t  ymax = 0, omax = 0;
         uint32_t j;
-        for (j = 0; j < AG_IR_FFT; j++) {
+        for (j = 0; j < ir->fft; j++) {
             const int32_t a = yre[j] < 0 ? -yre[j] : yre[j];
             const int32_t b = re[j] < 0 ? -re[j] : re[j];
             if (a > ymax) {

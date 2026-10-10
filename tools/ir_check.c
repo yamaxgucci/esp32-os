@@ -46,6 +46,21 @@
 /* WAV                                                                       */
 /* ------------------------------------------------------------------------ */
 
+/* The block, once, from AG_IR_BLK; anything silly falls back to 256. */
+static uint32_t ir_blk(void)
+{
+    static uint32_t cached;
+    if (cached == 0u) {
+        const char *e = getenv("AG_IR_BLK");
+        long        v = (e != NULL) ? strtol(e, NULL, 10) : 0;
+        if (v < 32 || v > (long)AG_IR_BLOCK || (v & (v - 1)) != 0) {
+            v = (long)AG_IR_BLOCK;
+        }
+        cached = (uint32_t)v;
+    }
+    return cached;
+}
+
 static uint32_t rd_u32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
@@ -388,7 +403,7 @@ static void band_report(const int16_t *ref, const int16_t *eng, uint32_t frames,
     uint32_t      off;
     int           i, b, which;
 
-    for (off = AG_IR_BLOCK; off + BAND_FFT <= frames; off += BAND_FFT / 2u) {
+    for (off = ir_blk(); off + BAND_FFT <= frames; off += BAND_FFT / 2u) {
         for (which = 0; which < 2; which++) {
             for (i = 0; i < BAND_FFT; i++) {
                 const double t = (double)i / BAND_FFT;
@@ -547,12 +562,13 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
     double    worst_sig = 0.0;
     char      path[512];
     int16_t   stereo[AG_IR_BLOCK * 2u];
+    const uint32_t blk = ir_blk();
 
-    blocks = frames / AG_IR_BLOCK;
+    blocks = frames / blk;
     if (blocks == 0u) {
         return;
     }
-    frames = blocks * AG_IR_BLOCK;
+    frames = blocks * blk;
 
     in = (int16_t *)malloc(sizeof(int16_t) * frames);
     eng = (int16_t *)malloc(sizeof(int16_t) * frames);
@@ -578,6 +594,7 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
 
     /* The engine. */
     if (ag_ir_init(&ir, rate) != 0 ||
+        ag_ir_set_block(&ir, blk) != 0 ||
         ag_ir_load(&ir, h, hn, h_rate) != 0) {
         fprintf(stderr, "ir init failed\n");
         return;
@@ -585,9 +602,9 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
     ag_ir_set_gain(&ir, (uint8_t)gain);
     ag_ir_set_wet(&ir, (uint8_t)wetmix);
     for (k = 0; k < blocks; k++) {
-        ag_ir_process_block(&ir, in + k * AG_IR_BLOCK, stereo);
-        for (i = 0; i < AG_IR_BLOCK; i++) {
-            eng[k * AG_IR_BLOCK + i] = stereo[i * 2u];
+        ag_ir_process_block(&ir, in + k * blk, stereo);
+        for (i = 0; i < blk; i++) {
+            eng[k * blk + i] = stereo[i * 2u];
         }
     }
     ag_ir_free(&ir);
@@ -622,7 +639,7 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
         double ad = d < 0.0 ? -d : d;
         double amp = d * 64.0;
         err[i] = sat16d(amp);
-        if (i < AG_IR_BLOCK) {
+        if (i < ir_blk()) {
             continue;
         }
         if (ad > peak_err) {
@@ -632,7 +649,7 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
         tot_e += d * d;
     }
 
-    for (w = AG_IR_BLOCK; w + win <= frames; w += win) {
+    for (w = ir_blk(); w + win <= frames; w += win) {
         double s = 0.0, e = 0.0, r;
         for (i = w; i < w + win; i++) {
             const double d = (double)eng[i] - (double)ref[i];
@@ -653,15 +670,15 @@ static void run_level(const int16_t *src, uint32_t frames, uint32_t rate,
     printf("  %-8s signal %7.1f dBFS   error %7.1f dBFS   "
            "err/sig %7.1f dB   worst window %7.1f dB (at %.0f dBFS)\n",
            tag,
-           db(sqrt(tot_s / (double)(frames - AG_IR_BLOCK)) / 32768.0),
-           db(sqrt(tot_e / (double)(frames - AG_IR_BLOCK)) / 32768.0),
+           db(sqrt(tot_s / (double)(frames - ir_blk())) / 32768.0),
+           db(sqrt(tot_e / (double)(frames - ir_blk())) / 32768.0),
            db(sqrt(tot_e / tot_s)), worst, worst_sig);
     printf("           peak error %.1f LSB over %u windows\n", peak_err, nwin);
     band_report(ref, eng, frames, rate,
-                db(sqrt(tot_s / (double)(frames - AG_IR_BLOCK)) / 32768.0), 1);
+                db(sqrt(tot_s / (double)(frames - ir_blk())) / 32768.0), 1);
     if (atten >= 1.0) {
         diag_floor(convd, in, ref, frames, rate, gain, wetmix,
-                   db(sqrt(tot_s / (double)(frames - AG_IR_BLOCK)) / 32768.0));
+                   db(sqrt(tot_s / (double)(frames - ir_blk())) / 32768.0));
     }
 
     snprintf(path, sizeof(path), "%s/ir_%s_engine.wav", outdir, tag);
