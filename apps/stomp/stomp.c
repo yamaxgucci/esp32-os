@@ -163,6 +163,17 @@ enum { BROWSE_OFF, BROWSE_CAB, BROWSE_PRESET };
 #define AMP_HEAD 4
 
 /*
+ * WHERE THE MASTER STOPS BEING LINEAR.
+ *
+ * Seven tenths: below it the knee does nothing, so everything played at a
+ * sane level is untouched, and the amplifier's own voice is what comes out.
+ * Above it the curve bends over and reaches full scale with zero slope, and
+ * the knee closes over twice the space that is left - which is what makes
+ * the slope continuous where it starts.
+ */
+#define OUT_KNEE_T 0.70f
+
+/*
  * How many frames the loop actually does at a time, which is latency.
  *
  * CHUNK above is only the size of the buffers - the most this will ever ask
@@ -244,6 +255,8 @@ static uint32_t     s_in_starved;  /* blocks the converter had nothing for */
 /* Frames of silence padded into the live input since the last status line,
  * which is the size of the hole a listener hears. */
 static uint32_t     s_in_holes;
+/* Samples the master's knee touched since the last status line. */
+static uint32_t     s_soft;
 static int16_t      s_mono[CHUNK];
 static int16_t      s_stereo[CHUNK * 2];
 static float        s_peak;     /* of the last block at the converter */
@@ -369,6 +382,14 @@ static ag_sem_t     s_cab_go;
 static ag_sem_t     s_cab_done;
 static volatile int s_cab_quit;
 static int          s_cab_primed; /* the first block has nothing to send yet */
+/*
+ * Asked for by `cab2`, and off otherwise.
+ *
+ * The other core is for effects - a reverb, a delay, a tremolo, each its own
+ * program - and a chain that has taken it for its own loudspeaker has
+ * nowhere to put them.  What has to be made to work is one core.
+ */
+static int          s_cab_two_core;
 static int16_t      s_cab_in[CHUNK];
 static int16_t      s_cab_out[CHUNK * 2];
 
@@ -2213,7 +2234,7 @@ static void cab_thread(void *arg)
  */
 static void cab_start(void)
 {
-    if (s_cab_thread != NULL || !s_ir_ready) {
+    if (s_cab_thread != NULL || !s_ir_ready || !s_cab_two_core) {
         return;
     }
     s_cab_quit = 0;
@@ -2701,17 +2722,41 @@ static AG_HOT void audio_block(void)
          * converter's business, counted, and shown as CLIP - rather than in
          * the middle of the chain where nothing could see it.
          */
-        const int num = s_vol_num * AMP_HEAD;
+        const int   num = s_vol_num * AMP_HEAD;
+        /*
+         * The knee, in the units the samples are already in.  Worked out
+         * once a block: nothing here depends on the sample.
+         */
+        const float kt = OUT_KNEE_T * 32767.0f;
+        const float ks = 32767.0f - kt;          /* what is left above it   */
+        const float kinv = 1.0f / (2.0f * ks);   /* the knee's own width    */
         for (i = 0; i < n; i++) {
             int v = s_stereo[i];
             {
                 v = (v * num) >> 6;
-                if (v > 32767) {
-                    v = 32767;
-                    s_out_clipped++;
-                } else if (v < -32768) {
-                    v = -32768;
-                    s_out_clipped++;
+                {
+                    /*
+                     * Soft above the threshold, and the rail only when the
+                     * knee has nothing left - which is where the old hard
+                     * clamp started.
+                     */
+                    const int   neg = v < 0;
+                    float       a = (float)(neg ? -v : v);
+                    if (a > kt) {
+                        float u = (a - kt) * kinv;
+                        if (u >= 1.0f) {
+                            u = 1.0f;
+                            s_out_clipped++;
+                        }
+                        a = kt + ks * (2.0f * u - u * u);
+                        s_soft++;
+                    }
+                    v = (int)(neg ? -a : a);
+                    if (v > 32767) {
+                        v = 32767;
+                    } else if (v < -32768) {
+                        v = -32768;
+                    }
                 }
                 s_stereo[i] = (int16_t)v;
             }
@@ -3396,6 +3441,10 @@ int ag_main(int argc, char **argv)
             s_fx_amount = (s_fx_amount < 0) ? 100 : s_fx_amount;
         } else if (strcmp(argv[i], "fxamount") == 0 && i + 1 < argc) {
             s_fx_amount = atoi_small(argv[++i]);
+        } else if (strcmp(argv[i], "cab2") == 0) {
+            /* The loudspeaker on the system core, a block behind.  Off by
+             * default: that core is for effects. */
+            s_cab_two_core = 1;
         } else if (strcmp(argv[i], "notext") == 0) {
             /* No panel of any kind: play, and leave the console alone.  For a
              * run being measured, where the console is the instrument. */
@@ -3843,11 +3892,12 @@ int ag_main(int argc, char **argv)
                          * wraps at forty columns and a number that falls off
                          * the end is a number nobody reads. */
                         ag_printf("stomp: %u blocks, %u%% cpu, rail %u, "
-                                  "hole %u, %u late, %u drop, %u resync, "
-                                  "amp %u%%, out %u%%%s\n",
+                                  "soft %u, hole %u, %u late, %u drop, "
+                                  "%u resync, amp %u%%, out %u%%%s\n",
                                   (unsigned)s_blocks,
                                   (unsigned)s_out.load_pct,
                                   (unsigned)s_clipped_win,
+                                  (unsigned)s_soft,
                                   (unsigned)s_in_holes,
                                   (unsigned)s_out.late, (unsigned)s_out.drop,
                                   (unsigned)s_out.resync,
@@ -3855,6 +3905,7 @@ int ag_main(int argc, char **argv)
                                   (unsigned)(s_peak * 100.0f),
                                   s_out_clipped > 0u ? " CLIP" : "");
                         s_clipped_win = 0;
+                        s_soft = 0;
                         s_in_holes = 0;
                     }
                 }
