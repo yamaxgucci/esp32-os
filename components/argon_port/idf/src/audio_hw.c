@@ -372,6 +372,10 @@ static int32_t dac_be_read(int16_t *pcm, int32_t frames)
 #define I2S_FRAMES  240
 #define I2S_WAIT_MS 120
 
+/* The block the stream asked for, in frames; 0 until something asks. */
+static uint32_t s_want_frames;
+static uint32_t i2s_ring_frames(void);
+
 static i2s_chan_handle_t s_tx;
 /*
  * The same peripheral the other way.  It is opened with the transmitter and
@@ -430,9 +434,12 @@ static bool i2s_be_open(uint32_t rate, uint8_t channels)
      * filled, and that is also the floor: a ring shorter than two of the
      * application's blocks runs dry between them.
      */
-    if (s_pins.dma_frames >= 64u) {
-        chan.dma_desc_num = 2;
-        chan.dma_frame_num = (uint32_t)s_pins.dma_frames / 2u;
+    {
+        const uint32_t ring = i2s_ring_frames();
+        if (ring > 0u) {
+            chan.dma_desc_num = 2;
+            chan.dma_frame_num = ring / 2u;
+        }
     }
     chan.auto_clear = true;
 
@@ -561,6 +568,52 @@ static void i2s_be_close(void)
 
 static bool i2s_be_capture(void) { return s_rx != NULL; }
 
+/*
+ * How deep the ring should be, in frames each way.
+ *
+ * Twice the block the stream asked for, which is the whole point: a ring is
+ * one buffer playing while the other is filled, so a block larger than half
+ * of it cannot be served inside its own period.  The board's number is a
+ * ceiling - how much DMA memory this machine will spend - and not a target,
+ * because two programs with different blocks should not have to agree on one
+ * number in a config file.
+ *
+ * Zero means neither has an opinion, and the port's own default stands.
+ */
+static uint32_t i2s_ring_frames(void)
+{
+    const uint32_t ceiling =
+        (s_pins.dma_frames >= 64u) ? (uint32_t)s_pins.dma_frames : 0u;
+    uint32_t want = s_want_frames * 2u;
+
+    if (s_want_frames == 0u) {
+        /* Nobody asked; the board's number, if any, is the whole ring, which
+         * is what it meant before any of this existed. */
+        return ceiling;
+    }
+    if (want < 64u) {
+        want = 64u; /* a ring shorter than this is more interrupts than audio */
+    }
+    if (ceiling > 0u && want > ceiling) {
+        want = ceiling;
+    }
+    return want;
+}
+
+uint32_t ag_port_audio_period(uint32_t frames)
+{
+    if (frames > 0u) {
+        s_want_frames = frames;
+    }
+    {
+        const uint32_t ring = i2s_ring_frames();
+        if (ring == 0u) {
+            return (uint32_t)(I2S_DESCS * I2S_FRAMES) / 2u;
+        }
+        return ring / 2u;
+    }
+}
+
 static int32_t i2s_be_read(int16_t *pcm, int32_t frames)
 {
     if (pcm == NULL || frames <= 0) {
@@ -662,8 +715,11 @@ static int32_t i2s_be_space(void)
     if (s_tx == NULL) {
         return 0;
     }
-    return (s_pins.dma_frames >= 64u) ? (int32_t)s_pins.dma_frames
-                                      : (int32_t)(I2S_DESCS * I2S_FRAMES);
+    {
+        const uint32_t ring = i2s_ring_frames();
+        return (ring > 0u) ? (int32_t)ring
+                           : (int32_t)(I2S_DESCS * I2S_FRAMES);
+    }
 }
 
 #endif /* SOC_I2S_SUPPORTED */

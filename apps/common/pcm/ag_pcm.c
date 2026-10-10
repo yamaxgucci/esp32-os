@@ -186,6 +186,21 @@ void ag_pcm_set_chunk(ag_pcm_t *o, uint32_t frames)
     }
     o->chunk = frames ? frames : AG_PCM_CHUNK_DEFAULT;
     set_chunk_us(o);
+    /*
+     * And tell the device, because the converter cuts its ring to fit.
+     *
+     * Before this the block was a private number in this struct and the ring
+     * was a number in BOARD.CFG, and the two had to agree by hand.  They did
+     * not: a 256-frame block against a 128-frame ring stalled every read 7.4
+     * ms past its own deadline, and the stall was counted as processing.
+     *
+     * A driver with nothing to cut answers -AG_ENOTSUP, which is the answer
+     * and not an error, so the result is not checked.
+     */
+    if (o->fd >= 0 && o->sink == AG_PCM_SINK_DEV) {
+        uint32_t want = o->chunk;
+        (void)ag_dev_ioctl(o->fd, AG_IOC_AUDIO_SETPERIOD, &want, sizeof(want));
+    }
 }
 
 int32_t ag_pcm_read(ag_pcm_t *o, int16_t *pcm, int32_t frames)
@@ -203,6 +218,9 @@ int32_t ag_pcm_read(ag_pcm_t *o, int16_t *pcm, int32_t frames)
         if (got < 0) {
             return got;
         }
+        /* From here the converter is this stream's clock, and the wall-clock
+         * pacing stands down - see clocked_by_in in the header. */
+        o->clocked_by_in = 1;
         return (int32_t)((size_t)got / ((size_t)o->channels * 2u));
     }
 }
@@ -276,6 +294,21 @@ void ag_pcm_pace_wait(ag_pcm_t *o)
     if (o->sink == AG_PCM_SINK_WAV) {
         return;
     }
+    /*
+     * A live input already paced this block, and two clocks are worse than
+     * one: the deadline below is kept in ag_micros() while the frames arrive
+     * on the codec's crystal, so the two walk apart and every block looks
+     * late against a schedule that was never the real one.
+     *
+     * The deadline is carried forward rather than abandoned, so a stream that
+     * stops being read - the guitar unplugged, the take taking over - picks
+     * the pacing back up from now instead of from a stale mark and bursting
+     * a second of audio to catch up.
+     */
+    if (o->clocked_by_in) {
+        o->next_due = ag_micros() + (ag_time_t)o->chunk_us;
+        return;
+    }
     now = ag_micros();
     if (now <= o->next_due) {
         for (;;) {
@@ -316,6 +349,20 @@ int32_t ag_pcm_slack_us(const ag_pcm_t *o)
         return 0;
     }
     return (int32_t)(o->next_due - now);
+}
+
+int32_t ag_pcm_period(const ag_pcm_t *o)
+{
+    uint32_t frames = 0;
+
+    if (o == 0 || o->fd < 0 || o->sink != AG_PCM_SINK_DEV) {
+        return 0;
+    }
+    if (ag_dev_ioctl(o->fd, AG_IOC_AUDIO_GETPERIOD, &frames,
+                     sizeof(frames)) != AG_OK) {
+        return 0; /* a driver that does not answer has nothing to declare */
+    }
+    return (int32_t)frames;
 }
 
 void ag_pcm_poll_stats(ag_pcm_t *o)

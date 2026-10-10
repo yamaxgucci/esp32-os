@@ -34,6 +34,17 @@ typedef struct ag_pcm {
     uint32_t    drop;
     uint32_t    resync;
     uint32_t    wav_bytes;
+    /*
+     * Set the first time a frame is read back from this stream.
+     *
+     * A converter that records as well as plays hands the loop its own clock:
+     * the read cannot answer until the block has arrived, which is exactly the
+     * pacing the sleep was imitating.  Running both means two clocks - the
+     * codec's crystal and ag_micros() - and they drift, so the deadline slips
+     * a little every block and the stream spends its life resynchronising
+     * against a schedule nothing is actually keeping.
+     */
+    uint8_t     clocked_by_in;
     ag_audio_stats_t stats;
     int         stats_ok;
 } ag_pcm_t;
@@ -56,10 +67,26 @@ int32_t ag_pcm_write(ag_pcm_t *o, const int16_t *pcm, int32_t frames);
 int32_t ag_pcm_read(ag_pcm_t *o, int16_t *pcm, int32_t frames);
 void    ag_pcm_mark_render(ag_pcm_t *o, uint32_t us);
 
+/*
+ * Hold the loop to the stream's rate.
+ *
+ * ag_pcm_pace_wait does nothing once the stream has been read from: there the
+ * converter is the clock, and a second one would only fight it.
+ */
 void    ag_pcm_pace_start(ag_pcm_t *o);
 void    ag_pcm_pace_wait(ag_pcm_t *o);
 int32_t ag_pcm_slack_us(const ag_pcm_t *o);
 void    ag_pcm_poll_stats(ag_pcm_t *o);
+
+/*
+ * The largest block this sink can actually serve, in frames; 0 when it has no
+ * such limit - a file, a null sink, anything that is not a converter.
+ *
+ * Ask it before choosing a block.  A block bigger than this is not slower by
+ * a little: the read cannot be answered inside the block it belongs to, so
+ * every block is late and the time shows up as processing that is not there.
+ */
+int32_t ag_pcm_period(const ag_pcm_t *o);
 
 #ifdef __cplusplus
 }

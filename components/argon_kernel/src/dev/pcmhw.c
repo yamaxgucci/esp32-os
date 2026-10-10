@@ -45,6 +45,8 @@
 
 static ag_device_t    *s_dev;
 static ag_audio_fmt_t  s_fmt;
+/* The block an application last asked for, so saying it again is free. */
+static uint32_t        s_period_asked;
 static bool            s_hw_open;
 static uint64_t        s_frames_in;
 static uint64_t        s_frames_out;
@@ -152,6 +154,46 @@ static ag_err_t pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
             return -AG_EINVAL;
         }
         *(ag_audio_fmt_t *)arg = s_fmt;
+        return AG_OK;
+    }
+    if (cmd == AG_IOC_AUDIO_GETPERIOD) {
+        if (arg == NULL || arglen < sizeof(uint32_t)) {
+            return -AG_EINVAL;
+        }
+        /*
+         * Half the ring, because the other half is playing.
+         *
+         * The board's `audio.dma_frames` is the whole ring in each
+         * direction; a block larger than half of it leaves the converter dry
+         * between blocks going out, and cannot be filled without waiting
+         * past its own deadline coming in.  BOARD.CFG has said so in
+         * capitals for a while - this is the same sentence where a program
+         * can read it instead of a person.
+         */
+        *(uint32_t *)arg = ag_port_audio_period(0u);
+        return AG_OK;
+    }
+    if (cmd == AG_IOC_AUDIO_SETPERIOD) {
+        if (arg == NULL || arglen < sizeof(uint32_t)) {
+            return -AG_EINVAL;
+        }
+        {
+            const uint32_t want = *(const uint32_t *)arg;
+            if (want == 0u || want > 4096u) {
+                return -AG_EINVAL;
+            }
+            if (want == s_period_asked) {
+                return AG_OK; /* saying it twice is not a reason to stop */
+            }
+            s_period_asked = want;
+            /*
+             * The ring is cut when the channel is created, so a converter
+             * already running has to come down and go back up - on the next
+             * write rather than here, which is how a rate change does it too.
+             */
+            hw_close();
+            (void)ag_port_audio_period(want);
+        }
         return AG_OK;
     }
     if (cmd == AG_IOC_AUDIO_SETFMT) {

@@ -120,6 +120,21 @@ const char *ag_port_audio_name(void);
 
 bool    ag_port_audio_present(void);
 bool    ag_port_audio_open(uint32_t rate, uint8_t channels);
+
+/*
+ * The block the stream means to work in, in frames.  Returns what it will
+ * actually get, which can be less when the board's ceiling says so.
+ *
+ * The ring is two of these: one playing while the next is filled, which is
+ * the floor for DMA and also the floor for not running dry.  Asking for more
+ * than half the ring is the fault this exists to prevent - the read cannot be
+ * answered inside the block it belongs to, so every block is born late and
+ * the wait is counted as if it were work.
+ *
+ * Call it before the converter opens; after, it takes effect on the next
+ * open, because the ring is cut when the channel is created.
+ */
+uint32_t ag_port_audio_period(uint32_t frames);
 void    ag_port_audio_close(void);
 int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames);
 int32_t ag_port_audio_space(void);

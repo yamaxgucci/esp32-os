@@ -1387,7 +1387,20 @@ typedef enum {
      * which deadline they have - see ag_link_ops_t.
      */
     AG_DEV_LINK,
+    /*
+     * ABI 0.69: something that processes a block of sound - a reverb, a
+     * delay, a cabinet somebody else wrote.
+     *
+     * A class rather than a new kind of thing, because everything an effect
+     * needs the device registry already does: a name, a list, an owner that
+     * revokes it when the module goes, and a hold across a call so the code
+     * cannot be unloaded while the audio thread is inside it.  It also means
+     * an effect on the board next door is reachable the same way its devices
+     * already are - the wire does not care that the device makes sound.
+     */
+    AG_DEV_FX,
 } ag_dev_class_t;
+
 
 enum ag_dev_flags {
     AG_DEVF_EXCLUSIVE = 1u << 0, /* one holder at a time; second open is EBUSY */
@@ -1458,6 +1471,36 @@ enum ag_ioctl_cmd {
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
     /* Optional: arg ag_audio_stats_t (pcmvirt/pcmmix; pcmnull returns zeros). */
     AG_IOC_AUDIO_GETSTATS = AG_IOC(AG_DEV_AUDIO, 3),
+    /*
+     * The largest block this converter can actually serve, in frames
+     * (arg uint32_t).  Not a preference - a limit.
+     *
+     * It is here because the lack of it cost an afternoon.  A converter
+     * holds a ring of a few DMA buffers; a read for more frames than half
+     * that ring cannot be answered without blocking past the block it is
+     * supposed to fill, so every block is born late however fast the
+     * processing is.  On the A1S with a 128-frame ring and an application
+     * asking for 256, the pedal spent 7.4 ms of an 11.6 ms block waiting,
+     * reported 126% cpu with 48% of real work, and read as a board too slow
+     * for the amplifier it was running.
+     *
+     * A driver that has no such limit - a file, a null sink - answers
+     * -AG_ENOTSUP, which is not an error but the answer.
+     */
+    AG_IOC_AUDIO_GETPERIOD = AG_IOC(AG_DEV_AUDIO, 4),
+    /*
+     * The block this stream means to work in, in frames (arg uint32_t).
+     *
+     * Said before the first write, it decides how deep the converter cuts its
+     * ring - two of this block, one playing while the next is filled.  Said
+     * after, it takes the converter down and brings it back, the way a rate
+     * change does, because a ring cannot be re-cut while DMA is walking it.
+     *
+     * A board may still refuse to spend that much DMA memory, so ask with
+     * GETPERIOD afterwards and work in what came back rather than in what was
+     * asked for.
+     */
+    AG_IOC_AUDIO_SETPERIOD = AG_IOC(AG_DEV_AUDIO, 5),
 };
 
 typedef struct {
@@ -1500,6 +1543,37 @@ typedef struct ag_dev_ops {
     ag_err_t (*ioctl_session)(ag_device_t *dev, void *session, uint32_t cmd,
                               void *arg, size_t arglen);
 } ag_dev_ops_t;
+
+/*
+ * What an effect does, published as class_ops on an AG_DEV_FX device.
+ *
+ * In place, interleaved 16-bit, because that is what every sink and source in
+ * this system already carries and a conversion at each end would cost more
+ * than most effects do.
+ *
+ * `prepare` is told the rate and the largest block it will be handed, so an
+ * effect that needs memory takes it once and never between two blocks.  It
+ * may be called again when either changes.  `process` is called from an audio
+ * thread with a deadline: it must not allocate, must not log, and must not
+ * block.  `reset` drops whatever is ringing - a delay line, a tail - without
+ * giving the memory back.
+ */
+typedef struct ag_fx_ops {
+    uint32_t size;
+    ag_err_t (*prepare)(ag_device_t *dev, uint32_t rate, uint32_t max_frames,
+                        uint8_t channels);
+    ag_err_t (*process)(ag_device_t *dev, int16_t *buf, uint32_t frames);
+    void (*reset)(ag_device_t *dev);
+    /*
+     * One number a person can turn, 0..100, and what it is called.  An effect
+     * with nothing to adjust leaves both out; one with more than a single
+     * control is a job for a later ABI, and saying so here is cheaper than
+     * pretending this covers it.
+     */
+    ag_err_t (*set_amount)(ag_device_t *dev, uint8_t percent);
+    const char *(*amount_name)(ag_device_t *dev);
+} ag_fx_ops_t;
+
 
 /*
  * How a .SYS publishes a device from ag_driver_init.  The owner is filled in by
