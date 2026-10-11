@@ -2592,10 +2592,18 @@ ag_pid_t ag_proc_overdue(uint32_t *late_by_ms)
         if (p->state != AG_PS_RUNNING && p->state != AG_PS_BACKGROUND) {
             continue;
         }
-        const uint32_t since = now - p->heartbeat_ms;
-        if (since > p->watchdog_ms) {
+        /*
+         * Signed.  `now` was read before the lock, and an application on the
+         * other core can beat in between - a heartbeat a millisecond in the
+         * future, which unsigned made 4294967 seconds old: Fallout on the
+         * 2.8B was killed as "4294367250 ms past its own deadline" in the
+         * middle of a movie, 11 Oct 2026, the first night it ran on the
+         * application core.
+         */
+        const int32_t since = (int32_t)(now - p->heartbeat_ms);
+        if (since > (int32_t)p->watchdog_ms) {
             found = p->pid;
-            late = since - p->watchdog_ms;
+            late = (uint32_t)since - p->watchdog_ms;
             break;
         }
     }
