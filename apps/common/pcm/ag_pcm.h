@@ -47,6 +47,10 @@ typedef struct ag_pcm {
     uint8_t     clocked_by_in;
     /* The last time the pacing was asked, for measuring a turn of the loop. */
     ag_time_t   paced_at;
+    /* The longest turn of the loop since it was last read, in microseconds:
+     * an average says the stream kept up, and this says whether it ever
+     * stopped - which is what a listener hears. */
+    uint32_t    worst_us;
     ag_audio_stats_t stats;
     int         stats_ok;
 } ag_pcm_t;

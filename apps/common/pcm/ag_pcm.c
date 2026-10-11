@@ -332,6 +332,9 @@ void ag_pcm_pace_wait(ag_pcm_t *o)
         const ag_time_t now = ag_micros();
         if (o->paced_at != 0) {
             const uint32_t took = (uint32_t)(now - o->paced_at);
+            if (took > o->worst_us) {
+                o->worst_us = took;
+            }
             if (took > o->chunk_us + o->chunk_us / 2u) {
                 o->late++;
                 if (took > o->chunk_us * 2u) {

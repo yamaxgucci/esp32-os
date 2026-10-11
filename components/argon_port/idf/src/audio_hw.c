@@ -472,6 +472,17 @@ static int32_t dac_be_read(int16_t *pcm, int32_t frames)
 
 /* The block the stream asked for, in frames; 0 until something asks. */
 static uint32_t s_want_frames;
+
+/*
+ * The least a ring may be, whatever the block is.
+ *
+ * Two blocks is the floor for not running dry between them, and at a
+ * 64-frame block that is 5.8 ms each way - so anything that holds the audio
+ * thread up for six milliseconds is heard.  The block is about latency
+ * through the chain; the ring is about how long a hiccup may be.  They are
+ * different questions and this one has the same answer at every block.
+ */
+#define I2S_RING_MIN 256u
 static uint32_t i2s_ring_frames(void);
 
 static i2s_chan_handle_t s_tx;
@@ -689,8 +700,8 @@ static uint32_t i2s_ring_frames(void)
          * is what it meant before any of this existed. */
         return ceiling;
     }
-    if (want < 64u) {
-        want = 64u; /* a ring shorter than this is more interrupts than audio */
+    if (want < I2S_RING_MIN) {
+        want = I2S_RING_MIN; /* tolerance, which the block does not decide */
     }
     if (ceiling > 0u && want > ceiling) {
         want = ceiling;

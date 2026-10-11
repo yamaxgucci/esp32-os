@@ -3893,7 +3893,8 @@ int ag_main(int argc, char **argv)
                          * the end is a number nobody reads. */
                         ag_printf("stomp: %u blocks, %u%% cpu, rail %u, "
                                   "soft %u, hole %u, %u late, %u drop, "
-                                  "%u resync, amp %u%%, out %u%%%s\n",
+                                  "%u resync, worst %u us, "
+                                  "amp %u%%, out %u%%%s\n",
                                   (unsigned)s_blocks,
                                   (unsigned)s_out.load_pct,
                                   (unsigned)s_clipped_win,
@@ -3901,9 +3902,11 @@ int ag_main(int argc, char **argv)
                                   (unsigned)s_in_holes,
                                   (unsigned)s_out.late, (unsigned)s_out.drop,
                                   (unsigned)s_out.resync,
+                                  (unsigned)s_out.worst_us,
                                   (unsigned)(s_amp_peak * 100.0f),
                                   (unsigned)(s_peak * 100.0f),
                                   s_out_clipped > 0u ? " CLIP" : "");
+                        s_out.worst_us = 0;
                         s_clipped_win = 0;
                         s_soft = 0;
                         s_in_holes = 0;
