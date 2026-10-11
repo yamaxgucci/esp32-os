@@ -257,6 +257,22 @@ static uint32_t     s_in_starved;  /* blocks the converter had nothing for */
 static uint32_t     s_in_holes;
 /* Samples the master's knee touched since the last status line. */
 static uint32_t     s_soft;
+/*
+ * The longest stretch of real work in one block since the run began - the
+ * turn's length with the two waits taken out.  Longer than a block and the
+ * converter ran dry while this was going on, which is the hole a listener
+ * hears; the turn's own length says nothing, because most of a long turn is
+ * usually the write being held at a full ring.
+ */
+static uint32_t     s_worst_busy;
+/*
+ * And how many blocks did not finish in their own time at all.
+ *
+ * The worst is one number and can be a single moment at start-up; this is
+ * the count of the holes, which is what somebody playing is actually
+ * counting without knowing it.
+ */
+static uint32_t     s_over;
 static int16_t      s_mono[CHUNK];
 static int16_t      s_stereo[CHUNK * 2];
 static float        s_peak;     /* of the last block at the converter */
@@ -2809,7 +2825,20 @@ static AG_HOT void audio_block(void)
         const ag_time_t t_out = ag_micros();
         const int32_t wrote =
             ag_pcm_write(&s_out, s_stereo, (int32_t)s_chunk);
-        s_us_out += (uint32_t)(ag_micros() - t_out);
+        const uint32_t out_us = (uint32_t)(ag_micros() - t_out);
+        s_us_out += out_us;
+        {
+            /* What this block cost with neither wait in it. */
+            const uint32_t spent = (uint32_t)(ag_micros() - t0);
+            const uint32_t waits = s_us_in_blk + out_us;
+            const uint32_t busy = (spent > waits) ? (spent - waits) : 0u;
+            if (busy > s_worst_busy) {
+                s_worst_busy = busy;
+            }
+            if (busy > (s_chunk * 1000000u) / RATE) {
+                s_over++;
+            }
+        }
         s_blocks++;
         if (s_blocks == 1u) {
             /* The first block is the one worth saying out loud: on a box with
@@ -3893,7 +3922,7 @@ int ag_main(int argc, char **argv)
                          * the end is a number nobody reads. */
                         ag_printf("stomp: %u blocks, %u%% cpu, rail %u, "
                                   "soft %u, hole %u, %u late, %u drop, "
-                                  "%u resync, worst %u us, "
+                                  "%u resync, over %u, worst busy %u us, "
                                   "amp %u%%, out %u%%%s\n",
                                   (unsigned)s_blocks,
                                   (unsigned)s_out.load_pct,
@@ -3902,11 +3931,14 @@ int ag_main(int argc, char **argv)
                                   (unsigned)s_in_holes,
                                   (unsigned)s_out.late, (unsigned)s_out.drop,
                                   (unsigned)s_out.resync,
-                                  (unsigned)s_out.worst_us,
+                                  (unsigned)s_over,
+                                  (unsigned)s_worst_busy,
                                   (unsigned)(s_amp_peak * 100.0f),
                                   (unsigned)(s_peak * 100.0f),
                                   s_out_clipped > 0u ? " CLIP" : "");
-                        s_out.worst_us = 0;
+                        /* Not reset: the worst hole of the whole session is
+                         * what somebody who has been playing wants to know,
+                         * and a window's worst is gone before he can ask. */
                         s_clipped_win = 0;
                         s_soft = 0;
                         s_in_holes = 0;

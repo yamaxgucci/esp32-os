@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef AG_HOST
+#include <argon/log.h>
+#endif
 #include <argon/path.h>
 #include <argon/port/place.h>
 
@@ -646,6 +649,29 @@ ag_handle_t ag_vfs_open(const char *path, const char *cwd, uint32_t flags)
     if (is_write_flag(flags) && (r.mount->flags & AG_MOUNT_READONLY)) {
         unlock();
         return -AG_EROFS;
+    }
+    if (is_write_flag(flags)) {
+        /*
+         * Said once a second, with who and what.
+         *
+         * Nothing should be writing to flash while the machine is playing: a
+         * sector erase takes tens of milliseconds and halts both cores for
+         * all of it, because a CPU fetching through a disabled cache does not
+         * run.  The audio loop's longest turn was measured at 37 ms against a
+         * block of 11.6, and a quiet machine prints nothing here at all.
+         */
+        static uint32_t writes;
+        writes++;
+        /* Every one of the first few, then one in sixty-four: a quiet machine
+           prints nothing, a busy one does not drown the journal. */
+#ifndef AG_HOST
+        if (writes <= 4u || (writes & 63u) == 0u) {
+            ag_log(AG_LOG_INFO, "fs", "write open: %s (%u since boot)", path,
+                   (unsigned)writes);
+        }
+#else
+        (void)writes;
+#endif
     }
     if (r.mount->ops->open == NULL) {
         unlock();
