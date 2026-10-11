@@ -2434,10 +2434,110 @@ static void serve_404(ag_handle_t h)
  * not speak gzip - curl without --compressed - gets bytes it cannot read, which
  * is a fair trade for a page written for browsers.
  */
+/*
+ * THE PAGE IS HELD IN MEMORY, BECAUSE READING FLASH STOPS BOTH CORES.
+ *
+ * On the ESP32 a read from SPI flash turns the cache off while it runs - for
+ * the whole chip, not for the core that asked - so every program fetching its
+ * code through that cache stops too.  Serving these seventeen kilobytes a
+ * kilobyte at a time is therefore not a background errand: it is a hole in
+ * whatever else the machine was doing.
+ *
+ * Measured on the Audio Kit, 11 Oct 2026, the amplifier playing the same take
+ * for forty seconds in each case:
+ *
+ *   quiet                     7880 blocks,   0.05% lost
+ *   pinged hard (1400 bytes)  7504 blocks,   0.12% lost
+ *   this page being fetched   3408 blocks,  39.88% lost
+ *
+ * The radio costs almost nothing; the flash reads cost two blocks in five and
+ * half the output.  So the file is read once and kept, and the reason it was a
+ * file rather than a C array still holds (see above): the memory comes from
+ * the process arena, which is PSRAM where there is any, and a board that
+ * cannot spare it keeps streaming from flash as before.
+ */
+static uint8_t *s_page_ram;
+static uint32_t s_page_len;
+
+static const uint8_t *page_in_memory(uint32_t size)
+{
+    if (s_page_ram != NULL && s_page_len == size) {
+        return s_page_ram;
+    }
+    if (s_page_ram != NULL) { /* the file changed under us */
+        ag_free(s_page_ram);
+        s_page_ram = NULL;
+        s_page_len = 0;
+    }
+
+    ag_meminfo_t mem;
+    ag_meminfo(&mem);
+    /* Four times its own size free afterwards, or it is not this driver's
+     * memory to take: on a board without PSRAM the arena is the one everything
+     * else is short of, which is why the page became a file in the first
+     * place. */
+    if (mem.arena_free < (size_t)size * 5u) {
+        return NULL;
+    }
+
+    /*
+     * Internal SRAM first, and the arena only if it will not give it.
+     *
+     * On this part the external RAM is read through the same cache the
+     * processor fetches code through, so copying seventeen kilobytes out of
+     * PSRAM throws somebody else's code out of it - a quieter version of the
+     * flash read this is meant to avoid.  Internal memory is not cached at
+     * all: nothing is disturbed by reading it.
+     */
+    ag_meminfo_t fast;
+    ag_meminfo(&fast);
+    uint8_t *buf = NULL;
+    if (fast.fast_free > (size_t)size * 3u) {
+        buf = (uint8_t *)ag_malloc_caps(size, AG_MEM_FAST);
+    }
+    if (buf == NULL) {
+        buf = (uint8_t *)ag_malloc(size);
+    }
+    if (buf == NULL) {
+        return NULL;
+    }
+    const ag_handle_t f = ag_open(s.page, AG_O_RDONLY);
+    if (f < 0) {
+        ag_free(buf);
+        return NULL;
+    }
+    uint32_t got = 0;
+    while (got < size) {
+        const int32_t n = ag_read(f, buf + got, (int32_t)(size - got));
+        if (n <= 0) {
+            break;
+        }
+        got += (uint32_t)n;
+    }
+    ag_close(f);
+    if (got != size) {
+        ag_free(buf);
+        return NULL;
+    }
+    s_page_ram = buf;
+    s_page_len = size;
+    ag_log(AG_LOG_INFO, "phone", "page held in memory, %u bytes",
+           (unsigned)size);
+    return s_page_ram;
+}
+
 static void serve_page(ag_handle_t h)
 {
     ag_stat_t st;
-    if (ag_stat(s.page, &st) != AG_OK || st.size == 0u) {
+    /*
+     * Asking the file system how big the file is costs a flash read of its
+     * own, and that read stops both cores exactly as the data read did.  Once
+     * the page is held in memory its size is known, so nobody asks again until
+     * the driver is loaded afresh.
+     */
+    if (s_page_ram != NULL) {
+        st.size = s_page_len;
+    } else if (ag_stat(s.page, &st) != AG_OK || st.size == 0u) {
         char msg[192];
         const int k = snprintf(msg, sizeof(msg),
                                "HTTP/1.1 500 Internal Server Error\r\n"
@@ -2452,8 +2552,9 @@ static void serve_page(ag_handle_t h)
         return;
     }
 
-    const ag_handle_t f = ag_open(s.page, AG_O_RDONLY);
-    if (f < 0) {
+    const uint8_t *held = page_in_memory((uint32_t)st.size);
+    const ag_handle_t f = (held != NULL) ? -1 : ag_open(s.page, AG_O_RDONLY);
+    if (held == NULL && f < 0) {
         return;
     }
 
@@ -2477,7 +2578,16 @@ static void serve_page(ag_handle_t h)
         uint8_t  buf[1024];
         uint32_t sent = 0;
         for (;;) {
-            const int32_t got = ag_read(f, buf, sizeof(buf));
+            int32_t got;
+            if (held != NULL) {
+                const uint32_t left = (uint32_t)st.size - sent;
+                got = (int32_t)((left > sizeof(buf)) ? sizeof(buf) : left);
+                if (got > 0) {
+                    memcpy(buf, held + sent, (size_t)got);
+                }
+            } else {
+                got = ag_read(f, buf, sizeof(buf));
+            }
             if (got <= 0) {
                 break;
             }
@@ -2503,7 +2613,9 @@ static void serve_page(ag_handle_t h)
                    (unsigned)sent);
         }
     }
-    (void)ag_close(f);
+    if (f >= 0) {
+        (void)ag_close(f);
+    }
 }
 
 /*

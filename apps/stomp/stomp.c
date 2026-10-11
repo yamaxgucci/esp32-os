@@ -265,6 +265,11 @@ static uint32_t     s_soft;
  * usually the write being held at a full ring.
  */
 static uint32_t     s_worst_busy;
+/* The last window's averages, for the journal: valves, cabinet, whole block. */
+static uint32_t     s_av_valves;
+static uint32_t     s_av_cab;
+static uint32_t     s_av_work;
+static uint32_t     s_av_budget;
 /*
  * And how many blocks did not finish in their own time at all.
  *
@@ -3887,6 +3892,13 @@ int ag_main(int argc, char **argv)
                     } else if (s_us_blocks > 0u) {
                         const uint32_t n = s_us_blocks;
                         const uint32_t budget = (s_chunk * 1000000u) / RATE;
+                        /* Kept for the journal line, which is read from
+                           another slot - standing in this one to read the
+                           console turns the painting back on. */
+                        s_av_valves = s_us_valves / n;
+                        s_av_cab = s_us_cab / n;
+                        s_av_work = s_us_total / n;
+                        s_av_budget = budget;
                         ag_printf("stomp: of %u us a block: waiting in "
                                   "%u, out %u, valves %u, cabinet %u, "
                                   "%s %u, the rest %u (%u work)\n",
@@ -3916,6 +3928,35 @@ int ag_main(int argc, char **argv)
                      * one that means a whole block was lost from the clock,
                      * and `drop` that one was thrown away.
                      */
+                    {
+                        /*
+                         * The same numbers in the journal, one line in five
+                         * windows - about half a minute apart.
+                         *
+                         * The console they are printed on belongs to this
+                         * slot, and reading it means standing in this slot,
+                         * which turns the panel's painting back on: the very
+                         * thing being measured.  The journal is readable from
+                         * any slot and from the wire.  Rarely, because a
+                         * journal line of its own can stall a real-time
+                         * thread.
+                         */
+                        static unsigned windows;
+                        if ((windows++ % 5u) == 0u) {
+                            /* Short on purpose: the journal is read on a
+                               forty-column screen and a line that wraps is a
+                               number nobody can read. */
+                            ag_log(AG_LOG_INFO, "stomp",
+                                   "v%u c%u w%u/%u", (unsigned)s_av_valves,
+                                   (unsigned)s_av_cab, (unsigned)s_av_work,
+                                   (unsigned)s_av_budget);
+                            ag_log(AG_LOG_INFO, "stomp",
+                                   "n%u late%u rsy%u ovr%u wb%u",
+                                   (unsigned)s_blocks, (unsigned)s_out.late,
+                                   (unsigned)s_out.resync, (unsigned)s_over,
+                                   (unsigned)s_worst_busy);
+                        }
+                    }
                     if (!s_text) {
                         /* The rail early in the line, because the console
                          * wraps at forty columns and a number that falls off
