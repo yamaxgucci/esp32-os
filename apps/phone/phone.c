@@ -2545,14 +2545,18 @@ static void serve_page(ag_handle_t h)
 {
     ag_stat_t st;
     /*
-     * Asking the file system how big the file is costs a flash read of its
-     * own, and that read stops both cores exactly as the data read did.  Once
-     * the page is held in memory its size is known, so nobody asks again until
-     * the driver is loaded afresh.
+     * The size is asked for every time, and that is deliberate.
+     *
+     * It was skipped once the page was held in memory - one flash read saved
+     * per request - and the cost was a driver that served a stale page for
+     * ever: a new PHONE.GZ went onto the board, and the board kept handing out
+     * the old one, which took an hour to see because every symptom was in the
+     * page.  A cache that cannot notice its file changed is not a cache, it is
+     * a copy.  One stat against seventeen kilobytes read a kilobyte at a time
+     * is the whole of what this costs, and nobody fetches a page while
+     * playing anyway.
      */
-    if (s_page_ram != NULL) {
-        st.size = s_page_len;
-    } else if (ag_stat(s.page, &st) != AG_OK || st.size == 0u) {
+    if (ag_stat(s.page, &st) != AG_OK || st.size == 0u) {
         char msg[192];
         const int k = snprintf(msg, sizeof(msg),
                                "HTTP/1.1 500 Internal Server Error\r\n"
