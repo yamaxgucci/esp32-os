@@ -265,6 +265,18 @@ static uint32_t     s_soft;
  * usually the write being held at a full ring.
  */
 static uint32_t     s_worst_busy;
+/* The longest single wait for the input, since the run began. */
+static uint32_t     s_worst_in;
+/*
+ * And the same two for the window just ended.
+ *
+ * A worst-since-start is what somebody who has been playing wants; it is also
+ * poisoned by the first block of the run, where the codec is still waking and
+ * one wait of 71 ms says nothing about the music.  So both are kept, and the
+ * window pair is what a measurement reads.
+ */
+static uint32_t     s_win_in;
+static uint32_t     s_win_busy;
 /* The last window's averages, for the journal: valves, cabinet, whole block. */
 static uint32_t     s_av_valves;
 static uint32_t     s_av_cab;
@@ -2625,6 +2637,16 @@ static AG_HOT void audio_block(void)
      */
     s_us_in_blk = (uint32_t)(ag_micros() - t0);
     s_us_in += s_us_in_blk;
+    /* The longest the input ever made a block wait.  A live codec hands its
+       frames over in whatever size its DMA was given, so a read of one block
+       can be waiting for a whole buffer - which is a hole of that length in
+       everything downstream, and nothing else in the status line shows it. */
+    if (s_us_in_blk > s_worst_in) {
+        s_worst_in = s_us_in_blk;
+    }
+    if (s_us_in_blk > s_win_in) {
+        s_win_in = s_us_in_blk;
+    }
     const ag_time_t t_valves = ag_micros();
 
     for (i = 0; i < s_chunk; i++) {
@@ -2839,6 +2861,9 @@ static AG_HOT void audio_block(void)
             const uint32_t busy = (spent > waits) ? (spent - waits) : 0u;
             if (busy > s_worst_busy) {
                 s_worst_busy = busy;
+            }
+            if (busy > s_win_busy) {
+                s_win_busy = busy;
             }
             if (busy > (s_chunk * 1000000u) / RATE) {
                 s_over++;
@@ -3960,6 +3985,11 @@ int ag_main(int argc, char **argv)
                             ag_log(AG_LOG_INFO, "stomp", "late%u ovr%u wb%u",
                                    (unsigned)s_out.late, (unsigned)s_over,
                                    (unsigned)s_worst_busy);
+                            ag_log(AG_LOG_INFO, "stomp", "in%u/%u bz%u",
+                                   (unsigned)s_win_in, (unsigned)s_worst_in,
+                                   (unsigned)s_win_busy);
+                            s_win_in = 0;
+                            s_win_busy = 0;
                         }
                     }
                     if (!s_text) {
