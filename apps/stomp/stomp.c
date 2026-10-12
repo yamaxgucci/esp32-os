@@ -3930,19 +3930,20 @@ int ag_main(int argc, char **argv)
                      */
                     {
                         /*
-                         * The same numbers in the journal, one line in five
-                         * windows - about half a minute apart.
+                         * The same numbers in the journal, every window.
                          *
                          * The console they are printed on belongs to this
                          * slot, and reading it means standing in this slot,
                          * which turns the panel's painting back on: the very
-                         * thing being measured.  The journal is readable from
-                         * any slot and from the wire.  Rarely, because a
-                         * journal line of its own can stall a real-time
-                         * thread.
+                         * thing being measured, and worth nine per cent of
+                         * the blocks.  The journal is readable from any slot
+                         * and from the wire, which is the only honest way to
+                         * watch a pedal played from somewhere else.  Every
+                         * window rather than every fifth, because `log`
+                         * shows a screenful and a line half a minute old has
+                         * already scrolled away.
                          */
-                        static unsigned windows;
-                        if ((windows++ % 5u) == 0u) {
+                        {
                             /* Short on purpose: the journal is read on a
                                forty-column screen and a line that wraps is a
                                number nobody can read. */
@@ -3950,10 +3951,14 @@ int ag_main(int argc, char **argv)
                                    "v%u c%u w%u/%u", (unsigned)s_av_valves,
                                    (unsigned)s_av_cab, (unsigned)s_av_work,
                                    (unsigned)s_av_budget);
-                            ag_log(AG_LOG_INFO, "stomp",
-                                   "n%u late%u rsy%u ovr%u wb%u",
-                                   (unsigned)s_blocks, (unsigned)s_out.late,
-                                   (unsigned)s_out.resync, (unsigned)s_over,
+                            /* Lost blocks first and few of them: the screen
+                               is forty columns wide and a number cut in half
+                               reads as a smaller number, which is worse than
+                               no number at all. */
+                            ag_log(AG_LOG_INFO, "stomp", "rsy%u n%u",
+                                   (unsigned)s_out.resync, (unsigned)s_blocks);
+                            ag_log(AG_LOG_INFO, "stomp", "late%u ovr%u wb%u",
+                                   (unsigned)s_out.late, (unsigned)s_over,
                                    (unsigned)s_worst_busy);
                         }
                     }

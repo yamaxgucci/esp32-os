@@ -28,6 +28,7 @@
 #include "esp_log.h"
 #include "esp_memory_utils.h"
 #include "esp_partition.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -164,9 +165,42 @@ static esp_err_t handed_over(req_t *r)
     return result;
 }
 
+/*
+ * EVERY READ OF FLASH IS COUNTED, BECAUSE NOBODY SHOULD BE DOING IT.
+ *
+ * Maxim's rule, and it holds for reading as much as for writing: write a file
+ * rarely, then work from memory.  The reason is measured - a read from SPI
+ * flash turns the cache off for the whole chip, so a core fetching its code
+ * through that cache stops for as long as the read lasts, and the amplifier
+ * lost two blocks in five while the phone's page was being served.
+ *
+ * A quiet machine prints nothing here.  One that does not says how many reads
+ * and how many bytes, once a second, so the next one can be found instead of
+ * guessed at.
+ */
+static uint32_t volatile s_reads;
+static uint32_t volatile s_read_bytes;
+static int64_t           s_said_us;
+
+static void counted(size_t size)
+{
+    s_reads++;
+    s_read_bytes += (uint32_t)size;
+    const int64_t now = esp_timer_get_time();
+    if (s_said_us == 0 || now - s_said_us >= 1000000) {
+        const uint32_t n = s_reads;
+        const uint32_t b = s_read_bytes;
+        s_said_us = now;
+        s_reads = 0;
+        s_read_bytes = 0;
+        ESP_LOGI("flash", "%u reads, %u bytes in the last second", n, b);
+    }
+}
+
 esp_err_t __wrap_esp_partition_read(const esp_partition_t *partition,
                                     size_t src_offset, void *dst, size_t size)
 {
+    counted(size);
     if (stack_is_internal()) {
         return __real_esp_partition_read(partition, src_offset, dst, size);
     }
@@ -191,6 +225,7 @@ esp_err_t __wrap_esp_partition_read_raw(const esp_partition_t *partition,
                                         size_t src_offset, void *dst,
                                         size_t size)
 {
+    counted(size);
     if (stack_is_internal()) {
         return __real_esp_partition_read_raw(partition, src_offset, dst, size);
     }
