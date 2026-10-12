@@ -1891,10 +1891,25 @@ static uint32_t utf8_next(const uint8_t *p, uint32_t len, uint32_t *at)
 #define INLOG_PATH "C:\\PHONELOG.TXT"
 #define INLOG_CAP  (64u * 1024u)
 static uint32_t s_inlog_bytes;
+/*
+ * OFF UNLESS THE BOARD ASKS FOR IT: `[phone] inputlog = yes` in SYSTEM.CFG.
+ *
+ * The rule on this machine is that nothing writes to flash while it plays,
+ * and this was writing AND syncing on every key and every tap.  On the ESP32
+ * a flash write turns the cache off for the whole chip, so a knob turned on
+ * the phone stops both cores for as long as the erase lasts - which is what
+ * Maxim heard, and reported from the first day as "I touch the panel and the
+ * sound goes".
+ *
+ * What it was built for is still right (19 Sep: keep the input that hangs the
+ * board, because the journal dies with the reset).  That is a debugging
+ * session, asked for by name, not something every owner pays for.
+ */
+static int s_inlog_on;
 
 static void input_log(const char *line)
 {
-    if (line == NULL || !AG_HAS(ag_api()->fs, write)) {
+    if (!s_inlog_on || line == NULL || !AG_HAS(ag_api()->fs, write)) {
         return;
     }
     const uint32_t n = (uint32_t)strlen(line);
@@ -3850,6 +3865,9 @@ ag_err_t ag_driver_init(void)
         s.want_frame = true;
         if (cfg != NULL && AG_HAS(cfg, get_bool)) {
             s.want_frame = cfg->get_bool("phone.frame", true);
+            /* The write-ahead log of every key and tap: a debugging session,
+               and a flash write per keystroke, so it is asked for by name. */
+            s_inlog_on = cfg->get_bool("phone.inputlog", false) ? 1 : 0;
         }
         /*
          * `[phone] codec = light`: never ask for the thirteen kilobytes of

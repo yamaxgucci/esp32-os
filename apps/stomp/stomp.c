@@ -275,6 +275,12 @@ static uint32_t     s_worst_in;
  * one wait of 71 ms says nothing about the music.  So both are kept, and the
  * window pair is what a measurement reads.
  */
+/* Samples the converter sent at its own full scale, run and window. */
+static uint32_t     s_in_clip;
+static uint32_t     s_in_clip_win;
+/* The worst single pass through each stage in the window just ended. */
+static uint32_t     s_win_v_max;
+static uint32_t     s_win_c_max;
 static uint32_t     s_win_in;
 static uint32_t     s_win_busy;
 /* The last window's averages, for the journal: valves, cabinet, whole block. */
@@ -1446,7 +1452,14 @@ static void text_present(void)
 
 #define BANDS 8
 
-static void present(void)
+/* What the panel costs the machine, for the window just ended: how many
+   passes and how long they took.  The audio thread does not paint, so this
+   is time on the system core - but it is memory traffic the audio thread
+   competes with, which is why it is worth a number. */
+static uint32_t     s_paints;
+static uint32_t     s_paint_us;
+
+static void present_body(void)
 {
     int i;
     if (s_text) {
@@ -1533,6 +1546,15 @@ static void present(void)
  * playing it back.  The mark has already woken the painter, so there is
  * nothing to do here but let it.
  */
+/* Timed, so that what the panel costs is a number rather than an opinion. */
+static void present(void)
+{
+    const ag_time_t t0 = ag_micros();
+    present_body();
+    s_paint_us += (uint32_t)(ag_micros() - t0);
+    s_paints++;
+}
+
 static void present_now(void)
 {
     if (s_painter == NULL && s_on_screen) {
@@ -2653,6 +2675,21 @@ static AG_HOT void audio_block(void)
         float x = 0.0f, y;
         int   v;
         if (s_live) {
+            /*
+             * What the converter sent, before anything is done to it.
+             *
+             * "It gets worse the louder I play" has to be answered at the
+             * input first: a guitar that drives the codec into its own rail
+             * is already a square wave by the time the model sees it, and
+             * every counter in this pedal watches the output.  Full scale is
+             * counted, not approached: 32700 of 32768 is a sixth of a
+             * decibel from the end.
+             */
+            const int16_t raw = s_in[i * s_in_ch];
+            if (raw >= 32700 || raw <= -32700) {
+                s_in_clip++;
+                s_in_clip_win++;
+            }
             /* Left channel: a guitar is one string of wire, and a codec that
              * was opened in stereo sends the same thing twice or sends the
              * other jack - neither is worth summing in. */
@@ -2696,7 +2733,16 @@ static AG_HOT void audio_block(void)
         s_mono[i] = (int16_t)v;
     }
     s_amp_peak = peak;
-    s_us_valves += (uint32_t)(ag_micros() - t_valves);
+    {
+        /* Which stage the long block was in.  The averages cannot say: a
+           block that took sixteen milliseconds instead of six is one block in
+           a window of three hundred, and it disappears into the mean. */
+        const uint32_t took = (uint32_t)(ag_micros() - t_valves);
+        s_us_valves += took;
+        if (took > s_win_v_max) {
+            s_win_v_max = took;
+        }
+    }
     const ag_time_t t_ir = ag_micros();
     if (s_cab_thread != NULL) {
         /*
@@ -2734,7 +2780,13 @@ static AG_HOT void audio_block(void)
             s_stereo[2 * i + 1] = s_mono[i];
         }
     }
-    s_us_cab += (uint32_t)(ag_micros() - t_ir);
+    {
+        const uint32_t took = (uint32_t)(ag_micros() - t_ir);
+        s_us_cab += took;
+        if (took > s_win_c_max) {
+            s_win_c_max = took;
+        }
+    }
 
     /*
      * And whatever somebody else brought, in the pedal's effects loop: after
@@ -3988,8 +4040,22 @@ int ag_main(int argc, char **argv)
                             ag_log(AG_LOG_INFO, "stomp", "in%u/%u bz%u",
                                    (unsigned)s_win_in, (unsigned)s_worst_in,
                                    (unsigned)s_win_busy);
+                            ag_log(AG_LOG_INFO, "stomp", "pt%u %uus",
+                                   (unsigned)s_paints,
+                                   (unsigned)s_paint_us);
+                            ag_log(AG_LOG_INFO, "stomp", "inclip%u/%u",
+                                   (unsigned)s_in_clip_win,
+                                   (unsigned)s_in_clip);
+                            ag_log(AG_LOG_INFO, "stomp", "vmax%u cmax%u",
+                                   (unsigned)s_win_v_max,
+                                   (unsigned)s_win_c_max);
+                            s_in_clip_win = 0;
+                            s_win_v_max = 0;
+                            s_win_c_max = 0;
                             s_win_in = 0;
                             s_win_busy = 0;
+                            s_paints = 0;
+                            s_paint_us = 0;
                         }
                     }
                     if (!s_text) {

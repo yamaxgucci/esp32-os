@@ -1167,10 +1167,29 @@ window.addEventListener("keydown", (e) => {
   mods |= st.sticky;
 
   let hid = BY_CODE[e.code] || 0;
-  if (!hid && /^Key[A-Z]$/.test(e.code)) hid = K[e.code[3].toLowerCase()];
+  let latin = 0;
+  if (!hid && /^Key[A-Z]$/.test(e.code)) {
+    hid = K[e.code[3].toLowerCase()];
+    latin = e.code.charCodeAt(3);     /* 'A'..'Z' from the physical key */
+  }
   if (!hid && /^Digit[0-9]$/.test(e.code)) hid = K[e.code[5]];
 
-  const uni = (e.key && e.key.length === 1) ? e.key.codePointAt(0) : 0;
+  let uni = (e.key && e.key.length === 1) ? e.key.codePointAt(0) : 0;
+  /*
+   * The letter of the key that was pressed, not the letter the layout prints.
+   *
+   * On a Russian layout `e.key` for the key marked A is a Cyrillic character,
+   * which goes on the wire as its own codepoint and arrives at a console that
+   * cannot take it - so the digits worked and the letters did nothing, which
+   * is exactly how it was reported.  `e.code` names the physical key and is
+   * layout independent, so a letter key always sends its Latin letter and the
+   * shell can be typed at from any layout.  Anything a layout composes that is
+   * NOT on a letter key - accents, punctuation, a phone's own keyboard - still
+   * goes through as what it composed.
+   */
+  if (latin && (uni < 32 || uni > 126)) {
+    uni = e.shiftKey ? latin : (latin + 32);
+  }
   if (!hid && !uni) return;
 
   e.preventDefault();
