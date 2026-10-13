@@ -1124,7 +1124,17 @@ const char *ag_amp_model_name(int model)
  */
 static const uint8_t k_pots_jcm800[] = { AG_POT_DRIVE, AG_POT_BASS, AG_POT_MID,
                                          AG_POT_TREBLE, AG_POT_MASTER };
-static const uint8_t k_pots_gainamp[] = { AG_POT_DRIVE, AG_POT_GAIN,
+/*
+ * ONE PREAMP CONTROL, BECAUSE THESE AMPLIFIERS HAVE ONE.
+ *
+ * There were two here, DRIVE and GAIN, and Maxim asked what the first one was
+ * supposed to be: a Soldano SLO and a Bogner have a preamp gain and a master,
+ * and no front panel on either carries both.  GAIN is the real one - the
+ * attenuator between the stages, which is in the circuit - and DRIVE was the
+ * level into the first stage wearing a knob's name.  The fitted level stays
+ * where the match put it; what is not on the amplifier is not on the panel.
+ */
+static const uint8_t k_pots_gainamp[] = { AG_POT_GAIN,
                                           AG_POT_BASS, AG_POT_MID,
                                           AG_POT_TREBLE, AG_POT_MASTER };
 static const uint8_t k_pots_ts9[] = { AG_POT_DRIVE, AG_POT_TONE, AG_POT_MASTER };
@@ -1263,8 +1273,33 @@ void ag_amp_pot_apply(struct ag_amp_cfg *cfg, const struct ag_amp_cfg *fitted,
             cfg->tone_treble = p;
             break;
         case AG_POT_TONE:
-            /* The pedal's one control: its own network, not three of them. */
-            cfg->tone_mid = p;
+            /*
+             * The pedal's one control, and it is the output network - which is
+             * where this model already carries it (cfg.out_top_hz, fitted at
+             * 4 kHz from the pedal's own chirp response).
+             *
+             * It used to write `tone_mid`, and `tone_mid` is read only by a
+             * tone stack: the TS9 has none - ag_amp_tone_spec says so by
+             * returning nothing for it - so the number went nowhere and the
+             * knob turned against a dead stop.  Maxim found it by ear, which
+             * is the only way anything could have: nothing warns when a
+             * setting is written and never read.
+             *
+             * The corner moves either side of the fitted one, a factor of
+             * two and a half each way: 1.6 kHz with the knob down, 10 kHz
+             * with it up, and exactly the fitted 4 kHz at noon so a preset
+             * untouched is still the preset that was measured.  The SHAPE is
+             * the measured one - a resistor into a capacitor, first order -
+             * and the travel is an approximation, stated as one: the
+             * schematic's own values for that network were not in front of
+             * whoever wrote this model, and the capture only ever saw one
+             * position of the pot.
+             */
+            if (fitted->out_top_hz > 0.0f) {
+                cfg->out_top_hz = fitted->out_top_hz *
+                                  (p <= 0.5f ? (0.4f + 1.2f * p)
+                                             : (1.0f + 3.0f * (p - 0.5f)));
+            }
             break;
         case AG_POT_MASTER:
             /*

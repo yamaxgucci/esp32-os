@@ -1450,6 +1450,76 @@ done:
  * the wrong corner rather than with no sound.  That is exactly how a chain would
  * fail if ag_amp_spec ever handed stage 2 the netlist for stage 1.
  */
+/*
+ * EVERY KNOB ON EVERY MODEL HAS TO CHANGE THE SOUND.
+ *
+ * The TS9's TONE did not, for as long as the model has existed: it wrote
+ * `tone_mid`, which only a tone stack reads, and the TS9 has no stack - so the
+ * number was stored and never looked at.  Nothing in the build, in the tests
+ * or in the panel said a word; Maxim found it by turning the knob and
+ * listening, which was the only instrument that could.
+ *
+ * So: for each model, each pot it puts on its panel is swept from a quarter to
+ * three quarters and the output has to move.  A knob that does nothing fails
+ * here from now on, whatever the reason.
+ */
+static void test_every_pot_does_something(void)
+{
+    ag_ckt_t    *k = (ag_ckt_t *)malloc(sizeof(ag_ckt_t));
+    float       *tab = (float *)malloc(sizeof(float) * AG_AMP_TAB_FLOATS);
+    ag_amp_t    *a = (ag_amp_t *)malloc(sizeof(ag_amp_t));
+    float       *probe = (float *)malloc(sizeof(float) * PROBE_N);
+    ag_amp_cfg_t fitted, cfg;
+    int          m, i, pot;
+
+    if (k == 0 || tab == 0 || a == 0 || probe == 0) {
+        AG_CHECK(0);
+        goto done;
+    }
+    ag_amp_probe_pluck(probe, PROBE_N, TFS);
+
+    for (m = 0; m < AG_AMP_MODEL_N; m++) {
+        const int n = ag_amp_pot_count(m);
+        AG_CHECK(n > 0);
+        ag_amp_model(&fitted, m, TFS);
+        fitted.os = 1;
+        fitted.adaa = 0;
+        AG_CHECK_INT(ag_amp_build(a, k, &fitted, tab, 0, probe, PROBE_N), 0);
+
+        for (pot = 0; pot < n; pot++) {
+            const int id = ag_amp_pot_id(m, pot);
+            double    sum[2];
+            int       pass;
+
+            AG_CHECK(id != AG_POT_NONE);
+            AG_CHECK(ag_amp_pot_name(m, pot)[0] != 0);
+            for (pass = 0; pass < 2; pass++) {
+                cfg = fitted;
+                cfg.pot[id] = pass == 0 ? 0.25f : 0.75f;
+                ag_amp_pot_apply(&cfg, &fitted, m);
+                AG_CHECK_INT(ag_amp_set_voicing(a, &cfg), 0);
+                ag_amp_reset(a);
+                sum[pass] = 0.0;
+                for (i = 0; i < 2000 && i < PROBE_N; i++) {
+                    const double y = (double)ag_amp_tick(a, probe[i]);
+                    sum[pass] += y * y;
+                }
+            }
+            /* A thousandth of the energy is far below anything audible and
+             * still a hundred times what float noise could produce, so a knob
+             * that fails this is not subtle - it is disconnected. */
+            AG_CHECK(fabs(sum[0] - sum[1]) >
+                     0.001 * (fabs(sum[0]) + fabs(sum[1])));
+        }
+    }
+
+done:
+    free(k);
+    free(tab);
+    free(a);
+    free(probe);
+}
+
 static void test_models(void)
 {
     ag_ckt_t    *k = (ag_ckt_t *)malloc(sizeof(ag_ckt_t));
@@ -2375,6 +2445,7 @@ void run_tube_tests(void)
     test_knobs_keep_state();
     test_voicing_banks();
     test_models();
+    test_every_pot_does_something();
     test_cold_clipper();
     test_model_gain_order();
     test_preset_models();
