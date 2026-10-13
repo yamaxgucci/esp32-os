@@ -95,6 +95,8 @@ ArgonOS
                            add -big for a speed number (14 checks)
   python tools/netfixture.py serve   the same servers, to try things by hand
   argon check              local CI: host tests, firmware, apps, relocations
+  argon remote CMD ...     run any argon command on the test PC with this
+                           working tree (docs\16-test-pc.md); -Probe: is it up
   argon target             which chip the firmware is built for
   argon target esp32c6     the RISC-V board (docs\12-esp32-c6-lcd.md)
   argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
@@ -801,6 +803,15 @@ switch ($Command.ToLowerInvariant()) {
         # to each other, measured with apps\link - the cluster's wire, with no
         # second board and nothing pretending to be a node.
         Invoke-Ps1 (Join-Path $PSScriptRoot 'nodetest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'remote' {
+        # Any argon command on the test PC, with this working tree as it is
+        # (docs\16-test-pc.md).  Exit 3: the PC does not answer.  The array
+        # splat on purpose: every word, -Scenario included, goes through to
+        # the PC as it was typed, which is exactly what binds positionally.
+        & (Join-Path $PSScriptRoot 'remote.ps1') @Rest
         exit $LASTEXITCODE
     }
 
