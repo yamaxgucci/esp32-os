@@ -2496,23 +2496,22 @@ static const uint8_t *page_in_memory(uint32_t size)
     }
 
     /*
-     * Internal SRAM first, and the arena only if it will not give it.
+     * THE ARENA, NEVER THE INTERNAL SRAM.
      *
-     * On this part the external RAM is read through the same cache the
-     * processor fetches code through, so copying seventeen kilobytes out of
-     * PSRAM throws somebody else's code out of it - a quieter version of the
-     * flash read this is meant to avoid.  Internal memory is not cached at
-     * all: nothing is disturbed by reading it.
+     * It was taken from internal memory first, on the theory that reading
+     * PSRAM goes through the same cache the processor fetches code through.
+     * That is true and it does not matter: this is read once per request, by
+     * a driver, while nothing is playing.
+     *
+     * What does matter is who else wants those bytes.  The amplifier's valve
+     * curves are 48 KB and must be in internal SRAM - outside it the chain
+     * costs twice as much, measured - and this page is eighteen.  A phone
+     * that had opened the page once left the pedal started afterwards with
+     * too little to put its curves in, and Maxim heard an amplifier that had
+     * been clean the day before.  Eighteen kilobytes of a four-megabyte arena
+     * costs nobody anything.
      */
-    ag_meminfo_t fast;
-    ag_meminfo(&fast);
-    uint8_t *buf = NULL;
-    if (fast.fast_free > (size_t)size * 3u) {
-        buf = (uint8_t *)ag_malloc_caps(size, AG_MEM_FAST);
-    }
-    if (buf == NULL) {
-        buf = (uint8_t *)ag_malloc(size);
-    }
+    uint8_t *buf = (uint8_t *)ag_malloc(size);
     if (buf == NULL) {
         return NULL;
     }

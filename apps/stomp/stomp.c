@@ -276,6 +276,9 @@ static uint32_t     s_worst_in;
  * window pair is what a measurement reads.
  */
 /* Samples the converter sent at its own full scale, run and window. */
+/* `stats`: the counters into the journal every window.  Off, because writing
+   them costs the audio thread the thing they are there to measure. */
+static int          s_journal;
 static uint32_t     s_in_clip;
 static uint32_t     s_in_clip_win;
 /* The worst single pass through each stage in the window just ended. */
@@ -3525,6 +3528,10 @@ int ag_main(int argc, char **argv)
              * nothing.
              */
             cab_path = argv[++i];
+        } else if (strcmp(argv[i], "stats") == 0) {
+            /* The counters into the journal, for a measurement.  Not for
+               playing: see the journal block in the loop. */
+            s_journal = 1;
         } else if (strcmp(argv[i], "quiet") == 0) {
             /*
              * No periodic status while playing.
@@ -4005,9 +4012,19 @@ int ag_main(int argc, char **argv)
                      * one that means a whole block was lost from the clock,
                      * and `drop` that one was thrown away.
                      */
-                    {
+                    if (s_journal) {
                         /*
-                         * The same numbers in the journal, every window.
+                         * The same numbers in the journal, every window, and
+                         * ONLY when `stats` was asked for.
+                         *
+                         * Writing them unasked was a regression Maxim heard
+                         * before any counter of mine showed it: five journal
+                         * lines every two seconds, written from the audio
+                         * thread itself, in a system where a journal line is
+                         * already known to stall a real-time thread.  An
+                         * instrument that changes what it measures is worse
+                         * than no instrument, and this one was left switched
+                         * on for everybody.
                          *
                          * The console they are printed on belongs to this
                          * slot, and reading it means standing in this slot,
