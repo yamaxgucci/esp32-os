@@ -720,6 +720,14 @@ def main():
                          "flash.  For an image that does not fit the arena and "
                          "is therefore running entirely from flash at half "
                          "speed")
+    ap.add_argument("--hot-cflags", default="",
+                    help="compiler flags for the --hot-src files instead of "
+                         "--cflags.  An image is split into a half that must "
+                         "be fast and a half that must be small, and those "
+                         "want opposite flags: the amplifier's inner loop at "
+                         "-O2 against -Os is worth a fifth of its time, and "
+                         "-O2 over the whole image makes it too big to load. "
+                         "Empty means --cflags for everything, as before.")
     ap.add_argument("--hot-src", action="append", default=[],
                     help="source file (by basename) whose whole contents go in "
                          "the hot part, as though every function in it were "
@@ -842,6 +850,18 @@ def main():
         # nowhere near each other, which medany cannot express.
         args.cflags += " -mcmodel=medlow"
 
+    if args.hot_cflags:
+        # The architecture flags this tool adds above belong to BOTH halves:
+        # they say what machine the code is for, not how hard to optimise.
+        # Without -mlongcalls on the hot half the link failed with "dangerous
+        # relocation: call target out of range" - the hot code sits in the
+        # arena and the cold in flash, which no short call can span.
+        for flag in ("-fno-builtin", "-mlongcalls", "-mcmodel=medany",
+                     "-mcmodel=medlow", "-march=rv32imc_zicsr_zifencei",
+                     "-mabi=ilp32"):
+            if flag in args.cflags and flag not in args.hot_cflags:
+                args.hot_cflags += " " + flag
+
     workdir = tempfile.mkdtemp(prefix="mkaxe-")
     try:
         objects = []
@@ -852,7 +872,14 @@ def main():
             # Unique names: LVGL (and any multi-dir tree) repeats basenames.
             obj = os.path.join(workdir, "s%d.o" % i)
             is_cxx = src.lower().endswith(CXX_SUFFIXES)
-            cmd = [args.gxx if is_cxx else args.gcc, "-c"] + args.cflags.split()
+            # The hot half gets its own flags where the caller asked for them:
+            # fast for the inner loop, small for everything else.
+            hot_names = {os.path.basename(h) for h in args.hot_src}
+            flags = (args.hot_cflags
+                     if (args.hot_cflags and
+                         os.path.basename(src) in hot_names)
+                     else args.cflags)
+            cmd = [args.gxx if is_cxx else args.gcc, "-c"] + flags.split()
             if is_cxx:
                 cmd += args.cxxflags.split()
             for inc in args.include:

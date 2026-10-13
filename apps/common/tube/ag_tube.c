@@ -214,7 +214,19 @@ void ag_tube_reset(ag_tube_t *tb)
 
 int ag_tube_set_adaa(ag_tube_t *tb, int on)
 {
-    if (tb == 0 || (on && tb->h == 0)) {
+    /*
+     * The running sums are a shortcut, not a requirement.
+     *
+     * integ_inside uses them only for a span wider than walk_max cells and
+     * walks every other span, which is every span a guitar ever makes: the
+     * counters put the shortcut's share at nought per cent at every level
+     * from a whisper to full scale.  Refusing the antialiasing without them
+     * cost a stage a third of its table for a path nothing takes - and on the
+     * SLO, whose four stages want 96 KB against 80 of internal memory, that
+     * third is the difference between the curves being fast and being in
+     * external RAM at twice the price.
+     */
+    if (tb == 0) {
         return 0;
     }
     tb->adaa = on ? 1u : 0u;
@@ -657,6 +669,38 @@ static float hat(const ag_tube_t *tb, float p)
  * noise of constant size, so it grows relative to the music as the music
  * decays, and it was found by ear on a fading note (rake 12 in docs/08).
  */
+/*
+ * ONE OVER A POSITIVE FLOAT, WITHOUT CALLING THE DIVIDER THAT IS NOT THERE.
+ *
+ * This processor has no divide instruction, so `a / b` on it is a call into
+ * __divsf3 - and the antialiasing divides once for every sample whose span
+ * crossed a cell, which at anything but a whisper is nearly every sample.
+ *
+ * Newton on a seed taken from the exponent.  The seed is five per cent out,
+ * so each pass squares the error: 2.5e-3, then 6.5e-6, then 4e-11.  Two
+ * passes were not enough and the tests said so - a span entirely outside the
+ * table has to average to the edge value exactly, and at a few hundred volts
+ * 6.5e-6 of that is a millivolt.  Three, and the last bit of the float is the
+ * only thing left.  Only ever called with a span length: positive, and far
+ * from the denormals by construction.
+ */
+static AG_HOT float recip(float x)
+{
+    union {
+        float    f;
+        uint32_t u;
+    } v;
+    float r;
+
+    v.f = x;
+    v.u = 0x7ef311c3u - v.u;    /* the usual seed: halve the exponent's sign */
+    r = v.f;
+    r = r * (2.0f - x * r);
+    r = r * (2.0f - x * r);
+    r = r * (2.0f - x * r);
+    return r;
+}
+
 static float integ_inside(const ag_tube_t *tb, float a, float b)
 {
     int   i0 = (int)a, i1 = (int)b, i;
@@ -750,7 +794,7 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
         if (i0 == i1) {
             return lin(tb, i0, (a + b) * 0.5f - (float)i0);
         }
-        return integ_inside(tb, a, b) / tot;
+        return integ_inside(tb, a, b) * recip(tot);
     }
 
     if (a < 0.0f) {
@@ -769,7 +813,7 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
     if (ib > ia) {
         acc += integ_inside(tb, ia, ib);
     }
-    return acc / tot;
+    return acc * recip(tot);
 }
 
 /*

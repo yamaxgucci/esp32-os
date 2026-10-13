@@ -279,6 +279,8 @@ static uint32_t     s_worst_in;
 /* `stats`: the counters into the journal every window.  Off, because writing
    them costs the audio thread the thing they are there to measure. */
 static int          s_journal;
+/* `noadaa`: the antialiasing off, to measure what it costs.  Never to play. */
+static int          s_no_adaa;
 static uint32_t     s_in_clip;
 static uint32_t     s_in_clip_win;
 /* The worst single pass through each stage in the window just ended. */
@@ -333,7 +335,9 @@ static uint32_t     s_say_ms;  /* when the console last heard how it goes */
 static char         s_hdr_shown[96]; /* what the top strip last said */
 static int          s_tab_n;   /* points the curve buffer is sized for */
 static int          s_tab_fast; /* and whether it got internal SRAM */
-static int          s_tab_inside; /* how many stages' curves are in SRAM */
+static int          s_tab_inside;
+/* Arrays per stage: 3 with the running sums, 2 without. */
+static int          s_tab_parts = 3; /* how many stages' curves are in SRAM */
 static int          s_tab_stages; /* and for how many stages */
 static char         s_status[64]; /* one line about the sound, or empty */
 static ag_amp_cfg_t s_cfg;
@@ -2057,9 +2061,25 @@ static void tab_release(void)
 
 static int tab_reserve(int want, int stages)
 {
-    const size_t floats = (size_t)stages * 3u * (size_t)want;
+    /*
+     * Three arrays a stage, or two when three will not fit the fast memory.
+     *
+     * The third is the running sums, and they buy one thing: a span wider
+     * than walk_max cells costs a subtraction rather than a walk.  Measured
+     * on the board that is five per cent, and in practice nothing - no span a
+     * guitar makes is that wide, and the counters put the shortcut's share at
+     * nought at every level.  Internal memory is worth far more: the SLO's
+     * four stages are 96 KB against about 80 free, so with the sums its
+     * curves go to external RAM and every lookup pays the cache.  Without
+     * them it is 64 KB, it fits, and the chain is half the price.
+     *
+     * Tried in that order, so a board with room keeps the shortcut and only
+     * one that is short gives it up - and it says which in the line below.
+     */
+    const int    parts = s_tab_parts;
+    const size_t floats = (size_t)stages * (size_t)parts * (size_t)want;
     const size_t bytes = floats * sizeof(float);
-    const size_t per_stage = 3u * (size_t)want * sizeof(float);
+    const size_t per_stage = (size_t)parts * (size_t)want * sizeof(float);
     int          i;
 
     if (s_tab_n >= want && s_tab_stages >= stages &&
@@ -2142,9 +2162,10 @@ static int tab_reserve(int want, int stages)
             }
         }
         ag_printf("stomp: %u KB of curves, %d of %d stages in internal "
-                  "memory, %s (%u KB fast free, largest %u KB)\n",
+                  "memory, %s%s (%u KB fast free, largest %u KB)\n",
                   (unsigned)(bytes / 1024u), s_tab_inside, stages,
                   s_tab_split ? "one block a stage" : "one block",
+                  parts == 3 ? "" : ", no running sums",
                   (unsigned)(mem.fast_free / 1024u),
                   (unsigned)((s_tab_fast ? bytes : probe) / 1024u));
     }
@@ -2581,11 +2602,45 @@ static int amp_from_model(int model)
      * JCM800 has two stages and wants 48 KB.
      */
     ag_amp_model(&cfg, model, (float)RATE);
-    if (amp_reserve() != 0 ||
-        tab_reserve(AG_AMP_TAB_N,
-                    cfg.n_stages > 0 ? cfg.n_stages : AG_AMP_STAGES) != 0) {
-        status("no room for the chain");
-        return -1;
+    if (s_no_adaa) {
+        cfg.adaa = 0;        /* measuring what it costs; see `noadaa` */
+    }
+    {
+        /*
+         * Three arrays a stage, and two if that is what it takes to keep the
+         * curves in fast memory.
+         *
+         * The third is the running sums; see tab_reserve for what they buy
+         * and what they cost.  The order matters: a board with room keeps
+         * them, and only one that is short gives them up - the SLO's four
+         * stages are 96 KB with and 64 without, against about 80 free.
+         */
+        const int stages = cfg.n_stages > 0 ? cfg.n_stages : AG_AMP_STAGES;
+        if (amp_reserve() != 0) {
+            status("no room for the chain");
+            return -1;
+        }
+        s_tab_parts = 3;
+        if (tab_reserve(AG_AMP_TAB_N, stages) != 0) {
+            status("no room for the chain");
+            return -1;
+        }
+        if (s_tab_inside < stages) {
+            const int was_inside = s_tab_inside;
+            s_tab_parts = 2;
+            tab_release();
+            if (tab_reserve(AG_AMP_TAB_N, stages) != 0 ||
+                s_tab_inside <= was_inside) {
+                /* No better without them: take the three back. */
+                s_tab_parts = 3;
+                tab_release();
+                if (tab_reserve(AG_AMP_TAB_N, stages) != 0) {
+                    status("no room for the chain");
+                    return -1;
+                }
+            }
+        }
+        cfg.tab_hat = (uint8_t)(s_tab_parts == 3 ? 1 : 0);
     }
     scratch = (ag_ckt_t *)ag_malloc(sizeof(ag_ckt_t));
     probe = (float *)ag_malloc((size_t)probe_n * sizeof(float));
@@ -2969,6 +3024,9 @@ static void set_model(int m)
         return;
     }
     ag_amp_model(&s_cfg, s_model, (float)RATE);
+    if (s_no_adaa) {
+        s_cfg.adaa = 0;      /* measuring what it costs; see `noadaa` */
+    }
     s_fit = s_cfg;
     ag_amp_pot_apply(&s_cfg, &s_fit, s_model);
     if (s_sel >= item_count()) {
@@ -3537,6 +3595,12 @@ int ag_main(int argc, char **argv)
              * nothing.
              */
             cab_path = argv[++i];
+        } else if (strcmp(argv[i], "noadaa") == 0) {
+            /* For measuring only: what the antialiasing costs, on the board,
+               in the chain rather than in a bench of its own.  It is what
+               keeps the model from making noise that is not in the amplifier,
+               so this is never a setting to play on. */
+            s_no_adaa = 1;
         } else if (strcmp(argv[i], "stats") == 0) {
             /* The counters into the journal, for a measurement.  Not for
                playing: see the journal block in the loop. */

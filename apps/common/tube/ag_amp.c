@@ -82,6 +82,7 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
      */
     cfg->os = 4;
     cfg->adaa = 1;
+    cfg->tab_hat = 1;   /* the running sums, unless the caller is short */
     cfg->blocking = 1;
     /* Full, which is the circuit; see ag_amp_cfg_t.block_depth. */
     cfg->block_depth = 1.0f;
@@ -1793,9 +1794,10 @@ static int bake_all(ag_amp_t *a, ag_ckt_t *scratch, float *tab,
          * memory.  Nothing about the arithmetic changes - the same floats sit
          * in the same order, in four places instead of one.
          */
-        float *t = tabs ? tabs[i] : tab + (3 * i) * a->tab_n;
-        float *h = t + n;
-        float *g = t + 2 * a->tab_n;
+        const int parts = a->cfg.tab_hat ? 3 : 2;
+        float    *t = tabs ? tabs[i] : tab + (parts * i) * a->tab_n;
+        float    *h = a->cfg.tab_hat ? t + n : 0;
+        float    *g = t + (a->cfg.tab_hat ? 2 : 1) * a->tab_n;
         ag_tube_init(&a->tube[i]);
         if (a->linear[i]) {
             continue; /* no table: gain and filters only */
@@ -2617,18 +2619,32 @@ static int preset_load_common(ag_amp_t *a, const void *buf, uint32_t n,
     in = (const float *)(const void *)(h + 1);
     for (i = 0; i < a->n; i++) {
         const int nn = a->tab_n;
-        float    *d = tabs ? tabs[i] : tab + (3 * i) * nn;
+        const int parts = a->cfg.tab_hat ? 3 : 2;
+        float    *d = tabs ? tabs[i] : tab + (parts * i) * nn;
         int       k;
-        for (k = 0; k < 3 * nn; k++) {
+        /* The file always carries three arrays; what is attached may be two.
+         * The curve first, then the grid current - the running sums in
+         * between are skipped when this chain is not keeping them. */
+        for (k = 0; k < nn; k++) {
             d[k] = in[(3 * i) * nn + k];
+        }
+        for (k = 0; k < nn; k++) {
+            d[(parts - 1) * nn + k] = in[(3 * i) * nn + 2 * nn + k];
+        }
+        if (parts == 3) {
+            for (k = 0; k < nn; k++) {
+                d[nn + k] = in[(3 * i) * nn + nn + k];
+            }
         }
         ag_tube_init(&a->tube[i]);
         if (!h->has_table[i]) {
             a->linear[i] = 1;
             continue;
         }
-        if (ag_tube_attach(&a->tube[i], d, d + nn, d + 2 * nn, nn, h->axis_lo[i],
-                           h->axis_hi[i]) != 0) {
+        if (ag_tube_attach(&a->tube[i], d,
+                           a->cfg.tab_hat ? d + nn : 0,
+                           d + (a->cfg.tab_hat ? 2 : 1) * nn, nn,
+                           h->axis_lo[i], h->axis_hi[i]) != 0) {
             return -1;
         }
         /* The bake knew these and the tables do not carry them: the operating

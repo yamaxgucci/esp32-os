@@ -509,6 +509,20 @@ typedef struct ag_amp_cfg {
      * inside that bound the fit follows the signal.
      */
     float axis_tol;
+    /*
+     * Whether a stage's table carries the running sums (three arrays a stage)
+     * or only the curve and the grid current (two).
+     *
+     * The sums buy one thing: a span wider than walk_max cells costs a
+     * subtraction instead of a walk.  Measured on the board, that is worth
+     * five per cent - and nothing at all in practice, because no span a
+     * guitar makes is that wide.  Two arrays instead of three is 16 KB a
+     * stage instead of 24, which is what decides whether four stages live in
+     * internal memory or in external, and THAT is worth half the chain.
+     *
+     * 1 by default: the caller that is short of memory asks for 0.
+     */
+    uint8_t tab_hat;
 
     /*
      * Explicit axes, one pair per stage, used instead of fitting when hi > lo.

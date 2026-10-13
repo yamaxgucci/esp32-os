@@ -133,6 +133,14 @@ def command_for(app, defaults, extra_cflags, target_pair, forced_gcc):
         cmd += ["--split-hot"]
         for src in app.get("hot_src", []):
             cmd += ["--hot-src", src]
+        # And the hot half may be compiled differently from the cold one,
+        # because they want opposite things: the inner loop wants speed and
+        # the rest wants to be small.  `hot_cflags` in apps.json.
+        hot_cflags = app.get("hot_cflags", "")
+        if hot_cflags:
+            if extra_cflags:
+                hot_cflags = (hot_cflags + " " + extra_cflags).strip()
+            cmd += ["--hot-cflags", hot_cflags]
     if app.get("icon"):
         # A program's own face, carried in its file (mkaxe --icon).  Kept in
         # apps.json beside its sources because that is where everything else
