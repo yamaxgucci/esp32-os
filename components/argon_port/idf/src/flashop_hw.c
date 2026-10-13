@@ -182,10 +182,13 @@ static uint32_t volatile s_reads;
 static uint32_t volatile s_read_bytes;
 static int64_t           s_said_us;
 
-static void counted(size_t size)
+static const esp_partition_t *s_last_part;
+
+static void counted(size_t size, const esp_partition_t *part)
 {
     s_reads++;
     s_read_bytes += (uint32_t)size;
+    s_last_part = part;
     const int64_t now = esp_timer_get_time();
     if (s_said_us == 0 || now - s_said_us >= 1000000) {
         const uint32_t n = s_reads;
@@ -193,14 +196,17 @@ static void counted(size_t size)
         s_said_us = now;
         s_reads = 0;
         s_read_bytes = 0;
-        ESP_LOGI("flash", "%u reads, %u bytes in the last second", n, b);
+        ESP_LOGI("flash", "%u reads, %u bytes in the last second (%s)", n, b,
+                 (s_last_part != NULL && s_last_part->label[0] != 0)
+                     ? s_last_part->label
+                     : "?");
     }
 }
 
 esp_err_t __wrap_esp_partition_read(const esp_partition_t *partition,
                                     size_t src_offset, void *dst, size_t size)
 {
-    counted(size);
+    counted(size, partition);
     if (stack_is_internal()) {
         return __real_esp_partition_read(partition, src_offset, dst, size);
     }
@@ -225,7 +231,7 @@ esp_err_t __wrap_esp_partition_read_raw(const esp_partition_t *partition,
                                         size_t src_offset, void *dst,
                                         size_t size)
 {
-    counted(size);
+    counted(size, partition);
     if (stack_is_internal()) {
         return __real_esp_partition_read_raw(partition, src_offset, dst, size);
     }

@@ -282,6 +282,9 @@ static int          s_journal;
 static uint32_t     s_in_clip;
 static uint32_t     s_in_clip_win;
 /* The worst single pass through each stage in the window just ended. */
+/* And the worst of the whole run, which is what the end reports. */
+static uint32_t     s_run_v_max;
+static uint32_t     s_run_c_max;
 static uint32_t     s_win_v_max;
 static uint32_t     s_win_c_max;
 static uint32_t     s_win_in;
@@ -2745,6 +2748,9 @@ static AG_HOT void audio_block(void)
         if (took > s_win_v_max) {
             s_win_v_max = took;
         }
+        if (took > s_run_v_max) {
+            s_run_v_max = took;
+        }
     }
     const ag_time_t t_ir = ag_micros();
     if (s_cab_thread != NULL) {
@@ -2788,6 +2794,9 @@ static AG_HOT void audio_block(void)
         s_us_cab += took;
         if (took > s_win_c_max) {
             s_win_c_max = took;
+        }
+        if (took > s_run_c_max) {
+            s_run_c_max = took;
         }
     }
 
@@ -4165,6 +4174,20 @@ int ag_main(int argc, char **argv)
     }
     if (s_sound) {
         ag_pcm_close(&s_out);
+        /*
+         * The worst single pass through each stage, said once, at the end.
+         *
+         * The averages fit and the sound still breaks, so the block that did
+         * not fit is the whole question - and there is no way to watch for it
+         * as it happens: printing a line costs more than a 64-frame block, so
+         * an instrument that reports while it runs becomes the fault it is
+         * looking for.  Counting is free, and saying it afterwards is free.
+         */
+        ag_printf("stomp: worst pass - valves %u us, cabinet %u us, of a "
+                  "%u us block (worst busy %u)\n",
+                  (unsigned)s_run_v_max, (unsigned)s_run_c_max,
+                  (unsigned)((s_chunk * 1000000u) / RATE),
+                  (unsigned)s_worst_busy);
         ag_printf("stomp: %u samples over the rail%s\n", (unsigned)s_clipped,
                   s_clipped > 0u ? " - turn the master down" : "");
     }
