@@ -2168,7 +2168,7 @@ static int apply_cfg(ag_amp_t *a, const ag_amp_cfg_t *cfg, int keep)
      * costs.
      */
     if (keep) {
-        float z[AMP_CHAINS][AG_BIQ_MAX][4];
+        float z[AMP_CHAINS][AG_BIQ_MAX][2];
         int   was[AMP_CHAINS];
         int   c, j;
 
@@ -2176,10 +2176,8 @@ static int apply_cfg(ag_amp_t *a, const ag_amp_cfg_t *cfg, int keep)
             const ag_biq_chain_t *ch = chain_at(a, c);
             was[c] = ch->n;
             for (j = 0; j < ch->n; j++) {
-                z[c][j][0] = ch->s[j].x1;
-                z[c][j][1] = ch->s[j].x2;
-                z[c][j][2] = ch->s[j].y1;
-                z[c][j][3] = ch->s[j].y2;
+                z[c][j][0] = ch->s[j].z1;
+                z[c][j][1] = ch->s[j].z2;
             }
         }
         design(a);
@@ -2187,10 +2185,8 @@ static int apply_cfg(ag_amp_t *a, const ag_amp_cfg_t *cfg, int keep)
             ag_biq_chain_t *ch = chain_at(a, c);
             const int       lim = ch->n < was[c] ? ch->n : was[c];
             for (j = 0; j < lim; j++) {
-                ch->s[j].x1 = z[c][j][0];
-                ch->s[j].x2 = z[c][j][1];
-                ch->s[j].y1 = z[c][j][2];
-                ch->s[j].y2 = z[c][j][3];
+                ch->s[j].z1 = z[c][j][0];
+                ch->s[j].z2 = z[c][j][1];
             }
         }
     } else {

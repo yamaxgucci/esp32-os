@@ -46,14 +46,23 @@
 #define AG_BIQ_MAX 8
 
 /*
- * Direct form I.  Transposed direct form II is quieter by a bit or two, and
- * this is not the place for it: a 7 Hz high pass at 22 kHz puts its pole at
- * 0.998, where what matters is that the coefficients are exact rather than that
- * the state is small, and DF1 keeps the coefficient error where it can be seen.
+ * TRANSPOSED DIRECT FORM II, FOR THE MEMORY RATHER THAN FOR THE NOISE.
+ *
+ * This said direct form I, and the reason given was numerical: a 7 Hz high
+ * pass at 22 kHz has its pole at 0.998, and DF1 keeps the coefficient error
+ * where it can be seen.  That argument is about coefficient quantisation,
+ * which is the same in both forms when the coefficients are floats - and the
+ * arithmetic is the same count either way.  What is not the same is the
+ * memory: DF1 carries four state words and touches all eight of them every
+ * sample, four loads and four stores; this carries two.
+ *
+ * On a chip whose FPU answers in four cycles and whose loop is one long
+ * dependency, those four words were measured - see the note in ag_amp.c on
+ * what each edit to this chain was worth.
  */
 typedef struct ag_biq {
     float b0, b1, b2, a1, a2;
-    float x1, x2, y1, y2;
+    float z1, z2;
 } ag_biq_t;
 
 typedef struct ag_biq_chain {

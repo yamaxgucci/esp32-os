@@ -93,10 +93,8 @@ void ag_biq_reset(ag_biq_t *s)
     if (s == 0) {
         return;
     }
-    s->x1 = 0.0f;
-    s->x2 = 0.0f;
-    s->y1 = 0.0f;
-    s->y2 = 0.0f;
+    s->z1 = 0.0f;
+    s->z2 = 0.0f;
 }
 
 float ag_biq_hp1(ag_biq_t *s, float fs, float f0)
@@ -243,12 +241,9 @@ AG_HOT float ag_biq_tick(ag_biq_t *s, float x)
     if (s == 0) {
         return x;
     }
-    y = s->b0 * x + s->b1 * s->x1 + s->b2 * s->x2 - s->a1 * s->y1 -
-        s->a2 * s->y2;
-    s->x2 = s->x1;
-    s->x1 = x;
-    s->y2 = s->y1;
-    s->y1 = y;
+    y = s->b0 * x + s->z1;
+    s->z1 = s->b1 * x - s->a1 * y + s->z2;
+    s->z2 = s->b2 * x - s->a2 * y;
     return y;
 }
 
@@ -304,12 +299,9 @@ AG_HOT float ag_biq_chain_tick(ag_biq_chain_t *c, float x)
     n = c->n;
     for (i = 0; i < n; i++) {
         ag_biq_t   *s = &c->s[i];
-        const float y = s->b0 * x + s->b1 * s->x1 + s->b2 * s->x2 -
-                        s->a1 * s->y1 - s->a2 * s->y2;
-        s->x2 = s->x1;
-        s->x1 = x;
-        s->y2 = s->y1;
-        s->y1 = y;
+        const float y = s->b0 * x + s->z1;
+        s->z1 = s->b1 * x - s->a1 * y + s->z2;
+        s->z2 = s->b2 * x - s->a2 * y;
         x = y;
     }
     return x;
