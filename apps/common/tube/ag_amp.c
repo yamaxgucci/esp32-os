@@ -2263,14 +2263,14 @@ static AG_HOT float run_stages(ag_amp_t *a, float v)
     if (a->tube[0].t != 0) {
         v = ag_tube_tick(&a->tube[0], v);
     }
-    a->tap[0] = v;
+    AG_AMP_TAP(a, 0, v);
     for (i = 1; i < a->n; i++) {
         v = ag_biq_chain_tick(&a->pre[i], v) * a->gain[i];
         v = ag_biq_chain_tick(&a->voice[i], v) * a->vtrim[i];
         if (a->tube[i].t != 0) {
             v = ag_tube_tick(&a->tube[i], v);
         }
-        a->tap[i] = v;
+        AG_AMP_TAP(a, i, v);
     }
     return v;
 }

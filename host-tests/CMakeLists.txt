@@ -402,6 +402,14 @@ foreach(target argon_tests ckt_smoke ckt_play ir_check ckt_exact tube_render
     target_compile_definitions(${target} PRIVATE AG_TUBE_STATS=1)
 endforeach()
 
+# And what each stage handed on, for the tool that draws it.  Same reasoning
+# as the counters above: a store per stage per oversampled sample, and on a
+# board nothing reads them - sixteen stores a sample at four stages and four
+# times oversampling, for a number that never leaves the chip.
+foreach(target argon_tests tube_render ckt_play ckt_exact)
+    target_compile_definitions(${target} PRIVATE AG_AMP_TAPS=1)
+endforeach()
+
 foreach(target argon_tests vtdump cchost pixband_sample engine_smoke
         synth_smoke ckt_smoke ckt_play ir_check wavdiff wavrate ckt_exact
         tube_render)

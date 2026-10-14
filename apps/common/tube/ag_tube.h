@@ -266,6 +266,13 @@ typedef struct ag_tube {
     uint8_t have_prev;
     float   prev_p; /* previous input, in index units, unclamped */
     /*
+     * Keeping this sample's cell for the next one was tried, to save a
+     * float-to-int conversion a sample: it cost five per cent rather than
+     * saving any.  The branch and the flag that say whether the kept index
+     * is usable are worth more than the conversion they replace, because the
+     * conversion sits in a chain the processor was going to wait on anyway.
+     */
+    /*
      * Where the average stops walking cells and starts subtracting - see the
      * note on AG_TUBE_WALK_MIN.  Set by the bake from the table size; writable,
      * because forcing it to the whole table makes the walk exact, and an exact
@@ -340,6 +347,14 @@ typedef struct ag_tube {
      * sample at 4x before this and far less after.
      */
     int   g_first;
+    /*
+     * The same index as a float, because the hot loop compares against it
+     * once a sample and this processor moves a number between its integer
+     * and floating registers through memory: a conversion that the compiler
+     * cannot hoist out of a call it cannot see into.  Set wherever g_first
+     * is.
+     */
+    float g_first_f;
     float vc;       /* volts across the coupling capacitor                 */
     float   blk_k;  /* T/C:        volts of vc per amp-second of grid current */
     float   blk_g;  /* T/(C*rgrid): the leak back, per sample              */

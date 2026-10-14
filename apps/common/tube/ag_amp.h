@@ -106,6 +106,21 @@
 #define AG_AMP_TAB_FLOATS (AG_AMP_STAGES * 3 * AG_AMP_TAB_N)
 
 /*
+ * What each stage handed on, kept only for the tools that ask.
+ *
+ * tube_render reads these to show where a signal is in the chain; nothing on
+ * a board ever does.  Writing them is a store per stage per oversampled
+ * sample - sixteen a sample for four stages at four times - for a number
+ * nobody on the board will read.  The host tools define AG_AMP_TAPS; the
+ * firmware does not, exactly as the tube's own counters work.
+ */
+#ifdef AG_AMP_TAPS
+#define AG_AMP_TAP(a, i, v) ((a)->tap[(i)] = (v))
+#else
+#define AG_AMP_TAP(a, i, v) ((void)0)
+#endif
+
+/*
  * One band of either voicing bank.  db of 0 disables it.
  *
  * EIGHT, AND WHY THE EIGHTH IS AT 630 Hz
@@ -594,6 +609,7 @@ typedef struct ag_amp {
      * being argued about from the far end of the chain.
      */
     float tap[AG_AMP_STAGES];
+
 } ag_amp_t;
 
 /* fs, two stages of a hot JCM800 front end, 4x with antialiasing, and the two

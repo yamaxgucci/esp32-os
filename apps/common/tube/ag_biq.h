@@ -138,13 +138,52 @@ float ag_biq_peak(ag_biq_t *s, float fs, float f0, float db, float q);
  */
 float ag_biq_bandpass(ag_biq_t *s, float fs, float f0, float bw);
 
-float ag_biq_tick(ag_biq_t *s, float x);
+/*
+ * THE TWO TICKS LIVE HERE, BECAUSE THEY ARE CALLED FROM ANOTHER FILE.
+ *
+ * Each is three multiplies and a couple of adds; the call around it costs
+ * more than that on this machine, which rotates a register window for every
+ * one.  The amplifier calls the chain twice a stage, at every stage, on every
+ * oversampled sample - eight calls a sample at four stages and four times
+ * oversampling - and a compiler cannot inline across a translation unit
+ * without being asked to link the whole program at once.  So they are here,
+ * where the caller can see them.
+ *
+ * Measured: see the note in ag_amp.c on what each edit to this chain was
+ * worth.
+ */
+static inline float ag_biq_tick(ag_biq_t *s, float x)
+{
+    float y;
+    if (s == 0) {
+        return x;
+    }
+    y = s->b0 * x + s->z1;
+    s->z1 = s->b1 * x - s->a1 * y + s->z2;
+    s->z2 = s->b2 * x - s->a2 * y;
+    return y;
+}
 
 void      ag_biq_chain_init(ag_biq_chain_t *c);
 void      ag_biq_chain_reset(ag_biq_chain_t *c);
 /* A section to design into, or NULL if the chain is full. */
 ag_biq_t *ag_biq_chain_push(ag_biq_chain_t *c);
-float     ag_biq_chain_tick(ag_biq_chain_t *c, float x);
+static inline float ag_biq_chain_tick(ag_biq_chain_t *c, float x)
+{
+    int i, n;
+    if (c == 0) {
+        return x;
+    }
+    n = c->n;
+    for (i = 0; i < n; i++) {
+        ag_biq_t   *s = &c->s[i];
+        const float y = s->b0 * x + s->z1;
+        s->z1 = s->b1 * x - s->a1 * y + s->z2;
+        s->z2 = s->b2 * x - s->a2 * y;
+        x = y;
+    }
+    return x;
+}
 
 /*
  * |H(f)| in dB, evaluated from the coefficients rather than measured by running

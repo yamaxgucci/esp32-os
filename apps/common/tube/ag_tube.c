@@ -588,6 +588,8 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
             if (tabg != 0) {
                 const float goff = tabg[i0];
                 tb->g_first = n - 1;
+    tb->g_first_f = (float)tb->g_first;
+                tb->g_first_f = (float)tb->g_first;
                 for (i = 0; i < n; i++) {
                     tabg[i] -= goff;
                     if (tabg[i] < 0.0f) {
@@ -599,6 +601,8 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
                 for (i = 0; i < n; i++) {
                     if (tabg[i] > 0.0f) {
                         tb->g_first = i > 0 ? i - 1 : 0;
+                tb->g_first_f = (float)tb->g_first;
+                        tb->g_first_f = (float)tb->g_first;
                         break;
                     }
                 }
@@ -634,14 +638,29 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
     return 0;
 }
 
+/*
+ * Put these in their caller, whatever the inliner's budget says.
+ *
+ * The chain is one long dependency and the hot path through each of them is
+ * a handful of instructions; the call around it is not.  On this machine a
+ * call rotates the register window, which the processor pays for whether the
+ * callee does anything or not - and ag_tube_tick made one of them a sample,
+ * at four stages and four times oversampling.
+ */
+#if defined(__GNUC__) && !defined(AG_HOST)
+#define AG_INLINE_HOT static inline __attribute__((always_inline))
+#else
+#define AG_INLINE_HOT static
+#endif
+
 /* Value inside cell i at fraction f. */
-static float lin(const ag_tube_t *tb, int i, float f)
+AG_INLINE_HOT float lin(const ag_tube_t *tb, int i, float f)
 {
     return tb->t[i] + (tb->t[i + 1] - tb->t[i]) * f;
 }
 
 /* The antiderivative at index position p, exact within the cell. */
-static float hat(const ag_tube_t *tb, float p)
+AG_INLINE_HOT float hat(const ag_tube_t *tb, float p)
 {
     int   i = (int)p;
     float f;
@@ -701,7 +720,7 @@ static AG_HOT float recip(float x)
     return r;
 }
 
-static float integ_inside(const ag_tube_t *tb, float a, float b)
+AG_INLINE_HOT float integ_inside(const ag_tube_t *tb, float a, float b)
 {
     int   i0 = (int)a, i1 = (int)b, i;
     float acc, fa, fb;
@@ -734,7 +753,7 @@ static float integ_inside(const ag_tube_t *tb, float a, float b)
 }
 
 /* The curve at index position p, extended flat outside the table. */
-static float read_at(const ag_tube_t *tb, float p)
+AG_INLINE_HOT float read_at(const ag_tube_t *tb, float p)
 {
     const float last = (float)(tb->n - 1);
     int         i;
@@ -760,7 +779,7 @@ static float read_at(const ag_tube_t *tb, float p)
  * instead would make the average jump about as the signal crossed the edge,
  * which is a new nonlinearity in the place least able to afford one.
  */
-static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped)
+AG_INLINE_HOT float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped)
 {
     const float last = (float)(tb->n - 1);
     float       a = pa < pb ? pa : pb;
@@ -821,7 +840,7 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
  * an index.  Split out so that blocking, which needs the index for its own
  * table, does not compute it twice.
  */
-static AG_HOT float tick_at(ag_tube_t *tb, float x, float p)
+AG_INLINE_HOT float tick_at(ag_tube_t *tb, float x, float p)
 {
     float y;
 
@@ -902,7 +921,7 @@ AG_HOT float ag_tube_tick(ag_tube_t *tb, float v)
      * Euler rings, so test_tube.c drives a burst into it and checks that the
      * charge climbs monotonically.
      */
-    if (p < (float)tb->g_first) {
+    if (p < tb->g_first_f) {
         /* Below conduction, which is nearly all of the time: nothing is being
          * added, so all that is left is the leak. */
         if (tb->vc != 0.0f) {
@@ -1393,10 +1412,12 @@ int ag_tube_attach(ag_tube_t *tb, const float *tab, const float *tabh,
         tb->walk_max = AG_TUBE_WALK_MAX;
     }
     tb->g_first = n - 1;
+    tb->g_first_f = (float)tb->g_first;
     if (tabg != 0) {
         for (i = 0; i < n; i++) {
             if (tabg[i] > 0.0f) {
                 tb->g_first = i > 0 ? i - 1 : 0;
+                tb->g_first_f = (float)tb->g_first;
                 break;
             }
         }
@@ -1630,10 +1651,12 @@ void ag_tube_blend(ag_tube_t *dst, const ag_tube_t *a, const ag_tube_t *b,
     dst->h = tabh;
     dst->g = tabg;
     dst->g_first = n - 1;
+    dst->g_first_f = (float)dst->g_first;
     if (tabg != 0) {
         for (i = 0; i < n; i++) {
             if (tabg[i] > 0.0f) {
                 dst->g_first = i > 0 ? i - 1 : 0;
+                dst->g_first_f = (float)dst->g_first;
                 break;
             }
         }
