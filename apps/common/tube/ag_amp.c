@@ -2257,6 +2257,17 @@ void ag_amp_reset(ag_amp_t *a)
  * Each valve carries its own coupling capacitor.s charge, so blocking is inside
  * ag_tube_tick rather than here.
  */
+/*
+ * `flatten`: put everything this calls inside it.
+ *
+ * Only possible because ag_hot.c compiles the valve, the filters and this
+ * file as one unit - a compiler cannot inline what it cannot see.  What it
+ * pulls in is the valve's tick, which at four stages and four times
+ * oversampling was sixteen calls for one sample of audio.
+ */
+#if defined(__GNUC__) && !defined(AG_HOST)
+__attribute__((flatten))
+#endif
 static AG_HOT float run_stages(ag_amp_t *a, float v)
 {
     int i;

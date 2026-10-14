@@ -267,13 +267,9 @@
       "split_hot": true,
       "hot_src": [
         "ag_ir.c",
-        "ag_tube.c",
-        "ag_biq.c",
-        "ag_os.c",
-        "ag_tone.c",
-        "ag_amp.c",
         "ag_mathf.c",
-        "ag_dsp.c"
+        "ag_dsp.c",
+        "ag_hot.c"
       ],
       "_note": "the amplifier with its knobs on a screen; the knob list comes from the model",
       "include": [
@@ -290,11 +286,6 @@
       "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin",
       "src": [
         "apps/stomp/stomp.c",
-        "apps/common/tube/ag_tube.c",
-        "apps/common/tube/ag_biq.c",
-        "apps/common/tube/ag_os.c",
-        "apps/common/tube/ag_amp.c",
-        "apps/common/tube/ag_tone.c",
         "apps/common/ckt/ag_mathf.c",
         "apps/common/ckt/ag_ckt.c",
         "apps/common/dsp/ag_dsp.c",
@@ -302,7 +293,8 @@
         "apps/common/ir/ag_fft.c",
         "apps/common/pcm/ag_pcm.c",
         "apps/common/wav/ag_wav.c",
-        "apps/common/libc/libc_shim.c"
+        "apps/common/libc/libc_shim.c",
+        "apps/common/tube/ag_hot.c"
       ],
       "hot_cflags": "-O2 -ffunction-sections -fdata-sections -fno-builtin"
     },

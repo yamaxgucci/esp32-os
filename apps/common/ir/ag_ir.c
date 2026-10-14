@@ -684,6 +684,16 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
  * The round rather than truncate is not cosmetic: an arithmetic shift floors,
  * and the half-a-bit bias would add up over every partition into a DC step.
  */
+/*
+ * One partition at a time into the accumulator, and that is the faster way.
+ *
+ * Summing a bin's partitions in registers instead - one pass over yre/yim
+ * rather than one per partition, and no zeroing beforehand - was built and
+ * measured: the cabinet went from 1622 us a block to 1778.  The gather it
+ * needs puts the pointers and the shifts behind an index, the inner loop is
+ * only as long as the partition count, and what is saved in memory traffic
+ * is lost in addressing.  Written down so the idea is not had twice.
+ */
 AG_IR_NOINLINE static void mac_part(int32_t *yre, int32_t *yim,
                                     const int16_t *Xp, const int16_t *Hp,
                                     uint32_t sh, uint32_t fft)
