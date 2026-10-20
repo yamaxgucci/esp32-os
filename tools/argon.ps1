@@ -748,6 +748,16 @@ switch ($Command.ToLowerInvariant()) {
         exit $LASTEXITCODE
     }
 
+    'storetest' {
+        # The shop in the emulator: a catalogue this PC serves, a program that
+        # arrives over HTTP and runs, an upgrade, a removal, and the three
+        # refusals a shop has to get right (a wrong hash, a program for another
+        # chip, a program bigger than the disk).  Not part of `check`, for the
+        # same reason as `nettest`: it wants a port and a Python to bind it.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'storetest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
     'rlinktest' {
         # The same network, but over an external radio: EXTRADIO.SYS bound with
         # `net use extradio`, talking RLINK to a fake coprocessor (rlinkd.py) on
