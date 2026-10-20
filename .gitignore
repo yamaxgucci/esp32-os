@@ -79,3 +79,13 @@ logs/*.txt
 logs/*/
 logs/SYSTEM-*.CFG
 logs/BOARD-*.CFG
+
+# The shop's server: its own Python, and the SQLite file plus the keys it
+# keeps.  Neither is anybody else's business, and a key in the repository is a
+# key in every clone.
+store/.venv/
+store/data/
+store/__pycache__/
+store/**/__pycache__/
+store/.pytest_cache/
+
