@@ -459,9 +459,39 @@ extern "C" {
  *      when an application takes the screen and when it lets it go, so a
  *      screen at the end of a wire says "picture" or "console" from the board
  *      instead of guessing from traffic.  Optional; NULL is the old behaviour.
+ *
+ * 0.69 appended net->http_request: one HTTP(S) exchange through the kernel's
+ *      own client, as the shop's board half needs it.
+ *
+ *      `ag_http_fetch` is a kernel function and applications do not have it;
+ *      what they have is raw TCP (api->net), and an HTTP client written a
+ *      second time inside a .AXE is a second set of timeouts and a second
+ *      chance to lose the first kilobyte of a body.  So the client the kernel
+ *      already has - redirects, chunked bodies, "open the file only after 2xx",
+ *      TLS - is published as one call rather than compiled again.
+ *
+ *      The response body goes to `dest`, an absolute path; `dest` NULL means
+ *      the caller wants the status and not the answer, and the body is counted
+ *      and discarded.  `status` gets the last status code seen (0 when the
+ *      request never reached a server).  `method` is "GET" or "POST" and
+ *      nothing else, because a typo here goes out on the wire; `headers` is a
+ *      run of "Name: value\r\n" lines, which is what the Authorization header
+ *      the shop needs is spelled as.  A POST that is redirected becomes a GET
+ *      unless the server answered 307 or 308, so a form post cannot press its
+ *      own button twice.
+ *
+ *      Silent on the console: this is the path an application polls with, and
+ *      a poll that prints is a program typing over somebody else's screen.  An
+ *      application that wants to say something says it itself.
+ *
+ *      APPENDED past resolve for the reason written out at 0.54: an image from
+ *      the build before leaves it NULL, and AG_HAS answers "no".  Unlike the
+ *      optional members elsewhere, the slot is never NULL in a build that has
+ *      the network at all: without CONFIG_ARGON_ENABLE_NET the whole table is
+ *      absent, and api->net being NULL is how a caller learns that.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 68u
+#define AG_ABI_MINOR 69u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -2580,6 +2610,25 @@ typedef struct ag_net_api {
      * nothing for half a minute.  Everything else should close.
      */
     ag_err_t (*reset)(ag_handle_t sock);
+
+    /*
+     * ABI 0.69: one HTTP(S) exchange through the kernel's own client.
+     *
+     * The body goes to `dest` (an already resolved absolute path) and `status`
+     * gets the last status code; `dest` NULL discards the body and `status`
+     * NULL discards the code.  `method` is "GET" or "POST"; `headers` is extra
+     * "Name: value\r\n" lines or NULL; `body`/`body_len` are the request body
+     * for a POST.
+     *
+     * No console output at all - this is the path an application polls with.
+     * -AG_ENOTSUP for https in a build without TLS; -AG_ENOENT/-AG_EACCES for
+     * 404-410/401-403, so a caller can tell "no such file" from "the server is
+     * broken"; -AG_ETIMEDOUT when the server accepted and then said nothing.
+     */
+    ag_err_t (*http_request)(const char *method, const char *url,
+                             const char *headers, const void *body,
+                             uint32_t body_len, const char *dest,
+                             uint16_t *status);
 } ag_net_api_t;
 
 /*

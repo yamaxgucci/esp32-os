@@ -13,6 +13,8 @@
 
 #if CONFIG_ARGON_ENABLE_NET
 
+#include "net/netsvc.h"
+
 #include <argon/log.h>
 #include <argon/net.h>
 #include <argon/proc.h>
@@ -353,6 +355,26 @@ static ag_err_t api_set_nonblock(ag_handle_t h, bool on)
     return ag_netprov_nonblock(fd, on);
 }
 
+/*
+ * ABI 0.69: one HTTP(S) exchange through the kernel's own client.  The
+ * application gets the status code and, if it asked for one, the body in a
+ * file; the console gets nothing, because an application polling a server must
+ * not be typing into whatever is on the screen.
+ *
+ * The slot is filled unconditionally.  There is no build of this table without
+ * the engine behind it: without CONFIG_ARGON_ENABLE_NET the whole file is not
+ * compiled and api->net is NULL, which is how a caller learns there is no
+ * network at all.  A build with the network but without TLS keeps the slot and
+ * answers -AG_ENOTSUP for an https URL.
+ */
+static ag_err_t api_http_request(const char *method, const char *url,
+                                 const char *headers, const void *body,
+                                 uint32_t body_len, const char *dest,
+                                 uint16_t *status)
+{
+    return ag_http_exchange(method, url, headers, body, body_len, dest, status);
+}
+
 const ag_net_api_t ag_net_api_impl = {
     .size = sizeof(ag_net_api_t),
     .ready = api_ready,
@@ -367,6 +389,7 @@ const ag_net_api_t ag_net_api_impl = {
     .close = api_close,
     .set_nonblock = api_set_nonblock,
     .resolve = api_resolve,
+    .http_request = api_http_request,
 };
 
 const ag_net_api_t *ag_net_api_table(void) { return &ag_net_api_impl; }

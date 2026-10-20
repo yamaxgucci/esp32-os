@@ -32,6 +32,25 @@
 ag_err_t ag_http_fetch(const char *url, const char *dest);
 
 /*
+ * The same engine for an application (ABI 0.69's net->http_request): method
+ * "GET" or "POST", extra header lines, a body for a POST, a status code out,
+ * and `dest` NULL to say "I want the answer, not the body".
+ *
+ * Silent on the console, unlike the two commands above: an application polling
+ * a server every ten seconds must not be typing into the screen of whatever is
+ * in front of the operator.  Errors come back as codes and are the caller's to
+ * print.
+ *
+ * `headers` is a run of "Name: value\r\n" lines and nothing else - the terminator
+ * is added here.  Redirects are followed; a POST that is redirected becomes a
+ * GET unless the server answered 307 or 308.
+ */
+ag_err_t ag_http_exchange(const char *method, const char *url,
+                          const char *headers, const void *body,
+                          uint32_t body_len, const char *dest,
+                          uint16_t *status);
+
+/*
  * Serves `root` (an absolute path) over HTTP on `port` until Ctrl+C.  One
  * connection at a time, on purpose: see the file.
  */

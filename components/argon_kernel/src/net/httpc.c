@@ -1,5 +1,5 @@
 /*
- * ArgonOS - fetching a file over HTTP.
+ * ArgonOS - one HTTP(S) exchange: request out, body to a file or nowhere.
  *
  * The smallest thing that is honestly a client: one connection, one request,
  * the body straight to a file.  No keep-alive, no cache, no compression.
@@ -10,9 +10,17 @@
  * TLS is a build option, and without it an https URL is refused by the URL
  * parser rather than fetched in clear.
  *
+ * It serves two callers, which is why the method, the extra headers, the body
+ * and the throw-the-answer-away case are all here rather than in a second
+ * file: `wget` at the console wants GET and a progress line, and an
+ * application (ABI 0.69's net->http_request) wants POST, an Authorization
+ * header, and silence.  Two clients would be two sets of timeouts and two
+ * chances to forget that the destination file must not be truncated until the
+ * server has answered.
+ *
  * What it does insist on:
  *
- * - The destination file is opened after the server has answered 200, not
+ * - The destination file is opened after the server has answered 2xx, not
  *   before.  A failed fetch that has already truncated the file it was going
  *   to replace has destroyed something to gain nothing.
  * - A body with no length is read until the connection closes, which is what
@@ -20,8 +28,12 @@
  *   written out with its framing.  A file that is 5% chunk headers is not the
  *   file that was asked for, and nothing downstream would notice.
  * - Redirects are followed, up to a few, because half the servers on a network
- *   answer with one - and only to http, so a redirect to https stops rather
- *   than silently fetching over a different scheme.
+ *   answer with one - and only to http or https, so a redirect to a scheme this
+ *   build cannot speak stops rather than fetching something else.
+ * - A POST that is redirected stops being one unless the server said 307 or
+ *   308, which is what a browser does and what every framework's
+ *   answer-a-form-with-a-redirect expects.  Sending the body twice is how a
+ *   button gets pressed twice.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -50,6 +62,7 @@
 #include "net/netio.h"
 
 #define HTTP_HDR_MAX 1024
+#define HTTP_REQ_MAX 1024
 #define HTTP_BODY_BUF 1536
 #define HTTP_CONNECT_MS 15000
 #define HTTP_MAX_REDIRECTS 4
@@ -57,6 +70,33 @@
 /* What this system calls itself to a server.  Servers log it, and a log that
  * says which machine asked is worth the twenty bytes. */
 #define HTTP_AGENT "ArgonOS/1.0"
+
+/* Console output, unless the caller asked for silence.  An application that
+ * polls a server every ten seconds must not be typing into the console of
+ * whatever is on the screen at the time. */
+#define SAY(q, ...)                                                          \
+    do {                                                                     \
+        if (!(q)) {                                                          \
+            ag_console_printf(__VA_ARGS__);                                  \
+        }                                                                    \
+    } while (0)
+#define SAYS(q, s)                                                           \
+    do {                                                                     \
+        if (!(q)) {                                                          \
+            ag_console_puts(s);                                              \
+        }                                                                    \
+    } while (0)
+
+/* One exchange, as the caller described it. */
+typedef struct {
+    const char *method;  /* "GET" or "POST"                               */
+    const char *headers; /* extra "Name: value\r\n" lines, or NULL        */
+    const void *body;    /* request body, POST only                       */
+    uint32_t    body_len;
+    const char *dest;    /* NULL: read the answer and throw it away       */
+    uint16_t   *status;  /* out: the last status code seen, 0 if none     */
+    bool        quiet;
+} http_req_t;
 
 /*
  * The bytes the transfer needs, in one allocation and only while it runs.
@@ -100,14 +140,89 @@ static void bufs_free(http_bufs_t *b)
 }
 
 /* ---------------------------------------------------------------------- */
+/* Building the request                                                     */
+/* ---------------------------------------------------------------------- */
+
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t at;
+    bool   overflow;
+} writer_t;
+
+static void w_str(writer_t *w, const char *s)
+{
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        if (w->at + 1 >= w->len) {
+            w->overflow = true;
+            return;
+        }
+        w->buf[w->at++] = s[i];
+    }
+    w->buf[w->at] = '\0';
+}
+
+static void w_u32(writer_t *w, uint32_t v)
+{
+    char tmp[10];
+    char out[11];
+    int  n = 0;
+    do {
+        tmp[n++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    } while (v != 0u);
+    for (int i = 0; i < n; i++) {
+        out[i] = tmp[n - 1 - i];
+    }
+    out[n] = '\0';
+    w_str(w, out);
+}
+
+/* Writes the request line and the headers into `req`. */
+static ag_err_t build_request(const ag_url_t *u, const http_req_t *r,
+                              char *req, size_t req_len)
+{
+    writer_t w = {req, req_len, 0, false};
+
+    w_str(&w, r->method);
+    w_str(&w, " ");
+    w_str(&w, u->path);
+    w_str(&w, " HTTP/1.1\r\nHost: ");
+    w_str(&w, u->host);
+    /* Port in Host: a server behind a name-based virtual host answers a bare
+     * name with the wrong site. */
+    if (u->port != 80 && u->port != 443) {
+        w_str(&w, ":");
+        w_u32(&w, (uint32_t)u->port);
+    }
+    w_str(&w, "\r\nUser-Agent: " HTTP_AGENT "\r\nAccept: */*\r\n");
+    /* Connection: close is what makes a body with no length finite. */
+    w_str(&w, "Connection: close\r\n");
+    if (r->body_len != 0u) {
+        w_str(&w, "Content-Length: ");
+        w_u32(&w, r->body_len);
+        w_str(&w, "\r\n");
+    }
+    if (r->headers != NULL) {
+        w_str(&w, r->headers);
+    }
+    w_str(&w, "\r\n");
+
+    return w.overflow ? -AG_ERANGE : AG_OK;
+}
+
+/* ---------------------------------------------------------------------- */
 
 /*
  * Everything the file system does with the bytes, in one place, so that the
  * chunked path and the plain path cannot disagree about what a short write
- * means.
+ * means.  `out < 0` means the caller wants the answer counted and thrown away.
  */
 static ag_err_t write_all(ag_handle_t out, const uint8_t *data, size_t len)
 {
+    if (out < 0) {
+        return AG_OK;
+    }
     size_t off = 0;
     while (off < len) {
         const int32_t n = ag_vfs_write(out, data + off, len - off);
@@ -233,10 +348,6 @@ static ag_err_t redirect_url(const ag_url_t *from, const char *location,
 }
 
 /*
- * One request.  Returns AG_OK with `next` empty when the file has been saved,
- * or AG_OK with `next` set when the server redirected.
- */
-/*
  * The connection request_once talks over is either a plain fd or a TLS handle.
  * These two helpers are the only places that care which; everywhere else the
  * buffered reader (with rdr.tls set) hides the difference.
@@ -290,24 +401,29 @@ static void conn_close(int fd, void *tls)
     }
 }
 
-static ag_err_t request_once(const ag_url_t *u, const char *dest,
+/*
+ * One request.  Returns AG_OK with `next` empty when the exchange succeeded,
+ * or AG_OK with `next` set when the server redirected.
+ */
+static ag_err_t request_once(const ag_url_t *u, const http_req_t *r,
                              http_bufs_t *b, char *next, size_t next_len)
 {
     next[0] = '\0';
+    const bool quiet = r->quiet;
 
     uint32_t addr = 0;
     ag_err_t err = ag_net_lookup(u->host, &addr);
     if (err != AG_OK) {
-        ag_console_printf("%s: cannot be resolved\n", u->host);
+        SAY(quiet, "%s: cannot be resolved\n", u->host);
         return err;
     }
 
     char ip[16];
     (void)ag_ipv4_str(addr, ip, sizeof(ip));
     if (strcmp(ip, u->host) != 0) {
-        ag_console_printf("%s is %s\n", u->host, ip);
+        SAY(quiet, "%s is %s\n", u->host, ip);
     }
-    ag_console_printf("%s:%u ... ", ip, (unsigned)u->port);
+    SAY(quiet, "%s:%u ... ", ip, (unsigned)u->port);
 
     int        fd = -1;
     void      *tls = NULL;
@@ -318,17 +434,17 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
          * against the certificate bundle. */
         tls = ag_port_tls_connect(u->host, u->port, HTTP_CONNECT_MS);
         if (tls == NULL) {
-            ag_console_puts("no answer (or the certificate did not check out)\n");
+            SAYS(quiet, "no answer (or the certificate did not check out)\n");
             return -AG_EIO;
         }
 #else
-        ag_console_puts("no TLS in this build\n");
+        SAYS(quiet, "no TLS in this build\n");
         return -AG_ENOTSUP;
 #endif
     } else {
         fd = ag_netprov_connect(addr, u->port, HTTP_CONNECT_MS);
         if (fd < 0) {
-            ag_console_puts("no answer\n");
+            SAYS(quiet, "no answer\n");
             return (ag_err_t)fd;
         }
         /*
@@ -340,33 +456,18 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
          */
         (void)ag_netprov_nonblock(fd, true);
     }
-    ag_console_puts("connected\n");
+    SAYS(quiet, "connected\n");
 
-    /*
-     * Host: carries the port when it is not the default, because a server
-     * behind a name-based virtual host answers a bare name with the wrong
-     * site.  Connection: close is what makes a body with no length finite.
-     */
-    char req[512];
-    int  rn;
-    if (u->port == 80 || u->port == 443) {
-        rn = snprintf(req, sizeof(req),
-                      "GET %s HTTP/1.1\r\nHost: %s\r\n"
-                      "User-Agent: " HTTP_AGENT "\r\n"
-                      "Accept: */*\r\nConnection: close\r\n\r\n",
-                      u->path, u->host);
-    } else {
-        rn = snprintf(req, sizeof(req),
-                      "GET %s HTTP/1.1\r\nHost: %s:%u\r\n"
-                      "User-Agent: " HTTP_AGENT "\r\n"
-                      "Accept: */*\r\nConnection: close\r\n\r\n",
-                      u->path, u->host, (unsigned)u->port);
-    }
-    if (rn < 0 || (size_t)rn >= sizeof(req)) {
+    char req[HTTP_REQ_MAX];
+    err = build_request(u, r, req, sizeof(req));
+    if (err != AG_OK) {
         conn_close(fd, tls);
-        return -AG_ERANGE;
+        return err;
     }
-    err = conn_send_all(fd, tls, req, (size_t)rn);
+    err = conn_send_all(fd, tls, req, strlen(req));
+    if (err == AG_OK && r->body_len != 0u && r->body != NULL) {
+        err = conn_send_all(fd, tls, r->body, r->body_len);
+    }
     if (err != AG_OK) {
         conn_close(fd, tls);
         return err;
@@ -388,7 +489,7 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
     size_t have = 0;
     while (ag_http_header_end(b->hdr, have) == 0) {
         if (have == HTTP_HDR_MAX) {
-            ag_console_puts("the reply header is too long for this system\n");
+            SAYS(quiet, "the reply header is too long for this system\n");
             conn_close(fd, tls);
             return -AG_ERANGE;
         }
@@ -401,18 +502,18 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
              * looks like a command that did nothing.
              */
             if (n == -AG_ETIMEDOUT) {
-                ag_console_puts("no reply within fifteen seconds\n");
+                SAYS(quiet, "no reply within fifteen seconds\n");
             } else if (n == -AG_EINTR) {
-                ag_console_puts("^C\n");
+                SAYS(quiet, "^C\n");
             } else {
-                ag_console_puts(
-                    "the connection failed while waiting for the reply\n");
+                SAYS(quiet,
+                     "the connection failed while waiting for the reply\n");
             }
             conn_close(fd, tls);
             return (ag_err_t)n;
         }
         if (n == 0) {
-            ag_console_puts("the connection closed before the reply\n");
+            SAYS(quiet, "the connection closed before the reply\n");
             conn_close(fd, tls);
             return -AG_EIO;
         }
@@ -423,26 +524,28 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
     ag_http_resp_t resp;
     err = ag_http_parse_response(b->hdr, end, &resp);
     if (err != AG_OK) {
-        ag_console_puts("this is not an HTTP server\n");
+        SAYS(quiet, "this is not an HTTP server\n");
         conn_close(fd, tls);
         return err;
     }
+    if (r->status != NULL) {
+        *r->status = resp.status;
+    }
 
     if (resp.status >= 300 && resp.status < 400) {
-        ag_console_printf("%d %s\n", resp.status,
-                          ag_http_status_text(resp.status));
+        SAY(quiet, "%d %s\n", resp.status, ag_http_status_text(resp.status));
         err = redirect_url(u, resp.location, next, next_len);
         if (err != AG_OK) {
-            ag_console_puts("...to somewhere this system cannot express\n");
+            SAYS(quiet, "...to somewhere this system cannot express\n");
         }
         conn_close(fd, tls);
         return err;
     }
 
-    if (resp.status != 200) {
+    if (resp.status < 200 || resp.status >= 300) {
         const char *text = ag_http_status_text(resp.status);
-        ag_console_printf("%d%s%s\n", resp.status, (text[0] != '\0') ? " " : "",
-                          text);
+        SAY(quiet, "%d%s%s\n", resp.status, (text[0] != '\0') ? " " : "",
+            text);
         conn_close(fd, tls);
         /* Distinguishable, so that a script can tell "no such file" from "the
          * server is broken". */
@@ -457,25 +560,33 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
 
     /*
      * Answered, so now the file may be replaced.  Not one line earlier: this
-     * is the difference between a failed fetch and a lost file.
+     * is the difference between a failed fetch and a lost file.  A NULL
+     * destination means the caller wants the status and not the answer, so
+     * nothing is opened and the body is counted and dropped.
      */
-    const ag_handle_t out =
-        ag_vfs_open(dest, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
-    if (out < 0) {
-        ag_console_printf("%s: cannot be written\n", dest);
-        conn_close(fd, tls);
-        return (ag_err_t)out;
+    ag_handle_t out = -1;
+    if (r->dest != NULL) {
+        out = ag_vfs_open(r->dest, NULL,
+                          AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+        if (out < 0) {
+            SAY(quiet, "%s: cannot be written\n", r->dest);
+            conn_close(fd, tls);
+            return (ag_err_t)out;
+        }
     }
 
-    if (resp.have_length) {
-        ag_console_printf("200 OK, %u bytes", (unsigned)resp.length);
-    } else {
-        ag_console_puts("200 OK, length unknown");
+    if (!quiet) {
+        if (resp.have_length) {
+            ag_console_printf("%d OK, %u bytes", resp.status,
+                              (unsigned)resp.length);
+        } else {
+            ag_console_printf("%d OK, length unknown", resp.status);
+        }
+        if (resp.type[0] != '\0') {
+            ag_console_printf(", %s", resp.type);
+        }
+        ag_console_puts("\n");
     }
-    if (resp.type[0] != '\0') {
-        ag_console_printf(", %s", resp.type);
-    }
-    ag_console_puts("\n");
 
     ag_progress_t prog;
     ag_progress_start(&prog, resp.have_length ? resp.length : 0);
@@ -487,41 +598,77 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
         err = pump(&rdr, out, resp.have_length ? resp.length : UINT64_MAX,
                    &prog, &total);
     }
-    ag_progress_done(&prog, total);
+    if (!quiet) {
+        ag_progress_done(&prog, total);
+    }
 
-    ag_vfs_close(out);
+    if (out >= 0) {
+        ag_vfs_close(out);
+    }
     conn_close(fd, tls);
 
     if (err == -AG_EINTR) {
         /* Named the way the operator typed it, not the way the VFS spells it. */
         char shown[AG_PATH_MAX];
-        ag_shell_dos_path(dest, shown, sizeof(shown));
-        ag_console_printf("^C - %s holds the %u bytes that arrived\n", shown,
-                          (unsigned)total);
+        if (r->dest != NULL) {
+            ag_shell_dos_path(r->dest, shown, sizeof(shown));
+        } else {
+            shown[0] = '\0';
+        }
+        SAY(quiet, "^C - %s holds the %u bytes that arrived\n", shown,
+            (unsigned)total);
         return err;
     }
     if (err != AG_OK) {
-        ag_console_printf("the transfer stopped after %u bytes\n",
-                          (unsigned)total);
+        SAY(quiet, "the transfer stopped after %u bytes\n", (unsigned)total);
         return err;
     }
     if (resp.have_length && total != resp.length) {
-        ag_console_printf("short: %u of %u bytes\n", (unsigned)total,
-                          (unsigned)resp.length);
+        SAY(quiet, "short: %u of %u bytes\n", (unsigned)total,
+            (unsigned)resp.length);
         return -AG_EIO;
     }
     return AG_OK;
 }
 
-ag_err_t ag_http_fetch(const char *url_text, const char *dest)
+/* GET or POST, and nothing else: a typo here would go out on the wire. */
+static bool method_ok(const char *method)
 {
-    if (url_text == NULL || dest == NULL) {
+    return method != NULL &&
+           (strcmp(method, "GET") == 0 || strcmp(method, "POST") == 0);
+}
+
+static ag_err_t http_run(const char *method, const char *url_text,
+                         const char *headers, const void *body,
+                         uint32_t body_len, const char *dest, uint16_t *status,
+                         bool quiet)
+{
+    if (url_text == NULL || !method_ok(method)) {
         return -AG_EINVAL;
     }
+    if (strcmp(method, "GET") == 0 && body_len != 0u) {
+        return -AG_EINVAL;
+    }
+    if (body_len != 0u && body == NULL) {
+        return -AG_EINVAL;
+    }
+    if (status != NULL) {
+        *status = 0;
+    }
+
+    http_req_t r;
+    memset(&r, 0, sizeof(r));
+    r.method = method;
+    r.headers = headers;
+    r.body = body;
+    r.body_len = body_len;
+    r.dest = dest;
+    r.status = status;
+    r.quiet = quiet;
 
     http_bufs_t bufs;
     if (!bufs_alloc(&bufs)) {
-        ag_console_puts("not enough memory for a transfer\n");
+        SAYS(quiet, "not enough memory for a transfer\n");
         return -AG_ENOMEM;
     }
 
@@ -540,13 +687,13 @@ ag_err_t ag_http_fetch(const char *url_text, const char *dest)
             break;
         }
         /*
-         * There is no Basic authentication here, so a URL that carries a name
-         * and a password is not going to use them - and a fetch that answers
-         * 401 after being given a password looks like a wrong password.
+         * http here has no login, so a URL that carries a name and a password
+         * is not going to use them - and a fetch that answers 401 after being
+         * given a password looks like a wrong password.
          */
         if (u.user[0] != '\0') {
-            ag_console_puts("(the name and password in that URL are ignored: "
-                            "http here has no login)\n");
+            SAYS(quiet, "(the name and password in that URL are ignored: "
+                        "http here has no login)\n");
         }
         /*
          * A redirect that changes scheme lands here: ftp:// is a different
@@ -558,28 +705,57 @@ ag_err_t ag_http_fetch(const char *url_text, const char *dest)
         ok_scheme = ok_scheme || (strcmp(u.scheme, "https") == 0);
 #endif
         if (!ok_scheme) {
-            ag_console_printf("%s: not http%s\n", current,
-                              AG_PORT_HAS_TLS ? " or https" : "");
+            SAY(quiet, "%s: not http%s\n", current,
+                AG_PORT_HAS_TLS ? " or https" : "");
             err = -AG_ENOTSUP;
             break;
         }
 
         char next[288];
-        err = request_once(&u, dest, &bufs, next, sizeof(next));
+        err = request_once(&u, &r, &bufs, next, sizeof(next));
         if (err != AG_OK || next[0] == '\0') {
             break;
         }
         if (hop == HTTP_MAX_REDIRECTS) {
-            ag_console_puts("too many redirects\n");
+            SAYS(quiet, "too many redirects\n");
             err = -AG_EIO;
             break;
         }
-        ag_console_printf("-> %s\n", next);
+        /*
+         * A redirected POST stops being one unless the server said 307 or 308:
+         * 303 means "look over there instead", and 301/302 are what frameworks
+         * answer after a form post.  Sending the body a second time is how a
+         * button gets pressed twice.
+         */
+        if (strcmp(r.method, "POST") == 0 && r.status != NULL &&
+            *r.status != 307 && *r.status != 308) {
+            r.method = "GET";
+            r.body = NULL;
+            r.body_len = 0;
+        }
+        SAY(quiet, "-> %s\n", next);
         memcpy(current, next, sizeof(current));
     }
 
     bufs_free(&bufs);
     return err;
+}
+
+ag_err_t ag_http_fetch(const char *url_text, const char *dest)
+{
+    if (url_text == NULL || dest == NULL) {
+        return -AG_EINVAL;
+    }
+    return http_run("GET", url_text, NULL, NULL, 0, dest, NULL, false);
+}
+
+ag_err_t ag_http_exchange(const char *method, const char *url_text,
+                          const char *headers, const void *body,
+                          uint32_t body_len, const char *dest,
+                          uint16_t *status)
+{
+    return http_run(method, url_text, headers, body, body_len, dest, status,
+                    true);
 }
 
 #endif /* CONFIG_ARGON_ENABLE_NET */
