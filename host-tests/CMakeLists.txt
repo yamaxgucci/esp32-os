@@ -92,6 +92,7 @@ set(ARGON_INCLUDES
     "${ARGON_ROOT}/apps/common/tube"
     "${ARGON_ROOT}/apps/common/pixband"
     "${ARGON_ROOT}/apps/common/ws"
+    "${ARGON_ROOT}/apps/store"
     "${ARGON_ROOT}/apps/cktbench")
 
 # The NAM player has to agree with the reference implementation to the last bit -
@@ -166,6 +167,16 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/esp8266/ag_espldr.c"
     test_stm32ldr.c
     "${ARGON_ROOT}/apps/common/stm32/ag_stm32ldr.c"
+    # The shop's own half: a catalogue, a version, a choice of build and the
+    # registry of what is installed.  Compiled here and into STORE.AXE from the
+    # same sources, so these are the tests of the code that ships.
+    test_store.c
+    "${ARGON_ROOT}/apps/store/store_text.c"
+    "${ARGON_ROOT}/apps/store/store_ver.c"
+    "${ARGON_ROOT}/apps/store/store_index.c"
+    "${ARGON_ROOT}/apps/store/store_pick.c"
+    "${ARGON_ROOT}/apps/store/store_db.c"
+    "${ARGON_ROOT}/apps/store/sha256.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     test_rv32.c
