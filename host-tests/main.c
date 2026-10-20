@@ -47,6 +47,7 @@ void run_phonelink_tests(void);
 void run_espldr_tests(void);
 void run_stm32ldr_tests(void);
 void run_store_tests(void);
+void run_store_sig_tests(void);
 void run_place_tests(void);
 
 int main(void)
@@ -91,6 +92,7 @@ int main(void)
     run_espldr_tests();
     run_stm32ldr_tests();
     run_store_tests();
+    run_store_sig_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);
     return ag_test_failures == 0 ? 0 : 1;

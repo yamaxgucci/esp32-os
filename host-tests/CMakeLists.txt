@@ -177,6 +177,12 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/store/store_pick.c"
     "${ARGON_ROOT}/apps/store/store_db.c"
     "${ARGON_ROOT}/apps/store/sha256.c"
+    # The signatures: certificates, the AXS1 tail, the catalogue's AGS1.  The
+    # maths is Monocypher, vendored in apps/store/vendor.
+    test_store_sig.c
+    "${ARGON_ROOT}/apps/store/store_sig.c"
+    "${ARGON_ROOT}/apps/store/vendor/monocypher.c"
+    "${ARGON_ROOT}/apps/store/vendor/monocypher-ed25519.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     test_rv32.c
@@ -205,6 +211,33 @@ target_compile_definitions(argon_tests PRIVATE
     AG_FIXTURE_DIR="${CMAKE_CURRENT_LIST_DIR}/fixtures"
     AG_TREE_ROOT="${ARGON_ROOT}"
     AG_HOST=1)
+
+# The vendored crypto is not ours to fix, and its warnings are not ours to
+# silence one by one.  It is also the one place in this tree where a compiler
+# warning could be about the thing being done rather than about style, so it
+# keeps its own file list and its own flag rather than a blanket -w.
+if(NOT MSVC)
+    set_source_files_properties(
+        "${ARGON_ROOT}/apps/store/vendor/monocypher.c"
+        "${ARGON_ROOT}/apps/store/vendor/monocypher-ed25519.c"
+        PROPERTIES COMPILE_OPTIONS "-w")
+endif()
+
+# Checks a signed image or a signed catalogue exactly as STORE.AXE does, so
+# that store/tests/test_argonsign.py can point it at what Python signed.  Two
+# implementations of RFC 8032 agreeing on the same bytes is the evidence.
+add_executable(storeverify
+    storeverify.c
+    "${ARGON_ROOT}/apps/store/store_sig.c"
+    "${ARGON_ROOT}/apps/store/sha256.c"
+    "${ARGON_ROOT}/apps/store/vendor/monocypher.c"
+    "${ARGON_ROOT}/apps/store/vendor/monocypher-ed25519.c")
+target_include_directories(storeverify PRIVATE
+    "${ARGON_ROOT}/sdk/include"
+    "${ARGON_ROOT}/apps/store")
+if(NOT MSVC)
+    target_link_libraries(storeverify PRIVATE m)
+endif()
 
 # Renders a raw serial transcript into the screen it produces, using the
 # kernel's own screen module.
