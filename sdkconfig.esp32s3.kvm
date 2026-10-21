@@ -62,4 +62,9 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_kvm.csv"
 # 16 each for the keyboard, the pointer and the CDC notification, and the rest
 # shared between the two bulk endpoints.  That is the whole budget and there is
 # no sixth interface to be had - see docs/14-usb-kvm.md.
-CONFIG_TINYUSB_MSC_BUFSIZE=512
+#
+# The MSC transfer buffer must be at least the wear-levelling sector size, not
+# the 512-byte USB block: esp_tinyusb reads a whole WL sector (4 KB) at a time
+# and refuses to mount the drive (ESP_ERR_NOT_SUPPORTED) if this is smaller.
+# Found on the board 21 Oct - with 512 the drive enumerated but had no media.
+CONFIG_TINYUSB_MSC_BUFSIZE=4096
