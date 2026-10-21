@@ -183,6 +183,10 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/store/store_sig.c"
     "${ARGON_ROOT}/apps/store/vendor/monocypher.c"
     "${ARGON_ROOT}/apps/store/vendor/monocypher-ed25519.c"
+    # AGX1: the frames a program arrives in, checked against the same
+    # vectors as the Python sender and the site.
+    test_agx.c
+    "${ARGON_ROOT}/apps/store/agx.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     test_rv32.c
