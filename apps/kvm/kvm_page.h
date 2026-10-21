@@ -148,6 +148,18 @@ static const char k_page[] =
      * keyboard layout does not turn the characters into something else. */
     "function BT(s){B(0x12,new TextEncoder().encode(s))}"
 
+    /* The password the board asks for on connect.  Kept in localStorage so a
+     * phone only types it once; an in-memory copy stands in when localStorage
+     * throws (private mode) or is empty.  A stored empty string is a real
+     * answer - a board with no password accepts it - so only a missing entry
+     * (getItem returns null) falls through to the prompt. */
+    "var pwmem='';"
+    "function pwset(p){pwmem=p;try{localStorage.setItem('kvmpw',p)}catch(e){}return p}"
+    "function pwget(){try{var v=localStorage.getItem('kvmpw');if(v!==null)return v}"
+    "catch(e){}if(pwmem)return pwmem;"
+    "var p=window.prompt('Password for this KVM:');if(p===null)p='';return pwset(p)}"
+    "function pwclear(){pwmem='';try{localStorage.removeItem('kvmpw')}catch(e){}}"
+
     /* One socket, reopened for as long as the page is up.  A phone that
      * locks its screen drops it, and coming back to a dead page would be
      * indistinguishable from a dead board. */
@@ -155,8 +167,10 @@ static const char k_page[] =
     "W=new WebSocket((location.protocol=='https:'?'wss://':'ws://')"
     "+location.host+'/ws');"
     "W.binaryType='arraybuffer';"
-    "W.onopen=function(){dot.className='on';st.textContent='connected';"
-    "B(0x11,null)};"
+    /* The board acts on nothing until it has seen the password.  Send it, and
+     * wait for 'A 1' before asking for a keyframe. */
+    "W.onopen=function(){dot.className='on';st.textContent='authenticating';"
+    "S('P '+pwget())};"
     "W.onclose=function(){dot.className='';st.textContent='reconnecting';"
     "W=null;setTimeout(open_,1000)};"
     "W.onmessage=function(e){"
@@ -166,7 +180,15 @@ static const char k_page[] =
      * - the fields in the order push_status writes them, and the reason this
      * is spelled out is that reading them one apart is exactly the mistake
      * that made a healthy link look like eighteen hundred resyncs. */
-    "function text(s){var a=s.split(' ');if(a[0]!='S')return;"
+    "function text(s){"
+    /* The authentication reply.  'A 1' opens the link - only now ask for the
+     * first picture.  'A 0' means the stored password was wrong: forget it and
+     * ask again, once, for the one 'A 0' the board sends per attempt. */
+    "if(s=='A 1'){dot.className='on';st.textContent='connected';B(0x11,null);return}"
+    "if(s=='A 0'){pwclear();st.textContent='wrong password';"
+    "var p=window.prompt('Password for this KVM:');if(p===null)p='';"
+    "S('P '+pwset(p));return}"
+    "var a=s.split(' ');if(a[0]!='S')return;"
     "st.textContent=(['off','waiting for a PC','ready'][+a[1]]||'?')"
     "+(+a[5]==2?' + screen':'');"
     "cnt.textContent=a[2]+' sent, '+a[3]+' lost'"

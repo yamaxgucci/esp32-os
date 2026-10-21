@@ -102,11 +102,23 @@ typedef struct {
     uint32_t       reports;
     uint32_t       refused;
     uint32_t       tiles;   /* picture messages forwarded to the phone      */
+
+    /* Config the agent sets and the board keeps in /sys/KVMCFG.TXT, so a
+     * dongle remembers its network and password across unplugging. */
+    char ssid[64];
+    char wpass[64];
+    char webpass[64]; /* the page's password; empty means the page is open  */
+    bool have_cfg;    /* a network has been configured                      */
+    bool authed;      /* this phone has given the password (or none is set) */
 } kvm_t;
 
 /* The phone went away, for whatever reason; declared here because the picture
  * pump finds out about it as often as the socket loop does. */
 static void ws_drop(kvm_t *k, const char *why);
+
+/* Credentials off the pipe; declared here because the picture pump is where a
+ * config message is noticed, above where the handler is defined. */
+static void kvm_apply_config(kvm_t *k, const uint8_t *p, uint32_t len);
 
 /* ------------------------------------------------------------------------ */
 /* Sockets                                                                  */
@@ -267,6 +279,22 @@ static void handle_line(kvm_t *k, const char *line, size_t len)
 {
     k->lines++;
 
+    /* "P <password>": the phone proving it may drive.  The reply tells the
+     * page whether to go on or ask again.  A board with no password set is
+     * open, and says so. */
+    if (len >= 1 && line[0] == 'P' && (len == 1 || line[1] == ' ')) {
+        const char  *pw = (len >= 2) ? line + 2 : "";
+        const size_t pwn = (len >= 2) ? len - 2 : 0;
+        const size_t wl = strlen(k->webpass);
+        k->authed = (wl == 0) || (pwn == wl && memcmp(pw, k->webpass, wl) == 0);
+        (void)ws_send(k, AG_WS_TEXT, k->authed ? "A 1" : "A 0", 3);
+        return;
+    }
+    /* Everything else is control, and control waits for the password. */
+    if (!k->authed) {
+        return;
+    }
+
     if (len >= 2 && line[0] == 'T' && line[1] == ' ') {
         type_text(k, line + 2, len - 2);
         return;
@@ -315,8 +343,14 @@ static bool pump_video(kvm_t *k)
         ag_vid_msg_t msg;
         while (ag_vid_rx_next(&k->vrx, &msg)) {
             moved = true;
-            if (k->ws < 0) {
-                continue; /* no phone: the message is read and dropped */
+            if (msg.type == AG_VID_CONFIG) {
+                /* Not a picture: the agent is configuring the dongle.  Handle
+                 * it here and never forward it on to the phone. */
+                kvm_apply_config(k, msg.payload, msg.len);
+                continue;
+            }
+            if (k->ws < 0 || !k->authed) {
+                continue; /* no phone, or one that has not given the password */
             }
             if (!ws_send_ms(k, AG_WS_BIN, msg.raw, msg.raw_len,
                             VID_SEND_MS)) {
@@ -368,6 +402,141 @@ static void video_out(kvm_t *k, const uint8_t *data, uint32_t len)
         }
         break; /* nothing at the other end */
     }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Configuration: the one thing the far machine cannot supply through a      */
+/* keyboard, because the keyboard is the board.  The agent sends which Wi-Fi */
+/* to join and a password for the page; the board keeps it in a file so an   */
+/* unplugged dongle remembers, and joins on its own on the next boot.        */
+/* ------------------------------------------------------------------------ */
+
+#define KVM_CFG_PATH "c:\\KVMCFG.TXT"
+
+/* Copy one NUL-separated field out of a bounded buffer, advancing past it. */
+static const char *take_field(char *dst, size_t cap, const char *s,
+                              uint32_t *rem)
+{
+    uint32_t i = 0;
+    while (i < *rem && s[i] != 0) {
+        i++;
+    }
+    size_t L = (i < cap) ? i : cap - 1;
+    memcpy(dst, s, L);
+    dst[L] = 0;
+    const uint32_t adv = (i < *rem) ? i + 1 : i; /* skip the NUL if present */
+    *rem -= adv;
+    return s + adv;
+}
+
+static void kvm_join(kvm_t *k)
+{
+    if (k->have_cfg && k->ssid[0] != 0 && ag_wifi_available()) {
+        (void)ag_wifi_connect(k->ssid, k->wpass, NULL);
+    }
+}
+
+static void kvm_read_cfg(kvm_t *k)
+{
+    const ag_handle_t h = ag_open(KVM_CFG_PATH, AG_O_RDONLY);
+    if (h < 0) {
+        return;
+    }
+    char          buf[256];
+    const int32_t n = ag_read(h, buf, sizeof(buf) - 1);
+    (void)ag_close(h);
+    if (n <= 0) {
+        return;
+    }
+    buf[n] = 0;
+    /* Three lines: ssid, pass, webpass. */
+    char        *into[3] = {k->ssid, k->wpass, k->webpass};
+    const size_t cap[3] = {sizeof(k->ssid), sizeof(k->wpass),
+                           sizeof(k->webpass)};
+    char *p = buf;
+    for (int i = 0; i < 3 && p != NULL; i++) {
+        char  *nl = strchr(p, '\n');
+        size_t L = nl ? (size_t)(nl - p) : strlen(p);
+        if (L > 0 && p[L - 1] == '\r') {
+            L--;
+        }
+        if (L >= cap[i]) {
+            L = cap[i] - 1;
+        }
+        memcpy(into[i], p, L);
+        into[i][L] = 0;
+        p = nl ? nl + 1 : NULL;
+    }
+    k->have_cfg = (k->ssid[0] != 0);
+    k->authed = (k->webpass[0] == 0);
+}
+
+static void kvm_write_cfg(kvm_t *k)
+{
+    const ag_handle_t h =
+        ag_open(KVM_CFG_PATH, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (h < 0) {
+        ag_printf("could not save config (%d)\n", (int)h);
+        return;
+    }
+    char      buf[256];
+    const int n = snprintf(buf, sizeof(buf), "%s\n%s\n%s\n", k->ssid, k->wpass,
+                           k->webpass);
+    if (n > 0) {
+        (void)ag_write(h, buf, (size_t)n);
+    }
+    (void)ag_close(h);
+}
+
+/* The agent sent credentials: remember them, join, and make the page ask for
+ * the new password. */
+static void kvm_apply_config(kvm_t *k, const uint8_t *p, uint32_t len)
+{
+    const char *s = (const char *)p;
+    uint32_t    rem = len;
+    s = take_field(k->ssid, sizeof(k->ssid), s, &rem);
+    s = take_field(k->wpass, sizeof(k->wpass), s, &rem);
+    (void)take_field(k->webpass, sizeof(k->webpass), s, &rem);
+
+    k->have_cfg = (k->ssid[0] != 0);
+    k->authed = (k->webpass[0] == 0);
+    kvm_write_cfg(k);
+    ag_printf("configured: joining %s\n", k->ssid);
+    kvm_join(k);
+}
+
+/* Tell the agent whether a network is set and, once joined, the address to
+ * open on the phone.  The agent shows this to whoever plugged the dongle in. */
+static void send_cfg_state(kvm_t *k)
+{
+    if (k->vid < 0) {
+        return;
+    }
+    uint8_t  buf[AG_VID_HDR + 1 + 16];
+    uint32_t addr = 0;
+    char     ip[16] = "0.0.0.0";
+    const bool ready = ag_net_is_ready();
+    if (ready && ag_net_ifaddr(&addr) == AG_OK) {
+        (void)snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
+                       (unsigned)((addr >> 24) & 0xFFu),
+                       (unsigned)((addr >> 16) & 0xFFu),
+                       (unsigned)((addr >> 8) & 0xFFu),
+                       (unsigned)(addr & 0xFFu));
+    }
+    const uint8_t state = ready ? AG_VID_CFG_READY
+                                : (k->have_cfg ? AG_VID_CFG_JOINING
+                                               : AG_VID_CFG_NEED);
+    const size_t   iplen = strlen(ip) + 1;
+    const uint32_t plen = 1u + (uint32_t)iplen;
+    (void)ag_vid_header(buf, AG_VID_CFG_STATE, 0, plen);
+    buf[AG_VID_HDR] = state;
+    memcpy(buf + AG_VID_HDR + 1, ip, iplen);
+    /* One non-blocking write, no retry: this runs on a timer whether or not an
+     * agent is draining the pipe, and the keyboard must not wait behind it.  A
+     * dropped state message is picked up by the next tick 700 ms later.  The
+     * message is far smaller than one endpoint buffer, so it goes whole or not
+     * at all. */
+    (void)ag_dev_write(k->vid, buf, AG_VID_HDR + plen);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -492,6 +661,7 @@ static void ws_adopt(kvm_t *k, ag_handle_t c)
     }
     k->ws = c;
     k->rx_n = 0;
+    k->authed = (k->webpass[0] == 0); /* a fresh phone must give the password */
     ag_kvm_reset(&k->st);
     ag_printf("phone connected\n");
 }
@@ -629,16 +799,16 @@ int ag_main(int argc, char **argv)
         return 1;
     }
 
-    if (!ag_net_is_ready() && ag_net_wait_ready(8000) != AG_OK) {
-        ag_printf("no network (is the radio up and joined?)\n");
-        (void)ag_dev_close(k.dev);
-        return 1;
-    }
-
     /*
-     * The serial pipe is optional and its absence is not a failure: a build
-     * without it, or a board with nothing running on the far machine, is a
-     * keyboard and a mouse, and that is a whole useful thing on its own.
+     * No network is not a failure any more.  A dongle plugged into a machine
+     * it has never seen has not been told a Wi-Fi yet; it waits here with the
+     * pipe open, and the agent sends the credentials down it.  Once a network
+     * is set the board joins on its own at boot (kvm_read_cfg + kvm_join).
+     *
+     * The serial pipe is likewise optional: a build without it, or a board
+     * with nothing running on the far machine, is a keyboard and a mouse, and
+     * that is a whole useful thing on its own.  It is opened before anything
+     * network, because it is how an unconfigured dongle is configured.
      */
     k.vid = ag_dev_open("usbcdc0");
 
@@ -653,6 +823,21 @@ int ag_main(int argc, char **argv)
     k.vbuf = (uint8_t *)k.mem + WS_RX + REQ_MAX;
     k.vchunk = k.vbuf + AG_VID_MAX_MSG;
     ag_vid_rx_init(&k.vrx, k.vbuf, AG_VID_MAX_MSG);
+
+    /*
+     * Bring the radio stack up ourselves.  With no [wifi] in SYSTEM.CFG the OS
+     * never starts it, and then the socket calls below have no stack under them
+     * - so a dongle that has not been configured must start it here.  Harmless
+     * when the OS already did: start on an started radio just returns.
+     */
+    if (ag_wifi_available()) {
+        (void)ag_wifi_start();
+    }
+
+    /* What the agent set last time.  Join now so the page is reachable as soon
+     * as the radio associates; if nothing is set, wait for the agent. */
+    kvm_read_cfg(&k);
+    kvm_join(&k);
 
     k.lfd = ag_tcp_listen(port);
     if (k.lfd < 0) {
@@ -682,6 +867,7 @@ int ag_main(int argc, char **argv)
     }
 
     uint32_t next_status = ag_millis();
+    uint32_t next_cfg = ag_millis();
 
     while (!ag_interrupted()) {
         /*
@@ -739,6 +925,14 @@ int ag_main(int argc, char **argv)
             if (k.ws >= 0) {
                 push_status(&k);
             }
+        }
+
+        /* Keep the agent told whether a network is set and, once joined, the
+         * address to open - it is the only screen the person configuring the
+         * dongle can read. */
+        if ((int32_t)(ag_millis() - next_cfg) >= 0) {
+            next_cfg = ag_millis() + 700u;
+            send_cfg_state(&k);
         }
 
         if (!busy) {

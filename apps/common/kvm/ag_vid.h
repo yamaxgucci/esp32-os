@@ -71,7 +71,22 @@ typedef enum {
      */
     AG_VID_CLIP = 0x10,  /* UTF-8 text for the far machine's clipboard       */
     AG_VID_WANT = 0x11,  /* send a whole screen: a phone that just connected */
+    AG_VID_TYPE = 0x12,  /* UTF-8 text the agent injects as Unicode keys      */
+
+    /*
+     * The two that do not travel on to the phone: the board and the agent use
+     * them to agree on Wi-Fi and the page password, so a dongle plugged into a
+     * machine that has never seen it can be told which network to join without
+     * any console on that machine.
+     */
+    AG_VID_CONFIG = 0x20,    /* agent->board: ssid '\0' pass '\0' webpass '\0' */
+    AG_VID_CFG_STATE = 0x21, /* board->agent: one state byte then an IP string */
 } ag_vid_type_t;
+
+/* AG_VID_CFG_STATE's first payload byte. */
+#define AG_VID_CFG_NEED 0u    /* no Wi-Fi configured yet - ask the user       */
+#define AG_VID_CFG_JOINING 1u /* credentials in hand, not associated yet      */
+#define AG_VID_CFG_READY 2u   /* on the network; the IP string follows        */
 
 /* AG_VID_HELLO payload: fixed part, then a UTF-8 name with no terminator. */
 typedef struct {

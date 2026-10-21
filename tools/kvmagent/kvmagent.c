@@ -64,6 +64,11 @@
 #define AG_VID_CLIP 0x10
 #define AG_VID_WANT 0x11
 #define AG_VID_TYPE 0x12
+/* First-run setup, the one thing the agent and board must agree on by hand: the
+ * board has no keyboard to be told a Wi-Fi name on, so the agent collects it at
+ * a console and ships it, and the board reports back where it ended up. */
+#define AG_VID_CONFIG 0x20    /* agent -> board: ssid '\0' pass '\0' webpass '\0' */
+#define AG_VID_CFG_STATE 0x21 /* board -> agent: [state:1][IP ascii, NUL-term]   */
 
 /* The board's VID/PID.  Matches ARGON_USB_VID/PID in usbdev_hw.c; a product
  * with its own pair changes both places. */
@@ -605,6 +610,84 @@ static void type_unicode(const uint8_t *utf8, uint32_t len)
 }
 
 /* ------------------------------------------------------------------------ */
+/* First-run configuration                                                   */
+/* ------------------------------------------------------------------------ */
+
+/* The board tells us, every few moments until we act, whether it has a network
+ * yet.  These remember what we have done about it so the once-only things stay
+ * once-only: g_asked guards the wizard (we do not re-prompt while it joins),
+ * g_configured guards the "Ready" line, and g_force_setup is --setup asking to
+ * run the wizard even on a board that is already configured. */
+static int g_configured = 0;
+static int g_asked = 0;
+static int g_force_setup = 0;
+
+/* Read one line from the console into buf, without its trailing CR/LF.  An EOF
+ * (the user closed the input) leaves an empty string, which the board reads as
+ * "unchanged"; there is nothing better to do without a console. */
+static void read_line(char *buf, size_t cap)
+{
+    buf[0] = '\0';
+    if (fgets(buf, (int)cap, stdin) == NULL) {
+        return;
+    }
+    size_t n = strlen(buf);
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
+        buf[--n] = '\0';
+    }
+}
+
+/*
+ * The wizard.  The board has just told us it has no Wi-Fi, so there is no phone
+ * to serve and nothing is lost by blocking on the console: ask for the network,
+ * its password, and the password that will guard the web page, and send all
+ * three as one NUL-separated payload (each field keeps its terminating NUL, so
+ * the board can read them straight out of the buffer).  The board replies with
+ * CFG_STATE 1 while it joins and 2 once it has an address.
+ */
+static void run_setup(link_t *l)
+{
+    char ssid[128], pass[128], webpass[128];
+
+    printf("\n-- First-run setup --\n");
+    printf("The dongle needs a Wi-Fi network to put the phone page on.\n");
+
+    printf("Wi-Fi network (SSID): ");
+    fflush(stdout);
+    read_line(ssid, sizeof(ssid));
+
+    printf("Wi-Fi password: ");
+    fflush(stdout);
+    read_line(pass, sizeof(pass));
+
+    printf("Password to open the web page: ");
+    fflush(stdout);
+    read_line(webpass, sizeof(webpass));
+
+    /* ssid '\0' pass '\0' webpass '\0' - the trailing NULs are part of the
+     * length so the board gets three C strings back, empty ones included. */
+    const size_t ls = strlen(ssid), lp = strlen(pass), lw = strlen(webpass);
+    const size_t total = ls + 1 + lp + 1 + lw + 1;
+    uint8_t *payload = (uint8_t *)malloc(total);
+    if (payload == NULL) {
+        return;
+    }
+    size_t o = 0;
+    memcpy(payload + o, ssid, ls + 1);
+    o += ls + 1;
+    memcpy(payload + o, pass, lp + 1);
+    o += lp + 1;
+    memcpy(payload + o, webpass, lw + 1);
+    o += lw + 1;
+
+    send_msg(l, AG_VID_CONFIG, payload, (uint32_t)total);
+    free(payload);
+
+    printf("sent to the dongle; joining the network...\n");
+    fflush(stdout);
+}
+
+/* ------------------------------------------------------------------------ */
 
 static volatile int s_stop;
 
@@ -632,6 +715,11 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--list") == 0) {
             list_only = 1;
+        } else if (strcmp(argv[i], "--setup") == 0) {
+            /* Force the wizard the next time the board reports its config
+             * state, even if it is already on a network - for changing the
+             * Wi-Fi or the web password after first run. */
+            g_force_setup = 1;
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             /* Accepted and ignored: the board is no longer a COM port, it is a
              * WinUSB device found by its interface GUID.  Kept so old scripts
@@ -645,7 +733,7 @@ int main(int argc, char **argv)
             tile = atoi(argv[++i]);
         } else {
             printf("usage: kvmagent [--tcp host:port] "
-                   "[--fps N] [--tile N] [--list]\n");
+                   "[--fps N] [--tile N] [--list] [--setup]\n");
             return 1;
         }
     }
@@ -773,6 +861,42 @@ int main(int argc, char **argv)
                     set_clipboard(msg + off + AG_VID_HDR, len);
                 } else if (type == AG_VID_TYPE && len > 0) {
                     type_unicode(msg + off + AG_VID_HDR, len);
+                } else if (type == AG_VID_CFG_STATE && len >= 1) {
+                    /*
+                     * Where the board is on getting onto a network.  The first
+                     * byte is the state; the rest is the IP as ASCII, which the
+                     * board NUL-terminates - but we never trust a wire length,
+                     * so bound the string to the frame and plant our own NUL.
+                     */
+                    const uint8_t *p = msg + off + AG_VID_HDR;
+                    const uint8_t  state = p[0];
+                    char ip[64];
+                    uint32_t iplen = len - 1; /* bytes after the state byte */
+                    if (iplen > sizeof(ip) - 1) {
+                        iplen = sizeof(ip) - 1;
+                    }
+                    memcpy(ip, p + 1, iplen);
+                    ip[iplen] = '\0'; /* terminate even if the board did not */
+
+                    if (g_force_setup && !g_asked) {
+                        /* --setup: reconfigure regardless of the reported
+                         * state (the board may already be on a network). */
+                        run_setup(&link);
+                        g_asked = 1;
+                    } else if (state == 0 && !g_asked) {
+                        run_setup(&link);
+                        g_asked = 1;
+                    } else if (state == 1) {
+                        if (!g_asked) {
+                            printf("joining the network...\n");
+                            fflush(stdout);
+                            g_asked = 1;
+                        }
+                    } else if (state == 2 && !g_configured) {
+                        printf("\nReady. Open  http://%s/  on the phone\n", ip);
+                        fflush(stdout);
+                        g_configured = 1;
+                    }
                 }
                 off += AG_VID_HDR + len;
             }
