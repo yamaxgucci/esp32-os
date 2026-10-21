@@ -48,23 +48,21 @@ CONFIG_TINYUSB_CDC_RX_BUFSIZE=4096
 CONFIG_TINYUSB_CDC_TX_BUFSIZE=1024
 CONFIG_TINYUSB_CDC_EP_BUFSIZE=2048
 
-# The drive the agent lives on: a FAT volume in the `usbdisk` partition, which
-# the far machine mounts like any memory stick.  This is what makes the whole
-# thing self-contained - the program that machine needs is on the device before
-# it is ever plugged in.
-CONFIG_TINYUSB_MSC_ENABLED=y
-
-# The partition table with `usbdisk` in it.  Half a megabyte off the end of
-# appfs; see partitions_kvm.csv.
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_kvm.csv"
-
-# Five IN endpoints and one kilobyte of FIFO, in words: 52 receive, 16 for EP0,
-# 16 each for the keyboard, the pointer and the CDC notification, and the rest
-# shared between the two bulk endpoints.  That is the whole budget and there is
-# no sixth interface to be had - see docs/14-usb-kvm.md.
+# No flash drive, and it is the hardware that forbids it, not a choice.  The
+# S3's OTG core has five IN endpoints TOTAL and the control endpoint EP0 is one
+# of them, so only FOUR are left for functions.  The keyboard, the pointer and
+# the serial pipe's two (notification + bulk) are those four.  A fifth - the
+# mass-storage bulk IN - makes TinyUSB's dfifo_alloc assert ("allocated_epin <
+# ep_in_count") the moment a real host opens the endpoints, and the device
+# fails to start (Windows error 10, connect/disconnect loop).  Found on the
+# board 21 Oct; docs/14-usb-kvm.md had claimed five functions fit and was wrong.
 #
-# The MSC transfer buffer must be at least the wear-levelling sector size, not
-# the 512-byte USB block: esp_tinyusb reads a whole WL sector (4 KB) at a time
-# and refuses to mount the drive (ESP_ERR_NOT_SUPPORTED) if this is smaller.
-# Found on the board 21 Oct - with 512 the drive enumerated but had no media.
-CONFIG_TINYUSB_MSC_BUFSIZE=4096
+# Getting the drive back means freeing an endpoint: a custom CDC without its
+# (unused) notification endpoint, which Windows usbser may or may not accept -
+# a separate experiment.  Until then the agent is delivered by other means.
+CONFIG_ARGON_USB_DEVICE_MSC=n
+CONFIG_TINYUSB_MSC_ENABLED=n
+
+# The partition table still carries `usbdisk` (harmless, unused) so the layout
+# does not change if the drive comes back.  See partitions_kvm.csv.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_kvm.csv"
