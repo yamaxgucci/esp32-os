@@ -29,6 +29,7 @@
       "include": ["apps/store"],
       "ldflags": ["-Wl,--gc-sections"],
       "src": ["apps/store/store.c",
+              "apps/store/agx.c",
               "apps/store/store_text.c",
               "apps/store/store_ver.c",
               "apps/store/store_index.c",
