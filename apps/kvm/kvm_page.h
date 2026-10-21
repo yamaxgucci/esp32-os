@@ -72,10 +72,19 @@ static const char k_page[] =
     "button{flex:1 1 56px;padding:7px 4px;background:#1c1c1c;color:#ddd;"
     "border:1px solid #333;border-radius:6px;font:12px system-ui;min-height:38px}"
     "button:active,button.on{background:#3a7;color:#000}"
-    "#tx{position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0}"
+    /* The keystroke catcher.  Invisible, but on-screen and focusable - a phone
+     * raises its keyboard for this but not for an off-screen field, and nothing
+     * is drawn, so there is no input box to see.  pointer-events:none so the
+     * strip it occupies does not swallow taps meant for the screen; the keyboard
+     * button focuses it.  16px so iOS does not zoom the page on focus. */
+    "#tx{position:fixed;left:0;bottom:0;width:100%;height:1px;opacity:0;"
+    "border:0;padding:0;margin:0;font-size:16px;pointer-events:none}"
+    "body.hideui .row{display:none}"
+    "#kb,#hui{flex:none;min-height:0;padding:3px 10px;font-size:14px}"
     "</style></head><body>"
     "<div id='bar'><span id='dot'></span><span id='st'>connecting</span>"
-    "<span id='cnt'></span></div>"
+    "<span id='cnt'></span><button id='hui'>Hide</button>"
+    "<button id='kb'>&#9000;</button></div>"
     "<div id='pad'>trackpad: drag to move, tap to click, two fingers to scroll"
     "<br><br>no picture: start the agent on that computer"
     "</div>"
@@ -85,8 +94,7 @@ static const char k_page[] =
     "</button><button id='bR'>Right</button><button id='bD'>Drag</button>"
     "<button id='bF'>Fit</button><button id='b11'>1:1</button>"
     "<button id='bPan'>Move</button>"
-    "<button id='bMode'>Pad</button>"
-    "<button id='bKbd'>&#9000;Keys</button></div>"
+    "<button id='bMode'>Pad</button></div>"
     "<div class='row'><button data-k='Escape'>Esc</button>"
     "<button data-k='Tab'>Tab</button><button data-m='1'>Ctrl</button>"
     "<button data-m='2'>Shift</button><button data-m='4'>Alt</button>"
@@ -99,7 +107,7 @@ static const char k_page[] =
     "<button data-k='Backspace'>&#9003;</button>"
     "<button id='cad'>C-A-Del</button></div>"
     "<input id='tx' autocomplete='off' autocapitalize='off'"
-    " autocorrect='off' spellcheck='false'>"
+    " autocorrect='off' spellcheck='false' placeholder='type - goes to the PC'>"
     "<script>"
     /* The map from a browser key position to a HID usage code.  Built rather
      * than written out: the letters and the digits and the function keys are
@@ -122,7 +130,7 @@ static const char k_page[] =
     "var dot=g('dot'),st=g('st'),cnt=g('cnt'),pad=g('pad'),tx=g('tx'),"
     "view=g('view'),wrap=g('wrap'),scr=g('scr');"
     "var ctx=null,SW=0,SH=0,zoom=1,ox=0,oy=0,q=Promise.resolve();"
-    "var cur=g('cur'),pmode='pad',cabs=[16383,16383],panning=0;"
+    "var cur=g('cur'),pmode='pad',cabs=[16383,16383],panning=0,gmode=0,kbon=0;"
     "function cl(v){return v<0?0:v>32767?32767:v}"
     "function drawc(){if(!ctx)return;cur.style.display='block';"
     "cur.style.left=(cabs[0]/32767*SW)+'px';cur.style.top=(cabs[1]/32767*SH)+'px'}"
@@ -136,6 +144,9 @@ static const char k_page[] =
     "b[0]=65;b[1]=71;b[2]=type;b[3]=0;"
     "b[4]=n&255;b[5]=(n>>8)&255;b[6]=(n>>16)&255;b[7]=(n>>24)&255;"
     "if(n)b.set(bytes,8);W.send(b.buffer)}"
+    /* Text to the agent for it to inject as Unicode, so the far machine's
+     * keyboard layout does not turn the characters into something else. */
+    "function BT(s){B(0x12,new TextEncoder().encode(s))}"
 
     /* One socket, reopened for as long as the page is up.  A phone that
      * locks its screen drops it, and coming back to a dead page would be
@@ -171,7 +182,7 @@ static const char k_page[] =
     "SW=p[2]|(p[3]<<8);SH=p[4]|(p[5]<<8);"
     "if(!SW||!SH)return;"
     "scr.width=SW;scr.height=SH;ctx=scr.getContext('2d');"
-    "pad.style.display='none';view.style.display='block';fit()}"
+    "pad.style.display='none';view.style.display='block';requestAnimationFrame(fit)}"
     "else if(t==2&&ctx){"
     "var x=p[0]|(p[1]<<8),y=p[2]|(p[3]<<8);"
     "var im=new Blob([p.subarray(8)],{type:'image/png'});"
@@ -186,18 +197,37 @@ static const char k_page[] =
     "function place(){wrap.style.transform="
     "'translate('+ox+'px,'+oy+'px) scale('+zoom+')'}"
     "function fit(){if(!SW)return;"
-    "var r=view.getBoundingClientRect();"
-    "zoom=Math.min(r.width/SW,r.height/SH);"
-    "ox=(r.width-SW*zoom)/2;oy=(r.height-SH*zoom)/2;place()}"
+    "var w=view.clientWidth,h=view.clientHeight;"
+    "zoom=Math.min(w/SW,h/SH);"
+    "ox=(w-SW*zoom)/2;oy=(h-SH*zoom)/2;place()}"
     "g('bF').onclick=function(){fit();B(0x11,null)};"
     "g('bMode').onclick=function(){pmode=pmode=='pad'?'abs':'pad';"
     "this.textContent=pmode=='pad'?'Pad':'Tap';this.className=pmode=='abs'?'on':'';drawc()};"
-    "g('bKbd').onclick=function(){tx.focus()};"
+    "g('kb').onclick=function(){kbon=!kbon;this.className=kbon?'on':'';"
+    "if(kbon){tx.value='';sent='';tx.focus()}else{tx.blur()}};"
+    "g('hui').onclick=function(){var on=D.body.classList.toggle('hideui');"
+    "this.className=on?'on':''};"
+    /* Tapping any control button moves focus off the catcher and would drop the
+     * phone keyboard; put it back within the same tap so the keyboard stays. */
+    "D.addEventListener('click',function(e){"
+    "if(kbon&&e.target.tagName=='BUTTON'&&e.target.id!='kb')tx.focus()});"
     "g('bPan').onclick=function(){panning=!panning;this.className=panning?'on':''};"
     "g('b11').onclick=function(){if(!SW)return;zoom=1;"
     "var r=view.getBoundingClientRect();"
     "ox=(r.width-SW)/2;oy=(r.height-SH)/2;place()};"
-    "addEventListener('resize',fit);"
+    /* Size the layout to the VISUAL viewport - the area left above the phone's
+     * keyboard - so the buttons sit above it and Hide actually frees screen.
+     * innerHeight does not shrink for the keyboard, visualViewport does.  No
+     * re-fit here: that would throw away the zoom the user set. */
+    "var vv=window.visualViewport,lastvh=0;"
+    "function sz(){var h=(vv?vv.height:innerHeight);"
+    /* The keyboard eats the bottom; shift the picture up by what it took so the
+     * spot the user lined up above the keyboard stays there, and back down when
+     * it closes. */
+    "if(lastvh&&h!=lastvh&&ctx){oy+=h-lastvh;place()}"
+    "lastvh=h;D.body.style.height=h+'px'}"
+    "if(vv){vv.addEventListener('resize',sz);vv.addEventListener('scroll',sz)}"
+    "addEventListener('resize',sz);addEventListener('orientationchange',sz);sz();"
 
     /* Where on the far machine's screen a finger is, as the absolute pointer
      * wants it: nought to 32767 across, whatever that screen turns out to be. */
@@ -212,7 +242,7 @@ static const char k_page[] =
      * reports, and sending each one would build a queue that arrives after
      * the finger has stopped. */
     "var pts={},np=0,ax=0,ay=0,aw=0,pend=0,t0=0,moved=0,SP=1.6;"
-    "var last=null,pinch=0,pd0=0,pz0=1,pc0=null;"
+    "var last=null,pinch=0,pd0=0,pz0=1,pc0=null,ly=0,lcx=0,lcy=0;"
     "function flush(){pend=0;"
     "if(last){var a=abs(last);cabs=a;S('A '+a[0]+' '+a[1]+' 0 '+btn);"
     "last=null;drawc();return}"
@@ -234,7 +264,8 @@ static const char k_page[] =
     "e.target.setPointerCapture&&e.target.setPointerCapture(e.pointerId);"
     "pts[e.pointerId]={x:e.clientX,y:e.clientY};np++;"
     "if(np==1){t0=Date.now();moved=0}"
-    "if(np==2&&ctx){var v=keys(pts);pinch=1;pd0=dist(v[0],v[1])||1;pz0=zoom;"
+    "if(np==2&&ctx){var v=keys(pts);pinch=1;gmode=0;pd0=dist(v[0],v[1])||1;pz0=zoom;"
+    "lcx=(v[0].x+v[1].x)/2;lcy=(v[0].y+v[1].y)/2;ly=lcy;"
     "pc0={x:(v[0].x+v[1].x)/2,y:(v[0].y+v[1].y)/2,cy:(v[0].y+v[1].y)/2,ox:ox,oy:oy}}"
     "e.preventDefault()}"
 
@@ -243,11 +274,15 @@ static const char k_page[] =
     "p.x=e.clientX;p.y=e.clientY;moved+=Math.abs(dx)+Math.abs(dy);"
     "if(pinch){var v=keys(pts);if(v.length>=2){"
     "var d=dist(v[0],v[1])||1,cx=(v[0].x+v[1].x)/2,cy=(v[0].y+v[1].y)/2;"
-    "if(Math.abs(d-pd0)>10){var nz=pz0*d/pd0;"
-    "if(nz<0.05)nz=0.05;if(nz>8)nz=8;"
-    "ox=cx-(cx-ox)*nz/zoom;oy=cy-(cy-oy)*nz/zoom;zoom=nz;place()}"
-    "else{aw-=(cy-pc0.cy)/12;qf()}"
-    "pc0.cy=cy}"
+    "if(!gmode){var dd=Math.abs(d-pd0),dc=Math.abs(cy-pc0.cy);"
+    "if(dd>14&&dd>=dc){gmode='z';pd0=d;pz0=zoom}"
+    "else if(dc>14)gmode='s'}"
+    /* Zoom about the point the fingers hold AND pan as that point moves, so two
+     * fingers scale and slide the view at once (lcx/lcy track last frame). */
+    "if(gmode=='z'){var nz=pz0*d/pd0;if(nz<0.05)nz=0.05;if(nz>8)nz=8;"
+    "ox=cx-nz*(lcx-ox)/zoom;oy=cy-nz*(lcy-oy)/zoom;zoom=nz;place()}"
+    "else if(gmode=='s'){aw-=(cy-ly)/9;qf()}"
+    "lcx=cx;lcy=cy;ly=cy}"
     "e.preventDefault();return}"
     "if(panning&&ctx){ox+=dx;oy+=dy;place();e.preventDefault();return}"
     "if(ctx){if(pmode=='abs'){last=e;qf()}else{ax+=dx*SP;ay+=dy*SP;qf()}}"
@@ -313,16 +348,18 @@ static const char k_page[] =
      * phone clearing an input mid-word is what stops the keyboard's own
      * word-by-word editing from working.  Clear is a button.
      */
-    "tx.addEventListener('input',function(e){"
-    "var t=e.inputType;"
-    "if(t&&t.indexOf('delete')==0){S('K d '+K.Backspace+' 0');"
+    "var sent='';"
+    "function flushtx(){var v=tx.value,i=0;"
+    "while(i<v.length&&i<sent.length&&v.charAt(i)==sent.charAt(i))i++;"
+    "for(var d=sent.length-i;d>0;d--){S('K d '+K.Backspace+' 0');"
     "S('K u '+K.Backspace+' 0')}"
-    "else if(t=='insertLineBreak'||t=='insertParagraph'){"
-    "S('K d '+K.Enter+' 0');S('K u '+K.Enter+' 0')}"
-    "else if(e.data)S('T '+e.data);"
-    "tx.value=''});"
+    "var add=v.slice(i);if(add){if(ctx)BT(add);else S('T '+add)}sent=v;"
+    "if(v.length>200){tx.value='';sent=''}}"
+    "tx.addEventListener('input',function(e){if(e.isComposing)return;flushtx()});"
+    "tx.addEventListener('compositionend',flushtx);"
     "tx.addEventListener('keydown',function(e){if(e.key=='Enter'){"
-    "S('K d '+K.Enter+' 0');S('K u '+K.Enter+' 0');e.preventDefault()}});"
+    "S('K d '+K.Enter+' 0');S('K u '+K.Enter+' 0');"
+    "e.preventDefault();tx.value='';sent=''}});"
     "open_();"
     "</script></body></html>";
 

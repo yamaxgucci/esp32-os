@@ -61,6 +61,7 @@
 #define AG_VID_BYE 0x03
 #define AG_VID_CLIP 0x10
 #define AG_VID_WANT 0x11
+#define AG_VID_TYPE 0x12
 
 /* The board's VID/PID.  Matches ARGON_USB_VID/PID in usbdev_hw.c; a product
  * with its own pair changes both places. */
@@ -513,6 +514,40 @@ static void set_clipboard(const uint8_t *utf8, uint32_t len)
     CloseClipboard();
 }
 
+/*
+ * Type text the way the phone meant it, not the way the PC's keyboard layout
+ * would read a scan code.  A USB keyboard sends key positions and the host
+ * decides the letter, so on a Russian layout the position of "r" becomes a
+ * Cyrillic letter.  The agent runs on the PC, so it can inject the actual
+ * characters with KEYEVENTF_UNICODE, which carries no layout at all - what was
+ * typed on the phone is what the focused window receives.
+ */
+static void type_unicode(const uint8_t *utf8, uint32_t len)
+{
+    const int wide = MultiByteToWideChar(CP_UTF8, 0, (const char *)utf8,
+                                         (int)len, NULL, 0);
+    if (wide <= 0) {
+        return;
+    }
+    wchar_t *w = (wchar_t *)malloc((size_t)wide * sizeof(wchar_t));
+    if (w == NULL) {
+        return;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, (const char *)utf8, (int)len, w, wide);
+
+    for (int i = 0; i < wide; i++) {
+        INPUT in[2];
+        memset(in, 0, sizeof(in));
+        in[0].type       = INPUT_KEYBOARD;
+        in[0].ki.wScan   = w[i];
+        in[0].ki.dwFlags = KEYEVENTF_UNICODE;
+        in[1]            = in[0];
+        in[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        SendInput(2, in, sizeof(INPUT));
+    }
+    free(w);
+}
+
 /* ------------------------------------------------------------------------ */
 
 static volatile int s_stop;
@@ -526,6 +561,13 @@ static BOOL WINAPI on_break(DWORD type)
 
 int main(int argc, char **argv)
 {
+    /* Without this the process is DPI-virtualised: on a display scaled past
+     * 100% (125% here) GetSystemMetrics and BitBlt report and capture the
+     * smaller logical screen, so the picture loses its bottom-right and the
+     * composited cursor lands short of where Windows actually drew it.  Make
+     * the agent see physical pixels, so one pixel is one pixel end to end. */
+    SetProcessDPIAware();
+
     const char *port = NULL;
     const char *tcp = NULL;
     int         fps = 15;
@@ -679,6 +721,8 @@ int main(int argc, char **argv)
                     want_hello = 1;
                 } else if (type == AG_VID_CLIP && len > 0) {
                     set_clipboard(msg + off + AG_VID_HDR, len);
+                } else if (type == AG_VID_TYPE && len > 0) {
+                    type_unicode(msg + off + AG_VID_HDR, len);
                 }
                 off += AG_VID_HDR + len;
             }
