@@ -40,6 +40,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <setupapi.h>
+#include <shellapi.h> /* Shell_NotifyIcon and NOTIFYICONDATA for the tray icon */
 /* winusb.h pulls in winusbio.h (the pipe-policy constants and PIPE_INFORMATION)
  * and needs windows.h ahead of it; include it last so those are in scope. */
 #include <winusb.h>
@@ -698,6 +699,181 @@ static BOOL WINAPI on_break(DWORD type)
     return TRUE;
 }
 
+/* ------------------------------------------------------------------------ */
+/* The system tray: once the agent is streaming there is nothing to watch in */
+/* the console, so it folds into a tray icon and gets out of the way.  This  */
+/* is all local Windows UI - none of it touches the link, the capture, or    */
+/* the framing; it only shows and hides the console and re-arms the wizard.  */
+/* ------------------------------------------------------------------------ */
+
+#define WM_KVM_TRAY (WM_APP + 1) /* the tray icon's notification callback     */
+#define IDM_SHOW    1            /* "Show console"                            */
+#define IDM_RECONFIG 2           /* "Reconfigure Wi-Fi / password"           */
+#define IDM_QUIT    3            /* "Quit"                                    */
+
+static HWND            g_console    = NULL;  /* this process's console window  */
+static HWND            g_tray_wnd   = NULL;  /* the hidden message-only window */
+static int             g_tray_added = 0;     /* is the icon in the tray?       */
+static int             g_console_up = 1;     /* is the console currently shown?*/
+static int             g_keep_console = 0;   /* --console: never auto-hide     */
+static NOTIFYICONDATAA g_nid;
+
+/* Show or hide the console window, remembering the state so the double-click
+ * toggle and the menu agree on what "showing" means. */
+static void console_show(int show)
+{
+    if (g_console == NULL) {
+        return;
+    }
+    ShowWindow(g_console, show ? SW_SHOW : SW_HIDE);
+    if (show) {
+        SetForegroundWindow(g_console);
+    }
+    g_console_up = show ? 1 : 0;
+}
+
+/* Put the icon in the tray, once.  Harmless to call again - it is a no-op once
+ * added, which is what lets "hide the console" call it unconditionally. */
+static void tray_add(void)
+{
+    if (g_tray_added || g_tray_wnd == NULL) {
+        return;
+    }
+    memset(&g_nid, 0, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = g_tray_wnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_KVM_TRAY;
+    g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    snprintf(g_nid.szTip, sizeof(g_nid.szTip), "ArgonOS KVM");
+    if (Shell_NotifyIconA(NIM_ADD, &g_nid)) {
+        g_tray_added = 1;
+    }
+}
+
+static void tray_remove(void)
+{
+    if (g_tray_added) {
+        Shell_NotifyIconA(NIM_DELETE, &g_nid);
+        g_tray_added = 0;
+    }
+}
+
+/* Pop the right-click menu at the cursor.  The SetForegroundWindow / WM_NULL
+ * dance is the documented way to make the menu dismiss when the user clicks
+ * away from it. */
+static void tray_menu(HWND hwnd)
+{
+    POINT pt;
+    GetCursorPos(&pt);
+    HMENU menu = CreatePopupMenu();
+    if (menu == NULL) {
+        return;
+    }
+    AppendMenuA(menu, MF_STRING, IDM_SHOW, "Show console");
+    AppendMenuA(menu, MF_STRING, IDM_RECONFIG, "Reconfigure Wi-Fi / password");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_STRING, IDM_QUIT, "Quit");
+
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+    PostMessage(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+}
+
+static LRESULT CALLBACK tray_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_KVM_TRAY:
+        switch (LOWORD(lp)) {
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU:
+            tray_menu(hwnd);
+            break;
+        case WM_LBUTTONDBLCLK:
+            console_show(!g_console_up);
+            break;
+        }
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDM_SHOW:
+            console_show(1);
+            break;
+        case IDM_RECONFIG:
+            /* Bring the console back so the typed answers are visible, then
+             * re-arm the wizard: g_force_setup makes the next CFG_STATE run it
+             * regardless of the board's reported state, and clearing g_asked
+             * lets that fire again (it is the once-only guard the first run
+             * set).  The board sends CFG_STATE periodically, so the wizard
+             * comes up on its own within a few moments and reads from the
+             * now-visible console. */
+            console_show(1);
+            g_force_setup = 1;
+            g_asked = 0;
+            printf("\n(reconfiguring: answer the prompts below)\n");
+            fflush(stdout);
+            break;
+        case IDM_QUIT:
+            s_stop = 1;
+            DestroyWindow(hwnd);
+            break;
+        }
+        return 0;
+
+    case WM_DESTROY:
+        tray_remove();
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+/* Register the window class and create the hidden message-only window that
+ * owns the tray icon.  Message-only (HWND_MESSAGE as parent) is enough: it is
+ * never shown, it only needs to receive the tray callback and WM_COMMAND. */
+static int tray_window_create(void)
+{
+    WNDCLASSA wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = tray_wndproc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = "ArgonKvmTray";
+    if (RegisterClassA(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return 0;
+    }
+    g_tray_wnd = CreateWindowA("ArgonKvmTray", "ArgonOS KVM", 0, 0, 0, 0, 0,
+                               HWND_MESSAGE, NULL, wc.hInstance, NULL);
+    return g_tray_wnd != NULL;
+}
+
+/* Drain the hidden window's message queue without blocking - called once per
+ * capture iteration so the tray stays responsive while the loop keeps
+ * streaming. */
+static void tray_pump(void)
+{
+    MSG m;
+    while (PeekMessage(&m, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&m);
+        DispatchMessage(&m);
+    }
+}
+
+/* Fold into the tray: make sure the icon exists, drop a hint, and hide the
+ * console.  With --console this is a no-op so a debugger keeps the window. */
+static void hide_to_tray(void)
+{
+    if (g_keep_console || !g_console_up || g_tray_wnd == NULL) {
+        return;
+    }
+    tray_add();
+    printf("(minimising to the tray; right-click the tray icon for options)\n");
+    fflush(stdout);
+    console_show(0);
+}
+
 int main(int argc, char **argv)
 {
     /* Without this the process is DPI-virtualised: on a display scaled past
@@ -720,6 +896,10 @@ int main(int argc, char **argv)
              * state, even if it is already on a network - for changing the
              * Wi-Fi or the web password after first run. */
             g_force_setup = 1;
+        } else if (strcmp(argv[i], "--console") == 0) {
+            /* Keep the console window visible for the whole run instead of
+             * folding into the tray once streaming - for debugging. */
+            g_keep_console = 1;
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             /* Accepted and ignored: the board is no longer a COM port, it is a
              * WinUSB device found by its interface GUID.  Kept so old scripts
@@ -733,7 +913,7 @@ int main(int argc, char **argv)
             tile = atoi(argv[++i]);
         } else {
             printf("usage: kvmagent [--tcp host:port] "
-                   "[--fps N] [--tile N] [--list] [--setup]\n");
+                   "[--fps N] [--tile N] [--list] [--setup] [--console]\n");
             return 1;
         }
     }
@@ -789,6 +969,12 @@ int main(int argc, char **argv)
 
     SetConsoleCtrlHandler(on_break, TRUE);
 
+    /* The tray lives on a hidden message-only window; create it before the
+     * loop so the icon and its menu are ready the moment we fold away.  If it
+     * cannot be made we simply never hide the console - the agent still runs. */
+    g_console = GetConsoleWindow();
+    tray_window_create();
+
     uint8_t *scratch = (uint8_t *)malloc((size_t)tile * tile * 3);
     uint8_t  in[1024];
     uint8_t  msg[AG_VID_HDR + AG_VID_MAX_PAYLOAD];
@@ -817,6 +1003,9 @@ int main(int argc, char **argv)
     DWORD    report = GetTickCount() + 5000;
 
     while (!s_stop) {
+        /* Keep the tray icon and its menu live without blocking the loop. */
+        tray_pump();
+
         /* Anything from the phone, by way of the board. */
         const int n = link_read(&link, in, sizeof(in));
         if (n < 0) {
@@ -896,6 +1085,10 @@ int main(int argc, char **argv)
                         printf("\nReady. Open  http://%s/  on the phone\n", ip);
                         fflush(stdout);
                         g_configured = 1;
+                        /* Streaming from here on; nothing more to read in the
+                         * console, so fold it into the tray (unless --console).
+                         * Any later Reconfigure brings it back by itself. */
+                        hide_to_tray();
                     }
                 }
                 off += AG_VID_HDR + len;
@@ -952,6 +1145,16 @@ int main(int argc, char **argv)
             printf("%u frames, %u tiles sent\n", frames, sent);
             fflush(stdout);
         }
+    }
+
+    /* Bring the console back for the parting line and take the icon down.
+     * (A Quit from the menu already removed the icon via WM_DESTROY; tray_remove
+     * is a no-op the second time.) */
+    console_show(1);
+    tray_remove();
+    if (g_tray_wnd != NULL) {
+        DestroyWindow(g_tray_wnd);
+        g_tray_wnd = NULL;
     }
 
     send_msg(&link, AG_VID_BYE, NULL, 0);

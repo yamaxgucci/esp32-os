@@ -226,7 +226,7 @@ static const char k_page[] =
     "g('bMode').onclick=function(){pmode=pmode=='pad'?'abs':'pad';"
     "this.textContent=pmode=='pad'?'Pad':'Tap';this.className=pmode=='abs'?'on':'';drawc()};"
     "g('kb').onclick=function(){kbon=!kbon;this.className=kbon?'on':'';"
-    "if(kbon){tx.value='';sent='';tx.focus()}else{tx.blur()}};"
+    "if(kbon){tx.value=SENT;sent=SENT;tx.focus()}else{tx.blur()}};"
     "g('hui').onclick=function(){var on=D.body.classList.toggle('hideui');"
     "this.className=on?'on':''};"
     /* Tapping any control button moves focus off the catcher and would drop the
@@ -241,14 +241,14 @@ static const char k_page[] =
      * keyboard - so the buttons sit above it and Hide actually frees screen.
      * innerHeight does not shrink for the keyboard, visualViewport does.  No
      * re-fit here: that would throw away the zoom the user set. */
-    "var vv=window.visualViewport,lastvh=0;"
-    "function sz(){var h=(vv?vv.height:innerHeight);"
-    /* The keyboard eats the bottom; shift the picture up by what it took so the
-     * spot the user lined up above the keyboard stays there, and back down when
-     * it closes. */
-    "if(lastvh&&h!=lastvh&&ctx){oy+=h-lastvh;place()}"
-    "lastvh=h;D.body.style.height=h+'px'}"
-    "if(vv){vv.addEventListener('resize',sz);vv.addEventListener('scroll',sz)}"
+    /* The keyboard just shrinks the area from the bottom; the picture is not
+     * moved - no jump, and what the user panned to stays where it is.  Lower
+     * parts the keyboard now hides are reached by panning (two fingers / Move).
+     * Nudging the picture on a keyboard open was tried twice and surprised the
+     * eye both ways, so it is gone. */
+    "var vv=window.visualViewport;"
+    "function sz(){D.body.style.height=((vv?vv.height:innerHeight))+'px'}"
+    "if(vv)vv.addEventListener('resize',sz);"
     "addEventListener('resize',sz);addEventListener('orientationchange',sz);sz();"
 
     /* Where on the far machine's screen a finger is, as the absolute pointer
@@ -370,18 +370,27 @@ static const char k_page[] =
      * phone clearing an input mid-word is what stops the keyboard's own
      * word-by-word editing from working.  Clear is a button.
      */
-    "var sent='';"
+    /* A zero-width anchor that always sits in the box.  A phone reports typing
+     * as text but a backspace as an edit that removes a character - and with an
+     * empty box there is nothing to remove, so a backspace meant for text the
+     * computer already holds produced nothing.  Keeping one invisible character
+     * there means a backspace always has something to delete: when it goes, a
+     * Backspace is sent to the far machine and the anchor is put back.  The box
+     * is reset to just the anchor after each edit, so it never shows what was
+     * typed and is always ready to delete again. */
+    "var SENT='\\u200b',sent=SENT;"
     "function flushtx(){var v=tx.value,i=0;"
     "while(i<v.length&&i<sent.length&&v.charAt(i)==sent.charAt(i))i++;"
     "for(var d=sent.length-i;d>0;d--){S('K d '+K.Backspace+' 0');"
     "S('K u '+K.Backspace+' 0')}"
-    "var add=v.slice(i);if(add){if(ctx)BT(add);else S('T '+add)}sent=v;"
-    "if(v.length>200){tx.value='';sent=''}}"
+    "var add=v.slice(i).split(SENT).join('');"
+    "if(add){if(ctx)BT(add);else S('T '+add)}"
+    "tx.value=SENT;sent=SENT}"
     "tx.addEventListener('input',function(e){if(e.isComposing)return;flushtx()});"
     "tx.addEventListener('compositionend',flushtx);"
     "tx.addEventListener('keydown',function(e){if(e.key=='Enter'){"
     "S('K d '+K.Enter+' 0');S('K u '+K.Enter+' 0');"
-    "e.preventDefault();tx.value='';sent=''}});"
+    "e.preventDefault();tx.value=SENT;sent=SENT}});"
     "open_();"
     "</script></body></html>";
 

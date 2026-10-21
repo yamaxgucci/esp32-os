@@ -37,7 +37,7 @@ if errorlevel 1 exit /b 1
 
 "%CC%" "%OBJ%\kvmagent.o" "%OBJ%\miniz.o" "%OBJ%\miniz_tdef.o" ^
   "%OBJ%\miniz_tinfl.o" -o "%OUT%" ^
-  -lgdi32 -luser32 -lsetupapi -lwinusb -lws2_32 -ladvapi32
+  -lgdi32 -luser32 -lshell32 -lsetupapi -lwinusb -lws2_32 -ladvapi32
 if errorlevel 1 (
   echo build failed
   exit /b 1
