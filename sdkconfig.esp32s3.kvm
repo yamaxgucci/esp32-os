@@ -33,35 +33,46 @@ CONFIG_ARGON_USB_DEVICE=y
 # mouse was the interface that had to go to make room for the drive.
 CONFIG_TINYUSB_HID_COUNT=2
 
-# The serial pipe beside the keyboard: on the far machine it is a COM port with
-# no driver to install, and it is the only way a picture can come back - USB has
-# no class for a display sink.  Two more interfaces and two more IN endpoints;
-# with the three HID ones that is all five the S3 has.
-CONFIG_TINYUSB_CDC_ENABLED=y
-CONFIG_TINYUSB_CDC_COUNT=1
+# The screen pipe beside the keyboard: a vendor (WinUSB) interface, and the
+# only way a picture can come back - USB has no class for a display sink.  On
+# the far machine Windows binds its built-in winusb.sys to it with nothing
+# installed, no COM port and no .inf, because the device advertises a Microsoft
+# OS 2.0 descriptor set through its BOS (see usbdev_hw.c, desc_bos).  This is a
+# CDC replacement: TINYUSB_CDC_ENABLED=n removes that class, and the port flag
+# ARGON_USB_DEVICE_CDC (which drives AG_PORT_HAS_USB_CDC) still means "the pipe
+# is present" - it now selects the vendor pipe.  It defaults to y; it is pinned
+# here so the meaning is on the page.
+#
+# One interface, one IN endpoint.  That is the whole reason the drive fits: CDC
+# took two IN endpoints (a notification nobody read plus the bulk), the vendor
+# interface takes one, and the endpoint it hands back is the drive's.
+CONFIG_ARGON_USB_DEVICE_CDC=y
+CONFIG_TINYUSB_CDC_ENABLED=n
+CONFIG_TINYUSB_VENDOR_COUNT=1
 
 # The buffers the picture flows through, and the one number worth tuning here.
 # Traffic is almost entirely one way - the far machine sends tiles, this end
 # sends the odd line of clipboard text back - so the receive side gets the
 # room.  These are internal RAM, not PSRAM: they are DMA buffers.
-CONFIG_TINYUSB_CDC_RX_BUFSIZE=4096
-CONFIG_TINYUSB_CDC_TX_BUFSIZE=1024
-CONFIG_TINYUSB_CDC_EP_BUFSIZE=2048
+CONFIG_TINYUSB_VENDOR_RX_BUFSIZE=4096
+CONFIG_TINYUSB_VENDOR_TX_BUFSIZE=1024
+CONFIG_TINYUSB_VENDOR_EPSIZE=64
 
-# No flash drive, and it is the hardware that forbids it, not a choice.  The
-# S3's OTG core has five IN endpoints TOTAL and the control endpoint EP0 is one
-# of them, so only FOUR are left for functions.  The keyboard, the pointer and
-# the serial pipe's two (notification + bulk) are those four.  A fifth - the
-# mass-storage bulk IN - makes TinyUSB's dfifo_alloc assert ("allocated_epin <
-# ep_in_count") the moment a real host opens the endpoints, and the device
-# fails to start (Windows error 10, connect/disconnect loop).  Found on the
-# board 21 Oct; docs/14-usb-kvm.md had claimed five functions fit and was wrong.
+# The flash drive is back, and the vendor pipe is what made room.  The S3's OTG
+# core has five IN endpoints TOTAL and the control endpoint EP0 is one of them,
+# so only FOUR are left for functions.  They are now the keyboard, the pointer,
+# the vendor pipe's single bulk IN, and mass storage's bulk IN - exactly four,
+# which fits.  With CDC's two IN endpoints this was five and the device would
+# not start (TinyUSB's dfifo_alloc asserted "allocated_epin < ep_in_count",
+# Windows error 10, connect/disconnect loop).  Found on the board 21 Oct; the
+# fix is the vendor interface, not giving up the drive.
 #
-# Getting the drive back means freeing an endpoint: a custom CDC without its
-# (unused) notification endpoint, which Windows usbser may or may not accept -
-# a separate experiment.  Until then the agent is delivered by other means.
-CONFIG_ARGON_USB_DEVICE_MSC=n
-CONFIG_TINYUSB_MSC_ENABLED=n
+# The drive is how KVMAGENT.EXE reaches a machine that has never seen this
+# device: it is already on the drive.  4 KB MSC transfer buffer (found on the
+# board - 512 B was too small).
+CONFIG_ARGON_USB_DEVICE_MSC=y
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=4096
 
 # The partition table still carries `usbdisk` (harmless, unused) so the layout
 # does not change if the drive comes back.  See partitions_kvm.csv.

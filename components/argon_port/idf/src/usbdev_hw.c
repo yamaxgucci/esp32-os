@@ -69,37 +69,43 @@ static const char *TAG = "usbdev";
  * There are two HID interfaces and not three.  The relative boot mouse that
  * used to sit between them is gone, and it is worth writing down why, because
  * it is the constraint the whole shape of this device is cut to: the S3's OTG
- * core has five device IN endpoints (soc/usb_dwc_cfg.h, OTG_NUM_IN_EPS 5) and
- * that is all.  The keyboard, the pointer, the serial pipe's notification and
- * bulk, and mass storage are five.  A sixth interface does not exist to be had.
+ * core has five device IN endpoints and the control endpoint EP0 is one of
+ * them, so only FOUR are left for functions (soc/usb_dwc_cfg.h, OTG_NUM_IN_EPS
+ * 5).  The keyboard, the pointer, the screen pipe and mass storage are four.
+ * A fifth function IN endpoint does not exist to be had.
  *
- * What was given up is a mouse in a BIOS - few have one and fewer use it.  What
- * it bought is the flash drive, which is how the program the far machine needs
- * gets onto a machine that has never seen this device before: it is already on
- * it.  A relative step is not lost either; it becomes a position, one layer up
+ * The pipe is a single vendor (WinUSB) interface, not CDC: CDC cost two IN
+ * endpoints (a notification nobody reads plus the bulk) and that second one is
+ * exactly what the flash drive needed.  A vendor interface is one bulk IN, so
+ * keyboard + pointer + pipe + drive fits the four.  What was given up to get
+ * there earlier - a mouse in a BIOS, few have one and fewer use it - is not
+ * given up again: a relative step becomes a position one layer up
  * (apps/common/kvm), which is what a phone's trackpad wanted anyway.
+ *
+ * Windows binds its WinUSB driver to the vendor interface on its own, with no
+ * COM port and no driver to install, because the device advertises a Microsoft
+ * OS 2.0 descriptor set through the BOS (see desc_bos / desc_ms_os_20 below).
  */
 #define ITF_KBD 0
 #define ITF_ABS 1
 
 #if AG_PORT_HAS_USB_CDC
 /*
- * The serial pipe takes two interfaces - a control one and a data one - which
- * is why a composite device with CDC in it needs an Interface Association
- * Descriptor and a device class of MISC/COMMON/IAD below: without that, a host
- * has no way to know the two belong together.
+ * The screen pipe: one vendor (WinUSB) interface.  A single interface needs no
+ * Interface Association Descriptor, which is why the device class below is zero
+ * rather than MISC/COMMON/IAD - that was only ever for CDC's two interfaces.
  */
-#define ITF_CDC 2
-#define ITF_AFTER_CDC 4
+#define ITF_VENDOR 2
+#define ITF_AFTER_PIPE 3
 #else
-#define ITF_AFTER_CDC 2
+#define ITF_AFTER_PIPE 2
 #endif
 
 #if AG_PORT_HAS_USB_MSC
-#define ITF_MSC ITF_AFTER_CDC
-#define ITF_COUNT (ITF_AFTER_CDC + 1)
+#define ITF_MSC ITF_AFTER_PIPE
+#define ITF_COUNT (ITF_AFTER_PIPE + 1)
 #else
-#define ITF_COUNT ITF_AFTER_CDC
+#define ITF_COUNT ITF_AFTER_PIPE
 #endif
 
 /* ------------------------------------------------------------------------ */
@@ -201,33 +207,34 @@ static const uint8_t k_desc_abs[] = {
  * is here.
  */
 #define ARGON_USB_VID 0x303A
-#define ARGON_USB_PID 0x4020
+/* 0x4021, bumped from 0x4020 when the pipe went from CDC to WinUSB: Windows
+ * caches the driver it bound to a VID/PID, so a machine that once saw this pair
+ * as a COM port would keep trying usbser on the new descriptors.  A fresh PID is
+ * a fresh device to Windows, so it re-reads the BOS and binds WinUSB.  The agent
+ * finds the board by its WinUSB interface GUID, not this pair, so it is
+ * unaffected. */
+#define ARGON_USB_PID 0x4021
 
 static const tusb_desc_device_t k_desc_device = {
     .bLength = sizeof(tusb_desc_device_t),
     .bDescriptorType = TUSB_DESC_DEVICE,
-    .bcdUSB = 0x0200,
-#if AG_PORT_HAS_USB_CDC
     /*
-     * With CDC in the mix the device has to say MISC/COMMON/IAD, because the
-     * serial port is two interfaces that belong together and the association
-     * descriptor is the only thing that says so.  Anything else and Windows
-     * binds a driver to the control interface and leaves the data one alone.
+     * 2.10, not 2.00, so the host asks for the BOS descriptor - which is where
+     * the Microsoft OS 2.0 set lives that makes Windows bind WinUSB to the
+     * vendor pipe with no driver install.  A 2.00 device is never asked.
      */
-    .bDeviceClass = TUSB_CLASS_MISC,
-    .bDeviceSubClass = MISC_SUBCLASS_COMMON,
-    .bDeviceProtocol = MISC_PROTOCOL_IAD,
-#else
+    .bcdUSB = 0x0210,
     /*
-     * Class in the interfaces, not here.  A composite device that names a class
-     * at the device level tells the host to look for one driver for the whole
-     * thing; zero means "read the interfaces", which is what a keyboard and two
-     * mice want.
+     * Class in the interfaces, not here.  Every interface this device publishes
+     * - two HID, one vendor, one MSC - is a single-interface function, so none
+     * needs an Interface Association Descriptor and the device names no class:
+     * zero means "read the interfaces", which is what they all want.  (CDC was
+     * the one exception, two interfaces that needed MISC/COMMON/IAD to be tied
+     * together; it is gone, and so is the IAD.)
      */
     .bDeviceClass = 0x00,
     .bDeviceSubClass = 0x00,
     .bDeviceProtocol = 0x00,
-#endif
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor = ARGON_USB_VID,
     .idProduct = ARGON_USB_PID,
@@ -250,7 +257,7 @@ static const char *k_desc_str[] = {
     "Keyboard",                 /* 4: interface 0                             */
     "Pointer",                  /* 5: interface 1                             */
 #if AG_PORT_HAS_USB_CDC
-    "ArgonOS screen link",      /* 6: the serial pipe                         */
+    "ArgonOS screen link",      /* 6: the vendor (WinUSB) pipe                 */
 #endif
 #if AG_PORT_HAS_USB_MSC
     "ArgonOS disk",             /* 7: the drive the agent lives on            */
@@ -259,30 +266,34 @@ static const char *k_desc_str[] = {
 
 #define STR_KBD 4
 #define STR_ABS 5
-#define STR_CDC 6
+#define STR_VENDOR 6
 #define STR_MSC 7
 
 /*
  * The endpoint budget, which is the tightest thing in this file and the reason
  * the composite device stops where it does.
  *
- * The S3's OTG core is built with five device IN endpoints besides EP0
- * (soc/usb_dwc_cfg.h: OTG_NUM_IN_EPS 5) and one kilobyte of FIFO shared
- * between the receive path and every transmit endpoint (OTG_DFIFO_DEPTH 256
- * words).  Three HID interrupt endpoints plus the serial pipe's notification
- * and bulk IN is exactly five.  There is no sixth, which is why the flash
- * drive that would carry the agent to the far machine is not here: adding mass
- * storage means giving up an interface, and the one to give up is the relative
- * mouse - see docs/14-usb-kvm.md.
+ * The S3's OTG core is built with five device IN endpoints (soc/usb_dwc_cfg.h:
+ * OTG_NUM_IN_EPS 5) and one kilobyte of FIFO shared between the receive path
+ * and every transmit endpoint (OTG_DFIFO_DEPTH 256 words).  The control
+ * endpoint EP0 claims one of the five, so FOUR IN endpoints are left for
+ * functions.  The keyboard, the pointer, the vendor pipe's bulk IN and mass
+ * storage's bulk IN are exactly four - no fifth function IN exists.
  *
- * The FIFO, in words: 52 receive, 16 for EP0, 16 for each of the three HID
- * endpoints, 16 for the notification, and what is left for the bulk IN, which
- * is the one that carries the picture and the only one throughput depends on.
+ * This fits where CDC did not: CDC wanted two IN endpoints, a notification it
+ * never used plus the bulk, so keyboard + pointer + CDC alone took four and
+ * the drive had no endpoint (it asserted dfifo_alloc the moment a host opened
+ * it).  A vendor interface is one bulk IN, which hands the fourth back to the
+ * drive - see docs/14-usb-kvm.md.
+ *
+ * The FIFO, in words: 52 receive, 16 for EP0, 16 for each of the two HID
+ * endpoints, what the vendor bulk IN carries the picture through, and the MSC
+ * bulk IN.  The vendor IN is the only one throughput depends on.
  */
 #if AG_PORT_HAS_USB_CDC
-#define CDC_DESC_BYTES TUD_CDC_DESC_LEN
+#define VENDOR_DESC_BYTES TUD_VENDOR_DESC_LEN
 #else
-#define CDC_DESC_BYTES 0
+#define VENDOR_DESC_BYTES 0
 #endif
 #if AG_PORT_HAS_USB_MSC
 #define MSC_DESC_BYTES TUD_MSC_DESC_LEN
@@ -291,7 +302,7 @@ static const char *k_desc_str[] = {
 #endif
 
 #define CFG_TOTAL_LEN                                                        \
-    (TUD_CONFIG_DESC_LEN + 2 * TUD_HID_DESC_LEN + CDC_DESC_BYTES +           \
+    (TUD_CONFIG_DESC_LEN + 2 * TUD_HID_DESC_LEN + VENDOR_DESC_BYTES +        \
      MSC_DESC_BYTES)
 
 /* One interrupt IN endpoint each, polled every millisecond - the fastest a
@@ -302,18 +313,17 @@ static const char *k_desc_str[] = {
 #define EP_SIZE 16
 #define EP_INTERVAL_MS 1
 
-/* The serial pipe: a notification endpoint nobody uses (CDC insists on one)
- * and a bulk pair.  Sixty-four bytes is the largest a full-speed bulk endpoint
- * may be, and the whole picture goes through it. */
-#define EP_CDC_NOTIF 0x83
-#define EP_CDC_OUT 0x04
-#define EP_CDC_IN 0x84
-#define EP_CDC_NOTIF_SIZE 8
-#define EP_CDC_SIZE 64
+/* The vendor pipe: a single bulk pair, no notification endpoint (that was
+ * CDC's, and the whole reason the drive now fits).  Sixty-four bytes is the
+ * largest a full-speed bulk endpoint may be, and the whole picture goes
+ * through the IN side of it. */
+#define EP_VENDOR_OUT 0x03
+#define EP_VENDOR_IN 0x83
+#define EP_VENDOR_SIZE 64
 
-/* The drive.  The fifth and last IN endpoint there is. */
-#define EP_MSC_OUT 0x05
-#define EP_MSC_IN 0x85
+/* The drive.  The fourth and last function IN endpoint there is. */
+#define EP_MSC_OUT 0x04
+#define EP_MSC_IN 0x84
 #define EP_MSC_SIZE 64
 
 static const uint8_t k_desc_cfg[] = {
@@ -324,13 +334,163 @@ static const uint8_t k_desc_cfg[] = {
     TUD_HID_DESCRIPTOR(ITF_ABS, STR_ABS, HID_ITF_PROTOCOL_NONE,
                        sizeof(k_desc_abs), EP_ABS, EP_SIZE, EP_INTERVAL_MS),
 #if AG_PORT_HAS_USB_CDC
-    TUD_CDC_DESCRIPTOR(ITF_CDC, STR_CDC, EP_CDC_NOTIF, EP_CDC_NOTIF_SIZE,
-                       EP_CDC_OUT, EP_CDC_IN, EP_CDC_SIZE),
+    TUD_VENDOR_DESCRIPTOR(ITF_VENDOR, STR_VENDOR, EP_VENDOR_OUT, EP_VENDOR_IN,
+                          EP_VENDOR_SIZE),
 #endif
 #if AG_PORT_HAS_USB_MSC
     TUD_MSC_DESCRIPTOR(ITF_MSC, STR_MSC, EP_MSC_OUT, EP_MSC_IN, EP_MSC_SIZE),
 #endif
 };
+
+/* ------------------------------------------------------------------------ */
+/* BOS and the Microsoft OS 2.0 descriptor set                              */
+/* ------------------------------------------------------------------------ */
+
+#if AG_PORT_HAS_USB_CDC
+
+/*
+ * This is what makes the vendor pipe bind WinUSB on Windows with nothing
+ * installed on the far machine, and it is the whole reason the device claims
+ * USB 2.10 up top.  A 2.1 host asks for the Binary Object Store (BOS); the BOS
+ * here carries one platform capability, Microsoft OS 2.0, which names a vendor
+ * request code and a descriptor-set length.  Windows then issues that vendor
+ * request, reads the set below, sees the WINUSB compatible-ID on our vendor
+ * interface and a DeviceInterfaceGUID to register it under, and loads winusb.sys
+ * by itself.  No .inf, no COM port, no driver download.
+ *
+ * Adapted from managed_components/espressif__tinyusb/examples/device/
+ * webusb_serial/src/usb_descriptors.c, with two differences: there is no WebUSB
+ * capability (that example had two device caps and a landing-page URL; we have
+ * one cap and no URL), and the one vendor request we answer is the Microsoft
+ * one.  The GUID is our own.
+ *
+ * How the host actually reaches this: esp_tinyusb installs strong
+ * tud_descriptor_device_cb and tud_descriptor_configuration_cb that read the
+ * tinyusb_config_t we pass in ag_port_usbdev_start, but it supplies NO BOS of
+ * its own - grep espressif__esp_tinyusb for "bos" finds nothing, and
+ * tinyusb_config_t has no BOS field.  TinyUSB's own tud_descriptor_bos_cb is a
+ * TU_ATTR_WEAK stub returning NULL (src/device/usbd.c).  So the strong
+ * definition below is the one the linker takes, and it is reached the moment
+ * the host requests the BOS.  Nothing else needs wiring.
+ */
+#define VENDOR_REQUEST_MICROSOFT 0x01
+
+#define BOS_TOTAL_LEN (TUD_BOS_DESC_LEN + TUD_BOS_MICROSOFT_OS_DESC_LEN)
+
+/*
+ * The length of the whole MS OS 2.0 set below.  Unchanged from the reference's
+ * 0xB2 because our DeviceInterfaceGUID is a standard 8-4-4-4-12 GUID in braces,
+ * the same 38 UTF-16 characters the reference's GUID was, so the registry
+ * property's length fields are identical.  The TU_VERIFY_STATIC under the array
+ * is the guard that keeps this honest.
+ */
+#define MS_OS_20_DESC_LEN 0xB2
+
+static const uint8_t desc_bos[] = {
+    TUD_BOS_DESCRIPTOR(BOS_TOTAL_LEN, 1),
+    TUD_BOS_MS_OS_20_DESCRIPTOR(MS_OS_20_DESC_LEN, VENDOR_REQUEST_MICROSOFT),
+};
+
+uint8_t const *tud_descriptor_bos_cb(void)
+{
+    return desc_bos;
+}
+
+/*
+ * The set itself.  Header, then a configuration subset, then a function subset
+ * whose "first interface" is the vendor interface (ITF_VENDOR), then the WINUSB
+ * compatible ID and a registry-property descriptor that writes our
+ * DeviceInterfaceGUID so the interface can be opened by name.
+ *
+ * The GUID is {A7B3F1C2-9D4E-4F8A-B6C1-2E3D4A5B6C7D}, stored UTF-16LE with a
+ * trailing null, 80 bytes (0x50) like the reference's.
+ */
+static const uint8_t desc_ms_os_20[] = {
+    /* Set header: length, type, windows version, total length */
+    U16_TO_U8S_LE(0x000A), U16_TO_U8S_LE(MS_OS_20_SET_HEADER_DESCRIPTOR),
+    U32_TO_U8S_LE(0x06030000), U16_TO_U8S_LE(MS_OS_20_DESC_LEN),
+
+    /* Configuration subset header: length, type, config index, reserved,
+       config total length */
+    U16_TO_U8S_LE(0x0008), U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_CONFIGURATION),
+    0, 0, U16_TO_U8S_LE(MS_OS_20_DESC_LEN - 0x0A),
+
+    /* Function subset header: length, type, first interface, reserved,
+       subset length - the vendor interface is the one WinUSB binds */
+    U16_TO_U8S_LE(0x0008), U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_FUNCTION),
+    ITF_VENDOR, 0, U16_TO_U8S_LE(MS_OS_20_DESC_LEN - 0x0A - 0x08),
+
+    /* Compatible ID descriptor: length, type, compatible ID, sub compatible */
+    U16_TO_U8S_LE(0x0014), U16_TO_U8S_LE(MS_OS_20_FEATURE_COMPATBLE_ID),
+    'W', 'I', 'N', 'U', 'S', 'B', 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* sub-compatible */
+
+    /* Registry property descriptor: length, type */
+    U16_TO_U8S_LE(MS_OS_20_DESC_LEN - 0x0A - 0x08 - 0x08 - 0x14),
+    U16_TO_U8S_LE(MS_OS_20_FEATURE_REG_PROPERTY),
+    /* wPropertyDataType (7 = REG_MULTI_SZ), wPropertyNameLength,
+       PropertyName "DeviceInterfaceGUIDs\0" in UTF-16 */
+    U16_TO_U8S_LE(0x0007), U16_TO_U8S_LE(0x002A),
+    'D', 0x00, 'e', 0x00, 'v', 0x00, 'i', 0x00, 'c', 0x00, 'e', 0x00,
+    'I', 0x00, 'n', 0x00, 't', 0x00, 'e', 0x00, 'r', 0x00, 'f', 0x00,
+    'a', 0x00, 'c', 0x00, 'e', 0x00, 'G', 0x00, 'U', 0x00, 'I', 0x00,
+    'D', 0x00, 's', 0x00, 0x00, 0x00,
+    U16_TO_U8S_LE(0x0050), /* wPropertyDataLength */
+    /* bPropertyData: "{A7B3F1C2-9D4E-4F8A-B6C1-2E3D4A5B6C7D}" */
+    '{', 0x00, 'A', 0x00, '7', 0x00, 'B', 0x00, '3', 0x00, 'F', 0x00,
+    '1', 0x00, 'C', 0x00, '2', 0x00, '-', 0x00,
+    '9', 0x00, 'D', 0x00, '4', 0x00, 'E', 0x00, '-', 0x00,
+    '4', 0x00, 'F', 0x00, '8', 0x00, 'A', 0x00, '-', 0x00,
+    'B', 0x00, '6', 0x00, 'C', 0x00, '1', 0x00, '-', 0x00,
+    '2', 0x00, 'E', 0x00, '3', 0x00, 'D', 0x00, '4', 0x00,
+    'A', 0x00, '5', 0x00, 'B', 0x00, '6', 0x00, 'C', 0x00,
+    '7', 0x00, 'D', 0x00, '}', 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+TU_VERIFY_STATIC(sizeof(desc_ms_os_20) == MS_OS_20_DESC_LEN, "Incorrect size");
+
+/*
+ * The vendor control request.  Only the setup stage matters, and the only
+ * request we answer is the Microsoft one with wIndex == 7, which returns the
+ * set above (its own header's total length, read from offset 8).  Everything
+ * else in a later stage is acknowledged; an unknown request is stalled by
+ * returning false.  There is no WebUSB branch - we never advertised one.
+ */
+bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
+                                tusb_control_request_t const *request)
+{
+    /* Nothing to do on the DATA and ACK stages. */
+    if (stage != CONTROL_STAGE_SETUP) {
+        return true;
+    }
+
+    switch (request->bmRequestType_bit.type) {
+    case TUSB_REQ_TYPE_VENDOR:
+        switch (request->bRequest) {
+        case VENDOR_REQUEST_MICROSOFT:
+            if (request->wIndex == 7) {
+                /* The descriptor set's own total length lives at offset 8. */
+                uint16_t total_len;
+                memcpy(&total_len, desc_ms_os_20 + 8, 2);
+                return tud_control_xfer(rhport, request,
+                                        (void *)(uintptr_t)desc_ms_os_20,
+                                        total_len);
+            }
+            return false;
+        default:
+            break;
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    /* Stall anything unrecognised. */
+    return false;
+}
+
+#endif /* AG_PORT_HAS_USB_CDC */
 
 /* ------------------------------------------------------------------------ */
 /* State                                                                    */
@@ -508,7 +668,7 @@ ag_err_t ag_port_usbdev_start(void)
     s_leds = 0;
     s_running = true;
     ESP_LOGI(TAG, "attached as a keyboard, a pointer%s%s (%04x:%04x)",
-             AG_PORT_HAS_USB_CDC ? ", a serial port" : "",
+             AG_PORT_HAS_USB_CDC ? ", a WinUSB pipe" : "",
              AG_PORT_HAS_USB_MSC ? " and a drive" : "", ARGON_USB_VID,
              ARGON_USB_PID);
     return AG_OK;
@@ -620,13 +780,13 @@ int32_t ag_port_usbdev_cdc_read(void *buf, uint32_t len)
         return -AG_ENODEV;
     }
 
-    const uint32_t have = tud_cdc_available();
+    const uint32_t have = tud_vendor_available();
     if (have == 0) {
         return -AG_EAGAIN;
     }
 
     const uint32_t take = (have < len) ? have : len;
-    const uint32_t got = tud_cdc_read(buf, take);
+    const uint32_t got = tud_vendor_read(buf, take);
     s_cdc_rx += got;
     return (int32_t)got;
 }
@@ -637,26 +797,25 @@ int32_t ag_port_usbdev_cdc_write(const void *buf, uint32_t len)
         return -AG_EINVAL;
     }
     if (!s_running || !tud_mounted()) {
-        return -AG_ENODEV;
-    }
-    if (!tud_cdc_connected()) {
         /*
-         * Enumerated, but nobody over there has opened the port.  Writing into
-         * a CDC buffer that nothing drains fills it and then blocks every
-         * later write, so this refuses instead - the caller sees the state in
-         * the status and can stop offering.
+         * A vendor interface has no "host has opened the port" signal the way
+         * CDC did (CDC's DTR line, tud_cdc_connected); the host either has the
+         * WinUSB handle open and drains the bulk IN or it does not, and either
+         * way the bulk endpoint's own flow control - tud_vendor_write_available
+         * below returning zero - is what keeps a stalled pipe from blocking.
+         * So mounted is the only gate here.
          */
         return -AG_ENODEV;
     }
 
-    const uint32_t room = tud_cdc_write_available();
+    const uint32_t room = tud_vendor_write_available();
     if (room == 0) {
         return -AG_EAGAIN;
     }
 
     const uint32_t take = (room < len) ? room : len;
-    const uint32_t put = tud_cdc_write(buf, take);
-    (void)tud_cdc_write_flush();
+    const uint32_t put = tud_vendor_write(buf, take);
+    (void)tud_vendor_flush();
     s_cdc_tx += put;
     return (int32_t)put;
 }
@@ -674,7 +833,13 @@ ag_err_t ag_port_usbdev_cdc_status(ag_port_usbdev_cdc_status_t *out)
     if (!tud_mounted()) {
         out->state = AG_USBCDC_OFF;
     } else {
-        out->state = tud_cdc_connected() ? AG_USBCDC_OPEN : AG_USBCDC_IDLE;
+        /*
+         * A vendor pipe gives no host-open signal, so being mounted is as much
+         * as this layer can tell: report OPEN once enumerated.  (CDC used to
+         * distinguish IDLE from OPEN by its DTR line; there is no equivalent to
+         * read here, and the pipe works regardless of whether one existed.)
+         */
+        out->state = AG_USBCDC_OPEN;
     }
     out->rx = s_cdc_rx;
     out->tx = s_cdc_tx;

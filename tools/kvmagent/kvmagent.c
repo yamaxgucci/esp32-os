@@ -24,9 +24,8 @@
  * ratios that would make it worth using, and a screen of text is exactly what
  * PNG is best at.
  *
- *   kvmagent                       find the board and start
- *   kvmagent --list                what serial ports look like the board
- *   kvmagent --port COM7           a particular one
+ *   kvmagent                       find the board's WinUSB interface and start
+ *   kvmagent --list                what WinUSB devices look like the board
  *   kvmagent --tcp 127.0.0.1:5563  the emulator instead of a board
  *   kvmagent --fps 20 --tile 64
  *
@@ -38,9 +37,12 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <setupapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <setupapi.h>
+/* winusb.h pulls in winusbio.h (the pipe-policy constants and PIPE_INFORMATION)
+ * and needs windows.h ahead of it; include it last so those are in scope. */
+#include <winusb.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -68,13 +70,26 @@
 #define ARGON_VID 0x303A
 #define ARGON_PID 0x4020
 
+/* The DeviceInterfaceGUID the board's WinUSB vendor interface advertises - it
+ * must match the GUID in the device's registry (set by the WinUSB/WCID
+ * descriptors on the board).  This is how we find the device without caring
+ * what COM-less path Windows gave it. */
+static const GUID ARGON_KVM_GUID = {
+    0xA7B3F1C2, 0x9D4E, 0x4F8A,
+    {0xB6, 0xC1, 0x2E, 0x3D, 0x4A, 0x5B, 0x6C, 0x7D}};
+
 /* ------------------------------------------------------------------------ */
-/* The link: a COM port, or a socket when there is no board                  */
+/* The link: WinUSB to a board, or a socket when there is no board           */
 /* ------------------------------------------------------------------------ */
 
 typedef struct {
-    HANDLE h;    /* the serial port, or INVALID_HANDLE_VALUE */
-    SOCKET s;    /* the socket, or INVALID_SOCKET            */
+    HANDLE                 dev;    /* device file handle (overlapped), or
+                                      INVALID_HANDLE_VALUE                     */
+    WINUSB_INTERFACE_HANDLE winusb; /* the WinUSB handle, or NULL              */
+    UCHAR                  pipe_in;  /* bulk IN  endpoint (device->host)       */
+    UCHAR                  pipe_out; /* bulk OUT endpoint (host->device)       */
+    HANDLE                 h;    /* legacy/unused; kept INVALID_HANDLE_VALUE   */
+    SOCKET                 s;    /* the socket, or INVALID_SOCKET              */
 } link_t;
 
 static int link_write(link_t *l, const void *buf, size_t len)
@@ -83,9 +98,16 @@ static int link_write(link_t *l, const void *buf, size_t len)
     size_t      off = 0;
 
     while (off < len) {
-        if (l->h != INVALID_HANDLE_VALUE) {
-            DWORD wrote = 0;
-            if (!WriteFile(l->h, p + off, (DWORD)(len - off), &wrote, NULL)) {
+        if (l->winusb != NULL) {
+            /* Synchronous bulk OUT: WinUsb_WritePipe without an OVERLAPPED
+             * blocks until the transfer completes, which is what we want - a
+             * stalled write is the board telling us the picture is arriving
+             * faster than it can forward it, the same back-pressure the serial
+             * path relied on. */
+            ULONG wrote = 0;
+            if (!WinUsb_WritePipe(l->winusb, l->pipe_out,
+                                  (PUCHAR)(p + off), (ULONG)(len - off),
+                                  &wrote, NULL)) {
                 return 0;
             }
             if (wrote == 0) {
@@ -107,21 +129,24 @@ static int link_write(link_t *l, const void *buf, size_t len)
  * has gone. */
 static int link_read(link_t *l, void *buf, size_t len)
 {
-    if (l->h != INVALID_HANDLE_VALUE) {
-        COMSTAT st;
-        DWORD   errs = 0;
-        if (!ClearCommError(l->h, &errs, &st)) {
-            return -1;
+    if (l->winusb != NULL) {
+        /* The IN pipe carries a PIPE_TRANSFER_TIMEOUT, so this returns soon
+         * even when the board has nothing to say.  A timeout is not a dead
+         * link - it is "nothing arrived" - so it maps to 0 bytes, the same
+         * answer the serial path gave from an empty queue.  Only a genuine
+         * failure (the device unplugged, the pipe wedged) is -1. */
+        ULONG got = 0;
+        if (WinUsb_ReadPipe(l->winusb, l->pipe_in, (PUCHAR)buf,
+                            (ULONG)len, &got, NULL)) {
+            return (int)got;
         }
-        if (st.cbInQue == 0) {
+        /* ERROR_SEM_TIMEOUT (121) is the PIPE_TRANSFER_TIMEOUT firing; the
+         * WinUSB docs spell it ERROR_SEMAPHORE_TIMEOUT but the winerror.h
+         * macro (MinGW and MSVC alike) is ERROR_SEM_TIMEOUT. */
+        if (GetLastError() == ERROR_SEM_TIMEOUT) {
             return 0;
         }
-        DWORD want = st.cbInQue < len ? st.cbInQue : (DWORD)len;
-        DWORD got = 0;
-        if (!ReadFile(l->h, buf, want, &got, NULL)) {
-            return -1;
-        }
-        return (int)got;
+        return -1;
     }
 
     fd_set rd;
@@ -165,115 +190,146 @@ static int send_msg(link_t *l, uint8_t type, const void *payload, uint32_t len)
 /* ------------------------------------------------------------------------ */
 
 /*
- * Walks the ports Windows knows about and picks the one whose hardware id
- * carries our VID and PID.  Guessing "the highest COM number" is what most
- * tools do and it is wrong the moment anything else is plugged in.
+ * Ask the WinUSB handle which pipes its one interface has, and keep the bulk
+ * IN and bulk OUT endpoint addresses.  The pipe id is the USB endpoint address:
+ * its high bit set means IN (device->host).  We do not assume the contract's
+ * 0x83/0x03 - we read whatever the device enumerated - but we do insist the two
+ * we need are bulk, because that is the transport the framing rides on.
  */
-static int find_port(char *out, size_t cap, int list_only)
+static int winusb_find_pipes(link_t *l)
 {
-    static const GUID guid_ports = {
-        0x4D36E978, 0xE325, 0x11CE,
-        {0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18}};
+    USB_INTERFACE_DESCRIPTOR ifd;
+    memset(&ifd, 0, sizeof(ifd));
+    if (!WinUsb_QueryInterfaceSettings(l->winusb, 0, &ifd)) {
+        return 0;
+    }
 
-    HDEVINFO info = SetupDiGetClassDevsA(&guid_ports, NULL, NULL,
-                                         DIGCF_PRESENT);
+    int have_in = 0, have_out = 0;
+    for (UCHAR i = 0; i < ifd.bNumEndpoints; i++) {
+        WINUSB_PIPE_INFORMATION pi;
+        memset(&pi, 0, sizeof(pi));
+        if (!WinUsb_QueryPipe(l->winusb, 0, i, &pi)) {
+            continue;
+        }
+        if (pi.PipeType != UsbdPipeTypeBulk) {
+            continue;
+        }
+        if (pi.PipeId & 0x80) {
+            if (!have_in) {
+                l->pipe_in = pi.PipeId;
+                have_in = 1;
+            }
+        } else {
+            if (!have_out) {
+                l->pipe_out = pi.PipeId;
+                have_out = 1;
+            }
+        }
+    }
+    return have_in && have_out;
+}
+
+/*
+ * Settle the IN pipe's policy.  A read with no data must come back quickly and
+ * say "nothing", not block the capture loop forever, so PIPE_TRANSFER_TIMEOUT
+ * gives it a 50 ms deadline (link_read turns that timeout into zero bytes).
+ * RAW_IO off lets WinUSB buffer short reads for us; AUTO_CLEAR_STALL on means a
+ * stalled endpoint recovers without us issuing the clear by hand.
+ */
+static void winusb_set_policy(link_t *l)
+{
+    ULONG   timeout = 50; /* ms */
+    UCHAR   off = FALSE, on = TRUE;
+    WinUsb_SetPipePolicy(l->winusb, l->pipe_in, PIPE_TRANSFER_TIMEOUT,
+                         sizeof(timeout), &timeout);
+    WinUsb_SetPipePolicy(l->winusb, l->pipe_in, RAW_IO,
+                         sizeof(off), &off);
+    WinUsb_SetPipePolicy(l->winusb, l->pipe_in, AUTO_CLEAR_STALL,
+                         sizeof(on), &on);
+}
+
+/*
+ * Find the board by its vendor interface's DeviceInterfaceGUID and open it.
+ * Replaces the COM-port walk: a WinUSB device has no COM name to match on, it
+ * has an interface path, so we enumerate the present interfaces that carry our
+ * GUID, take the first, and bring up WinUSB on it.
+ *
+ * With list_only, print the paths instead of opening - the WinUSB equivalent of
+ * "--list".  Returns 1 when a device was opened (or, for list_only, when at
+ * least one was found).
+ */
+static int find_winusb_device(link_t *l, int list_only)
+{
+    HDEVINFO info = SetupDiGetClassDevsA(&ARGON_KVM_GUID, NULL, NULL,
+                                         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (info == INVALID_HANDLE_VALUE) {
         return 0;
     }
 
-    char want[32];
-    snprintf(want, sizeof(want), "VID_%04X&PID_%04X", ARGON_VID, ARGON_PID);
-
-    SP_DEVINFO_DATA dev;
-    dev.cbSize = sizeof(dev);
+    SP_DEVICE_INTERFACE_DATA iface;
+    iface.cbSize = sizeof(iface);
     int found = 0;
 
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(info, i, &dev); i++) {
-        char id[512] = {0};
-        if (!SetupDiGetDeviceRegistryPropertyA(info, &dev, SPDRP_HARDWAREID,
-                                               NULL, (PBYTE)id, sizeof(id),
-                                               NULL)) {
+    for (DWORD i = 0;
+         SetupDiEnumDeviceInterfaces(info, NULL, &ARGON_KVM_GUID, i, &iface);
+         i++) {
+        /* Two-call pattern: the first asks how many bytes the detail needs. */
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailA(info, &iface, NULL, 0, &need, NULL);
+        if (need == 0) {
+            continue;
+        }
+        SP_DEVICE_INTERFACE_DETAIL_DATA_A *detail =
+            (SP_DEVICE_INTERFACE_DETAIL_DATA_A *)malloc(need);
+        if (detail == NULL) {
+            continue;
+        }
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+        if (!SetupDiGetDeviceInterfaceDetailA(info, &iface, detail, need, NULL,
+                                              NULL)) {
+            free(detail);
             continue;
         }
 
-        char name[64] = {0};
-        HKEY key = SetupDiOpenDevRegKey(info, &dev, DICS_FLAG_GLOBAL, 0,
-                                        DIREG_DEV, KEY_READ);
-        if (key != INVALID_HANDLE_VALUE) {
-            DWORD type = 0, n = sizeof(name);
-            RegQueryValueExA(key, "PortName", NULL, &type, (LPBYTE)name, &n);
-            RegCloseKey(key);
-        }
-        if (name[0] == '\0') {
-            continue;
-        }
-
-        const int mine = (strstr(id, want) != NULL);
         if (list_only) {
-            char desc[256] = {0};
-            SetupDiGetDeviceRegistryPropertyA(info, &dev, SPDRP_DEVICEDESC,
-                                              NULL, (PBYTE)desc, sizeof(desc),
-                                              NULL);
-            printf("%-6s %s%s\n", name, desc, mine ? "   <- the board" : "");
-        } else if (mine && !found) {
-            snprintf(out, cap, "%s", name);
+            printf("%s%s\n", detail->DevicePath,
+                   found ? "" : "   <- the board");
             found = 1;
+            free(detail);
+            continue;
         }
+
+        HANDLE dev = CreateFileA(detail->DevicePath,
+                                 GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                 OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+        free(detail);
+        if (dev == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+
+        WINUSB_INTERFACE_HANDLE wu = NULL;
+        if (!WinUsb_Initialize(dev, &wu)) {
+            CloseHandle(dev);
+            continue;
+        }
+
+        l->dev = dev;
+        l->winusb = wu;
+        if (!winusb_find_pipes(l)) {
+            WinUsb_Free(wu);
+            CloseHandle(dev);
+            l->dev = INVALID_HANDLE_VALUE;
+            l->winusb = NULL;
+            continue;
+        }
+        winusb_set_policy(l);
+        found = 1;
+        break;
     }
+
     SetupDiDestroyDeviceInfoList(info);
     return found;
-}
-
-static HANDLE open_port(const char *name)
-{
-    char path[64];
-    /* The \\.\ prefix is needed for COM10 and above and harmless below it. */
-    snprintf(path, sizeof(path), "\\\\.\\%s", name);
-
-    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                           OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        return h;
-    }
-
-    DCB dcb;
-    memset(&dcb, 0, sizeof(dcb));
-    dcb.DCBlength = sizeof(dcb);
-    if (GetCommState(h, &dcb)) {
-        /*
-         * The baud rate is a fiction on a USB serial port - the bytes go at
-         * bulk-endpoint speed whatever is asked for - but DTR is not: the
-         * board watches it to know whether anything over here has the port
-         * open, and that is what its status line reports.
-         */
-        dcb.BaudRate = CBR_115200;
-        dcb.ByteSize = 8;
-        dcb.Parity = NOPARITY;
-        dcb.StopBits = ONESTOPBIT;
-        dcb.fBinary = TRUE;
-        dcb.fDtrControl = DTR_CONTROL_ENABLE;
-        dcb.fRtsControl = RTS_CONTROL_ENABLE;
-        dcb.fOutxCtsFlow = FALSE;
-        dcb.fOutxDsrFlow = FALSE;
-        SetCommState(h, &dcb);
-    }
-
-    COMMTIMEOUTS to;
-    memset(&to, 0, sizeof(to));
-    /* Reads never block: link_read asks how much is queued first. Writes get
-     * a long deadline, because a write stalling is the board telling us the
-     * picture is arriving faster than it can forward it - which is exactly the
-     * back-pressure this design wants. */
-    to.ReadIntervalTimeout = MAXDWORD;
-    to.ReadTotalTimeoutConstant = 0;
-    to.ReadTotalTimeoutMultiplier = 0;
-    to.WriteTotalTimeoutConstant = 5000;
-    to.WriteTotalTimeoutMultiplier = 0;
-    SetCommTimeouts(h, &to);
-
-    SetupComm(h, 4096, 65536);
-    PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR);
-    return h;
 }
 
 static SOCKET open_tcp(const char *hostport)
@@ -568,7 +624,6 @@ int main(int argc, char **argv)
      * the agent see physical pixels, so one pixel is one pixel end to end. */
     SetProcessDPIAware();
 
-    const char *port = NULL;
     const char *tcp = NULL;
     int         fps = 15;
     int         tile = 64;
@@ -578,7 +633,10 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--list") == 0) {
             list_only = 1;
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-            port = argv[++i];
+            /* Accepted and ignored: the board is no longer a COM port, it is a
+             * WinUSB device found by its interface GUID.  Kept so old scripts
+             * and muscle memory do not error out. */
+            ++i;
         } else if (strcmp(argv[i], "--tcp") == 0 && i + 1 < argc) {
             tcp = argv[++i];
         } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
@@ -586,7 +644,7 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--tile") == 0 && i + 1 < argc) {
             tile = atoi(argv[++i]);
         } else {
-            printf("usage: kvmagent [--port COMn | --tcp host:port] "
+            printf("usage: kvmagent [--tcp host:port] "
                    "[--fps N] [--tile N] [--list]\n");
             return 1;
         }
@@ -601,15 +659,18 @@ int main(int argc, char **argv)
         tile = 64;
     }
 
-    if (list_only) {
-        char dummy[32];
-        find_port(dummy, sizeof(dummy), 1);
-        return 0;
-    }
-
     link_t link;
+    link.dev = INVALID_HANDLE_VALUE;
+    link.winusb = NULL;
+    link.pipe_in = 0;
+    link.pipe_out = 0;
     link.h = INVALID_HANDLE_VALUE;
     link.s = INVALID_SOCKET;
+
+    if (list_only) {
+        find_winusb_device(&link, 1);
+        return 0;
+    }
 
     if (tcp != NULL) {
         link.s = open_tcp(tcp);
@@ -619,25 +680,14 @@ int main(int argc, char **argv)
         }
         printf("connected to %s\n", tcp);
     } else {
-        char found[32] = {0};
-        if (port == NULL) {
-            if (!find_port(found, sizeof(found), 0)) {
-                fprintf(stderr,
-                        "no ArgonOS board found (%04X:%04X).  Is it plugged "
-                        "in, and running an image with the serial pipe?\n"
-                        "Try --list, or --port COMn.\n",
-                        ARGON_VID, ARGON_PID);
-                return 2;
-            }
-            port = found;
-        }
-        link.h = open_port(port);
-        if (link.h == INVALID_HANDLE_VALUE) {
-            fprintf(stderr, "cannot open %s (%lu)\n", port,
-                    (unsigned long)GetLastError());
+        if (!find_winusb_device(&link, 0)) {
+            fprintf(stderr,
+                    "no ArgonOS KVM device found (is it plugged in and "
+                    "running KVM.AXE?)\n");
             return 2;
         }
-        printf("connected on %s\n", port);
+        printf("connected over WinUSB (IN 0x%02X, OUT 0x%02X)\n",
+               link.pipe_in, link.pipe_out);
     }
 
     grab_t g;
@@ -783,8 +833,11 @@ int main(int argc, char **argv)
     send_msg(&link, AG_VID_BYE, NULL, 0);
     free(scratch);
     grab_close(&g);
-    if (link.h != INVALID_HANDLE_VALUE) {
-        CloseHandle(link.h);
+    if (link.winusb != NULL) {
+        WinUsb_Free(link.winusb);
+    }
+    if (link.dev != INVALID_HANDLE_VALUE) {
+        CloseHandle(link.dev);
     }
     if (link.s != INVALID_SOCKET) {
         closesocket(link.s);
