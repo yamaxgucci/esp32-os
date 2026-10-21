@@ -44,47 +44,61 @@ AG_DRV("ST7789", "0.1", "argon");
  * own, so nothing here has to know the card exists - but it is why this driver
  * must never drive the bus pins itself.
  */
+/*
+ * Two panels, one file.  -DST7789_BOARD_S3CAM (tools/apps.json, ST7789S3.SYS)
+ * picks the ESP32-S3-WROOM CAM board's soldered panel; the default is the
+ * ESP32-C6-LCD-1.47.  Only the constants below change - the init sequence and
+ * the whole driver are shared.
+ *
+ * MADCTL 0x60 is MV|MX (landscape); bit 3 clear is RGB.  Which landscape (0x60
+ * or 0xA0) is which end of the flex the module was soldered by, so it is a
+ * first guess the screen settles.
+ */
+#if defined(ST7789_BOARD_S3CAM)
+
+/*
+ * A 2.0" 240x320 ST7789 soldered to the header of the ESP32-S3-WROOM CAM board
+ * (COM4, the Fallout board), driven landscape as 320x240.  Clock 12 and data 11
+ * are SPI2's IOMUX pins; CS is FSPICS0, DC on 13 (would be MISO - the panel
+ * cannot answer, so nothing is lost).  BL on 46 (a strapping pin with a
+ * pull-down; a transistor base pulls the same way), CS deliberately not on 46.
+ * Every pin here except 3 and 46 used to be the camera - do not load GC2145.
+ * Bus pins (sck 12, mosi 11) come from [spi2] in BOARD.CFG.  No offset: the
+ * controller's 240x320 is all glass.  Proven on the board 21 Oct 2026.
+ */
+#define LCD_BUS      2
+#define LCD_CS      10
+#define LCD_DC      13
+#define LCD_RST      3
+#define LCD_BL      46
+#define LCD_MADCTL 0x60
+#define LCD_W      320
+#define LCD_H      240
+#define LCD_X_OFF 0
+#define LCD_Y_OFF 0
+
+#else
+
+/*
+ * The ESP32-C6-LCD-1.47: a 172x320 ST7789 driven landscape as 320x172.  The
+ * chip select is the whole of what separates this panel from the SD card - both
+ * are on SPI2 and share clock and data - which is why this driver must never
+ * drive the bus pins itself.  The 172 rows sit centred in the controller's 240
+ * (34 above, 34 below), so the short axis starts 34 in; mirroring the axis
+ * (0xA0) does not move them.
+ */
 #define LCD_BUS      2
 #define LCD_CS      14
 #define LCD_DC      15
 #define LCD_RST     21
 #define LCD_BL      22
-
-/*
- * Landscape, and which way up.
- *
- * MV turns the addressing on its side; MX or MY then decides which corner is
- * the origin, which is to say which end of the board the first row is at.
- * 0x60 is MV|MX and 0xA0 is MV|MY - the two landscapes, one the other's
- * 180-degree rotation.
- *
- * 0x60 reads the right way up with the USB socket on the right, which is the
- * board held as a phone is held in landscape and is what this was checked on.
- * 0xA0 is the same screen for somebody who puts the cable out the other side;
- * it is the only line to change, because the offset below is the same either
- * way - the 172 rows sit centred in the controller's 240 (34 above, 34 below),
- * so mirroring the axis does not move them.
- *
- * Bit 3 is left clear: this panel is RGB, not BGR.  A picture with the reds
- * and blues exchanged is that bit and nothing else.
- */
 #define LCD_MADCTL 0x60
-
 #define LCD_W      320
 #define LCD_H      172
-
-/*
- * Where the glass is inside the controller.
- *
- * The ST7789 addresses 240x320 whatever is attached to it; this panel is 172
- * wide, centred, so the short axis starts 34 in.  Landscape puts the short
- * axis on the rows, which is why the offset is on Y here and would be on X in
- * portrait.  Getting this wrong does not look like an offset - it looks like a
- * screen with a band of noise down one side and everything shifted, because
- * the rows past the end still exist in memory and are simply not lit.
- */
 #define LCD_X_OFF 0
 #define LCD_Y_OFF 34
+
+#endif
 
 #define CELL_W AG_FONT8X8_W
 #define CELL_H AG_FONT8X8_H

@@ -183,6 +183,13 @@
       "include": ["apps/common"],
       "src": ["apps/st7789/st7789.c"]
     },
+    {
+      "out": "ST7789S3.SYS", "group": "board",
+      "_note": "The same driver repinned for the ESP32-S3-WROOM CAM board (xtensa): 2.0in 240x320 ST7789 on the header, SPI2 pins 10/11/12/13, RST 3, BL 46. -DST7789_BOARD_S3CAM swaps the constant block. Loaded as a .SYS over the KVM firmware so the console (and the board IP) appears on the glass. Board-verified 21 Oct 2026.",
+      "cflags": "-Os -ffunction-sections -fdata-sections -DST7789_BOARD_S3CAM",
+      "include": ["apps/common"],
+      "src": ["apps/st7789/st7789.c"]
+    },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
 
     {

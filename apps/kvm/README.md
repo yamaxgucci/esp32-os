@@ -70,11 +70,16 @@ the S3 has one OTG controller behind one internal PHY. On the CAM board the
 console stays on the CH343 bridge and nothing collides; on a board whose only
 socket is the native one (the S3-Zero) this image takes the console with it.
 
-The far machine sees five interfaces: a boot keyboard, an absolute pointer, a
-serial port and a flash drive. That is every IN endpoint the S3 has, which is
-why there is no relative mouse — the drive was worth more, because it is what
-puts the agent on a computer that has never seen this device. Drag
-`KVMAGENT.EXE` onto the drive once, from anywhere.
+The far machine sees three functions: a boot keyboard, an absolute pointer and a
+serial port. That is the whole endpoint budget — the S3's OTG core has five IN
+endpoints and the control endpoint EP0 is one of them, so functions get four,
+and the keyboard, the pointer and the serial pipe's notification + bulk are
+those four. There is no relative mouse (a trackpad step becomes an absolute
+position in `apps/common/kvm`) and no flash drive — a fifth function's IN
+endpoint makes TinyUSB's `dfifo_alloc` assert the moment a real host opens the
+pipes (found on the S3-CAM, 21 Oct; the agent is delivered by other means until
+a CDC without its notification endpoint frees one up). Proven on the board:
+Windows enumerates the composite with every `ConfigManagerErrorCode` 0.
 
 In the emulator there is no OTG peripheral at all, so the devices come from
 drivers instead:
