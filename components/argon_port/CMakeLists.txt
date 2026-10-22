@@ -213,6 +213,8 @@ endif()
 if(CONFIG_ARGON_USB_DEVICE)
     idf_component_get_property(tusb_lib espressif__esp_tinyusb COMPONENT_LIB)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${tusb_lib})
+endif()
+
 # USB device (CONFIG_ARGON_USB_MSC): the OTG peripheral as a mass-storage DEVICE
 # for the card-reader application (usbd_hw.c).  Bare TinyUSB, not esp_tinyusb -
 # see main/idf_component.yml for why.  The `usb` component supplies the PHY API
