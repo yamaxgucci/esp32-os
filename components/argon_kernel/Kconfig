@@ -563,12 +563,16 @@ menu "ArgonOS"
             USBHIDVIRT.SYS instead.
 
     config ARGON_USB_DEVICE_CDC
-        bool "USB device: a serial pipe beside the keyboard"
+        bool "USB device: a picture pipe beside the keyboard"
         depends on ARGON_USB_DEVICE
         default y
         help
-            One more function on the same composite device: a CDC serial port,
-            which on the far machine is a COM port with no driver to install.
+            One more function on the same composite device: a byte pipe to the
+            far machine.  The symbol keeps its old name, but it no longer backs
+            a CDC serial port - it is now a vendor (WinUSB) interface.  Windows
+            binds winusb.sys to it on its own, from a BOS + Microsoft OS 2.0
+            descriptor set (a DeviceInterfaceGUID), so there is no driver to
+            install and no COM port.
 
             It exists for the picture.  That machine will not send its screen
             out over USB by itself - USB has no class for a display sink - so
@@ -578,10 +582,10 @@ menu "ArgonOS"
             frames, and the board forwards them to the phone without ever
             decoding a pixel.
 
-            Costs an interface pair and two of the five device IN endpoints the
-            S3's OTG core has.  With the three HID interfaces that is all five,
-            which is why there is no mass-storage function here to carry the
-            program to the far machine - see docs/14-usb-kvm.md.
+            Costs one interface and a single bulk IN endpoint.  The old CDC spent
+            two (a bulk and a notification endpoint nobody read), which left no
+            room for the flash drive; dropping to one vendor bulk is what let the
+            drive fit alongside - see docs/14-usb-kvm.md.
 
             On by default when the gadget is, because a KVM without a picture is
             only half of one; off is for bringing the keyboard up on its own
@@ -601,12 +605,14 @@ menu "ArgonOS"
             is already there - put KVMAGENT.EXE on it once, from any computer,
             by dragging it across.
 
-            It costs the relative mouse and there was no way round that.  The
-            S3's OTG core has five device IN endpoints; the keyboard, the
-            pointer, the serial pipe's two and this are five.  What is lost is
-            a mouse in a BIOS, which few machines offer and fewer people use; a
-            relative step from a phone's trackpad is turned into a position one
-            layer up and nothing about pointing changes.
+            It fits because the picture pipe is a WinUSB vendor interface (one
+            bulk IN), not CDC (which spent two).  The S3's OTG core gives four
+            function IN endpoints; the keyboard, the pointer, the vendor pipe
+            and this drive are exactly four.  What was given up for the picture
+            is the relative mouse, not the drive: the only loss is a mouse in a
+            BIOS, which few machines offer and fewer people use, and a relative
+            step from a phone's trackpad is turned into a position one layer up,
+            so nothing about pointing changes.
 
             Needs a partition called `usbdisk` (partitions_kvm.csv, which
             `argon target esp32s3-kvm` selects).  Without one the interface is
