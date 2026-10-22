@@ -1,26 +1,27 @@
 # What mksysfs puts under C:\drv\ for this board.  One line per image; the
 # names are the built .SYS in build/apps (argon apps --group board).
 #
-# REMDISP only.  This board has no display controller of its own - no ILI9341,
-# no touch - so the default list, which is the CYD's, would install two drivers
-# onto pins that answer nothing.  What it has instead is UART1 to a second
-# board that does have glass.
-REMDISP.SYS
+# The panel.  This board is the S3 CAM with the ST7789 soldered to the CAM
+# header - 320x240, SPI, backlight on the driver's own pin - and that panel is
+# the console: the shell, the shop and every program that paints come up on the
+# glass.  It was REMDISP here, with a comment saying this board had no display
+# controller of its own; that is true of the bare CAM board and false of this
+# one, and the result was a screen that went dark after every reflash of C:
+# while the same panel worked fine under the KVM pack.
+ST7789S3.SYS
 #
-# As one half of a cluster, NODELINK.SYS instead of REMDISP.SYS (see
-# SYSTEM.CFG).  What that note said:
+# REMDISP instead, when this board is one half of a cluster and the picture
+# leaves over UART1 to the CYD (docs\09-esp32-cyd.md).  Not both at once - the
+# two want the same UART1 - and a board with its own glass never asks the
+# neighbour for one, so a cluster test wants this line and not the one above.
+# REMDISP.SYS
 #
-#  # What goes into C:\drv on this board, staged by tools\mksysfs.py.
-#  #
+# As one half of a cluster, NODELINK.SYS as well (see SYSTEM.CFG).  What that
+# note said:
+#
 #  # NODELINK.SYS is the default build - this board is an ESP32-S3, an LX7, and
 #  # the plain image in build\apps is built for it.  The CYD on the other end of
 #  # the wire loads NODELN32.SYS instead: same source, LX6 compiler.  A .SYS built
 #  # for the wrong one of the two loads and then throws an illegal instruction
 #  # somewhere inside, which reads as a driver bug rather than as the wrong image.
-#  #
-#  # The panel is deliberately NOT here.  This board has a screen when one is
-#  # soldered to the CAM header (ST7789S3.SYS), and for a cluster test it is a
-#  # distraction: a board with its own glass never asks the neighbour for one, so
-#  # half of what placement does would go untested.  Add it when testing the
-#  # screen, not the cluster.
 #  NODELINK.SYS

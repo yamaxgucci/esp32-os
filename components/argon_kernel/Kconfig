@@ -495,7 +495,11 @@ menu "ArgonOS"
         bool "Bluetooth Low Energy (input devices)"
         default n
         select BT_ENABLED
-        select BT_NIMBLE_ENABLED
+        # NOT select BT_NIMBLE_ENABLED: that is a member of a choice (the host
+        # stack), and kconfig has no effect selecting into one - ESP-IDF warns
+        # about exactly this and then cannot settle the configuration at all
+        # ("Missing required kconfig option after retry").  The board defaults
+        # name the host stack themselves: sdkconfig.esp32s3.board says NimBLE.
         help
             The host side of BLE, so that a keyboard or a mouse can be attached
             to a board whose chip has no USB - which the original ESP32 has
