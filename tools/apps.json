@@ -265,7 +265,7 @@
       "include": ["apps/common/kvm", "apps/common/libc"],
       "src": ["apps/kvm/kvm.c",
               "apps/common/kvm/ag_kvm.c",
-              "apps/common/kvm/ag_ws.c",
+              "apps/common/kvm/ag_kvmws.c",
               "apps/common/kvm/ag_vid.c",
               "apps/common/libc/libc_shim.c"]
     },

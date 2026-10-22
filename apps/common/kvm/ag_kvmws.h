@@ -32,8 +32,8 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
-#ifndef AG_WS_H
-#define AG_WS_H
+#ifndef AG_KVMWS_H
+#define AG_KVMWS_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -70,27 +70,27 @@ size_t ag_base64(const void *data, size_t len, char *out, size_t out_size);
 /* ------------------------------------------------------------------------ */
 
 /* Sec-WebSocket-Accept is 28 characters plus a NUL. */
-#define AG_WS_ACCEPT_LEN 29
+#define AG_KVMWS_ACCEPT_LEN 29
 
 /*
  * The value of Sec-WebSocket-Accept for a given Sec-WebSocket-Key.  `key` is
  * the header's value as it arrived, without surrounding spaces.  False when
  * `key` is empty or `out` is too small.
  */
-bool ag_ws_accept_key(const char *key, size_t key_len,
-                      char out[AG_WS_ACCEPT_LEN]);
+bool ag_kvmws_accept_key(const char *key, size_t key_len,
+                      char out[AG_KVMWS_ACCEPT_LEN]);
 
 /* ------------------------------------------------------------------------ */
 /* Frames                                                                   */
 /* ------------------------------------------------------------------------ */
 
 enum {
-    AG_WS_CONT = 0x0,
-    AG_WS_TEXT = 0x1,
-    AG_WS_BIN = 0x2,
-    AG_WS_CLOSE = 0x8,
-    AG_WS_PING = 0x9,
-    AG_WS_PONG = 0xA,
+    AG_KVMWS_CONT = 0x0,
+    AG_KVMWS_TEXT = 0x1,
+    AG_KVMWS_BIN = 0x2,
+    AG_KVMWS_CLOSE = 0x8,
+    AG_KVMWS_PING = 0x9,
+    AG_KVMWS_PONG = 0xA,
 };
 
 typedef struct {
@@ -98,7 +98,7 @@ typedef struct {
     bool     fin;
     uint8_t *payload; /* points into the caller's buffer, unmasked in place */
     uint32_t len;
-} ag_ws_frame_t;
+} ag_kvmws_frame_t;
 
 /*
  * Take one frame off the front of `buf`.  The payload is unmasked in place, so
@@ -108,25 +108,25 @@ typedef struct {
  * Returns the number of bytes consumed, 0 when the buffer does not yet hold a
  * whole frame, and a negative value for a frame this will not accept: an
  * unmasked frame from a client (RFC 6455 §5.1 says the connection must fail), a
- * fragment, or a payload longer than AG_WS_MAX_PAYLOAD.
+ * fragment, or a payload longer than AG_KVMWS_MAX_PAYLOAD.
  */
-#define AG_WS_MAX_PAYLOAD 65535u
+#define AG_KVMWS_MAX_PAYLOAD 65535u
 
-#define AG_WS_ERR_UNMASKED (-1)
-#define AG_WS_ERR_FRAGMENT (-2)
-#define AG_WS_ERR_TOOBIG (-3)
+#define AG_KVMWS_ERR_UNMASKED (-1)
+#define AG_KVMWS_ERR_FRAGMENT (-2)
+#define AG_KVMWS_ERR_TOOBIG (-3)
 
-int32_t ag_ws_decode(uint8_t *buf, size_t len, ag_ws_frame_t *out);
+int32_t ag_kvmws_decode(uint8_t *buf, size_t len, ag_kvmws_frame_t *out);
 
 /*
  * The header for a frame a server sends: never masked, so two bytes for
  * anything shorter than 126 and four up to 65535.  Returns the header length,
  * or 0 for a payload this cannot describe.  `hdr` needs four bytes.
  */
-uint32_t ag_ws_header(uint8_t *hdr, uint8_t opcode, size_t payload_len);
+uint32_t ag_kvmws_header(uint8_t *hdr, uint8_t opcode, size_t payload_len);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* AG_WS_H */
+#endif /* AG_KVMWS_H */

@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
-#include "ag_ws.h"
+#include "ag_kvmws.h"
 
 #include <string.h>
 
@@ -155,8 +155,8 @@ size_t ag_base64(const void *data, size_t len, char *out, size_t out_size)
 /* RFC 6455 §1.3: the one constant in the protocol. */
 static const char k_guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-bool ag_ws_accept_key(const char *key, size_t key_len,
-                      char out[AG_WS_ACCEPT_LEN])
+bool ag_kvmws_accept_key(const char *key, size_t key_len,
+                      char out[AG_KVMWS_ACCEPT_LEN])
 {
     if (key == NULL || key_len == 0 || out == NULL) {
         return false;
@@ -170,14 +170,14 @@ bool ag_ws_accept_key(const char *key, size_t key_len,
     ag_sha1_update(&s, k_guid, sizeof(k_guid) - 1u);
     ag_sha1_final(&s, digest);
 
-    return ag_base64(digest, sizeof(digest), out, AG_WS_ACCEPT_LEN) == 28u;
+    return ag_base64(digest, sizeof(digest), out, AG_KVMWS_ACCEPT_LEN) == 28u;
 }
 
 /* ------------------------------------------------------------------------ */
 /* Frames                                                                   */
 /* ------------------------------------------------------------------------ */
 
-int32_t ag_ws_decode(uint8_t *buf, size_t len, ag_ws_frame_t *out)
+int32_t ag_kvmws_decode(uint8_t *buf, size_t len, ag_kvmws_frame_t *out)
 {
     if (buf == NULL || out == NULL || len < 2u) {
         return 0;
@@ -202,7 +202,7 @@ int32_t ag_ws_decode(uint8_t *buf, size_t len, ag_ws_frame_t *out)
          * A 64-bit length.  Nothing this protocol carries is that long, and
          * accepting one would mean growing a buffer on a remote party's say-so.
          */
-        return AG_WS_ERR_TOOBIG;
+        return AG_KVMWS_ERR_TOOBIG;
     }
 
     /*
@@ -212,19 +212,19 @@ int32_t ag_ws_decode(uint8_t *buf, size_t len, ag_ws_frame_t *out)
      * unmasked frame is an error rather than something to be lenient about.
      */
     if (!masked) {
-        return AG_WS_ERR_UNMASKED;
+        return AG_KVMWS_ERR_UNMASKED;
     }
-    if (plen > AG_WS_MAX_PAYLOAD) {
-        return AG_WS_ERR_TOOBIG;
+    if (plen > AG_KVMWS_MAX_PAYLOAD) {
+        return AG_KVMWS_ERR_TOOBIG;
     }
 
     /* A control frame is never fragmented and never longer than 125 bytes. */
     if ((opcode & 0x08u) != 0u && (!fin || plen > 125u)) {
-        return AG_WS_ERR_FRAGMENT;
+        return AG_KVMWS_ERR_FRAGMENT;
     }
     /* Data frames: this carries lines, and a line fits in a frame. */
-    if ((opcode & 0x08u) == 0u && (!fin || opcode == AG_WS_CONT)) {
-        return AG_WS_ERR_FRAGMENT;
+    if ((opcode & 0x08u) == 0u && (!fin || opcode == AG_KVMWS_CONT)) {
+        return AG_KVMWS_ERR_FRAGMENT;
     }
 
     if (len < pos + 4u + plen) {
@@ -246,9 +246,9 @@ int32_t ag_ws_decode(uint8_t *buf, size_t len, ag_ws_frame_t *out)
     return (int32_t)(pos + plen);
 }
 
-uint32_t ag_ws_header(uint8_t *hdr, uint8_t opcode, size_t payload_len)
+uint32_t ag_kvmws_header(uint8_t *hdr, uint8_t opcode, size_t payload_len)
 {
-    if (hdr == NULL || payload_len > AG_WS_MAX_PAYLOAD) {
+    if (hdr == NULL || payload_len > AG_KVMWS_MAX_PAYLOAD) {
         return 0;
     }
     hdr[0] = (uint8_t)(0x80u | (opcode & 0x0Fu)); /* FIN, one frame */

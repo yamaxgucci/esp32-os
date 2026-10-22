@@ -37,7 +37,7 @@
 
 #include "ag_kvm.h"
 #include "ag_vid.h"
-#include "ag_ws.h"
+#include "ag_kvmws.h"
 #include "kvm_page.h"
 
 AG_APP("KVM", "1.0", "argon", AG_AXE_NEEDS_NET);
@@ -181,7 +181,7 @@ static bool ws_send_ms(kvm_t *k, uint8_t opcode, const void *payload,
                        size_t len, uint32_t ms)
 {
     uint8_t        hdr[4];
-    const uint32_t hn = ag_ws_header(hdr, opcode, len);
+    const uint32_t hn = ag_kvmws_header(hdr, opcode, len);
 
     if (k->ws < 0 || hn == 0) {
         return false;
@@ -288,7 +288,7 @@ static void handle_line(kvm_t *k, const char *line, size_t len)
         const size_t pwn = (len >= 2) ? len - 2 : 0;
         const size_t wl = strlen(k->webpass);
         k->authed = (wl == 0) || (pwn == wl && memcmp(pw, k->webpass, wl) == 0);
-        (void)ws_send(k, AG_WS_TEXT, k->authed ? "A 1" : "A 0", 3);
+        (void)ws_send(k, AG_KVMWS_TEXT, k->authed ? "A 1" : "A 0", 3);
         return;
     }
     /* Everything else is control, and control waits for the password. */
@@ -353,7 +353,7 @@ static bool pump_video(kvm_t *k)
             if (k->ws < 0 || !k->authed) {
                 continue; /* no phone, or one that has not given the password */
             }
-            if (!ws_send_ms(k, AG_WS_BIN, msg.raw, msg.raw_len,
+            if (!ws_send_ms(k, AG_KVMWS_BIN, msg.raw, msg.raw_len,
                             VID_SEND_MS)) {
                 ws_drop(k, "the picture could not be sent");
                 return moved;
@@ -757,8 +757,8 @@ static bool ws_service(kvm_t *k)
         /* Take whole frames off the front until what is left is a fragment. */
         size_t off = 0;
         for (;;) {
-            ag_ws_frame_t f;
-            const int32_t used = ag_ws_decode(k->rx + off, k->rx_n - off, &f);
+            ag_kvmws_frame_t f;
+            const int32_t used = ag_kvmws_decode(k->rx + off, k->rx_n - off, &f);
             if (used == 0) {
                 break;
             }
@@ -767,10 +767,10 @@ static bool ws_service(kvm_t *k)
                 return moved;
             }
             switch (f.opcode) {
-            case AG_WS_TEXT:
+            case AG_KVMWS_TEXT:
                 handle_line(k, (const char *)f.payload, f.len);
                 break;
-            case AG_WS_BIN:
+            case AG_KVMWS_BIN:
                 /*
                  * Not input.  Input is text and goes out as HID, because that
                  * is the half that has to work when nothing runs on the far
@@ -779,11 +779,11 @@ static bool ws_service(kvm_t *k)
                  */
                 video_out(k, f.payload, f.len);
                 break;
-            case AG_WS_PING:
-                (void)ws_send(k, AG_WS_PONG, f.payload, f.len);
+            case AG_KVMWS_PING:
+                (void)ws_send(k, AG_KVMWS_PONG, f.payload, f.len);
                 break;
-            case AG_WS_CLOSE:
-                (void)ws_send(k, AG_WS_CLOSE, NULL, 0);
+            case AG_KVMWS_CLOSE:
+                (void)ws_send(k, AG_KVMWS_CLOSE, NULL, 0);
                 ws_drop(k, "goodbye");
                 return moved;
             default:
@@ -825,7 +825,7 @@ static void push_status(kvm_t *k)
                            (unsigned)vs.state, (unsigned)k->tiles,
                            (unsigned)k->vrx.resyncs);
     if (n > 0) {
-        (void)ws_send(k, AG_WS_TEXT, line, (size_t)n);
+        (void)ws_send(k, AG_KVMWS_TEXT, line, (size_t)n);
     }
 }
 
@@ -954,9 +954,9 @@ int ag_main(int argc, char **argv)
                 const char *key =
                     hdr_value(k.req, n, "sec-websocket-key:", &klen);
                 if (key != NULL && klen > 0 && klen < 64) {
-                    char accept[AG_WS_ACCEPT_LEN];
+                    char accept[AG_KVMWS_ACCEPT_LEN];
                     char resp[200];
-                    if (ag_ws_accept_key(key, klen, accept)) {
+                    if (ag_kvmws_accept_key(key, klen, accept)) {
                         const int rn =
                             snprintf(resp, sizeof(resp),
                                      "HTTP/1.1 101 Switching Protocols\r\n"

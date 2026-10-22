@@ -12,7 +12,7 @@
  */
 #include "test.h"
 
-#include "ag_ws.h"
+#include "ag_kvmws.h"
 
 #include <string.h>
 
@@ -100,14 +100,14 @@ static void test_base64(void)
 
 static void test_handshake(void)
 {
-    char accept[AG_WS_ACCEPT_LEN];
+    char accept[AG_KVMWS_ACCEPT_LEN];
 
     /* RFC 6455 §1.3, the worked example. */
-    AG_CHECK(ag_ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==", 24, accept));
+    AG_CHECK(ag_kvmws_accept_key("dGhlIHNhbXBsZSBub25jZQ==", 24, accept));
     AG_CHECK_STR(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
 
-    AG_CHECK(!ag_ws_accept_key("", 0, accept));
-    AG_CHECK(!ag_ws_accept_key(NULL, 4, accept));
+    AG_CHECK(!ag_kvmws_accept_key("", 0, accept));
+    AG_CHECK(!ag_kvmws_accept_key(NULL, 4, accept));
 }
 
 /* Builds a client frame the way a browser does: masked, one piece. */
@@ -136,57 +136,57 @@ static void test_decode(void)
 {
     static const uint8_t mask[4] = {0x37, 0xFA, 0x21, 0x3D};
     uint8_t              buf[512];
-    ag_ws_frame_t        f;
+    ag_kvmws_frame_t        f;
 
     /* A short text frame, which is what an event is. */
     const char    *line = "M 3 -4 0 0";
-    const size_t   n = make_frame(buf, AG_WS_TEXT, line, strlen(line), mask);
-    const int32_t  used = ag_ws_decode(buf, n, &f);
+    const size_t   n = make_frame(buf, AG_KVMWS_TEXT, line, strlen(line), mask);
+    const int32_t  used = ag_kvmws_decode(buf, n, &f);
     AG_CHECK_INT(used, (int)n);
-    AG_CHECK_INT(f.opcode, AG_WS_TEXT);
+    AG_CHECK_INT(f.opcode, AG_KVMWS_TEXT);
     AG_CHECK(f.fin);
     AG_CHECK_INT(f.len, (int)strlen(line));
     AG_CHECK(memcmp(f.payload, line, f.len) == 0);
 
     /* Half a frame is not an error, it is "come back with more". */
-    AG_CHECK_INT(ag_ws_decode(buf, 1, &f), 0);
-    AG_CHECK_INT(ag_ws_decode(buf, n - 1, &f), 0);
+    AG_CHECK_INT(ag_kvmws_decode(buf, 1, &f), 0);
+    AG_CHECK_INT(ag_kvmws_decode(buf, n - 1, &f), 0);
 
     /* Exactly 126 bytes: the length grows a two-byte field, and this is the
      * boundary a hand-written parser reads one byte short at. */
     {
         char big[200];
         memset(big, 'a', sizeof(big));
-        const size_t bn = make_frame(buf, AG_WS_TEXT, big, 126, mask);
+        const size_t bn = make_frame(buf, AG_KVMWS_TEXT, big, 126, mask);
         AG_CHECK_INT(bn, 2 + 2 + 4 + 126);
-        AG_CHECK_INT(ag_ws_decode(buf, bn, &f), (int)bn);
+        AG_CHECK_INT(ag_kvmws_decode(buf, bn, &f), (int)bn);
         AG_CHECK_INT(f.len, 126);
         AG_CHECK_INT(f.payload[0], 'a');
         AG_CHECK_INT(f.payload[125], 'a');
 
         /* And 125, which still fits the short field. */
-        const size_t sn = make_frame(buf, AG_WS_TEXT, big, 125, mask);
+        const size_t sn = make_frame(buf, AG_KVMWS_TEXT, big, 125, mask);
         AG_CHECK_INT(sn, 2 + 4 + 125);
-        AG_CHECK_INT(ag_ws_decode(buf, sn, &f), (int)sn);
+        AG_CHECK_INT(ag_kvmws_decode(buf, sn, &f), (int)sn);
         AG_CHECK_INT(f.len, 125);
     }
 
     /* A ping is a control frame and must be answered, so it has to arrive. */
     {
-        const size_t pn = make_frame(buf, AG_WS_PING, "hi", 2, mask);
-        AG_CHECK_INT(ag_ws_decode(buf, pn, &f), (int)pn);
-        AG_CHECK_INT(f.opcode, AG_WS_PING);
+        const size_t pn = make_frame(buf, AG_KVMWS_PING, "hi", 2, mask);
+        AG_CHECK_INT(ag_kvmws_decode(buf, pn, &f), (int)pn);
+        AG_CHECK_INT(f.opcode, AG_KVMWS_PING);
         AG_CHECK_INT(f.len, 2);
     }
 
     /* Two frames back to back: the decoder must report what it consumed so the
      * caller can find the second one. */
     {
-        const size_t a = make_frame(buf, AG_WS_TEXT, "K d 4 0", 7, mask);
-        const size_t b = make_frame(buf + a, AG_WS_TEXT, "K u 4 0", 7, mask);
-        AG_CHECK_INT(ag_ws_decode(buf, a + b, &f), (int)a);
+        const size_t a = make_frame(buf, AG_KVMWS_TEXT, "K d 4 0", 7, mask);
+        const size_t b = make_frame(buf + a, AG_KVMWS_TEXT, "K u 4 0", 7, mask);
+        AG_CHECK_INT(ag_kvmws_decode(buf, a + b, &f), (int)a);
         AG_CHECK(memcmp(f.payload, "K d 4 0", 7) == 0);
-        AG_CHECK_INT(ag_ws_decode(buf + a, b, &f), (int)b);
+        AG_CHECK_INT(ag_kvmws_decode(buf + a, b, &f), (int)b);
         AG_CHECK(memcmp(f.payload, "K u 4 0", 7) == 0);
     }
 }
@@ -195,7 +195,7 @@ static void test_decode_refusals(void)
 {
     static const uint8_t mask[4] = {1, 2, 3, 4};
     uint8_t              buf[64];
-    ag_ws_frame_t        f;
+    ag_kvmws_frame_t        f;
 
     /* Unmasked from a client: RFC 6455 says fail the connection, and masking
      * is the thing that stops a page steering a proxy - so not "be lenient". */
@@ -203,46 +203,46 @@ static void test_decode_refusals(void)
     buf[1] = 0x02;
     buf[2] = 'h';
     buf[3] = 'i';
-    AG_CHECK_INT(ag_ws_decode(buf, 4, &f), AG_WS_ERR_UNMASKED);
+    AG_CHECK_INT(ag_kvmws_decode(buf, 4, &f), AG_KVMWS_ERR_UNMASKED);
 
     /* A fragment.  Nothing here sends one, and reassembling would mean holding
      * a buffer open at a remote party's discretion. */
-    const size_t n = make_frame(buf, AG_WS_TEXT, "hi", 2, mask);
+    const size_t n = make_frame(buf, AG_KVMWS_TEXT, "hi", 2, mask);
     buf[0] &= (uint8_t)~0x80u; /* clear FIN */
-    AG_CHECK_INT(ag_ws_decode(buf, n, &f), AG_WS_ERR_FRAGMENT);
+    AG_CHECK_INT(ag_kvmws_decode(buf, n, &f), AG_KVMWS_ERR_FRAGMENT);
 
     /* A 64-bit length is refused outright rather than parsed and rejected
      * later: the point is to never size a buffer from it. */
     buf[0] = 0x81;
     buf[1] = (uint8_t)(0x80u | 127u);
     memset(buf + 2, 0, 8);
-    AG_CHECK_INT(ag_ws_decode(buf, 20, &f), AG_WS_ERR_TOOBIG);
+    AG_CHECK_INT(ag_kvmws_decode(buf, 20, &f), AG_KVMWS_ERR_TOOBIG);
 }
 
 static void test_header(void)
 {
     uint8_t hdr[4];
 
-    AG_CHECK_INT(ag_ws_header(hdr, AG_WS_TEXT, 5), 2);
+    AG_CHECK_INT(ag_kvmws_header(hdr, AG_KVMWS_TEXT, 5), 2);
     AG_CHECK_INT(hdr[0], 0x81);
     AG_CHECK_INT(hdr[1], 5); /* no mask bit: a server never masks */
 
-    AG_CHECK_INT(ag_ws_header(hdr, AG_WS_TEXT, 125), 2);
+    AG_CHECK_INT(ag_kvmws_header(hdr, AG_KVMWS_TEXT, 125), 2);
     AG_CHECK_INT(hdr[1], 125);
 
-    AG_CHECK_INT(ag_ws_header(hdr, AG_WS_BIN, 126), 4);
+    AG_CHECK_INT(ag_kvmws_header(hdr, AG_KVMWS_BIN, 126), 4);
     AG_CHECK_INT(hdr[0], 0x82);
     AG_CHECK_INT(hdr[1], 126);
     AG_CHECK_INT(hdr[2], 0);
     AG_CHECK_INT(hdr[3], 126);
 
-    AG_CHECK_INT(ag_ws_header(hdr, AG_WS_TEXT, 65535), 4);
+    AG_CHECK_INT(ag_kvmws_header(hdr, AG_KVMWS_TEXT, 65535), 4);
     AG_CHECK_INT(hdr[2], 0xFF);
     AG_CHECK_INT(hdr[3], 0xFF);
 
-    AG_CHECK_INT(ag_ws_header(hdr, AG_WS_TEXT, 65536), 0);
+    AG_CHECK_INT(ag_kvmws_header(hdr, AG_KVMWS_TEXT, 65536), 0);
 
-    AG_CHECK_INT(ag_ws_header(hdr, AG_WS_PONG, 0), 2);
+    AG_CHECK_INT(ag_kvmws_header(hdr, AG_KVMWS_PONG, 0), 2);
     AG_CHECK_INT(hdr[0], 0x8A);
     AG_CHECK_INT(hdr[1], 0);
 }

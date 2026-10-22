@@ -77,7 +77,7 @@ set(ARGON_DSP_SRCS
 # far machine - see the header of host-tests/test_kvm.c.
 set(ARGON_KVM_SRCS
     "${ARGON_ROOT}/apps/common/kvm/ag_kvm.c"
-    "${ARGON_ROOT}/apps/common/kvm/ag_ws.c"
+    "${ARGON_ROOT}/apps/common/kvm/ag_kvmws.c"
     "${ARGON_ROOT}/apps/common/kvm/ag_vid.c")
 
 set(ARGON_INCLUDES
