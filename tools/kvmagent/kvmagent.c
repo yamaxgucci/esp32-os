@@ -374,6 +374,55 @@ static SOCKET open_tcp(const char *hostport)
     return s;
 }
 
+/* Where to find the link, remembered from argv so the reconnect loop can go
+ * looking again: the --tcp target, or NULL for the WinUSB board. */
+static const char *g_tcp = NULL;
+
+/*
+ * Bring the link up, from nothing to ready-to-stream: for a board, find its
+ * WinUSB interface and its bulk pipes; for --tcp, connect the socket.  Returns
+ * 1 connected, 0 not (yet).  The whole reason it is a function is that the
+ * board reboots - the USB re-enumerates and the old handle dies - so we come
+ * back here to open it afresh.  It resets the handles up front and leaves
+ * nothing half-open on failure (find_winusb_device and open_tcp each close
+ * their own partial state), so it is safe to call again and again.
+ */
+static int link_open(link_t *l)
+{
+    l->dev     = INVALID_HANDLE_VALUE;
+    l->winusb  = NULL;
+    l->pipe_in = 0;
+    l->pipe_out = 0;
+    l->h       = INVALID_HANDLE_VALUE;
+    l->s       = INVALID_SOCKET;
+
+    if (g_tcp != NULL) {
+        l->s = open_tcp(g_tcp);
+        return l->s != INVALID_SOCKET;
+    }
+    return find_winusb_device(l, 0);
+}
+
+/* Drop the link and return l to the "nothing open" state, so link_open can run
+ * again.  WinUsb_Free before CloseHandle for the board; closesocket for tcp.
+ * (WSACleanup is left for the final teardown - WSAStartup is reference-counted
+ * and a reconnect simply opens another socket.) */
+static void link_close(link_t *l)
+{
+    if (l->winusb != NULL) {
+        WinUsb_Free(l->winusb);
+        l->winusb = NULL;
+    }
+    if (l->dev != INVALID_HANDLE_VALUE) {
+        CloseHandle(l->dev);
+        l->dev = INVALID_HANDLE_VALUE;
+    }
+    if (l->s != INVALID_SOCKET) {
+        closesocket(l->s);
+        l->s = INVALID_SOCKET;
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* The screen                                                               */
 /* ------------------------------------------------------------------------ */
@@ -940,23 +989,9 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (tcp != NULL) {
-        link.s = open_tcp(tcp);
-        if (link.s == INVALID_SOCKET) {
-            fprintf(stderr, "cannot connect to %s\n", tcp);
-            return 2;
-        }
-        printf("connected to %s\n", tcp);
-    } else {
-        if (!find_winusb_device(&link, 0)) {
-            fprintf(stderr,
-                    "no ArgonOS KVM device found (is it plugged in and "
-                    "running KVM.AXE?)\n");
-            return 2;
-        }
-        printf("connected over WinUSB (IN 0x%02X, OUT 0x%02X)\n",
-               link.pipe_in, link.pipe_out);
-    }
+    /* Remember where the link lives; the reconnect loop opens it (and re-opens
+     * it after every board reboot) through link_open, which reads this. */
+    g_tcp = tcp;
 
     grab_t g;
     if (!grab_open(&g, tile)) {
@@ -983,7 +1018,9 @@ int main(int argc, char **argv)
         return 3;
     }
 
-    /* HELLO first: the phone cannot size its canvas until it knows. */
+    /* HELLO's payload is the screen's size; it never changes, so build it once
+     * here and resend it on every (re)connection - the phone cannot size its
+     * canvas until it has one. */
     uint8_t hello[8];
     hello[0] = 1;
     hello[1] = 0;
@@ -993,8 +1030,8 @@ int main(int argc, char **argv)
     hello[5] = (uint8_t)(g.h >> 8);
     hello[6] = (uint8_t)(tile & 0xFF);
     hello[7] = (uint8_t)(tile >> 8);
-    send_msg(&link, AG_VID_HELLO, hello, sizeof(hello));
 
+    /* Per-connection streaming state, reset each time we (re)connect below. */
     int      want_all = 1;
     int      want_hello = 0;
     uint32_t frames = 0, sent = 0;
@@ -1002,148 +1039,225 @@ int main(int argc, char **argv)
     const DWORD period = (DWORD)(1000 / fps);
     DWORD    report = GetTickCount() + 5000;
 
+    int connected = 0;   /* is the link up right now?                         */
+    int waiting_said = 0; /* have we already printed the "waiting" line?      */
+
+    /*
+     * The outer loop survives the board rebooting.  When the USB re-enumerates
+     * the WinUSB handle dies, link_read returns -1 (or a write fails), and
+     * instead of exiting we close the dead handle, come back up here, and
+     * link_open the device anew - looping until the user actually quits
+     * (Ctrl+C or the tray's Quit, both of which set s_stop).
+     *
+     * The wizard state (g_configured, g_asked) is deliberately NOT touched
+     * across reconnects: a board that was already set up must not re-run the
+     * wizard when it reappears.  Only the streaming state above is reset.
+     */
     while (!s_stop) {
-        /* Keep the tray icon and its menu live without blocking the loop. */
-        tray_pump();
-
-        /* Anything from the phone, by way of the board. */
-        const int n = link_read(&link, in, sizeof(in));
-        if (n < 0) {
-            printf("the link went away\n");
-            break;
-        }
-        if (n > 0) {
-            if (have + (size_t)n > sizeof(msg)) {
-                have = 0; /* nothing we send is this big; resynchronise */
+        if (!connected) {
+            if (!link_open(&link)) {
+                /* No board yet - booting, unplugged, or not here at all, all
+                 * the same to us.  Say it once, keep the tray responsive, and
+                 * wait a beat; do not busy-spin on the enumerator. */
+                if (!waiting_said) {
+                    printf("waiting for the dongle...\n");
+                    fflush(stdout);
+                    waiting_said = 1;
+                }
+                tray_pump();
+                Sleep(700);
+                continue;
             }
-            memcpy(msg + have, in, (size_t)n);
-            have += (size_t)n;
 
-            size_t off = 0;
-            while (have - off >= AG_VID_HDR) {
-                if (msg[off] != 'A' || msg[off + 1] != 'G') {
-                    off++;
-                    continue;
-                }
-                const uint32_t len = (uint32_t)msg[off + 4] |
-                                     ((uint32_t)msg[off + 5] << 8) |
-                                     ((uint32_t)msg[off + 6] << 16) |
-                                     ((uint32_t)msg[off + 7] << 24);
-                if (len > AG_VID_MAX_PAYLOAD) {
-                    off++;
-                    continue;
-                }
-                if (have - off < AG_VID_HDR + len) {
-                    break;
-                }
-                const uint8_t type = msg[off + 2];
-                if (type == AG_VID_WANT) {
-                    /*
-                     * A phone that has just connected asks for this, and it
-                     * needs the screen's size as much as it needs the pixels:
-                     * it never saw the HELLO sent when this program started,
-                     * and without one there is nothing to size a canvas from.
-                     */
-                    want_all = 1;
-                    want_hello = 1;
-                } else if (type == AG_VID_CLIP && len > 0) {
-                    set_clipboard(msg + off + AG_VID_HDR, len);
-                } else if (type == AG_VID_TYPE && len > 0) {
-                    type_unicode(msg + off + AG_VID_HDR, len);
-                } else if (type == AG_VID_CFG_STATE && len >= 1) {
-                    /*
-                     * Where the board is on getting onto a network.  The first
-                     * byte is the state; the rest is the IP as ASCII, which the
-                     * board NUL-terminates - but we never trust a wire length,
-                     * so bound the string to the frame and plant our own NUL.
-                     */
-                    const uint8_t *p = msg + off + AG_VID_HDR;
-                    const uint8_t  state = p[0];
-                    char ip[64];
-                    uint32_t iplen = len - 1; /* bytes after the state byte */
-                    if (iplen > sizeof(ip) - 1) {
-                        iplen = sizeof(ip) - 1;
-                    }
-                    memcpy(ip, p + 1, iplen);
-                    ip[iplen] = '\0'; /* terminate even if the board did not */
-
-                    if (g_force_setup && !g_asked) {
-                        /* --setup: reconfigure regardless of the reported
-                         * state (the board may already be on a network). */
-                        run_setup(&link);
-                        g_asked = 1;
-                    } else if (state == 0 && !g_asked) {
-                        run_setup(&link);
-                        g_asked = 1;
-                    } else if (state == 1) {
-                        if (!g_asked) {
-                            printf("joining the network...\n");
-                            fflush(stdout);
-                            g_asked = 1;
-                        }
-                    } else if (state == 2 && !g_configured) {
-                        printf("\nReady. Open  http://%s/  on the phone\n", ip);
-                        fflush(stdout);
-                        g_configured = 1;
-                        /* Streaming from here on; nothing more to read in the
-                         * console, so fold it into the tray (unless --console).
-                         * Any later Reconfigure brings it back by itself. */
-                        hide_to_tray();
-                    }
-                }
-                off += AG_VID_HDR + len;
+            connected = 1;
+            waiting_said = 0;
+            if (g_tcp != NULL) {
+                printf("connected to %s\n", g_tcp);
+            } else {
+                printf("connected over WinUSB (IN 0x%02X, OUT 0x%02X)\n",
+                       link.pipe_in, link.pipe_out);
             }
-            if (off > 0) {
-                memmove(msg, msg + off, have - off);
-                have -= off;
-            }
-        }
+            fflush(stdout);
 
-        const DWORD now = GetTickCount();
-        if ((int)(now - next) < 0) {
-            Sleep(2);
-            continue;
-        }
-        next = now + period;
-
-        if (want_hello) {
+            /* A fresh link is a fresh stream: forget any half-read frame, hand
+             * the next client a full picture, and clear the counters.  The
+             * wizard flags survive (see the outer-loop comment). */
+            have = 0;
+            want_all = 1;
             want_hello = 0;
+            frames = 0;
+            sent = 0;
+            next = GetTickCount();
+            report = GetTickCount() + 5000;
+
             send_msg(&link, AG_VID_HELLO, hello, sizeof(hello));
         }
 
-        grab_frame(&g);
-        frames++;
+        /* The inner loop streams until the board goes away or the user quits.
+         * On link loss it closes the link, marks us disconnected, and breaks
+         * back to the outer loop to reconnect - it never exits the program. */
+        while (!s_stop) {
+            /* Keep the tray icon and its menu live without blocking the loop. */
+            tray_pump();
 
-        for (int ty = 0; ty < g.rows; ty++) {
-            for (int tx = 0; tx < g.cols; tx++) {
-                const int x = tx * tile;
-                const int y = ty * tile;
-                const int w = (x + tile <= g.w) ? tile : g.w - x;
-                const int h = (y + tile <= g.h) ? tile : g.h - y;
-                const uint32_t hv = tile_hash(&g, x, y, w, h);
-                const int      idx = ty * g.cols + tx;
-
-                if (!want_all && g.hash[idx] == hv) {
-                    continue;
-                }
-                g.hash[idx] = hv;
-                if (!send_rect(&link, &g, x, y, w, h, scratch, 0)) {
-                    printf("the link went away\n");
-                    s_stop = 1;
-                    break;
-                }
-                sent++;
-            }
-            if (s_stop) {
+            /* Anything from the phone, by way of the board. */
+            const int n = link_read(&link, in, sizeof(in));
+            if (n < 0) {
+                /* link_read maps a WinUSB read timeout (nothing arrived) to 0,
+                 * so -1 is a genuine failure: the board rebooted and the handle
+                 * died.  Drop it and go reconnect rather than exiting. */
+                link_close(&link);
+                connected = 0;
+                printf("the board went away - waiting for it to come back\n");
+                fflush(stdout);
                 break;
             }
-        }
-        want_all = 0;
+            if (n > 0) {
+                if (have + (size_t)n > sizeof(msg)) {
+                    have = 0; /* nothing we send is this big; resynchronise */
+                }
+                memcpy(msg + have, in, (size_t)n);
+                have += (size_t)n;
 
-        if ((int)(GetTickCount() - report) >= 0) {
-            report = GetTickCount() + 5000;
-            printf("%u frames, %u tiles sent\n", frames, sent);
-            fflush(stdout);
+                size_t off = 0;
+                while (have - off >= AG_VID_HDR) {
+                    if (msg[off] != 'A' || msg[off + 1] != 'G') {
+                        off++;
+                        continue;
+                    }
+                    const uint32_t len = (uint32_t)msg[off + 4] |
+                                         ((uint32_t)msg[off + 5] << 8) |
+                                         ((uint32_t)msg[off + 6] << 16) |
+                                         ((uint32_t)msg[off + 7] << 24);
+                    if (len > AG_VID_MAX_PAYLOAD) {
+                        off++;
+                        continue;
+                    }
+                    if (have - off < AG_VID_HDR + len) {
+                        break;
+                    }
+                    const uint8_t type = msg[off + 2];
+                    if (type == AG_VID_WANT) {
+                        /*
+                         * A phone that has just connected asks for this, and it
+                         * needs the screen's size as much as it needs the
+                         * pixels: it never saw the HELLO sent when this program
+                         * started, and without one there is nothing to size a
+                         * canvas from.
+                         */
+                        want_all = 1;
+                        want_hello = 1;
+                    } else if (type == AG_VID_CLIP && len > 0) {
+                        set_clipboard(msg + off + AG_VID_HDR, len);
+                    } else if (type == AG_VID_TYPE && len > 0) {
+                        type_unicode(msg + off + AG_VID_HDR, len);
+                    } else if (type == AG_VID_CFG_STATE && len >= 1) {
+                        /*
+                         * Where the board is on getting onto a network.  The
+                         * first byte is the state; the rest is the IP as ASCII,
+                         * which the board NUL-terminates - but we never trust a
+                         * wire length, so bound the string to the frame and
+                         * plant our own NUL.
+                         */
+                        const uint8_t *p = msg + off + AG_VID_HDR;
+                        const uint8_t  state = p[0];
+                        char ip[64];
+                        uint32_t iplen = len - 1; /* bytes after the state byte */
+                        if (iplen > sizeof(ip) - 1) {
+                            iplen = sizeof(ip) - 1;
+                        }
+                        memcpy(ip, p + 1, iplen);
+                        ip[iplen] = '\0'; /* terminate even if the board did not */
+
+                        if (g_force_setup && !g_asked) {
+                            /* --setup: reconfigure regardless of the reported
+                             * state (the board may already be on a network). */
+                            run_setup(&link);
+                            g_asked = 1;
+                        } else if (state == 0 && !g_asked) {
+                            run_setup(&link);
+                            g_asked = 1;
+                        } else if (state == 1) {
+                            if (!g_asked) {
+                                printf("joining the network...\n");
+                                fflush(stdout);
+                                g_asked = 1;
+                            }
+                        } else if (state == 2 && !g_configured) {
+                            printf("\nReady. Open  http://%s/  on the phone\n",
+                                   ip);
+                            fflush(stdout);
+                            g_configured = 1;
+                            /* Streaming from here on; nothing more to read in
+                             * the console, so fold it into the tray (unless
+                             * --console).  Any later Reconfigure brings it back
+                             * by itself. */
+                            hide_to_tray();
+                        }
+                    }
+                    off += AG_VID_HDR + len;
+                }
+                if (off > 0) {
+                    memmove(msg, msg + off, have - off);
+                    have -= off;
+                }
+            }
+
+            const DWORD now = GetTickCount();
+            if ((int)(now - next) < 0) {
+                Sleep(2);
+                continue;
+            }
+            next = now + period;
+
+            if (want_hello) {
+                want_hello = 0;
+                send_msg(&link, AG_VID_HELLO, hello, sizeof(hello));
+            }
+
+            grab_frame(&g);
+            frames++;
+
+            for (int ty = 0; ty < g.rows; ty++) {
+                for (int tx = 0; tx < g.cols; tx++) {
+                    const int x = tx * tile;
+                    const int y = ty * tile;
+                    const int w = (x + tile <= g.w) ? tile : g.w - x;
+                    const int h = (y + tile <= g.h) ? tile : g.h - y;
+                    const uint32_t hv = tile_hash(&g, x, y, w, h);
+                    const int      idx = ty * g.cols + tx;
+
+                    if (!want_all && g.hash[idx] == hv) {
+                        continue;
+                    }
+                    g.hash[idx] = hv;
+                    if (!send_rect(&link, &g, x, y, w, h, scratch, 0)) {
+                        /* A write failed: the board vanished mid-frame.  Same
+                         * answer as a dead read - drop the link and reconnect,
+                         * do not quit. */
+                        link_close(&link);
+                        connected = 0;
+                        printf("the board went away - waiting for it to come "
+                               "back\n");
+                        fflush(stdout);
+                        break;
+                    }
+                    sent++;
+                }
+                if (!connected || s_stop) {
+                    break;
+                }
+            }
+            if (!connected) {
+                break; /* back to the outer loop to reconnect */
+            }
+            want_all = 0;
+
+            if ((int)(GetTickCount() - report) >= 0) {
+                report = GetTickCount() + 5000;
+                printf("%u frames, %u tiles sent\n", frames, sent);
+                fflush(stdout);
+            }
         }
     }
 
@@ -1157,19 +1271,18 @@ int main(int argc, char **argv)
         g_tray_wnd = NULL;
     }
 
-    send_msg(&link, AG_VID_BYE, NULL, 0);
-    free(scratch);
-    grab_close(&g);
-    if (link.winusb != NULL) {
-        WinUsb_Free(link.winusb);
+    /* Say goodbye only if the link is still up (a reboot may have taken it);
+     * then close whatever is open.  WSACleanup balances the WSAStartup that
+     * open_tcp did on the tcp path. */
+    if (connected) {
+        send_msg(&link, AG_VID_BYE, NULL, 0);
     }
-    if (link.dev != INVALID_HANDLE_VALUE) {
-        CloseHandle(link.dev);
-    }
-    if (link.s != INVALID_SOCKET) {
-        closesocket(link.s);
+    link_close(&link);
+    if (g_tcp != NULL) {
         WSACleanup();
     }
+    free(scratch);
+    grab_close(&g);
     printf("stopped: %u frames, %u tiles\n", frames, sent);
     return 0;
 }
