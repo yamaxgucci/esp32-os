@@ -384,7 +384,7 @@ uint32_t wl_rx(wlink_t *w, const uint8_t *f, uint32_t got);
 /* No acknowledgement for too long with frames out: send the first again. */
 void wl_rto_check(wlink_t *w);
 
-int32_t wl_write(wlink_t *w, const void *buf, size_t len);
+int32_t wlink_write(wlink_t *w, const void *buf, size_t len);
 int32_t wl_write_wait(wlink_t *w, const void *buf, size_t len,
                       uint32_t timeout_ms);
 int32_t wl_send(wlink_t *w, const void *buf, size_t len, uint32_t flags,
@@ -397,7 +397,7 @@ int32_t wl_send2(wlink_t *w, const void *head, size_t hlen, const void *buf,
                  size_t len, uint32_t flags, uint32_t timeout_ms);
 int32_t wl_recv2(wlink_t *w, void *head, size_t hcap, void *buf, size_t cap,
                  ag_spilink_block_t *info, uint32_t timeout_ms);
-int32_t wl_read(wlink_t *w, void *buf, size_t len, uint32_t timeout_ms);
+int32_t wlink_read(wlink_t *w, void *buf, size_t len, uint32_t timeout_ms);
 /* The protocol's counters into a stats struct. */
 void wl_stats(const wlink_t *w, ag_spilink_stats_t *out);
 

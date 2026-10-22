@@ -275,6 +275,26 @@
               "components/argon_kernel/src/net/netmsg.c",
               "apps/common/libc/libc_shim.c"]
     },
+    {
+      "out": "KVM.AXE", "group": "core",
+      "_note": "The board as a USB keyboard and mouse for the PC on its OTG port, driven from a phone over Wi-Fi. Serves one page and one WebSocket; every event is a line of text that apps/common/kvm turns into a HID report, written to /dev/usbhid0. Needs CONFIG_ARGON_USB_DEVICE on a board (argon target esp32s3-kvm); in QEMU the device comes from USBHIDVIRT.SYS instead, which is how the whole path above the port is verified. The report builder and the WebSocket framing are host-tested (test_kvm.c, test_ws.c) because what they get wrong is invisible on the far machine.",
+      "include": ["apps/common/kvm", "apps/common/libc"],
+      "src": ["apps/kvm/kvm.c",
+              "apps/common/kvm/ag_kvm.c",
+              "apps/common/kvm/ag_kvmws.c",
+              "apps/common/kvm/ag_vid.c",
+              "apps/common/libc/libc_shim.c"]
+    },
+    {
+      "out": "USBHIDVIRT.SYS", "group": "core",
+      "_note": "/dev/usbhid0 with a socket where the cable goes: the emulator models no OTG peripheral, so this is how KVM.AXE and everything under it is run without a board. Frames go out to tools/usbhidvirt.py on TCP :5562, which prints them as keystrokes and pointer moves.",
+      "src": ["apps/usbhidvirt/usbhidvirt.c"]
+    },
+    {
+      "out": "USBCDCVIRT.SYS", "group": "core",
+      "_note": "/dev/usbcdc0 with a socket where the cable goes: the serial pipe the far machine's agent sends its screen down. TCP :5563, so the same agent binary that would speak to a COM port speaks to the emulator instead and the picture reaches the phone with no board in the chain.",
+      "src": ["apps/usbcdcvirt/usbcdcvirt.c"]
+    },
     { "out": "PCMVIRT.SYS", "group": "core", "src": ["apps/pcmvirt/pcmvirt.c"] },
     { "out": "KBDVIRT.SYS", "group": "core", "src": ["apps/kbdvirt/kbdvirt.c"] },
     { "out": "MOUSEVIRT.SYS", "group": "core", "src": ["apps/mousevirt/mousevirt.c"] },

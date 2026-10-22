@@ -950,7 +950,7 @@ void wl_stats(const wlink_t *s, ag_spilink_stats_t *out)
     out->frame = s->agreed ? s->frame : 0u;
 }
 
-int32_t wl_write(wlink_t *s, const void *buf, size_t len)
+int32_t wlink_write(wlink_t *s, const void *buf, size_t len)
 {
     if (buf == NULL || len == 0) {
         return -AG_EINVAL;
@@ -1358,7 +1358,7 @@ int32_t wl_recv2(wlink_t *s, void *head, size_t hcap, void *buf, size_t cap,
     }
 }
 
-int32_t wl_read(wlink_t *s, void *buf, size_t len, uint32_t timeout_ms)
+int32_t wlink_read(wlink_t *s, void *buf, size_t len, uint32_t timeout_ms)
 {
     if (buf == NULL || len == 0) {
         return -AG_EINVAL;

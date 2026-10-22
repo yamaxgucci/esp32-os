@@ -69,7 +69,9 @@ ArgonOS
   argon run -tcp           run in QEMU, console on 127.0.0.1:5556
                            (connect with PuTTY in Raw mode)
   argon run                (default) also OpenEth hostfwd 127.0.0.1:5558
-                           (5559 midivirt, 5560 mousevirt, 5561 kbdvirt)
+                           (5559 midivirt, 5560 mousevirt, 5561 kbdvirt,
+                            5562 usbhidvirt, 5563 usbcdcvirt,
+                            8080 -> guest :80 for KVM.AXE)
   argon run -NoNet         skip the virtual NIC
   python tools/pcmplay.py  play guest PCM streamed to :5558 (MD `net`);
                            or use -Virt / argon virt with kbd+mouse
@@ -93,6 +95,10 @@ ArgonOS
                            tools\netfixture.py (37 checks)
   argon boardnet -port COM3   the same on the real board, over Wi-Fi;
                            add -big for a speed number (14 checks)
+  argon kvmtest            the phone-to-USB-keyboard path in QEMU: page,
+                           WebSocket, wire format, HID reports (19 checks);
+                           add `picture` to run the agent and check the screen
+                           as well (`keep` leaves the emulator up)
   python tools/netfixture.py serve   the same servers, to try things by hand
   argon check              local CI: host tests, firmware, apps, relocations
   argon remote CMD ...     run any argon command on the test PC with this
@@ -414,6 +420,8 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32s3-board  the S3 on the desk: no OpenEth, no HostFS'
             Write-Host '                esp32s3-cam    esp32s3-board + the camera built into the image'
             Write-Host '                esp32s3-zero   ESP32-S3-Zero: 4 MB flash, USB-JTAG console, I2S DAC, no display/SD'
+            Write-Host '                esp32s3-kvm    esp32s3-board with the OTG port as a keyboard, pointer,'
+            Write-Host '                               serial pipe and flash drive (KVM.AXE, partitions_kvm.csv)'
             Write-Host '                esp32s3-lcd2   Waveshare ESP32-S3-Touch-LCD-2: 16 MB flash, ST7789 panel and TF card on one SPI bus'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
@@ -444,6 +452,8 @@ switch ($Command.ToLowerInvariant()) {
                             $chip = 'esp32s3' }
             'esp32s3-zero' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.zero'
                              $chip = 'esp32s3' }
+            'esp32s3-kvm' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board;sdkconfig.esp32s3.kvm'
+                            $chip = 'esp32s3' }
             # Waveshare ESP32-S3-Touch-LCD-2.  main called the same board
             # esp32s3-touch-lcd-2 (sdkconfig.esp32s3.wslcd2) while this line
             # called it esp32s3-lcd2; the merge of 25 Sep 2026 kept one build
@@ -737,6 +747,32 @@ switch ($Command.ToLowerInvariant()) {
             exit 1
         }
         & python (Join-Path $PSScriptRoot 'boardnet.py') '-p' $port '--quiet' @rest
+        exit $LASTEXITCODE
+    }
+
+    'kvmtest' {
+        # The remote keyboard in the emulator: the phone, the wire format and
+        # the HID reports that come out of it.  Not part of `check` for the
+        # same reason nettest is not - it wants ports and a Python that can
+        # bind them.
+        #
+        # Named through a hashtable rather than @Rest, because splatting an
+        # array passes its elements *positionally*: '-Picture' would arrive as
+        # a value for the first parameter and fail to be an integer.
+        #
+        $kvmArgs = @{}
+        foreach ($a in $Rest) {
+            switch -Regex ($a) {
+                '^-?picture$' { $kvmArgs['Picture'] = $true }
+                '^-?keep$'    { $kvmArgs['Keep'] = $true }
+                default {
+                    Write-Host "argon kvmtest: unknown argument '$a'"
+                    Write-Host 'usage: argon kvmtest [picture] [keep]'
+                    exit 1
+                }
+            }
+        }
+        & (Join-Path $PSScriptRoot 'kvmtest.ps1') @kvmArgs
         exit $LASTEXITCODE
     }
 

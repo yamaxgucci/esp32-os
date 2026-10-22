@@ -926,7 +926,7 @@ static wlink_t *wl_of(int port)
 int32_t ag_uartlink_write(int port, const void *buf, size_t len)
 {
     wlink_t *const w = wl_of(port);
-    return (w == NULL) ? -AG_EINVAL : wl_write(w, buf, len);
+    return (w == NULL) ? -AG_EINVAL : wlink_write(w, buf, len);
 }
 
 int32_t ag_uartlink_write_wait(int port, const void *buf, size_t len,
@@ -971,5 +971,5 @@ int32_t ag_uartlink_recv2(int port, void *head, size_t hcap, void *buf,
 int32_t ag_uartlink_read(int port, void *buf, size_t len, uint32_t timeout_ms)
 {
     wlink_t *const w = wl_of(port);
-    return (w == NULL) ? -AG_EINVAL : wl_read(w, buf, len, timeout_ms);
+    return (w == NULL) ? -AG_EINVAL : wlink_read(w, buf, len, timeout_ms);
 }

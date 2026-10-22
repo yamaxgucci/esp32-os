@@ -204,6 +204,17 @@ if(CONFIG_ARGON_USB_HOST)
     target_link_libraries(${COMPONENT_LIB} PRIVATE ${usb_lib})
 endif()
 
+# USB device (CONFIG_ARGON_USB_DEVICE): the same OTG peripheral the other way
+# round - this board as a keyboard and mouse for somebody else's computer
+# (usbdev_hw.c).  Mutually exclusive with the host above, and not by choice:
+# one controller, one internal PHY.  Named here rather than in REQUIRES for the
+# same reason the camera is - a build without it neither fetches the managed
+# component nor puts tinyusb.h on the include path.
+if(CONFIG_ARGON_USB_DEVICE)
+    idf_component_get_property(tusb_lib espressif__esp_tinyusb COMPONENT_LIB)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE ${tusb_lib})
+endif()
+
 # USB device (CONFIG_ARGON_USB_MSC): the OTG peripheral as a mass-storage DEVICE
 # for the card-reader application (usbd_hw.c).  Bare TinyUSB, not esp_tinyusb -
 # see main/idf_component.yml for why.  The `usb` component supplies the PHY API

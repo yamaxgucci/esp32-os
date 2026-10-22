@@ -62,7 +62,8 @@ realtime-эмуляции — в [07-emulator-performance.md](07-emulator-perfor
 что стоит симуляция аналоговых цепей — в
 [08-circuit-simulation.md](08-circuit-simulation.md), что умеет и чего стоит
 сеть — в [10-network.md](10-network.md), режимы энергосбережения — в
-[11-power.md](11-power.md).
+[11-power.md](11-power.md), плата как клавиатура для чужого компьютера — в
+[14-usb-kvm.md](14-usb-kvm.md).
 
 Основная платформа **ESP32-S3** с PSRAM 8 или 16 МБ.
 **Модуль с 32 МБ PSRAM непригоден** — см. «Грабли» ниже.
@@ -296,6 +297,7 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 | Таблица ABI | `src/loader/api.c` | ⚠ **0.47**: `inp->btnp`, `gfx` draw/present, `net` TCP+`resolve` (0.33), **`api->ble`** — BLE-MIDI (0.34), **`api->power`** (0.35), снятие неподтвердившихся (0.36), ступень `cruise` (0.37), **общий BLE central+peripheral и `api->wifimon` monitor/raw-tx (0.38)**, `api->wifi` (0.39), `ble->adv_raw` (0.40), `api->cam` (0.41), **`ag_net_ops_t` — класс AG_DEV_NET для внешнего радио (0.46)**, **станционная половина того же класса — радио на проводе отвечает `wifi scan`/`connect` (0.47)** |
 | Загрузчик `.SYS` | `src/loader/module.c` | ✅ `ag_driver_init`, резидент, `drv`, стадия `modules`, пример `apps/echo` |
 | Probe I2C | `src/loader/probe.c` | ✅ `modules.probe`, `drv probe`, `ag_probe_hint`, пример `apps/whoami` |
+| USB-устройство: клавиатура, мышь и экран | порт `idf/src/usbdev_hw.c`, `src/dev/usbhid.c`, `src/dev/usbcdc.c`, `apps/kvm`, `tools/kvmagent` | ✅ **в эмуляторе**, ждёт платы. OTG-порт наоборот: плата — HID-клавиатура и мышь для чужого ПК, который не запускает ничего (BIOS, экран блокировки, зависший стол). Пять интерфейсов и это весь бюджет S3: boot keyboard, абсолютный указатель, CDC и флешка с агентом. Относительной мыши нет — она стоила бы флешки. `/dev/usbhid0` берёт кадры `ag_usbhid_frame_t` (**ABI 0.45**); `KVM.AXE` отдаёт телефону страницу и держит WebSocket. Взаимоисключающе с USB-хостом — один контроллер за одним PHY; цель `argon target esp32s3-kvm`. QEMU OTG не эмулирует вообще, поэтому всё выше порта проверяется через `USBHIDVIRT.SYS`: `argon kvmtest` — 19 проверок, плюс хостовые `test_kvm.c`/`test_ws.c`. **Картинка (M2)** идёт по CDC-трубе `/dev/usbcdc0` (**ABI 0.44**) от агента на том ПК ([`tools/kvmagent`](../tools/kvmagent), один `.exe` без установщика): он жмёт изменившиеся плитки в PNG, плата только пересылает байты и не трогает ни одного пикселя, разжимает браузер телефона. Тому компьютеру сеть не нужна — наружу ведёт только плата. `argon kvmtest picture` — 23 проверки, включая целый экран 1536×864 как 333 плитки. Экрана по USB *без* программы на той стороне не будет никогда: класса «приёмник видео» в USB нет — разбор в [14-usb-kvm.md](14-usb-kvm.md) |
 
 Загрузка в QEMU, измерено 16 августа 2026 (`argon test -Sd ver mem boot`):
 

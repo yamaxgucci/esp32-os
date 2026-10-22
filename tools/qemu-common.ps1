@@ -621,7 +621,8 @@ function Get-QemuNetArgs {
         # guest's telnet console from the host (CONFIG_ARGON_NET_TELNET).
         $ports = @(
             @(5558, 5558), @(5559, 5559), @(5560, 5560), @(5561, 5561),
-            @(2323, 23), @(2222, 22), @(8765, 8765)
+            @(5562, 5562), @(5563, 5563),
+            @(2323, 23), @(2222, 22), @(8765, 8765), @(8080, 80)
         )
         $fwd = ($ports | ForEach-Object {
             "hostfwd=tcp:{0}:{1}-:{2}" -f $bind, $_[0], $_[1]

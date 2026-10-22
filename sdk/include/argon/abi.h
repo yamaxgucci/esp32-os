@@ -460,7 +460,17 @@ extern "C" {
  *      screen at the end of a wire says "picture" or "console" from the board
  *      instead of guessing from traffic.  Optional; NULL is the old behaviour.
  *
- * 0.69 appended net->http_request: one HTTP(S) exchange through the kernel's
+ * 0.69 the USB-KVM branch landing on main at last - renumbered from the
+ *      0.43-0.45 it used on its own line, which main had long since spent.
+ *      The board as a keyboard and absolute pointer for another computer
+ *      (/dev/usbhid0, ag_usbhid_frame_t, AG_IOC_USBHID_STATUS); a WinUSB
+ *      vendor pipe beside it that carries the far machine's picture back
+ *      (/dev/usbcdc0, AG_IOC_USBCDC_STATUS); and an MSC flash drive that
+ *      carries the agent onto a machine that has never seen the device.  No
+ *      relative mouse - a relative step becomes an absolute one a layer up
+ *      (apps/common/kvm).  No new api-table slot: these are character devices
+ *      and ioctls, so nothing an existing image calls has moved.
+ * 0.70 appended net->http_request: one HTTP(S) exchange through the kernel's
  *      own client, as the shop's board half needs it.
  *
  *      `ag_http_fetch` is a kernel function and applications do not have it;
@@ -491,7 +501,7 @@ extern "C" {
  *      absent, and api->net being NULL is how a caller learns that.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 69u
+#define AG_ABI_MINOR 70u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -1490,7 +1500,137 @@ enum ag_ioctl_cmd {
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
     /* Optional: arg ag_audio_stats_t (pcmvirt/pcmmix; pcmnull returns zeros). */
     AG_IOC_AUDIO_GETSTATS = AG_IOC(AG_DEV_AUDIO, 3),
+
+    /*
+     * The USB HID gadget (/dev/usbhid0): what the machine at the other end of
+     * the cable makes of us.  arg: ag_usbhid_status_t.
+     */
+    AG_IOC_USBHID_STATUS = AG_IOC(AG_DEV_CHAR, 1),
+
+    /*
+     * The USB serial pipe (/dev/usbcdc0): whether the far machine has opened
+     * it, and how much has gone each way.  arg: ag_usbcdc_status_t.
+     */
+    AG_IOC_USBCDC_STATUS = AG_IOC(AG_DEV_CHAR, 2),
 };
+
+/* ------------------------------------------------------------------------ */
+/* usbhid - the keyboard and mouse this board pretends to be                 */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * The other direction of USB.  Everywhere else in this system USB is a host
+ * with a keyboard plugged into it; here the board is the keyboard, plugged into
+ * somebody else's computer, and what an application writes to /dev/usbhid0 is
+ * what that computer believes a person typed.
+ *
+ * Two interfaces, because they are two different promises:
+ *
+ *   AG_USBHID_KBD    boot keyboard, the fixed eight-byte report
+ *   AG_USBHID_ABS    a pointer that names a position rather than a step
+ *
+ * The keyboard is a boot-protocol device on purpose.  A BIOS, a boot menu and a
+ * bootloader speak boot protocol and nothing else, and the whole reason to be a
+ * keyboard on a wire rather than a program on the far machine is to be able to
+ * type where no program of ours can run.
+ *
+ * The pointer is the opposite trade and there is only one of it.  There used to
+ * be a relative boot mouse beside this, and it went because the S3 has five
+ * device IN endpoints and no more: the keyboard, the pointer, the serial pipe's
+ * two, and the flash drive that carries the agent to the far machine are all
+ * five.  What that costs is a mouse in a BIOS, which few have and fewer use;
+ * what it buys is that the program the far machine needs is *on* the device.
+ * A relative step is not lost - it is added to a remembered position and sent
+ * as an absolute one (apps/common/kvm), which is what a phone's trackpad wants
+ * anyway.
+ *
+ * Two is therefore a hole rather than a renumbering: a frame built by something
+ * older must not quietly become a pointer report.
+ *
+ * A write is a whole number of AG_USBHID_FRAME-byte frames and returns how many
+ * bytes it took, so a caller can send a chord and its release in one call.  A
+ * frame naming an interface this build does not publish is refused rather than
+ * dropped: silence and success look identical from the far end.
+ */
+typedef enum {
+    AG_USBHID_KBD = 1,
+    /* 2 was the relative boot mouse, removed in 0.45 - see above. */
+    AG_USBHID_ABS = 3,
+} ag_usbhid_kind_t;
+
+#define AG_USBHID_FRAME 16u    /* one frame on the way to the device        */
+#define AG_USBHID_DATA_MAX 14u /* the report inside it                      */
+
+/* Report lengths, fixed by the descriptors the gadget publishes. */
+#define AG_USBHID_KBD_LEN 8u /* mods, reserved, six key slots               */
+#define AG_USBHID_ABS_LEN 6u /* buttons, x lo/hi, y lo/hi, wheel            */
+
+/*
+ * The absolute pointer's axes, full scale: a position is 0..AG_USBHID_ABS_MAX
+ * across whatever screen the far machine turns out to have.
+ */
+#define AG_USBHID_ABS_MAX 32767
+
+typedef struct {
+    uint8_t kind; /* ag_usbhid_kind_t                                       */
+    uint8_t len;  /* bytes of `data` that are the report                    */
+    uint8_t data[AG_USBHID_DATA_MAX];
+} ag_usbhid_frame_t;
+
+typedef enum {
+    AG_USBHID_OFF = 0,  /* the gadget is not running                        */
+    AG_USBHID_ATTACHED, /* a cable with power on it, but nobody has asked   */
+    AG_USBHID_READY,    /* configured: reports go somewhere                 */
+} ag_usbhid_state_t;
+
+typedef struct {
+    uint32_t state;    /* ag_usbhid_state_t                                 */
+    uint32_t sent;     /* reports handed to the endpoint since it came up   */
+    uint32_t dropped;  /* reports refused because the endpoint was busy     */
+    uint8_t  leds;     /* the host's lamps: bit0 num, bit1 caps, bit2 scroll */
+    uint8_t  protocol; /* 0 the host asked for boot, 1 for report           */
+    uint8_t  reserved[2];
+} ag_usbhid_status_t;
+
+/* ------------------------------------------------------------------------ */
+/* usbcdc - the serial pipe back from the machine we are plugged into        */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * /dev/usbcdc0 is a byte stream to and from the computer at the other end of
+ * the cable, and it exists for one reason: that computer will not send its
+ * screen out over USB by itself (there is no USB display class - see
+ * docs/14-usb-kvm.md), so the only way to a picture is a program running over
+ * there, and that program needs a way to talk back down the same wire.
+ *
+ * It is a serial port and nothing more.  What goes over it is a stream of
+ * messages this system does not interpret: the board reads them, finds their
+ * boundaries and forwards them, and the pixels inside are decoded by the phone.
+ * That is deliberate - an ESP32 that never touches a pixel costs no frame
+ * buffer, no codec and no CPU, and the wire is the limit rather than we are.
+ *
+ * A CDC device on the far machine is a COM port with no driver to install:
+ * Windows binds usbser.sys to it by class, and Linux and macOS give a tty.
+ * That is the whole reason it is CDC rather than a vendor pipe.
+ */
+typedef enum {
+    AG_USBCDC_OFF = 0,   /* the gadget is not running                       */
+    AG_USBCDC_IDLE,      /* enumerated, but nobody has opened the port      */
+    AG_USBCDC_OPEN,      /* a program over there has it open (DTR asserted) */
+} ag_usbcdc_state_t;
+
+typedef struct {
+    uint32_t state; /* ag_usbcdc_state_t                                    */
+    uint32_t rx;    /* bytes from the far machine since it came up          */
+    uint32_t tx;    /* bytes to it                                          */
+} ag_usbcdc_status_t;
+
+/*
+ * There is deliberately no "bytes lost" here.  A serial port cannot tell you:
+ * when the receive buffer fills, the bytes are gone and nothing counted them.
+ * What *can* be counted is a message that did not frame, and that belongs to
+ * whoever owns the framing - see apps/common/kvm.
+ */
 
 typedef struct {
     uint32_t sector_size; /* smallest unit the media reads and writes      */
