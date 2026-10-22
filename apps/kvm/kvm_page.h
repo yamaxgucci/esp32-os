@@ -80,10 +80,11 @@ static const char k_page[] =
     "#tx{position:fixed;left:0;bottom:0;width:100%;height:1px;opacity:0;"
     "border:0;padding:0;margin:0;font-size:16px;pointer-events:none}"
     "body.hideui .row{display:none}"
-    "#kb,#hui{flex:none;min-height:0;padding:3px 10px;font-size:14px}"
+    "#kb,#hui,#run{flex:none;min-height:0;padding:3px 10px;font-size:14px}"
     "</style></head><body>"
     "<div id='bar'><span id='dot'></span><span id='st'>connecting</span>"
-    "<span id='cnt'></span><button id='hui'>Hide</button>"
+    "<span id='cnt'></span><button id='run'>&#9654;Agent</button>"
+    "<button id='hui'>Hide</button>"
     "<button id='kb'>&#9000;</button></div>"
     "<div id='pad'>trackpad: drag to move, tap to click, two fingers to scroll"
     "<br><br>no picture: start the agent on that computer"
@@ -225,6 +226,11 @@ static const char k_page[] =
     "g('bF').onclick=function(){fit();B(0x11,null)};"
     "g('bMode').onclick=function(){pmode=pmode=='pad'?'abs':'pad';"
     "this.textContent=pmode=='pad'?'Pad':'Tap';this.className=pmode=='abs'?'on':'';drawc()};"
+    /* Start the agent on the far machine without touching it: send the keyboard
+     * shortcut (Ctrl+Alt+K) that its desktop shortcut is bound to.  Needs the
+     * shortcut set up on that PC; it is how a picture appears when none is yet
+     * running. */
+    "g('run').onclick=function(){S('K d '+K['KeyK']+' 5');S('K u '+K['KeyK']+' 0')};"
     "g('kb').onclick=function(){kbon=!kbon;this.className=kbon?'on':'';"
     "if(kbon){tx.value=SENT;sent=SENT;tx.focus()}else{tx.blur()}};"
     "g('hui').onclick=function(){var on=D.body.classList.toggle('hideui');"
