@@ -73,6 +73,14 @@ def stage(board_dir, apps_dir, out_dir, display=None, extra=()):
         shutil.copy2(src, os.path.join(out_dir, name))
         staged.append(name)
 
+    # AUTOEXEC.BAT, if the pack carries one, so a board that is meant to boot
+    # straight into an app (the KVM dongle) ships that way without an --add.
+    for name in ("AUTOEXEC.BAT",):
+        src = os.path.join(board_dir, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(out_dir, name))
+            staged.append(name)
+
     # SYSTEM.CFG is read after BOARD.CFG and wins, so the override goes there
     # rather than editing the board's own description of its hardware.
     if display is not None:
