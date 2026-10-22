@@ -105,14 +105,6 @@ def stage(board_dir, apps_dir, out_dir, display=None, extra=(),
             shutil.copy2(src, os.path.join(out_dir, name))
             staged.append(name)
 
-    # AUTOEXEC.BAT, if the pack carries one, so a board that is meant to boot
-    # straight into an app (the KVM dongle) ships that way without an --add.
-    for name in ("AUTOEXEC.BAT",):
-        src = os.path.join(board_dir, name)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(out_dir, name))
-            staged.append(name)
-
     # SYSTEM.CFG is read after BOARD.CFG and wins, so the override goes there
     # rather than editing the board's own description of its hardware.
     if display is not None:
@@ -121,59 +113,52 @@ def stage(board_dir, apps_dir, out_dir, display=None, extra=(),
             f.write("\n; Added by mksysfs --display\n"
                     "[display]\n"
                     f"driver = {display}\n")
-        # Applications this board is supposed to carry, listed in apps.txt
-        # beside modules.txt.
-        #
-        # They used to be named on the command line with --add, every time, by
-        # whoever happened to be flashing the board.  That is a card whose
-        # contents live in somebody's shell history: the cluster pair needs
-        # five images on one board and seven on the other, chosen so that each
-        # carries what its NEIGHBOUR can execute, and getting one wrong shows
-        # up as a test failing for a reason that looks like the cluster.
-        # --add still works, for one-off files that are nobody's board.
-        appsfile = os.path.join(board_dir, "apps.txt")
-        if os.path.isfile(appsfile):
-            with open(appsfile, "r", encoding="utf-8") as f:
-                for line in f:
-                    image = line.strip()
-                    if not image or image.startswith("#"):
-                        continue
-                    src = os.path.join(apps_dir, image)
-                    if not os.path.isfile(src):
-                        raise SystemExit(
-                            f"mksysfs: {src} is missing - run "
-                            f"`argon apps --group board`")
-                    shutil.copy2(src, os.path.join(out_dir, image))
-                    staged.append(image)
 
-        # AUTOEXEC.BAT if the pack has one - what this board does for itself at
-        # boot, as against what it IS, which is the two files above.  Optional,
-        # and most boards do nothing: binding a wire used to be here and is now
-        # [link] bind in SYSTEM.CFG, which is read before this file runs.
-        auto = os.path.join(board_dir, "AUTOEXEC.BAT")
-        if os.path.isfile(auto):
-            shutil.copy2(auto, os.path.join(out_dir, "AUTOEXEC.BAT"))
-            staged.append("AUTOEXEC.BAT")
+    # Applications this board is supposed to carry, listed in apps.txt beside
+    # modules.txt, rather than named with --add every time.  --add still works,
+    # for one-off files that are nobody's board.
+    appsfile = os.path.join(board_dir, "apps.txt")
+    if os.path.isfile(appsfile):
+        with open(appsfile, "r", encoding="utf-8") as f:
+            for line in f:
+                image = line.strip()
+                if not image or image.startswith("#"):
+                    continue
+                src = os.path.join(apps_dir, image)
+                if not os.path.isfile(src):
+                    raise SystemExit(
+                        f"mksysfs: {src} is missing - run "
+                        f"`argon apps --group board`")
+                shutil.copy2(src, os.path.join(out_dir, image))
+                staged.append(image)
 
-        # Drivers, under the names SYSTEM.CFG spells: lower case, because that
-        # is what `drv install` writes and littlefs does not fold case.
-        drv_dir = os.path.join(out_dir, "drv")
-        os.makedirs(drv_dir, exist_ok=True)
-        sysfile = os.path.join(board_dir, "modules.txt")
-        if os.path.isfile(sysfile):
-            with open(sysfile, "r", encoding="utf-8") as f:
-                wanted = [l.strip() for l in f
-                          if l.strip() and not l.startswith("#")]
-        else:
-            wanted = ["ILI9341.SYS", "XPT2046.SYS"]
+    # AUTOEXEC.BAT if the pack has one - what this board does for itself at boot
+    # (the KVM dongle boots straight into KVM.AXE this way), as against what it
+    # IS, which is the two config files above.  Optional; most boards do nothing.
+    auto = os.path.join(board_dir, "AUTOEXEC.BAT")
+    if os.path.isfile(auto):
+        shutil.copy2(auto, os.path.join(out_dir, "AUTOEXEC.BAT"))
+        staged.append("AUTOEXEC.BAT")
 
-        for image in wanted:
-            src = os.path.join(apps_dir, image)
-            if not os.path.isfile(src):
-                raise SystemExit(
-                    f"mksysfs: {src} is missing - run `argon apps --group board`")
-            shutil.copy2(src, os.path.join(drv_dir, image.lower()))
-            staged.append("drv/" + image.lower())
+    # Drivers, under the names SYSTEM.CFG spells: lower case, because that is
+    # what `drv install` writes and littlefs does not fold case.
+    drv_dir = os.path.join(out_dir, "drv")
+    os.makedirs(drv_dir, exist_ok=True)
+    sysfile = os.path.join(board_dir, "modules.txt")
+    if os.path.isfile(sysfile):
+        with open(sysfile, "r", encoding="utf-8") as f:
+            wanted = [l.strip() for l in f
+                      if l.strip() and not l.startswith("#")]
+    else:
+        wanted = ["ILI9341.SYS", "XPT2046.SYS"]
+
+    for image in wanted:
+        src = os.path.join(apps_dir, image)
+        if not os.path.isfile(src):
+            raise SystemExit(
+                f"mksysfs: {src} is missing - run `argon apps --group board`")
+        shutil.copy2(src, os.path.join(drv_dir, image.lower()))
+        staged.append("drv/" + image.lower())
 
     for spec in extra:
         host, _, name = spec.partition("=")

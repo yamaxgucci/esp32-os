@@ -41,8 +41,11 @@ if ($Config) {
     if (-not (Test-Path $Config)) { throw "config file not found: $Config" }
     $addargs += @('--add', "$Config=KVMCFG.TXT")
 }
+# The generated sdkconfig (not the fragment): it carries CONFIG_IDF_TARGET, which
+# mksysfs checks against the board's chip.  It exists once the firmware target is
+# set - argon target esp32s3-kvm.
 & $py tools\mksysfs.py --board $pack --apps build\sd_card `
-    --partitions partitions_kvm.csv --sdkconfig sdkconfig.esp32s3.kvm `
+    --partitions partitions_kvm.csv --sdkconfig sdkconfig `
     @addargs --out build\sysfs_kvm.bin
 
 Write-Host '[4/4] flash-drive image (build\usbdisk.img) with the agent on it'
