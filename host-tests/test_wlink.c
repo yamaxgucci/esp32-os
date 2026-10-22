@@ -134,7 +134,7 @@ static void bytes_through_a_bad_wire(void)
             for (uint32_t i = 0; i < n; i++) {
                 buf[i] = pat(wrote + i);
             }
-            const int32_t w = wl_write(&a, buf, n);
+            const int32_t w = wlink_write(&a, buf, n);
             if (w > 0) {
                 wrote += (uint32_t)w;
             }
@@ -142,7 +142,7 @@ static void bytes_through_a_bad_wire(void)
         one_frame(&a, &b, 5u, 2u);
         one_frame(&b, &a, 5u, 2u);
         for (;;) {
-            const int32_t r = wl_read(&b, buf, sizeof(buf), 0u);
+            const int32_t r = wlink_read(&b, buf, sizeof(buf), 0u);
             if (r <= 0) {
                 break;
             }
