@@ -117,8 +117,9 @@ def stage(board_dir, apps_dir, out_dir, display=None, extra=(),
     # Applications this board is supposed to carry, listed in apps.txt beside
     # modules.txt, rather than named with --add every time.  --add still works,
     # for one-off files that are nobody's board.
-    appsfile = os.path.join(board_dir, "apps.txt")
-    if os.path.isfile(appsfile):
+    appsfile = (os.path.join(board_dir, "apps.txt")
+                if board_dir is not None else None)
+    if appsfile is not None and os.path.isfile(appsfile):
         with open(appsfile, "r", encoding="utf-8") as f:
             for line in f:
                 image = line.strip()
@@ -135,30 +136,34 @@ def stage(board_dir, apps_dir, out_dir, display=None, extra=(),
     # AUTOEXEC.BAT if the pack has one - what this board does for itself at boot
     # (the KVM dongle boots straight into KVM.AXE this way), as against what it
     # IS, which is the two config files above.  Optional; most boards do nothing.
-    auto = os.path.join(board_dir, "AUTOEXEC.BAT")
-    if os.path.isfile(auto):
+    auto = (os.path.join(board_dir, "AUTOEXEC.BAT")
+            if board_dir is not None else None)
+    if auto is not None and os.path.isfile(auto):
         shutil.copy2(auto, os.path.join(out_dir, "AUTOEXEC.BAT"))
         staged.append("AUTOEXEC.BAT")
 
     # Drivers, under the names SYSTEM.CFG spells: lower case, because that is
-    # what `drv install` writes and littlefs does not fold case.
+    # what `drv install` writes and littlefs does not fold case.  A pack is what
+    # names them, so with no pack there is nothing to copy and the directory is
+    # made only if --add is about to put something in it.
     drv_dir = os.path.join(out_dir, "drv")
-    os.makedirs(drv_dir, exist_ok=True)
-    sysfile = os.path.join(board_dir, "modules.txt")
-    if os.path.isfile(sysfile):
-        with open(sysfile, "r", encoding="utf-8") as f:
-            wanted = [l.strip() for l in f
-                      if l.strip() and not l.startswith("#")]
-    else:
-        wanted = ["ILI9341.SYS", "XPT2046.SYS"]
+    if board_dir is not None:
+        os.makedirs(drv_dir, exist_ok=True)
+        sysfile = os.path.join(board_dir, "modules.txt")
+        if os.path.isfile(sysfile):
+            with open(sysfile, "r", encoding="utf-8") as f:
+                wanted = [l.strip() for l in f
+                          if l.strip() and not l.startswith("#")]
+        else:
+            wanted = ["ILI9341.SYS", "XPT2046.SYS"]
 
-    for image in wanted:
-        src = os.path.join(apps_dir, image)
-        if not os.path.isfile(src):
-            raise SystemExit(
-                f"mksysfs: {src} is missing - run `argon apps --group board`")
-        shutil.copy2(src, os.path.join(drv_dir, image.lower()))
-        staged.append("drv/" + image.lower())
+        for image in wanted:
+            src = os.path.join(apps_dir, image)
+            if not os.path.isfile(src):
+                raise SystemExit(
+                    f"mksysfs: {src} is missing - run `argon apps --group board`")
+            shutil.copy2(src, os.path.join(drv_dir, image.lower()))
+            staged.append("drv/" + image.lower())
 
     for spec in extra:
         host, _, name = spec.partition("=")

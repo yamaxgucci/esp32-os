@@ -37,9 +37,18 @@ dependencies:
     rules:
       - if: "$CONFIG{ARGON_CAMERA_BUILTIN} == True"
   # The USB device stack, for the board that is a keyboard rather than has one
-  # (CONFIG_ARGON_USB_DEVICE, `argon target esp32s3-kvm`).  Gated the same way
-  # the camera is: a default image neither downloads it nor compiles any of it.
+  # (`argon target esp32s3-kvm`).  Whether any of it is compiled is decided by
+  # CONFIG_ARGON_USB_DEVICE in the port's CMakeLists, not here.
+  #
+  # The condition is SOC_USB_OTG_SUPPORTED and not CONFIG_ARGON_USB_DEVICE, and
+  # that is a fix rather than a slip: ARGON_USB_DEVICE is `depends on
+  # !ARGON_USB_HOST`, so on a board that HAS a USB host - this S3-CAM among them
+  # - the symbol does not exist in sdkconfig at all, the component manager
+  # cannot find it, and the whole configure dies with `Missing required kconfig
+  # option after retry` before a single file is compiled.  Found on 22 Oct 2026,
+  # on the first build after this block came back from the KVM work.
+  # SOC_USB_OTG_SUPPORTED is an SoC capability and is always defined.
   espressif/esp_tinyusb:
     version: "^2.2.1"
     rules:
-      - if: "$CONFIG{ARGON_USB_DEVICE} == True"
+      - if: "$CONFIG{SOC_USB_OTG_SUPPORTED} == True"

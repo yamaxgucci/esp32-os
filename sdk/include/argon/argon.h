@@ -100,6 +100,16 @@ extern "C" {
  *
  *     AG_HOT_RODATA const uint8_t k_gamma[256] = { ... };
  *
+ * Word-aligned and word-wide only, on the chips whose code part is instruction
+ * RAM (ESP32, ESP32-S3).  That memory is the same SRAM seen through two buses,
+ * and the address the image is linked at is the instruction-bus one: it answers
+ * 32-bit accesses and raises a load/store error for a byte or halfword one, so
+ * `k_gamma[3]` compiled to an `l8ui` ends the program.  Measured on an S3 on
+ * 22 Oct 2026 - a word read of the same address returned the right four bytes,
+ * the byte read faulted.  A table read a byte at a time - most fonts and
+ * bitmaps - belongs in the data part, which is PSRAM; this is for the small
+ * word-wise exception, and the program reads it with `((const uint32_t *)k)[i]`.
+ *
  * It says nothing in a built-in build: that code is already inside the kernel
  * image, which has its own linker script and no .hot_rodata in it, and a section
  * nobody places is a section the linker puts wherever it likes.

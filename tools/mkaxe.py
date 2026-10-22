@@ -265,7 +265,16 @@ def code_block(rodata_in_code):
              "    KEEP(*(.literal.ag_main .text.ag_main "
              ".literal.ag_driver_init .text.ag_driver_init))",
              "    *(.literal .text .literal.* .text.*)",
-             "    " + HOT_RODATA_INPUT]
+             # A constant that stays in the code part is read a word at a time
+             # and nothing smaller: on an S3 the address the image is linked at
+             # is the instruction-bus one, and it raises a load/store error for
+             # a byte access.  So the section starts word aligned, on 16 like
+             # the data part, and ends word aligned too.  Without this it landed
+             # wherever the last text byte left the cursor - HELLO's table came
+             # out at ...ba6, and reading it as words was an unaligned load.
+             "    . = ALIGN(16);",
+             "    " + HOT_RODATA_INPUT,
+             "    . = ALIGN(4);"]
     if rodata_in_code:
         lines += rodata_lines()
     lines += ["    KEEP(*(.ag_header))",

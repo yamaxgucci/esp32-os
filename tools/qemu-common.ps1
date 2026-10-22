@@ -624,7 +624,36 @@ function Get-QemuNetArgs {
             @(5562, 5562), @(5563, 5563),
             @(2323, 23), @(2222, 22), @(8765, 8765), @(8080, 80)
         )
-        $fwd = ($ports | ForEach-Object {
+        # A host port that somebody else already owns is skipped, not fatal.
+        #
+        # QEMU builds the whole -nic line before it opens anything, so one taken
+        # port refuses the forward AND the start: on 22 Oct 2026 two emulator
+        # test runs died with `Could not set up host forwarding rule
+        # tcp:127.0.0.1:8080-:80` because a system service held 8080, and the
+        # message reads like a broken driver rather than a busy port.  None of
+        # these forwards is needed to boot the guest - each is a way in from the
+        # host - so the taken ones are named and dropped, while the ports a test
+        # actually talks to (5558-5563) fail later and louder if they are gone.
+        $free = @()
+        foreach ($p in $ports) {
+            $busy = @(Get-NetTCPConnection -State Listen -LocalPort $p[0] `
+                        -ErrorAction SilentlyContinue)
+            if ($busy.Count -gt 0) {
+                $owner = Get-Process -Id $busy[0].OwningProcess `
+                    -ErrorAction SilentlyContinue
+                $name = if ($owner) { $owner.ProcessName } else { 'another process' }
+                Write-Host ("qemu: host port {0} is taken by {1} (pid {2}); not" -f `
+                    $p[0], $name, $busy[0].OwningProcess) -ForegroundColor Yellow
+                Write-Host '  forwarded - the guest is still reachable on the rest' `
+                    -ForegroundColor Yellow
+                continue
+            }
+            $free += , $p
+        }
+        if ($free.Count -eq 0) {
+            return @('-nic', 'user,model=open_eth,id=argon0')
+        }
+        $fwd = ($free | ForEach-Object {
             "hostfwd=tcp:{0}:{1}-:{2}" -f $bind, $_[0], $_[1]
         }) -join ','
     }
