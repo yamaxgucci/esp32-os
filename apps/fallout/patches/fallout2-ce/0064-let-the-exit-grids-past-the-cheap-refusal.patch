@@ -1,0 +1,52 @@
+diff --git a/src/object.cc b/src/object.cc
+--- a/src/object.cc
++++ b/src/object.cc
+@@ -6,6 +6,7 @@ extern "C" int ag_draw_cull;
+ extern "C" unsigned ag_exit_calls, ag_exit_hidden, ag_exit_early;
+ extern "C" unsigned ag_exit_noart, ag_exit_missed, ag_exit_drew;
+ extern "C" unsigned ag_exit_w, ag_exit_h, ag_exit_flags;
++extern "C" unsigned ag_exit_cullwrong;
+ extern "C" int ag_exit_fid, ag_exit_pid, ag_exit_on_map;
+ 
+ /* ARGON: -render 1 bounds the object search by the art actually seen
+@@ -5380,12 +5381,26 @@ static void _obj_render_object(Object* object, Rect* rect, int light)
+     }
+ 
+     /* ARGON: the cheap refusal, before the art is fetched.  See ag_size_note. */
++    /*
++     * ARGON: the cheap refusal, before the art is fetched.  See ag_size_note.
++     *
++     * Exit grids go past it and are judged by the engine's own test instead,
++     * for two reasons.  They are a handful of objects, so the saving is
++     * nothing; and when one of them would have been refused here and then
++     * turns out to intersect after all, that is this shortcut being wrong,
++     * counted as cullwrong.  Whether it ever is remains to be seen: the
++     * window that showed 62 refusals and no draws was taken standing far
++     * from any edge, so it proves nothing on its own.
++     */
++    bool ag_exit_cull_said_no = false;
++
+     if (ag_cannot_touch(object, rect)) {
+-        ag_draw_early++;
+-        if (ag_is_exit) {
+-            ag_exit_early++;
++        if (!ag_is_exit) {
++            ag_draw_early++;
++            return;
+         }
+-        return;
++        ag_exit_early++;
++        ag_exit_cull_said_no = true;
+     }
+ 
+     const uint32_t ag_d0 = ag_us();
+@@ -5457,6 +5472,9 @@ static void _obj_render_object(Object* object, Rect* rect, int light)
+         ag_exit_drew++;
+         ag_exit_w = frameWidth;
+         ag_exit_h = frameHeight;
++        if (ag_exit_cull_said_no) {
++            ag_exit_cullwrong++;
++        }
+     }
+ 
+     unsigned char* src = artGetFrameData(art, object->frame, object->rotation);

@@ -9,6 +9,7 @@ applications and the public SDK stay easy to adopt.
 | Public SDK (`sdk/`), build tools (`tools/`), sample/apps under `apps/` (unless a subdirectory says otherwise) | **Apache-2.0** | [LICENSE.Apache-2.0](LICENSE.Apache-2.0), also [sdk/LICENSE](sdk/LICENSE) |
 | The valve amplifier emulator (see the list below) | **PolyForm-Noncommercial-1.0.0** | [LICENSE.PolyForm-Noncommercial-1.0.0](LICENSE.PolyForm-Noncommercial-1.0.0) |
 | Vendored code (`third_party/`, some `apps/*/core`) | Their own licenses | Keep the local `LICENSE` / notices |
+| The bitmap fonts (see below) | **Public domain** | no file: nobody owns them |
 
 GitHub’s repository license field should be set to **GPL-3.0** (covers the kernel,
 the primary work distributed as the OS image).
@@ -98,6 +99,40 @@ files say so in their headers.
 
 The capture files themselves (`assets/**/*.nam`) are third-party work by the people
 who made them and are **not** in the repository - `.gitignore` excludes them.
+
+## The fonts are public domain, and saying otherwise was a bug
+
+Two files hold nothing but glyph pixels:
+
+    components/argon_kernel/src/dev/font8x16.c   the console and gfx font
+    apps/common/font8x8.h                        the same glyphs, half height
+
+and a third copy of the printable rows lives in `apps/marauder/mrd_font.h`,
+because an application cannot link kernel code.
+
+They are **font8x8** by Daniel Hepper <daniel@hepper.net>, whose own header
+reads, verbatim, `License: Public Domain`, and which is in turn based on
+`font8x8.h` by Marcel Sondaas and International Business Machines - the
+public-domain VGA fonts. The file as published is vendored at
+[`third_party/font8x8/`](third_party/font8x8/), so the evidence for that claim
+is in the tree and the build does not reach the network for the pixels it puts
+in the firmware. `tools/gen_font8x16.py` doubles every scanline to fill a
+sixteen-pixel cell; `tools/gen_font8x8.py` takes every other row back out. Both
+operations are mechanical and add no authorship, and the handful of block cells
+ArgonOS fills in above code 127 are dedicated to the public domain as well, so
+the whole of both tables is unencumbered.
+
+This is written down because the tree said three different things about it. The
+8x16 file carried **GPL-3.0-or-later** while its own comment called the glyphs
+public domain; the generator that writes that file said **Apache-2.0**; and the
+8x8 header said **GPL-3.0-or-later** as well - which mattered, because it is
+included by Apache-2.0 applications (`apps/ili9341`, `apps/st7789`,
+`apps/desktop`) and would have pulled the GPL over each of them. A licence
+cannot be claimed over pixels nobody owns, and it should not be claimed by
+accident either.
+
+Both files now carry `SPDX-License-Identifier: LicenseRef-PublicDomain`. That
+identifier is not a licence: it records that there is none to give.
 
 ## SPDX
 

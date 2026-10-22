@@ -41,6 +41,21 @@ typedef struct {
      */
     uint16_t cols;
     uint16_t rows;
+
+    /*
+     * Rows the terminal has yet to be told to scroll, and the height of the
+     * scrolling region it has been given.
+     *
+     * The region is set once per size (DECSTBM) so that a line feed on the
+     * bottom row scrolls the console's rows and not the whole window - a
+     * terminal taller than the console would otherwise walk the cursor down
+     * into space that is nobody's.  The line feed itself is the scroll: every
+     * terminal ever made does that one, which is why it is used instead of the
+     * tidier CSI S - a terminal that does not know CSI S swallows it silently
+     * and the screen is then quietly wrong.
+     */
+    uint16_t pending_scroll;
+    uint16_t region_rows;
 } ag_vtout_t;
 
 void ag_vtout_init(ag_vtout_t *o);

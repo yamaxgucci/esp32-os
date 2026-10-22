@@ -47,19 +47,87 @@ CONFIG_ARGON_ENABLE_PM=y
 # For measuring rather than for using the board, `argon target esp32-dsp`
 # builds the same system with no radios and a 48 KB arena, which is what
 # CKTBENCH wants: 36 KB of code, timed from RAM rather than through the cache.
+# Sizes for a board with 208 KB and a radio, not for one with PSRAM.
+#
+# Measured on the CYD: an application taking the generic defaults leaves the
+# machine with a largest free block of 5 KB, and at 5 KB the access point goes
+# on beaconing while refusing every station - a WPA2 handshake has nowhere to
+# happen.  The board is then unreachable with nothing in any log, and the phone
+# says "wrong password".  The demo that showed it touches 4.3 KB of stack out
+# of the sixteen it was handed.
+#
+# Eight is also the floor the loader itself runs on (AG_PROC_LOAD_STACK_MIN),
+# so this is the smallest default that cannot break loading.  An image that
+# needs more says so with AG_APP_SIZED and gets it - or is refused, which is
+# the answer we want over a board that cannot be reached.
+#
+# Only the stack: the process arena is CONFIG_ARGON_APP_HEAP_KB, which has no
+# Kconfig entry and so cannot be set from here at all.  ARGON_APP_ARENA_KB,
+# which does exist, is the *code* arena an .AXE is relocated into - a different
+# thing entirely, and lowering it by mistake only makes images fall back to
+# flash XIP.
+CONFIG_ARGON_APP_STACK_KB=8
 CONFIG_ARGON_APP_ARENA_KB=8
 
-# Both radios, in one image.
+# The radio takes its transmit buffers up front instead of asking for them
+# when it needs them.
 #
-# They were two builds for half a day, on the strength of a link failure that
-# turned out to be the arena above rather than the radios.  Linked, they cost
-# flash and about 25 KB of static RAM; *running*, Wi-Fi costs ~37 KB and
-# Bluetooth ~54, and both at once leave 11 KB free, which is not a machine.  So
-# neither starts unless something asks: [wifi] ssid or [bt] keyboard in
-# SYSTEM.CFG, or `wifi on` / `bt on` at the prompt, and `off` gives it back.
+# Maxim's question, and the right one: if the memory is going to be needed
+# anyway, why not take it at the start?  By default the driver keeps sixteen
+# dynamic transmit buffers, allocated from the shared heap at the moment of
+# use - which on this board is the moment there is nothing left, because an
+# application is running.  Static buffers are taken during esp_wifi_init,
+# before any application exists, and nothing can take them away.
+#
+# Eight rather than sixteen: each is about 1.6 KB, so this is ~13 KB claimed
+# for good on a 208 KB machine.  That is memory applications no longer get,
+# and that is the trade being made on purpose - a large application now fails
+# to start, with a message, instead of starting and quietly cutting the board
+# off the air.
+#
+# What this does NOT cover: the WPA2 handshake itself, which the supplicant
+# allocates when a station appears.  There is no setting for that one.
+# Four, not eight, and not the sixteen dynamic ones the default keeps.
+#
+# Eight static buffers cost ~13 KB taken for good, and that turned out to be
+# the file manager's whole margin: it failed to start with "no memory for a
+# 8192 byte task stack", having run perfectly well before.  What fixed the
+# radio was the stack default, measured; these were added on top and never
+# tested on their own, so they were paying rent in somebody else's room.
+#
+# Four keeps the point of the idea - the radio holds transmit memory that no
+# application can take - at half the price, and leaves the room an application
+# needs to exist at all.  A board that stays reachable and runs nothing is not
+# the goal.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=0
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=4
+
+# One radio in this image: Wi-Fi.  Bluetooth is OFF, and that is a measurement
+# rather than a preference.
+#
+# The arithmetic was already in this file: linked, the two radios cost flash and
+# about 25 KB of static RAM; *running*, Wi-Fi costs ~37 KB and Bluetooth ~54,
+# and both at once leave 11 KB free, which is not a machine.  So neither starts
+# unless something asks: [wifi] ssid in SYSTEM.CFG, or `wifi on` at the prompt,
+# and `off` gives it back.
+#
+# What turned that into a decision, measured on the board 2026-09-20: `link run`
+# FROM THE NEIGHBOUR answered -12 while the very same program ran when typed
+# here, and the journal said why -
+#
+#     E proc: nodehi32.axe: no memory for a 16384 byte task stack
+#     (internal SRAM and PSRAM both failed)
+#
+# A remote run holds one more task - the 6144-byte `noderun` in nodeproc.c - and
+# the wire machinery beside it, and that was the difference between a largest
+# free block of 19 KB and one big enough for the stack this board's own programs
+# ask for.  Nothing here uses Bluetooth: the board has a touchscreen, not a
+# keyboard to pair, and no HID host to be.  Wi-Fi stays - this is the board that
+# serves files to a phone.
 CONFIG_ARGON_ENABLE_NET=y
 CONFIG_ARGON_NET_WIFI=y
-CONFIG_ARGON_ENABLE_BLE=y
+CONFIG_ARGON_ENABLE_BLE=n
 CONFIG_ETH_USE_OPENETH=n
 
 # Monitor mode and raw 802.11 injection, off by default because a board that
@@ -70,26 +138,12 @@ CONFIG_ETH_USE_OPENETH=n
 # running; the static cost is small.
 CONFIG_ARGON_NET_WIFI_MON=y
 
-CONFIG_BT_ENABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y
-# BLE only, and NimBLE rather than Bluedroid: the controller's classic half is
-# handed back at start (about 30 KB), and NimBLE is roughly half of Bluedroid.
-CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
-CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
-CONFIG_BTDM_CTRL_MODE_BTDM=n
-CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
-CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
-# Peripheral is on, and not by choice: the whole of ESP-IDF's NimBLE HID *host*
-# is behind BT_NIMBLE_HID_SERVICE, whose menu depends on the GATT *server*.
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
-CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_NIMBLE_GATT_SERVER=y
-CONFIG_BT_NIMBLE_HID_SERVICE=y
-# A keyboard is bonded once and remembered.  Without this it asks to be paired
-# again after every power cut - and pairing is done from a keyboard.
-CONFIG_BT_NIMBLE_NVS_PERSIST=y
-CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+# And the Bluetooth half of the menu goes with it.  Kept as a line rather than
+# deleted so that the next reader sees the choice instead of wondering where a
+# keyboard went.  BT_NIMBLE_ENABLED is deliberately NOT named here: it is a
+# choice symbol, and setting one of those from a defaults file earns a warning
+# about select/imply having no effect on it on every single build.
+CONFIG_BT_ENABLED=n
 
 # A panic reboots rather than halting.
 #
@@ -149,3 +203,6 @@ CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 # serial console shows the same grid - it is one screen, rendered twice.
 CONFIG_ARGON_CONSOLE_COLS=40
 CONFIG_ARGON_CONSOLE_ROWS=25
+
+# Room for a neighbour's devices as well as this board's - see the C3 defaults.
+CONFIG_ARGON_DEV_MAX=40

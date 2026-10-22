@@ -1,0 +1,107 @@
+diff --git a/src/character_selector.cc b/src/character_selector.cc
+index 76d3ea4..982151c 100644
+--- a/src/character_selector.cc
++++ b/src/character_selector.cc
+@@ -145,6 +145,12 @@ static FrmImage _previousButtonPressedFrmImage;
+ 
+ static std::vector<PremadeCharacterDescription> gCustomPremadeCharacterDescriptions;
+ 
++/*
++ * ARGON: set by the port when the image was started with -autostart, and
++ * cleared by main() once it has been used.  See the note there.
++ */
++extern "C" int ag_autostart;
++
+ // 0x4A71D0
+ int characterSelectorOpen()
+ {
+@@ -162,6 +168,15 @@ int characterSelectorOpen()
+ 
+     int rc = 0;
+     bool done = false;
++
++    // ARGON: -autostart takes the premade character the selector is already
++    // showing.  The window's own init has loaded it - that is where
++    // _proto_dude_init happens - so this is exactly what pressing T does.
++    if (ag_autostart != 0) {
++        rc = 2;
++        done = true;
++    }
++
+     while (!done) {
+         sharedFpsLimiter.mark();
+ 
+diff --git a/src/main.cc b/src/main.cc
+index ee67a0a..b2fa0ad 100644
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -71,6 +71,12 @@ static bool _main_show_death_scene = false;
+ static bool _main_death_voiceover_done;
+ 
+ // 0x48099C
++/*
++ * ARGON: -autostart, defined by the port.  Non-zero means go straight into a
++ * new game with the premade character instead of showing the main menu.
++ */
++extern "C" int ag_autostart;
++
+ int falloutMain(int argc, char** argv)
+ {
+     if (!autorunMutexCreate()) {
+@@ -98,7 +104,18 @@ int falloutMain(int argc, char** argv)
+             mainMenuWindowUnhide(1);
+ 
+             mouseShowCursor();
+-            int mainMenuRc = mainMenuWindowHandleEvents();
++            // ARGON: -autostart starts a new game without waiting for the
++            // keypress that says so.  Every measurement of what the game costs
++            // while standing on a map has to get to a map first, and doing
++            // that by sending keys means five minutes of movie and a menu that
++            // ignores the key when it is busy fading in.  Once only: it is
++            // cleared below, so dying still returns to the menu.
++            int mainMenuRc;
++            if (ag_autostart != 0) {
++                mainMenuRc = MAIN_MENU_NEW_GAME;
++            } else {
++                mainMenuRc = mainMenuWindowHandleEvents();
++            }
+             mouseHideCursor();
+ 
+             switch (mainMenuRc) {
+@@ -107,11 +124,25 @@ int falloutMain(int argc, char** argv)
+                 gameMoviePlay(MOVIE_INTRO, GAME_MOVIE_STOP_MUSIC);
+                 gameMoviePlay(MOVIE_CREDITS, 0);
+                 break;
+-            case MAIN_MENU_NEW_GAME:
++            case MAIN_MENU_NEW_GAME: {
+                 mainMenuWindowHide(true);
+                 mainMenuWindowFree();
+-                if (characterSelectorOpen() == 2) {
+-                    gameMoviePlay(MOVIE_ELDER, GAME_MOVIE_STOP_MUSIC);
++                // ARGON: see above.  The flag is read once and cleared here.
++                const bool automatic = ag_autostart != 0;
++                const int characterSelectorRc = characterSelectorOpen();
++                ag_autostart = 0;
++                if (characterSelectorRc == 2) {
++                    if (automatic) {
++                        // The movie is skipped, but what it does to the sound
++                        // is not.  GAME_MOVIE_STOP_MUSIC is the reason the main
++                        // menu's track is not still playing when the map loads
++                        // its own ambience, and two background sounds at once
++                        // is a state this port has never been in - not one for
++                        // a debugging flag to put it in.
++                        backgroundSoundDelete();
++                    } else {
++                        gameMoviePlay(MOVIE_ELDER, GAME_MOVIE_STOP_MUSIC);
++                    }
+                     randomSeedPrerandom(-1);
+ 
+                     // SFALL: Override starting map.
+@@ -147,6 +178,7 @@ int falloutMain(int argc, char** argv)
+                 mainMenuWindowInit();
+ 
+                 break;
++            }
+             case MAIN_MENU_LOAD_GAME:
+                 if (1) {
+                     int win = windowCreate(0, 0, screenGetWidth(), screenGetHeight(), _colorTable[0], WINDOW_MODAL | WINDOW_MOVE_ON_TOP);

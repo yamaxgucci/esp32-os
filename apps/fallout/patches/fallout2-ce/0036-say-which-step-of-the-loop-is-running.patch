@@ -1,0 +1,54 @@
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -51,6 +51,13 @@
+ extern uint32_t ag_ml_maps_us;
+ extern uint32_t ag_ml_present_us;
+ extern uint32_t ag_ml_throttle_us;
++// ARGON: which of the six steps the loop is in, and how many times round
++// it has been.  A watcher thread in the port reads both and says so when
++// they stop moving - see watch_thread in sdl_shim.cc.  Written without a
++// lock, because a torn read of a word is one wrong answer and this is
++// asked every two seconds for as long as the fault lasts.
++extern volatile uint32_t ag_ml_phase;
++extern volatile uint32_t ag_ml_laps;
+ }
+ 
+ namespace fallout {
+@@ -410,6 +417,7 @@
+         // on the board and the rest was unattributed, which is the same
+         // "somewhere in the engine" this instrumentation exists to stop.
+         // Seven calls, seven clocks: whichever one it is, it says so.
++        ag_ml_phase = 1;
+         const uint32_t ml0 = ag_us();
+         int keyCode = inputGetInput();
+         const uint32_t ml1 = ag_us();
+@@ -417,12 +425,15 @@
+         // SFALL: MainLoopHook.
+         sfall_gl_scr_process_main();
+ 
++        ag_ml_phase = 2;
+         gameHandleKey(keyCode, false);
+         const uint32_t ml2 = ag_us();
+ 
++        ag_ml_phase = 3;
+         scriptsHandleRequests();
+         const uint32_t ml3 = ag_us();
+ 
++        ag_ml_phase = 4;
+         mapHandleTransition();
+ 
+         // ARGON: outside every script, which is what this needs.
+@@ -444,10 +455,13 @@
+             _game_user_wants_to_quit = 2;
+         }
+ 
++        ag_ml_phase = 5;
+         const uint32_t ml5 = ag_us();
+         renderPresent();
+         const uint32_t ml6 = ag_us();
++        ag_ml_phase = 6;
+         sharedFpsLimiter.throttle();
++        ag_ml_laps++;
+         ag_ml_present_us += ml6 - ml5;
+         ag_ml_throttle_us += ag_us() - ml6;
+     }

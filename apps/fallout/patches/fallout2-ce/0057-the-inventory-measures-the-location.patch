@@ -1,0 +1,256 @@
+diff --git a/src/art.cc b/src/art.cc
+--- a/src/art.cc
++++ b/src/art.cc
+@@ -1363,10 +1363,31 @@ static int artCacheReadDataImpl(int fid, int* sizePtr, unsigned char* data)
+  * read from the card as before, which is exactly the behaviour without a
+  * store at all.
+  */
++/* ARGON: the size of one picture, for anyone counting what a map needs.
++ * Goes through the same path the cache uses, so the store answers first
++ * and the card only if it must. */
++int ag_art_size_of(int fid)
++{
++    int size = 0;
++
++    if (artCacheGetFileSizeImpl(fid, &size) != 0) {
++        return 0;
++    }
++    return size;
++}
++
+ void artStoreTopUp(void)
+ {
+-    int wanted[64];
+-    const unsigned n = ag_art_store_wanted(wanted, 64);
++    /* ARGON: sixty-four at a time, until the list is empty.  It used to take
++     * one batch and leave the rest, which was fine when the list was a handful
++     * of save-panel pictures and useless now that a map names eight hundred. */
++    for (;;) {
++        int wanted[64];
++        const unsigned n = ag_art_store_wanted(wanted, 64);
++
++        if (n == 0u) {
++            break;
++        }
+ 
+     for (unsigned i = 0; i < n; i++) {
+         int size = 0;
+@@ -1384,6 +1405,7 @@ void artStoreTopUp(void)
+             ag_art_store_offer(wanted[i], buf, size);
+         }
+         internal_free(buf);
++        }
+     }
+ }
+ 
+diff --git a/src/art.h b/src/art.h
+--- a/src/art.h
++++ b/src/art.h
+@@ -157,6 +157,7 @@ const unsigned char* artGetFrameData(Art* art, int frame, int direction);
+ /* ARGON: write the art asked for outside a map load into the flash store.
+  * Call it at the start of a fill window; see apps/fallout/port/art_store.h. */
+ void artStoreTopUp(void);
++int ag_art_size_of(int fid);
+ ArtFrame* artGetFrame(Art* art, int frame, int direction);
+ bool artExists(int fid);
+ bool _art_fid_valid(int fid);
+diff --git a/src/cache.cc b/src/cache.cc
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -385,6 +385,17 @@ bool cacheLock(Cache* cache, int key, void** data, CacheEntry** cacheEntryPtr)
+ 
+         const unsigned kb = (unsigned)(cache->entries[index]->size / 1024);
+         ag_cache_miss_kb[slot] += kb;
++
++        /* ARGON: who keeps coming back off the card.
++         *
++         * The store holds eight hundred files and nine of them are ever
++         * read back, which says the wrong things are in it - so the right
++         * question is which art is read off the card more than once.  That
++         * is the art that belongs in flash, and Maxim asked it exactly so.
++         */
++        if (cache->ag_kind == AG_CACHE_ART) {
++            ag_reread_note(key, (unsigned)cache->entries[index]->size);
++        }
+         ag_top_note(cache->ag_kind, slot % AG_WHERES, kb, took_ms);
+ 
+         _lock_sound_ticker %= 4;
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -824,6 +824,150 @@ int mapLoadByName(char* fileName)
+ }
+ 
+ // 0x482B34
++/*
++ * ARGON: what art this map actually needs, counted before the game starts.
++ *
++ * Maxim asked whether a location can say its art budget up front.  It can:
++ * the tile grid names two tiles per square, every object carries its fid,
++ * and the sizes are in master.IDX, which is already mapped.  Nothing here
++ * reads the card for pixels - only sizes.
++ *
++ * This is the inventory the flash store should be filled FROM, instead of
++ * from whatever the cache happened to evict: measured, 788 stored files
++ * and nine of them ever read back.
++ */
++static void ag_map_inventory(void)
++{
++    enum { kMax = 3000 };
++    static int      seen[kMax];
++    static unsigned kb_by_kind[16];
++    static unsigned n_by_kind[16];
++    unsigned        n = 0;
++    unsigned        total_kb = 0;
++    unsigned        skipped = 0;
++
++    memset(kb_by_kind, 0, sizeof(kb_by_kind));
++    memset(n_by_kind, 0, sizeof(n_by_kind));
++
++    /* Sorted insert, so the "have I seen this" question stays cheap. */
++    struct local {
++        static bool add(int *list, unsigned *len, unsigned max, int fid)
++        {
++            unsigned lo = 0, hi = *len;
++
++            while (lo < hi) {
++                const unsigned mid = lo + (hi - lo) / 2u;
++
++                if (list[mid] == fid) {
++                    return false;
++                }
++                if (list[mid] < fid) {
++                    lo = mid + 1u;
++                } else {
++                    hi = mid;
++                }
++            }
++            if (*len >= max) {
++                return false;
++            }
++            for (unsigned i = *len; i > lo; i--) {
++                list[i] = list[i - 1u];
++            }
++            list[lo] = fid;
++            (*len)++;
++            return true;
++        }
++    };
++
++    for (int elevation = 0; elevation < ELEVATION_COUNT; elevation++) {
++        if (_square[elevation] == nullptr) {
++            continue;
++        }
++        for (int tile = 0; tile < SQUARE_GRID_SIZE; tile++) {
++            const int packed = _square[elevation]->field_0[tile];
++            const int fids[2] = {
++                buildFid(OBJ_TYPE_TILE, packed & 0xFFF, 0, 0, 0),
++                buildFid(OBJ_TYPE_TILE, (packed >> 16) & 0xFFF, 0, 0, 0)
++            };
++
++            for (int k = 0; k < 2; k++) {
++                if (!local::add(seen, &n, kMax, fids[k])) {
++                    if (n >= kMax) {
++                        skipped++;
++                    }
++                    continue;
++                }
++
++                const int size = ag_art_size_of(fids[k]);
++                const unsigned kind = ((unsigned)fids[k] >> 24) & 15u;
++
++                if (size > 0) {
++                    total_kb += (unsigned)size / 1024u;
++                    kb_by_kind[kind] += (unsigned)size / 1024u;
++                    n_by_kind[kind]++;
++                }
++            }
++        }
++    }
++
++    for (Object* obj = objectFindFirst(); obj != nullptr;
++            obj = objectFindNext()) {
++        /*
++         * ARGON: a critter is not one picture.
++         *
++         * The object carries its standing pose, and the moment it takes a
++         * step the engine wants a different file - walking, running, each
++         * its own fid.  Those are not in the map at all, which is why a
++         * megabyte of critter art gets written to flash DURING play, one
++         * animation at a time, and each of those writes is the stall.
++         * They belong in the inventory.
++         */
++        if (PID_TYPE(obj->pid) == OBJ_TYPE_CRITTER) {
++            /* Poses and walking: Maxim's call.  Running as well would be 7.3 MB
++                 * of an 8 MB store, before attacks and deaths. */
++                static const int wanted_anim[] = { ANIM_WALK };
++
++            for (unsigned a = 0;
++                    a < sizeof(wanted_anim) / sizeof(wanted_anim[0]); a++) {
++                const int afid = buildFid(OBJ_TYPE_CRITTER,
++                                          obj->fid & 0xFFF,
++                                          wanted_anim[a],
++                                          (obj->fid & 0xF000) >> 12,
++                                          (obj->fid & 0x70000000) >> 28);
++
++                if (local::add(seen, &n, kMax, afid)) {
++                    const int asize = ag_art_size_of(afid);
++                    const unsigned akind = ((unsigned)afid >> 24) & 15u;
++
++                    if (asize > 0) {
++                        total_kb += (unsigned)asize / 1024u;
++                        kb_by_kind[akind] += (unsigned)asize / 1024u;
++                        n_by_kind[akind]++;
++                    }
++                }
++            }
++        }
++
++        if (!local::add(seen, &n, kMax, obj->fid)) {
++            if (n >= kMax) {
++                skipped++;
++            }
++            continue;
++        }
++
++        const int size = ag_art_size_of(obj->fid);
++        const unsigned kind = ((unsigned)obj->fid >> 24) & 15u;
++
++        if (size > 0) {
++            total_kb += (unsigned)size / 1024u;
++            kb_by_kind[kind] += (unsigned)size / 1024u;
++            n_by_kind[kind]++;
++        }
++    }
++
++    ag_map_inventory_note(n, total_kb, skipped, n_by_kind, kb_by_kind);
++}
++
+ int mapLoadById(int map)
+ {
+     scriptSetFixedParam(gMapSid, map);
+@@ -1200,6 +1344,24 @@ err:
+     if (ag_map_loading != 0u) {
+         ag_map_loading--;
+     }
++    /* ARGON: say what this map needed, now that it is all known. */
++    ag_map_inventory();
++
++    /*
++     * ARGON: filling the store from the inventory is OFF until the loop is
++     * understood.  With it on, 808 wanted files became 94098 card reads and
++     * 312 MB in five minutes, with nothing written to flash at all - so the
++     * top-up was spinning, not working.  The inventory above still measures
++     * what the location needs (770 pictures / 3925 KB for poses and tiles,
++     * 808 / 7259 KB with walking and running), which is the number the
++     * decision rests on.
++     *
++     * The want list is not built either: artStoreTopUp still runs at the
++     * START of a map load, so a list left over from the previous load was
++     * drained there - 27000 card reads and 89 MB before the map even
++     * appeared.  Measuring must not leave anything behind it.
++     */
++
+     ag_art_store_fill_end();
+     ag_loan_map_end();
+     AG_STEP("playing");

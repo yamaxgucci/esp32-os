@@ -41,6 +41,7 @@
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
+#include <argon/netprov.h>
 #include <argon/port/net.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
@@ -285,7 +286,7 @@ static void conn_close(int fd, void *tls)
     (void)tls;
 #endif
     if (fd >= 0) {
-        ag_port_net_close(fd);
+        ag_netprov_close(fd);
     }
 }
 
@@ -325,7 +326,7 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
         return -AG_ENOTSUP;
 #endif
     } else {
-        fd = ag_port_net_connect(addr, u->port, HTTP_CONNECT_MS);
+        fd = ag_netprov_connect(addr, u->port, HTTP_CONNECT_MS);
         if (fd < 0) {
             ag_console_puts("no answer\n");
             return (ag_err_t)fd;
@@ -337,7 +338,7 @@ static ag_err_t request_once(const ag_url_t *u, const char *dest,
          * interrupted while it waits is a board that has to be reset.  (The TLS
          * connection is set non-blocking by the port after its handshake.)
          */
-        (void)ag_port_net_nonblock(fd, true);
+        (void)ag_netprov_nonblock(fd, true);
     }
     ag_console_puts("connected\n");
 

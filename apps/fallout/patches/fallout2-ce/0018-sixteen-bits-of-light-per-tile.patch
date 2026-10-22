@@ -1,0 +1,139 @@
+diff --git a/src/light.cc b/src/light.cc
+--- a/src/light.cc
++++ b/src/light.cc
+@@ -1,6 +1,7 @@
+ #include "light.h"
+ 
+ #include <algorithm>
++#include <stdint.h>
+ 
+ #include "map_defs.h"
+ #include "object.h"
+@@ -15,9 +16,69 @@
+ // 0x51923C
+ static int gAmbientIntensity = LIGHT_INTENSITY_MAX;
+ 
++/*
++ * ARGON: sixteen bits per tile instead of thirty-two, with the low two dropped.
++ *
++ * int[3][40000] is 480000 bytes, which makes this the largest single object in
++ * the image by a factor of three - the next one down is gObjectListHeadByTile
++ * at 156 KB.  It matters twice over on an 8 MB part.  The loader takes the
++ * image's data and the app's arena out of the same extended memory, and with
++ * 8040 KB free and 1770 KB of data the arena tops out around 6270 KB: a 6300 KB
++ * arena is refused.  So every kilobyte saved here is a kilobyte the arena can
++ * have, and the arena is what Fallout 2 runs out of.
++ *
++ * Two bits is a free choice.  The value ends up selecting one of about sixty
++ * palette shades, which is a step of 1024 out of LIGHT_INTENSITY_MAX (65536);
++ * dropping two bits makes the quantum 4, a two-hundred-and-fiftieth of a shade.
++ * The reset value is 655 and becomes 652, a difference of three parts in 65536.
++ *
++ * Sixteen bits then hold 32767, which is 131068 in intensity - two lights at
++ * full LIGHT_INTENSITY_MAX on one hex, where the readers clamp at one.  A third
++ * would saturate, and saturating loses the exactness of increase-then-decrease
++ * on that hex.  Three full-strength lights on one tile of one map is a corner
++ * worth 240 KB.
++ *
++ * The truncation is applied to each delta rather than to the total, so
++ * increase(x) followed by decrease(x) is exact for any x.
++ */
++#define LIGHT_STORE_SHIFT 2
++#define LIGHT_STORE_MIN (-32768)
++#define LIGHT_STORE_MAX 32767
++
+ // light intensity per elevation per tile
+ // 0x59E994
+-static int gTileIntensity[ELEVATION_COUNT][HEX_GRID_SIZE];
++static int16_t gTileIntensity[ELEVATION_COUNT][HEX_GRID_SIZE];
++
++static inline int16_t lightPackIntensity(int intensity)
++{
++    int packed = intensity >> LIGHT_STORE_SHIFT;
++
++    if (packed > LIGHT_STORE_MAX) {
++        packed = LIGHT_STORE_MAX;
++    } else if (packed < LIGHT_STORE_MIN) {
++        packed = LIGHT_STORE_MIN;
++    }
++
++    return (int16_t)packed;
++}
++
++static inline int lightUnpackIntensity(int16_t packed)
++{
++    return (int)packed << LIGHT_STORE_SHIFT;
++}
++
++static inline int16_t lightAddPacked(int16_t current, int intensity)
++{
++    int sum = (int)current + (intensity >> LIGHT_STORE_SHIFT);
++
++    if (sum > LIGHT_STORE_MAX) {
++        sum = LIGHT_STORE_MAX;
++    } else if (sum < LIGHT_STORE_MIN) {
++        sum = LIGHT_STORE_MIN;
++    }
++
++    return (int16_t)sum;
++}
+ 
+ // 0x47A8F0
+ int lightInit()
+@@ -71,7 +132,8 @@
+         return 0;
+     }
+ 
+-    return std::min(gTileIntensity[elevation][tile], LIGHT_INTENSITY_MAX);
++    return std::min(lightUnpackIntensity(gTileIntensity[elevation][tile]),
++        LIGHT_INTENSITY_MAX);
+ }
+ 
+ // 0x47A9C4
+@@ -85,7 +147,7 @@
+         return 0;
+     }
+ 
+-    return gTileIntensity[elevation][tile];
++    return lightUnpackIntensity(gTileIntensity[elevation][tile]);
+ }
+ 
+ // 0x47A9EC
+@@ -99,7 +161,7 @@
+         return;
+     }
+ 
+-    gTileIntensity[elevation][tile] = intensity;
++    gTileIntensity[elevation][tile] = lightPackIntensity(intensity);
+ }
+ 
+ // 0x47AA10
+@@ -113,7 +175,8 @@
+         return;
+     }
+ 
+-    gTileIntensity[elevation][tile] += intensity;
++    gTileIntensity[elevation][tile] =
++        lightAddPacked(gTileIntensity[elevation][tile], intensity);
+ }
+ 
+ // 0x47AA48
+@@ -127,7 +190,8 @@
+         return;
+     }
+ 
+-    gTileIntensity[elevation][tile] -= intensity;
++    gTileIntensity[elevation][tile] =
++        lightAddPacked(gTileIntensity[elevation][tile], -intensity);
+ }
+ 
+ // 0x47AA84
+@@ -135,7 +199,7 @@
+ {
+     for (int elevation = 0; elevation < ELEVATION_COUNT; elevation++) {
+         for (int tile = 0; tile < HEX_GRID_SIZE; tile++) {
+-            gTileIntensity[elevation][tile] = 655;
++            gTileIntensity[elevation][tile] = lightPackIntensity(655);
+         }
+     }
+ }

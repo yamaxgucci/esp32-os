@@ -15,6 +15,8 @@
 
 #include <argon/log.h>
 #include <argon/net.h>
+#include <argon/proc.h>
+#include <argon/netprov.h>
 #include <argon/power.h>
 #include <argon/netmsg.h>
 
@@ -28,6 +30,13 @@
 
 static int             s_fds[AG_NET_MAX_SOCK];
 static bool            s_in_use[AG_NET_MAX_SOCK];
+/*
+ * Whose socket it is.  AG_PID_KERNEL for one opened by a driver's own task or
+ * by a kernel service, and those are nobody's to reclaim: the phone link's
+ * listener is opened from the driver's task and must outlive every process
+ * that ever connects to it.
+ */
+static ag_pid_t        s_owner[AG_NET_MAX_SOCK];
 static ag_port_mutex_t s_lock;
 
 static void lock(void)
@@ -68,6 +77,7 @@ static ag_handle_t adopt_fd(int fd)
         if (!s_in_use[i]) {
             s_in_use[i] = true;
             s_fds[i] = fd;
+            s_owner[i] = ag_proc_self();
             unlock();
             return (ag_handle_t)(AG_NET_HANDLE_BASE + i);
         }
@@ -83,7 +93,7 @@ static ag_handle_t adopt_fd(int fd)
         ag_log(AG_LOG_ERROR, "net", "adopt_fd ENFILE used=%d/%d", used,
                AG_NET_MAX_SOCK);
     }
-    ag_port_net_close(fd);
+    ag_netprov_close(fd);
     return (ag_handle_t)(-AG_ENFILE);
 }
 
@@ -138,7 +148,7 @@ ag_err_t ag_net_init(void)
 
     ag_port_net_on_ready(on_ready);
 
-    const ag_err_t err = ag_port_net_start();
+    const ag_err_t err = ag_netprov_start();
     if (err != AG_OK) {
         ag_log(AG_LOG_ERROR, "net", "the interface did not start: %d",
                (int)err);
@@ -149,13 +159,32 @@ ag_err_t ag_net_init(void)
     return AG_OK;
 }
 
-bool ag_net_ready(void) { return ag_port_net_ready(); }
+/*
+ * Drop every socket the handle table holds, through whoever owns them right
+ * now.  Called by the provider layer just before it swaps the active provider,
+ * while that provider is still the one that can close its own sockets.
+ */
+void ag_net_reset_sockets(void)
+{
+    lock();
+    for (int i = 0; i < AG_NET_MAX_SOCK; i++) {
+        if (s_in_use[i]) {
+            const int fd = s_fds[i];
+            s_in_use[i] = false;
+            s_fds[i] = -1;
+            ag_netprov_close(fd);
+        }
+    }
+    unlock();
+}
 
-static bool api_ready(void) { return ag_port_net_ready(); }
+bool ag_net_ready(void) { return ag_netprov_ready(); }
+
+static bool api_ready(void) { return ag_netprov_ready(); }
 
 static ag_err_t api_ifaddr(uint32_t *addr_out)
 {
-    return ag_port_net_ifaddr(addr_out);
+    return ag_netprov_ifaddr(addr_out);
 }
 
 static ag_err_t api_wait_ready(uint32_t timeout_ms)
@@ -164,7 +193,7 @@ static ag_err_t api_wait_ready(uint32_t timeout_ms)
     const ag_port_ticks_t budget =
         (timeout_ms == UINT32_MAX) ? AG_PORT_FOREVER
                                    : ag_port_ms_to_ticks(timeout_ms);
-    while (!ag_port_net_ready()) {
+    while (!ag_netprov_ready()) {
         if (budget != AG_PORT_FOREVER &&
             (ag_port_ticks() - start) >= budget) {
             return -AG_ETIMEDOUT;
@@ -191,7 +220,7 @@ ag_err_t ag_net_lookup(const char *host, uint32_t *addr_out)
     if (ag_ipv4_parse(host, addr_out)) {
         return AG_OK;
     }
-    return ag_port_net_resolve(host, addr_out);
+    return ag_netprov_resolve(host, addr_out);
 }
 
 static ag_err_t api_resolve(const char *host, uint32_t *addr_out)
@@ -201,7 +230,7 @@ static ag_err_t api_resolve(const char *host, uint32_t *addr_out)
 
 static ag_handle_t api_tcp_listen(uint16_t port)
 {
-    return adopt_fd(ag_port_net_listen(port));
+    return adopt_fd(ag_netprov_listen(port));
 }
 
 static ag_handle_t api_tcp_accept(ag_handle_t listen_h, uint32_t timeout_ms)
@@ -210,13 +239,13 @@ static ag_handle_t api_tcp_accept(ag_handle_t listen_h, uint32_t timeout_ms)
     if (lfd < 0) {
         return (ag_handle_t)(-AG_EBADF);
     }
-    return adopt_fd(ag_port_net_accept(lfd, timeout_ms));
+    return adopt_fd(ag_netprov_accept(lfd, timeout_ms));
 }
 
 static ag_handle_t api_tcp_connect(uint32_t addr, uint16_t port,
                                    uint32_t timeout_ms)
 {
-    return adopt_fd(ag_port_net_connect(addr, port, timeout_ms));
+    return adopt_fd(ag_netprov_connect(addr, port, timeout_ms));
 }
 
 static int32_t api_send(ag_handle_t h, const void *buf, size_t len)
@@ -228,7 +257,7 @@ static int32_t api_send(ag_handle_t h, const void *buf, size_t len)
     if (buf == NULL && len > 0) {
         return -AG_EINVAL;
     }
-    return ag_port_net_send(fd, buf, len);
+    return ag_netprov_send(fd, buf, len);
 }
 
 static int32_t api_recv(ag_handle_t h, void *buf, size_t len)
@@ -240,7 +269,7 @@ static int32_t api_recv(ag_handle_t h, void *buf, size_t len)
     if (buf == NULL && len > 0) {
         return -AG_EINVAL;
     }
-    return ag_port_net_recv(fd, buf, len);
+    return ag_netprov_recv(fd, buf, len);
 }
 
 static ag_err_t api_close(ag_handle_t h)
@@ -257,9 +286,62 @@ static ag_err_t api_close(ag_handle_t h)
     const int fd = s_fds[slot];
     s_in_use[slot] = false;
     s_fds[slot] = -1;
+    s_owner[slot] = AG_PID_KERNEL;
     unlock();
-    ag_port_net_close(fd);
+    ag_netprov_close(fd);
     return AG_OK;
+}
+
+static ag_err_t api_reset(ag_handle_t h)
+{
+    const int slot = slot_of(h);
+    if (slot < 0) {
+        return -AG_EBADF;
+    }
+    lock();
+    if (!s_in_use[slot]) {
+        unlock();
+        return -AG_EBADF;
+    }
+    const int fd = s_fds[slot];
+    s_in_use[slot] = false;
+    s_fds[slot] = -1;
+    s_owner[slot] = AG_PID_KERNEL;
+    unlock();
+    ag_netprov_close_hard(fd);
+    return AG_OK;
+}
+
+uint32_t ag_net_close_owned_by(ag_pid_t pid)
+{
+    if (pid == AG_PID_KERNEL) {
+        return 0u; /* the kernel's own are not anybody's to reclaim */
+    }
+
+    int      fds[AG_NET_MAX_SOCK];
+    uint32_t n = 0;
+
+    lock();
+    for (int i = 0; i < AG_NET_MAX_SOCK; i++) {
+        if (s_in_use[i] && s_owner[i] == pid) {
+            fds[n++] = s_fds[i];
+            s_in_use[i] = false;
+            s_fds[i] = -1;
+            s_owner[i] = AG_PID_KERNEL;
+        }
+    }
+    unlock();
+
+    /* Outside the lock: a close goes into the stack, and the stack is
+     * entitled to take its time about a connection it is still flushing. */
+    for (uint32_t i = 0; i < n; i++) {
+        ag_netprov_close(fds[i]);
+    }
+    if (n != 0u) {
+        ag_log(AG_LOG_INFO, "net", "closed %u socket(s) left by pid %u",
+               (unsigned)n, (unsigned)pid);
+    }
+    return n;
 }
 
 static ag_err_t api_set_nonblock(ag_handle_t h, bool on)
@@ -268,7 +350,7 @@ static ag_err_t api_set_nonblock(ag_handle_t h, bool on)
     if (fd < 0) {
         return -AG_EBADF;
     }
-    return ag_port_net_nonblock(fd, on);
+    return ag_netprov_nonblock(fd, on);
 }
 
 const ag_net_api_t ag_net_api_impl = {
@@ -279,6 +361,7 @@ const ag_net_api_t ag_net_api_impl = {
     .tcp_listen = api_tcp_listen,
     .tcp_accept = api_tcp_accept,
     .tcp_connect = api_tcp_connect,
+    .reset = api_reset,
     .send = api_send,
     .recv = api_recv,
     .close = api_close,

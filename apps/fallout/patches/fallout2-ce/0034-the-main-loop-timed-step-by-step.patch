@@ -1,0 +1,70 @@
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -41,6 +41,18 @@
+ #include "word_wrap.h"
+ #include "worldmap.h"
+ 
++// ARGON: the port's microsecond clock and where the loop's timings go.
++// Defined in apps/fallout/port/sdl_shim.cc, outside any namespace.
++extern "C" {
++uint32_t ag_us(void);
++extern uint32_t ag_ml_input_us;
++extern uint32_t ag_ml_keys_us;
++extern uint32_t ag_ml_scripts_us;
++extern uint32_t ag_ml_maps_us;
++extern uint32_t ag_ml_present_us;
++extern uint32_t ag_ml_throttle_us;
++}
++
+ namespace fallout {
+ 
+ #define DEATH_WINDOW_WIDTH 640
+@@ -392,19 +404,35 @@
+     while (_game_user_wants_to_quit == 0) {
+         sharedFpsLimiter.mark();
+ 
++        // ARGON: the loop, timed step by step.
++        //
++        // The ticker list (see input.cc) accounted for 18 ms of a 34 ms frame
++        // on the board and the rest was unattributed, which is the same
++        // "somewhere in the engine" this instrumentation exists to stop.
++        // Seven calls, seven clocks: whichever one it is, it says so.
++        const uint32_t ml0 = ag_us();
+         int keyCode = inputGetInput();
++        const uint32_t ml1 = ag_us();
+ 
+         // SFALL: MainLoopHook.
+         sfall_gl_scr_process_main();
+ 
+         gameHandleKey(keyCode, false);
++        const uint32_t ml2 = ag_us();
+ 
+         scriptsHandleRequests();
++        const uint32_t ml3 = ag_us();
+ 
+         mapHandleTransition();
+ 
+         // ARGON: outside every script, which is what this needs.
+         scriptsTrimPrograms();
++        const uint32_t ml4 = ag_us();
++
++        ag_ml_input_us += ml1 - ml0;
++        ag_ml_keys_us += ml2 - ml1;
++        ag_ml_scripts_us += ml3 - ml2;
++        ag_ml_maps_us += ml4 - ml3;
+ 
+         if (_main_game_paused != 0) {
+             _main_game_paused = 0;
+@@ -416,8 +444,12 @@
+             _game_user_wants_to_quit = 2;
+         }
+ 
++        const uint32_t ml5 = ag_us();
+         renderPresent();
++        const uint32_t ml6 = ag_us();
+         sharedFpsLimiter.throttle();
++        ag_ml_present_us += ml6 - ml5;
++        ag_ml_throttle_us += ag_us() - ml6;
+     }
+ 
+     scriptsDisable();

@@ -16,11 +16,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/clu.h>
+#include <argon/budget.h>
 #include <argon/console.h>
 #include <argon/journal.h>
 #include <argon/keys.h>
 #include <argon/log.h>
 #include <argon/power.h>
+#include <argon/place.h>
 #include <argon/proc.h>
 #include <argon/session.h>
 #include <argon/vfs.h>
@@ -28,6 +31,9 @@
 #include "proc/proc_internal.h"
 
 #include <argon/port/fault.h>
+#include <argon/port/mem.h>
+#include <argon/port/time.h>
+#include <argon/port/wifi.h>
 #include <argon/port/task.h>
 
 /*
@@ -67,6 +73,9 @@
 /* Nothing needs doing most of the time; a wake-up also collects zombies. */
 #define AG_SUP_TICK_MS 250
 
+/* And while a driver is being charged for its time - see argon/budget.h. */
+#define AG_SUP_BUDGET_TICK_MS 50
+
 static ag_port_task_t      s_task;
 static volatile bool     s_stop_request;
 static volatile bool     s_interrupt_request;
@@ -84,8 +93,12 @@ void ag_supervisor_kill_request(ag_pid_t pid)
     }
 }
 
+static volatile bool s_explain_stop;
+
 static void request_soft_interrupt(ag_event_t *ev)
 {
+    ag_log(AG_LOG_INFO, "supervisor", "stop key: foreground pid %u, slot %d",
+           (unsigned)ag_proc_foreground(), ag_session_focused());
     if (ag_proc_foreground() != AG_PID_KERNEL) {
         s_interrupt_request = true;
         if (s_task != NULL) {
@@ -94,6 +107,46 @@ static void request_soft_interrupt(ag_event_t *ev)
         ev->type = AG_EV_QUIT;
     } else {
         s_shell_interrupt = true;
+        /*
+         * And if the thing the person is trying to stop is somewhere else.
+         *
+         * Ctrl+C belongs to the shell in front of you.  With the system shell
+         * in front of you and an application in a slot, it cancels the empty
+         * line you were not typing and the application carries on - correctly,
+         * and completely silently, which is how an evening goes on being spent
+         * pressing it.  Deciding here and printing on the supervisor's task,
+         * like everything else this function touches.
+         */
+        if (ag_proc_count() > 0u) {
+            s_explain_stop = true;
+            if (s_task != NULL) {
+                ag_port_notify_give(s_task);
+            }
+        }
+    }
+}
+
+/* What is running, where, and the two ways to reach it. */
+static void explain_how_to_stop(void)
+{
+    ag_session_slot_t slots[AG_SESSION_SLOTS];
+    ag_session_info(slots);
+    bool said = false;
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        if (slots[i].pid == AG_PID_KERNEL) {
+            continue;
+        }
+        ag_console_printf(
+            "%s (pid %u) is running in slot %d: Alt+%d goes to it, "
+            "Ctrl+\\ twice stops it\n",
+            slots[i].name[0] ? slots[i].name : "an application",
+            (unsigned)slots[i].pid, ag_session_display_number(i),
+            ag_session_display_number(i));
+        said = true;
+    }
+    if (!said) {
+        ag_console_puts("nothing is running in a slot; Ctrl+\\ twice stops "
+                        "the last application\n");
     }
 }
 
@@ -167,6 +220,16 @@ static void interrupt_foreground(void)
 }
 
 /*
+ * What counts as starving: the largest block the board could still
+ * hand out.  Sixteen kilobytes because that is the floor the phone
+ * link refuses visitors below, measured by HTTPD.AXE before it -
+ * under it the board is reachable in name only.  Free total is the
+ * wrong number here and has been before: a board can show seventy
+ * kilobytes free and refuse a twenty-five kilobyte image.
+ */
+#define AG_SUP_STARVED_BYTES (16u * 1024u)
+
+/*
  * The crash record on disk.  Written here rather than where the crash happened:
  * that task may be one instruction from ceasing to exist, or short of stack, and
  * writing to a filesystem is not the thing to attempt in either state.
@@ -177,6 +240,15 @@ static void interrupt_foreground(void)
 #define AG_CRASH_PATH "/sys/crash.log"
 #define AG_CRASH_KEEP_BYTES (32u * 1024u)
 #define AG_CRASH_TAIL_LINES 20
+
+/*
+ * True while the record in the crash buffer came from a panic the port kept in
+ * RTC memory rather than from a process that this system killed.  The port holds
+ * such a record until it is told it has been written down, so that a machine
+ * that dies again before the supervisor gets to it does not take the evidence
+ * with it (see ag_port_fault_last_panic in argon/port/fault.h).
+ */
+static bool s_panic_waiting;
 
 static void write_crash_record(void)
 {
@@ -242,6 +314,26 @@ static void write_crash_record(void)
 
     ag_log(AG_LOG_INFO, "supervisor", "crash record appended to %s",
            AG_CRASH_PATH);
+
+    /*
+     * Written down, so the port may forget it - after the close and not before,
+     * because the whole point of holding it is that it survives a death between
+     * the read and the write.  The early return above (the file could not be
+     * opened) leaves it in RTC on purpose: a record that could not be written is
+     * reported again next boot rather than dropped because the disk was busy.
+     */
+    if (s_panic_waiting) {
+        s_panic_waiting = false;
+        ag_port_fault_panic_reported();
+    }
+}
+
+void ag_supervisor_poke_isr(void)
+{
+    ag_port_task_t t = s_task;
+    if (t != NULL) {
+        ag_port_notify_give_isr(t);
+    }
 }
 
 static void supervisor_task(void *arg)
@@ -250,11 +342,31 @@ static void supervisor_task(void *arg)
 
     for (;;) {
         /* Woken by a hotkey, or on the tick to collect what has finished. */
-        ag_port_notify_take(true, ag_port_ms_to_ticks(AG_SUP_TICK_MS));
+        /*
+         * A quarter of a second when there is nothing to police, fifty
+         * milliseconds when there is: a budget window is a hundred, and a
+         * punishment that arrives after the window it belongs to has closed is
+         * no punishment at all.
+         */
+        ag_port_notify_take(true,
+                            ag_port_ms_to_ticks(ag_budget_watching()
+                                                    ? AG_SUP_BUDGET_TICK_MS
+                                                    : AG_SUP_TICK_MS));
+
+        /*
+         * First, because it is the cheapest thing here and the most urgent:
+         * a driver that has overrun its budget is holding a core away from an
+         * application right now, and the tick that noticed cannot fix it.
+         */
+        (void)ag_budget_service();
 
         if (s_interrupt_request) {
             s_interrupt_request = false;
             interrupt_foreground();
+        }
+        if (s_explain_stop) {
+            s_explain_stop = false;
+            explain_how_to_stop();
         }
         if (s_stop_request) {
             s_stop_request = false;
@@ -292,6 +404,104 @@ static void supervisor_task(void *arg)
          */
         ag_powerctl_tick();
 
+#if AG_PORT_HAS_WIFI && AG_PORT_WIFI_HAS_AP
+        /*
+         * And the point, once in a long while, when nobody is on it.
+         *
+         * A board that runs its own access point has gone off the air several
+         * times with no event, the right mode, and every field of its status
+         * correct - the failure that cannot be detected from in here.  What
+         * fixes it is re-issuing the configuration, which takes milliseconds.
+         *
+         * So: every ten minutes, and only with no station associated, because
+         * applying a configuration takes the point down and up again.  A board
+         * with somebody connected is a board that is demonstrably working, and
+         * this leaves it alone.
+         *
+         * This is not the cause and does not pretend to be.  It is the board
+         * staying reachable while the cause is looked for - the alternative
+         * being a board that is fine except that nobody can reach it, which is
+         * the same as broken from every chair in the room.
+         */
+        {
+            static int64_t s_ap_checked_us;
+            const int64_t  now = ag_port_us();
+
+            if (now - s_ap_checked_us >= 600000000) {
+                s_ap_checked_us = now;
+                ag_port_wifi_ap_status_t ap;
+                if (ag_port_wifi_ap_status(&ap) == AG_OK && ap.on &&
+                    ap.clients == 0u) {
+                    (void)ag_port_wifi_ap_refresh();
+                }
+            }
+
+            /*
+             * And the state that should now be unreachable, watched anyway.
+             *
+             * A board with nothing loaded and no memory was the shape of a
+             * fault that took an evening: a socket outlived the process that
+             * opened it, the far end held the connection and everything queued
+             * on it, and the only thing that returned the memory was taking
+             * the interface down.  For a while this bounced the access point
+             * to get it back, which worked and explained nothing.
+             *
+             * The cause is fixed - a socket belongs to its process and dies
+             * with it, and a peer judged gone is reset rather than closed - so
+             * the bounce is gone with it.  A board that quietly repairs itself
+             * every two minutes is a board that never tells anybody the next
+             * leak of this shape exists.  Said once, and then only again if it
+             * gets worse.
+             */
+            {
+                static size_t   s_starved_said;
+                static uint64_t s_starved_looked;
+
+                /*
+                 * Cheap questions first, and the expensive one hardly ever.
+                 *
+                 * The largest free block is not a counter: IDF walks every
+                 * block in the heap to find it, with interrupts disabled for
+                 * the whole walk.  Idle, that is microseconds; with the
+                 * picture path allocating and freeing bands as fast as an
+                 * application draws, one walk outlasted the interrupt
+                 * watchdog and reset the board - three times out of three,
+                 * with this line at the top of the backtrace.  A leak watcher
+                 * that kills the machine is worse than no leak watcher.
+                 *
+                 * The report below only ever fires with nothing loaded, so ask
+                 * that first; then the free total, which is a real counter;
+                 * and only then, and at most every few seconds, walk.
+                 */
+                const uint64_t now_us = ag_port_us();
+                if (ag_proc_count() != 0u ||
+                    ag_port_mem_free(AG_MEM_FAST | AG_MEM_BYTE) >
+                        AG_SUP_STARVED_BYTES * 4u ||
+                    (s_starved_looked != 0ull &&
+                     now_us - s_starved_looked < 5000000ull)) {
+                    goto starve_done;
+                }
+                s_starved_looked = now_us;
+
+                const size_t largest =
+                    ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE);
+                if (largest < AG_SUP_STARVED_BYTES) {
+                    if (s_starved_said == 0u || largest + 2048u < s_starved_said) {
+                        s_starved_said = largest;
+                        ag_log(AG_LOG_WARN, "supervisor",
+                               "nothing is loaded and the largest free block "
+                               "is %u bytes; `net sockets` says who is holding "
+                               "them",
+                               (unsigned)largest);
+                    }
+                } else {
+                    s_starved_said = 0u;
+                }
+            starve_done:;
+            }
+        }
+#endif
+
         /*
          * How close that came.  Reported once, at the low-water mark, because
          * the interesting event is the margin shrinking and not its value on
@@ -323,6 +533,13 @@ static void supervisor_task(void *arg)
             (void)ag_proc_kill(hung, reason);
         }
 
+        /*
+         * Before reaping, because reaping frees the very blocks an overrun
+         * damages: an application caught here is killed and named while the
+         * evidence and the culprit are both still in memory.
+         */
+        (void)ag_proc_check_guards();
+
         (void)ag_proc_reap_finished();
 
         /* Last, so that the journal tail it writes includes everything above. */
@@ -351,8 +568,28 @@ ag_err_t ag_supervisor_init(void)
         return err;
     }
 
+    /*
+     * The cluster's thread table, which exists on every board whether or not
+     * there is a second one: with no link it answers "one node, this one" and
+     * runs every thread here, so a program written for the cluster runs
+     * unchanged alone.  A failure is not fatal to the system - it costs jobs,
+     * not the machine - but it is said out loud.
+     */
+    const ag_err_t cerr = ag_clu_init();
+    if (cerr != AG_OK) {
+        ag_log(AG_LOG_WARN, "clu", "no thread table (%d): no cluster jobs",
+               (int)cerr);
+    }
+
     ag_session_init();
     s_focus_slot_request = -1;
+
+    /*
+     * The tick starts charging here, before the first driver can be loaded:
+     * the supervisor is what acts on what it finds, so there is no point
+     * accounting for a moment when nobody can be punished.
+     */
+    ag_budget_init();
 
     /*
      * Before any application can run: from here on a fault in one costs that
@@ -366,8 +603,35 @@ ag_err_t ag_supervisor_init(void)
                (int)err);
     }
 
-    if (!ag_port_task_create(supervisor_task, "ag_super", AG_SUP_STACK, NULL,
-                             AG_SUP_PRIORITY, 0, 0, &s_task)) {
+    /*
+     * And the other half of that: a panic the port could NOT recover, kept
+     * across the reboot it caused.  Read here rather than reported where it
+     * happened, because where it happened was an exception context on a machine
+     * that is no longer running, and here there is a filesystem, a log and a
+     * console.  The port answers once; a second boot with no panic hears false.
+     *
+     * This is the case that matters on a bench nobody is watching: an
+     * intermittent fault during a long soak used to leave nothing at all behind.
+     */
+    {
+        ag_port_panic_t panic;
+        if (ag_port_fault_last_panic(&panic)) {
+            ag_proc_record_panic(&panic);
+            /*
+             * Held in RTC until write_crash_record has it on disk.  This boot
+             * may not live that long - the C3 does not - and the record is the
+             * only account of why the last one died.
+             */
+            s_panic_waiting = true;
+        }
+    }
+
+    /* [memory] supervisor, `only iram` unless the configuration says
+     * otherwise: it writes the crash record, and a stack in PSRAM would make
+     * that write depend on the flash relay (flashop_hw.c) a crashed program
+     * may have left holding its lock. */
+    if (!ag_place_task("supervisor", supervisor_task, "ag_super", AG_SUP_STACK,
+                       NULL, AG_SUP_PRIORITY, 0, (void **)&s_task, NULL)) {
         return -AG_ENOMEM;
     }
 

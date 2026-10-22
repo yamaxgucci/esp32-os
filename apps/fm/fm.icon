@@ -1,0 +1,22 @@
+# FM's own face: two panels side by side, which is what it is.
+#
+# Sixteen lines of sixteen.  '.' is nothing and the desk shows through;
+# 0-F are the shell's sixteen colours (0 black, 7 light grey, 8 dark grey,
+# 1 navy, F white).  Text on purpose: it is edited with an editor, read in
+# a diff, and needs no decoder in mkaxe.
+................
+.00000000000000.
+.0FFFFFF00FFFFF0
+.0F7777F00F7777F
+.0F0000F00F0000F
+.0F7777F00F7777F
+.0F0FF0F00F0FF0F
+.0F7777F00F7777F
+.0F0000F00F0000F
+.0F7777F00F7777F
+.0F0FF0F00F0FF0F
+.0F7777F00F7777F
+.0FFFFFF00FFFFF0
+.00000000000000.
+.....08888880...
+................

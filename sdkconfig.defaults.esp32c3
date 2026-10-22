@@ -1,0 +1,220 @@
+# ArgonOS - ESP32-C3 (RISC-V), the "C3 SuperMini" on the desk.
+#
+# The fourth chip this system builds for and the second RISC-V one, so the hard
+# part was already paid for by the C6: everything above components/argon_port
+# compiled for it unchanged.  What is different here is not the instruction set
+# but the size of the machine.
+#
+# The board: ESP32-C3 (usually -MINI-1 or a bare chip), 4 MB flash, 400 KB HP
+# SRAM, no PSRAM, ONE core at 160 MHz.  The Type-C socket goes to the chip
+# itself, so the console is the built-in USB serial device and not a UART.  No
+# display and no card slot: a header of thirteen pins and a green LED.
+#
+# QEMU DOES run this target, since 18 Sep 2026: `idf_tools.py install
+# qemu-riscv32` and `argon target esp32c3-qemu`, which is this file plus
+# sdkconfig.esp32c3.qemu.  What the emulator cannot show is the radio, the
+# USB console and the pins; everything else no longer waits for the board.
+#
+# THE THREE NUMBERS THAT MAKE THIS BOARD DIFFERENT FROM THE C6:
+#
+#   400 KB of SRAM, not 512.  A hundred kilobytes is most of what Wi-Fi wants,
+#   so the buffers below are smaller and the arena is smaller, and if something
+#   refuses to start for want of memory those are the two lines to move.
+#
+#   One core.  Cluster threads still work - a thread is a thread - but "every
+#   core of every board" means one core here, and `grind` will say so.
+#
+#   Wi-Fi 4, not 6, and BLE only.  Nothing above cares; it is written down so
+#   that nobody looks for 802.11ax settings that this part has no symbols for.
+
+CONFIG_IDF_TARGET="esp32c3"
+
+# 4 MB, sharing the C6's table: the same chip-sized flash and the same reason
+# for the split - C: has to be big enough to hold what gets flashed into it in
+# one esptool run, because the console's hex protocol is minutes per kilobyte.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c6.csv"
+
+# 160 MHz is this part's ceiling, not a choice.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+
+# The console, and the one line that makes this board usable at all.
+#
+# There is no bridge chip: the USB-C socket is wired to GPIO 18 and 19, the
+# chip's own USB pins.  Left on UART0 the system would be talking to GPIO 20
+# and 21 - two pads on the header - and the cable in the socket would carry
+# nothing.  The device is offered above as one more serial port, the one after
+# the last real UART, and the console attaches to it by number like any other.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+
+# The code arena, out of the same heap Wi-Fi wants.  32 KB rather than the C6's
+# 64: this part has a hundred kilobytes less to divide, and an arena that cannot
+# be allocated is a board that does not boot rather than one that runs smaller
+# programs.  Raise it if an application is refused for want of code space AND
+# there is memory to spare at the boot line - both halves, not either.
+#
+# IT WAS 48, AND 48 IS THE VALUE THAT MAKES THIS BOARD UNABLE TO RUN ANYTHING.
+#
+# The arena is a static array in .iram.bss, so every kilobyte of it is a
+# kilobyte the heap never sees - and on this part the heap is short enough that
+# the SIZE OF THE LARGEST FREE BLOCK is what decides whether a program starts.
+# At 48 KB, on the bench, with two wires up:
+#
+#   $ mem
+#                    total        free     largest
+#     internal       173 KB        23 KB        15 KB
+#   $ run c:\nodehirv.axe
+#   E proc: nodehirv.axe: no memory for a 16384 byte task stack
+#           (internal SRAM and PSRAM both failed)
+#
+# 23 KB free and a 16 KB stack refused, because no single block was big enough.
+# 48 KB of arena bought nothing: what is loaded into it is the wire driver
+# (6.8 KB of code, 1.9 KB of data) and a program the size of TONE (19 KB), so a
+# 32 KB ceiling holds both and hands 16 KB back to the heap at the same time -
+# and this board's whole purpose in the cluster is to run the guest on the
+# other end of a wire, so "cannot start a program" is "cannot do its job".
+#
+# 32 and not 16: TONE is on this board's C: on purpose (it has no converter, so
+# a tone started here lands on the neighbour's), and it needs 19 KB of the
+# arena beside the driver.  Sixteen would fit the stack and lose the program.
+CONFIG_ARGON_APP_ARENA_KB=32
+
+# And the one line without which the arena is useless.  It is not the C6's line,
+# and finding that out cost the first boot on this board.
+#
+# The C6 turns off CONFIG_ESP_SYSTEM_PMP_IDRAM_SPLIT.  THAT SYMBOL DOES NOT
+# EXIST ON THE C3, and kconfiglib shrugs at a name it does not know rather than
+# complaining - so the line was there, read, and did nothing.  This part guards
+# its memory with the PMS peripheral instead, behind a different name.
+#
+# What the board did without it, every boot, reproducibly:
+#
+#   E (18) boot: stage 'media' failed with -19
+#   Guru Meditation Error: Core 0 panic'ed (Memory protection fault).
+#   MEPC : 0x42019554   MCAUSE : 0x0000001a   MTVAL : 0xfef71ae3
+#
+# and 0x42019554 is copy_image() in the loader: the fault is on the WRITE of a
+# module's code into the arena, not on the jump into it.  Three of those in a
+# row put the system into recovery, where modules are skipped - so the symptom
+# a reader meets first is "the wire driver did not load", which points nowhere
+# near memory protection.
+#
+# ARGON_APP_ARENA_KB says in so many words that ESP-IDF hands out no memory that
+# is both writable and executable through one address, and the arena is how
+# ArgonOS gets some anyway.  It is a protection this design cannot keep - see
+# [T-12] on the no-MMU trade - and not one it silently loses.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE_LOCK=n
+
+# WI-FI OFF TOO, since 23 Sep 2026, at Maxim's word.  It was kept for one
+# reason - the board sat on a power bank and telnet was its only console.  It
+# is on USB now, beside the Zero, and what it is for is the wire: the stack
+# held ~50 KB of a machine that had 25 KB free after boot with its largest
+# piece 7 KB, which is less than one DMA ring for the UART at 16 Mbaud.
+# Getting files on is mksysfs over USB, as on every other board here.
+CONFIG_ARGON_ENABLE_NET=n
+CONFIG_ARGON_NET_WIFI=n
+CONFIG_ETH_USE_OPENETH=n
+
+# BLE IS OFF ON THIS BOARD, and it is the 400 KB that decides it.
+#
+# Measured here with it on: 142 KB of heap in total, 95 KB of that held by the
+# system, 46 KB free - and an application that asked for one 8 KB thread stack
+# was refused (-12).  `grind` got as far as printing its one-core baseline and
+# then said "nowhere to run anything", which on a board whose whole purpose is
+# to be a second node is the same as not working.
+#
+# What this board is: a header, a wire and no glass.  It has no keyboard to
+# pair, nothing to be a HID host for, and no user sitting at it - its user is
+# on the other end of the wire.  Wi-Fi stays, because getting a file onto a
+# board over the console is 0.6 KB/s and silently truncates.
+#
+# Turn it back on for a board that needs it, and expect to lower the arena in
+# the same breath.
+CONFIG_ARGON_ENABLE_BLE=n
+CONFIG_BT_ENABLED=n
+
+CONFIG_ARGON_NET_WIFI_MON=n
+
+# Smaller than the C6's, and that is the 400 KB talking: these buffers come out
+# of internal SRAM, which is the memory this part is short of.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+
+# A panic reboots rather than halting: this target has no fault recovery (see
+# fault_hw.c - the RISC-V half says so in words), so the panic path is the only
+# path, and a machine that comes back and says "reset: panic" beats one that
+# stops with nobody watching.
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=n
+
+# No host helper on UART1 - and here that is not only about the 80 KB it costs.
+# UART1 IS THE CLUSTER WIRE on this board.  HostFS would configure the same
+# port for its own protocol and the two would talk over each other.
+CONFIG_ARGON_ENABLE_HOSTFS=n
+
+# No virtual panel: no QEMU runs this target, and the component that talks to
+# the emulated one does not compile for RISC-V.
+CONFIG_ARGON_PANEL_QEMU=n
+
+# No DACs on this part at all, and the ADC is left off until something on the
+# board needs measuring.
+CONFIG_ARGON_ENABLE_AUDIO=n
+CONFIG_ARGON_ENABLE_ADC=n
+
+# There is no glass on this board, so the console grid is chosen for the thing
+# that will actually read it: a terminal on the USB cable.  Eighty by twenty-
+# five, the size every terminal already is.
+CONFIG_ARGON_CONSOLE_COLS=80
+CONFIG_ARGON_CONSOLE_ROWS=25
+
+# Room for a neighbour's devices as well as this board's - and this board has
+# TWO neighbours, so the pair's arithmetic does not cover it.  Measured on the
+# bench: this board's own registry is twelve entries, the CYD offers fifteen
+# (one of them its link, skipped) and the S3-Zero twelve.  Twelve plus fifteen
+# plus twelve is thirty-nine.
+#
+# WHAT IT COSTS, MEASURED on this board with `mem` either side of the change:
+# thirty-two kilobyte entries is seven kilobytes - free went 39 -> 32 KB and the
+# largest block 31 -> 25 KB - because a borrowed device costs a slot in this
+# table *and* an entry in the proxy table behind it.  That is 224 bytes an
+# entry, which is what the number below is now chosen against.
+#
+# SIXTY-FOUR BECAME FORTY-EIGHT, AND THE SECOND GUEST IS WHY.
+#
+# The C3's whole reason to exist in this cluster is to run a program on behalf
+# of a neighbour, and the pair test now reaches the state the middle board has
+# to survive: ONE guest already running (a migrated MIGRANT, or the neighbour's
+# build being substituted for a foreign one) while a SECOND is asked for.  With
+# the table at sixty-four entries the C3 has 15308 bytes free and a 7424-byte
+# largest block while that one guest runs, and the second is refused - by 768
+# bytes, which is what a 224-byte entry times sixteen is worth.  At forty-eight
+# the same state has room for the second 8 KB stack, and thirty-nine is still
+# what it needs, with nine to spare.
+#
+# Forty was the value that first suggested itself here and it is the wrong one:
+# thirty-nine is the measured requirement with NO margin, and a table that fills
+# up refuses the screen and the touchscreen first (see the note that follows).
+# Forty-eight is the smallest round number that holds what the middle must hold.
+#
+# THE OLD VALUE HERE WAS FORTY, AND IT WAS ALSO A LINE THAT DID NOTHING.  See
+# argon/device.h: the header read CONFIG_ARGON_DEV_MAX without asking the port
+# for it, so every board ran on the twenty-four in its #else - and this board
+# refused the CYD's screen, touchscreen and card slot with -ENFILE (-23) while
+# its sdkconfig said forty.  A number here is only worth writing now that it
+# arrives.
+CONFIG_ARGON_DEV_MAX=48
+
+# The timer task at 2 KB, not 4.  Its one client on this board is the kernel's
+# lock watch (ag_port_lockwatch_start: a line a second at most, formatted into
+# 160 bytes), there is no radio here to add others, and measured it had used
+# 225 bytes of the 4089 it was given - on a board where the merge of 25 Sep 2026
+# had just cost twelve kilobytes of heap.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=2048

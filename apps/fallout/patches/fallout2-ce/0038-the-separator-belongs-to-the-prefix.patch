@@ -1,0 +1,305 @@
+diff --git a/src/loadsave.cc b/src/loadsave.cc
+--- a/src/loadsave.cc
++++ b/src/loadsave.cc
+@@ -207,6 +207,28 @@
+ // 0x5193CC
+ static const char* _patches = nullptr;
+ 
++/*
++ * ARGON: the game directory as a prefix, separator included, or nothing.
++ *
++ * See patches/fallout2-ce/0038 for why.  Every format below used to write the
++ * separator itself - a backslash after the first %s - which turns an unset master_patches into a
++ * path from the root of the filesystem instead of a path from where the game
++ * is.  Now the separator belongs to the prefix and disappears with it.
++ */
++static const char* _patches_dir()
++{
++    static char buf[COMPAT_MAX_PATH];
++    const char* p = settings.system.master_patches_path.c_str();
++
++    if (p == nullptr || p[0] == '\0') {
++        buf[0] = '\0';
++        return buf;
++    }
++    snprintf(buf, sizeof(buf), "%s\\", p);
++    return buf;
++}
++
++
+ // 0x5193EC
+ static SaveGameHandler* _master_save_list[LOAD_SAVE_HANDLER_COUNT] = {
+     _DummyFunc,
+@@ -338,7 +360,7 @@
+ {
+     _quick_done = false;
+     _slot_cursor = 0;
+-    _patches = settings.system.master_patches_path.c_str();
++    _patches = _patches_dir();
+ 
+     MapDirErase("MAPS\\", "SAV");
+     MapDirErase(PROTO_DIR_NAME "\\" CRITTERS_DIR_NAME "\\", PROTO_FILE_EXT);
+@@ -367,7 +389,7 @@
+     MessageListItem messageListItem;
+ 
+     _ls_error_code = 0;
+-    _patches = settings.system.master_patches_path.c_str();
++    _patches = _patches_dir();
+ 
+     // SFALL: skip slot selection if auto quicksave is enabled
+     if (autoQuickSaveSlots) {
+@@ -888,7 +910,7 @@
+     };
+ 
+     _ls_error_code = 0;
+-    _patches = settings.system.master_patches_path.c_str();
++    _patches = _patches_dir();
+ 
+     if (mode == LOAD_SAVE_MODE_QUICK && _quick_done) {
+         int quickSaveWindowX = (screenGetWidth() - LS_WINDOW_WIDTH) / 2;
+@@ -1536,10 +1558,10 @@
+ 
+     backgroundSoundPause();
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s", _patches, "SAVEGAME");
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s", _patches, "SAVEGAME");
+     compat_mkdir(_gmpath);
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s\\%s%.2d", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s\\%s%.2d", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
+     compat_mkdir(_gmpath);
+ 
+     strcat(_gmpath, "\\" PROTO_DIR_NAME);
+@@ -2456,8 +2478,8 @@
+         const char* critterItemPath = (pid >> 24) == OBJ_TYPE_CRITTER
+             ? PROTO_DIR_NAME "\\" CRITTERS_DIR_NAME
+             : PROTO_DIR_NAME "\\" ITEMS_DIR_NAME;
+-        snprintf(_str0, sizeof(_str0), "%s\\%s\\%s", _patches, critterItemPath, path);
+-        snprintf(_str1, sizeof(_str1), "%s\\%s\\%s%.2d\\%s\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, critterItemPath, path);
++        snprintf(_str0, sizeof(_str0), "%s%s\\%s", _patches, critterItemPath, path);
++        snprintf(_str1, sizeof(_str1), "%s%s\\%s%.2d\\%s\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, critterItemPath, path);
+         if (fileCopyCompressed(_str0, _str1) == -1) {
+             return -1;
+         }
+@@ -2488,7 +2510,7 @@
+         return -1;
+     }
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
+     _strmfe(_str0, "AUTOMAP.DB", "SAV");
+     strcat(_gmpath, _str0);
+     compat_remove(_gmpath);
+@@ -2500,8 +2522,8 @@
+             return -1;
+         }
+ 
+-        snprintf(_str0, sizeof(_str0), "%s\\%s\\%s", _patches, "MAPS", string);
+-        snprintf(_str1, sizeof(_str1), "%s\\%s\\%s%.2d\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, string);
++        snprintf(_str0, sizeof(_str0), "%s%s\\%s", _patches, "MAPS", string);
++        snprintf(_str1, sizeof(_str1), "%s%s\\%s%.2d\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, string);
+         if (fileCopyCompressed(_str0, _str1) == -1) {
+             fileNameListFree(&fileNameList, 0);
+             return -1;
+@@ -2511,8 +2533,8 @@
+     fileNameListFree(&fileNameList, 0);
+ 
+     _strmfe(_str0, "AUTOMAP.DB", "SAV");
+-    snprintf(_str1, sizeof(_str1), "%s\\%s\\%s%.2d\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, _str0);
+-    snprintf(_str0, sizeof(_str0), "%s\\%s\\%s", _patches, "MAPS", "AUTOMAP.DB");
++    snprintf(_str1, sizeof(_str1), "%s%s\\%s%.2d\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, _str0);
++    snprintf(_str0, sizeof(_str0), "%s%s\\%s", _patches, "MAPS", "AUTOMAP.DB");
+ 
+     if (fileCopyCompressed(_str0, _str1) == -1) {
+         return -1;
+@@ -2579,7 +2601,7 @@
+         return -1;
+     }
+ 
+-    snprintf(_str0, sizeof(_str0), "%s\\%s\\%s", _patches, "MAPS", "AUTOMAP.DB");
++    snprintf(_str0, sizeof(_str0), "%s%s\\%s", _patches, "MAPS", "AUTOMAP.DB");
+     compat_remove(_str0);
+ 
+     for (int index = 1; index < gPartyMemberDescriptionsLength; index += 1) {
+@@ -2590,8 +2612,8 @@
+                 const char* basePath = PID_TYPE(pid) == OBJ_TYPE_CRITTER
+                     ? PROTO_DIR_NAME "\\" CRITTERS_DIR_NAME
+                     : PROTO_DIR_NAME "\\" ITEMS_DIR_NAME;
+-                snprintf(_str0, sizeof(_str0), "%s\\%s\\%s", _patches, basePath, protoPath);
+-                snprintf(_str1, sizeof(_str1), "%s\\%s\\%s%.2d\\%s\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, basePath, protoPath);
++                snprintf(_str0, sizeof(_str0), "%s%s\\%s", _patches, basePath, protoPath);
++                snprintf(_str1, sizeof(_str1), "%s%s\\%s%.2d\\%s\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, basePath, protoPath);
+ 
+                 if (_gzdecompress_file(_str1, _str0) == -1) {
+                     debugPrint("LOADSAVE: returning 6\n");
+@@ -2607,8 +2629,8 @@
+             break;
+         }
+ 
+-        snprintf(_str0, sizeof(_str0), "%s\\%s\\%s%.2d\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, fileName);
+-        snprintf(_str1, sizeof(_str1), "%s\\%s\\%s", _patches, "MAPS", fileName);
++        snprintf(_str0, sizeof(_str0), "%s%s\\%s%.2d\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, fileName);
++        snprintf(_str1, sizeof(_str1), "%s%s\\%s", _patches, "MAPS", fileName);
+ 
+         if (_gzdecompress_file(_str0, _str1) == -1) {
+             debugPrint("LOADSAVE: returning 7\n");
+@@ -2617,8 +2639,8 @@
+     }
+ 
+     const char* automapFileName = _strmfe(_str1, "AUTOMAP.DB", "SAV");
+-    snprintf(_str0, sizeof(_str0), "%s\\%s\\%s%.2d\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, automapFileName);
+-    snprintf(_str1, sizeof(_str1), "%s\\%s\\%s", _patches, "MAPS", "AUTOMAP.DB");
++    snprintf(_str0, sizeof(_str0), "%s%s\\%s%.2d\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, automapFileName);
++    snprintf(_str1, sizeof(_str1), "%s%s\\%s", _patches, "MAPS", "AUTOMAP.DB");
+     if (fileCopyDecompressed(_str0, _str1) == -1) {
+         debugPrint("LOADSAVE: returning 8\n");
+         return -1;
+@@ -2757,7 +2779,7 @@
+     char** fileList;
+     int fileListLength = fileNameListInit(path, &fileList, 0, 0);
+     while (--fileListLength >= 0) {
+-        snprintf(path, sizeof(path), "%s\\%s%s", _patches, relativePath, fileList[fileListLength]);
++        snprintf(path, sizeof(path), "%s%s%s", _patches, relativePath, fileList[fileListLength]);
+         compat_remove(path);
+     }
+     fileNameListFree(&fileList, 0);
+@@ -2770,7 +2792,7 @@
+ {
+     char path[COMPAT_MAX_PATH];
+ 
+-    snprintf(path, sizeof(path), "%s\\%s%s", _patches, a1, a2);
++    snprintf(path, sizeof(path), "%s%s%s", _patches, a1, a2);
+     if (compat_remove(path) != 0) {
+         return -1;
+     }
+@@ -2783,7 +2805,7 @@
+ {
+     debugPrint("\nLOADSAVE: Backing up save slot files..\n");
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
+     strcpy(_str0, _gmpath);
+ 
+     strcat(_str0, "SAVE.DAT");
+@@ -2809,7 +2831,7 @@
+ 
+     _map_backup_count = fileListLength;
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
+     for (int index = fileListLength - 1; index >= 0; index--) {
+         strcpy(_str0, _gmpath);
+         strcat(_str0, fileList[index]);
+@@ -2856,7 +2878,7 @@
+ 
+     _EraseSave();
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
+     strcpy(_str0, _gmpath);
+     strcat(_str0, "SAVE.DAT");
+     _strmfe(_str1, _str0, "BAK");
+@@ -2882,7 +2904,7 @@
+         return -1;
+     }
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
+ 
+     for (int index = fileListLength - 1; index >= 0; index--) {
+         strcpy(_str0, _gmpath);
+@@ -2902,7 +2924,7 @@
+         return 0;
+     }
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
+     char* v1 = _strmfe(_str2, "AUTOMAP.DB", "BAK");
+     strcpy(_str0, _gmpath);
+     strcat(_str0, v1);
+@@ -2944,7 +2966,7 @@
+ {
+     debugPrint("\nLOADSAVE: Erasing save(bad) slot...\n");
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
+     strcpy(_str0, _gmpath);
+     strcat(_str0, "SAVE.DAT");
+     compat_remove(_str0);
+@@ -2958,7 +2980,7 @@
+         return -1;
+     }
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
+     for (int index = fileListLength - 1; index >= 0; index--) {
+         strcpy(_str0, _gmpath);
+         strcat(_str0, fileList[index]);
+@@ -2967,7 +2989,7 @@
+ 
+     fileNameListFree(&fileList, 0);
+ 
+-    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
++    snprintf(_gmpath, sizeof(_gmpath), "%s%s\\%s%.2d\\", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1);
+ 
+     char* v1 = _strmfe(_str1, "AUTOMAP.DB", "SAV");
+     strcpy(_str0, _gmpath);
+diff --git a/src/automap.cc b/src/automap.cc
+--- a/src/automap.cc
++++ b/src/automap.cc
+@@ -44,6 +44,28 @@
+ static int automapLoadHeader(File* stream);
+ static void _decode_map_data(int elevation);
+ static int automapCreate();
++
++/*
++ * ARGON: the game directory as a prefix, separator included, or nothing.
++ *
++ * See patches/fallout2-ce/0038 for why.  Every format below used to write the
++ * separator itself - "%s\\%s" - which turns an unset master_patches into a
++ * path from the root of the filesystem instead of a path from where the game
++ * is.  Now the separator belongs to the prefix and disappears with it.
++ */
++static const char* _patches_dir()
++{
++    static char buf[COMPAT_MAX_PATH];
++    const char* p = settings.system.master_patches_path.c_str();
++
++    if (p == nullptr || p[0] == '\0') {
++        buf[0] = '\0';
++        return buf;
++    }
++    snprintf(buf, sizeof(buf), "%s\\", p);
++    return buf;
++}
++
+ static int _copy_file_data(File* stream1, File* stream2, int length);
+ 
+ typedef enum AutomapFrm {
+@@ -272,7 +294,7 @@
+ void automapExit()
+ {
+     char path[COMPAT_MAX_PATH];
+-    snprintf(path, sizeof(path), "%s\\%s\\%s", settings.system.master_patches_path.c_str(), "MAPS", AUTOMAP_DB);
++    snprintf(path, sizeof(path), "%s%s\\%s", _patches_dir(), "MAPS", AUTOMAP_DB);
+     compat_remove(path);
+ }
+ 
+@@ -836,7 +858,7 @@
+ 
+         // NOTE: Not sure about the size.
+         char automapDbPath[512];
+-        snprintf(automapDbPath, sizeof(automapDbPath), "%s\\%s\\%s", settings.system.master_patches_path.c_str(), "MAPS", AUTOMAP_DB);
++        snprintf(automapDbPath, sizeof(automapDbPath), "%s%s\\%s", _patches_dir(), "MAPS", AUTOMAP_DB);
+         if (compat_remove(automapDbPath) != 0) {
+             debugPrint("\nAUTOMAP: Error removing database!\n");
+             return -1;
+@@ -844,7 +866,7 @@
+ 
+         // NOTE: Not sure about the size.
+         char automapTmpPath[512];
+-        snprintf(automapTmpPath, sizeof(automapTmpPath), "%s\\%s\\%s", settings.system.master_patches_path.c_str(), "MAPS", AUTOMAP_TMP);
++        snprintf(automapTmpPath, sizeof(automapTmpPath), "%s%s\\%s", _patches_dir(), "MAPS", AUTOMAP_TMP);
+         if (compat_rename(automapTmpPath, automapDbPath) != 0) {
+             debugPrint("\nAUTOMAP: Error renaming database!\n");
+             return -1;

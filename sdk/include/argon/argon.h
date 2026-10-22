@@ -17,6 +17,27 @@ extern "C" {
 #endif
 
 /*
+ * What the two objects AG_APP defines have to be declared with in C++.
+ *
+ * Both are found by name: mkaxe looks up __ag_app_header to read the metadata
+ * and g_ag_api to tell the loader which word to write the syscall table into.
+ * A C++ definition at namespace scope would be mangled, and the const one
+ * would also be given internal linkage by the language - so both would come
+ * out as something like _ZL15__ag_app_header, the tool would find neither, and
+ * an image would be built with an empty name and no stack or heap request.
+ * That failed quietly, once, which is why this exists.
+ *
+ * The macro is used inside AG_APP_SIZED rather than wrapping the header,
+ * because the macro expands at the application's file scope, where this block
+ * has long since closed.
+ */
+#ifdef __cplusplus
+#define AG_LINKAGE extern "C"
+#else
+#define AG_LINKAGE
+#endif
+
+/*
  * Declares the application image header and the API pointer slot.  Put this
  * once at file scope in the application's main translation unit:
  *
@@ -55,8 +76,8 @@ extern "C" {
  */
 #define AG_APP_SIZED(app_name, app_version, app_author, app_flags,           \
                      app_stack, app_heap)                                    \
-    const ag_api_t *g_ag_api = NULL;                                         \
-    __attribute__((used, section(".ag_header")))                             \
+    AG_LINKAGE const ag_api_t *g_ag_api = NULL;                              \
+    AG_LINKAGE __attribute__((used, section(".ag_header")))                  \
     const ag_app_header_t __ag_app_header = {                                \
         .magic = AG_AXE_MAGIC,                                               \
         .abi_major = AG_ABI_MAJOR,                                           \
@@ -106,6 +127,25 @@ static inline void ag_module_on_unload(void (*fn)(void))
     if (AG_HAS(g_ag_api->sys, module_on_unload)) {
         g_ag_api->sys->module_on_unload(fn);
     }
+}
+
+/*
+ * ABI 0.48: a task that belongs to this module, from ag_driver_init only.
+ *
+ * For the work a driver cannot do on the caller's thread - a wire that takes
+ * milliseconds, a socket that has to be accepted, a sensor that has to be read
+ * on a clock.  Tell it to stop from the ag_module_on_unload hook and let it
+ * return; unload waits for it, and a task that does not return keeps the image
+ * loaded rather than being executed out of freed memory.
+ */
+static inline bool ag_module_task(void (*fn)(void *), void *arg,
+                                  const char *name, uint32_t stack,
+                                  int priority, uint32_t flags)
+{
+    if (!AG_HAS(g_ag_api->sys, module_task)) {
+        return false;
+    }
+    return g_ag_api->sys->module_task(fn, arg, name, stack, priority, flags);
 }
 
 #define ag_log(lvl, tag, ...) (g_ag_api->sys->log((lvl), (tag), __VA_ARGS__))
@@ -167,6 +207,65 @@ static inline void ag_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
  * anything above ASCII - the byte for a Cyrillic letter is not the same in 866 as
  * in 1251, and 1251 has no box drawing at all.
  */
+/*
+ * The console's own cells, for an application that draws the console itself.
+ * `max` is how many cells `cells` holds; the answer is how many were written.
+ */
+/*
+ * A row of the screen belonging to another session slot (ABI 0.45).
+ *
+ * For a window drawing somebody else's prompt: that slot's screen is
+ * nowhere on the glass while this program holds it.
+ */
+static inline int32_t ag_con_peek_row_slot(int slot, uint16_t row,
+                                           ag_textcell_t *cells, uint16_t max)
+{
+    if (!AG_HAS(g_ag_api->con, peek_row_slot) ||
+        g_ag_api->con->peek_row_slot == NULL) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->con->peek_row_slot(slot, row, cells, max);
+}
+
+/* Where the cursor is on another slot's screen (ABI 0.46). */
+static inline bool ag_con_cursor_slot(int slot, uint16_t *x, uint16_t *y)
+{
+    if (!AG_HAS(g_ag_api->con, cursor_of_slot) ||
+        g_ag_api->con->cursor_of_slot == NULL) {
+        return false;
+    }
+    return g_ag_api->con->cursor_of_slot(slot, x, y) == 0;
+}
+
+/* Hand a key to the prompt living in a slot (ABI 0.45). */
+static inline bool ag_post_to_slot(int slot, const ag_event_t *e)
+{
+    if (!AG_HAS(g_ag_api->inp, post_to_slot) ||
+        g_ag_api->inp->post_to_slot == NULL) {
+        return false;
+    }
+    return g_ag_api->inp->post_to_slot(slot, e);
+}
+
+/* Give a slot a shell of its own; negative slot means any free one. */
+static inline int32_t ag_prompt_in_slot(int slot, const char *cwd)
+{
+    if (!AG_HAS(g_ag_api->sys, prompt_in_slot) ||
+        g_ag_api->sys->prompt_in_slot == NULL) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->sys->prompt_in_slot(slot, cwd);
+}
+
+static inline int32_t ag_con_peek_row(uint16_t row, ag_textcell_t *cells,
+                                      uint16_t max)
+{
+    if (!AG_HAS(g_ag_api->con, peek_row) || g_ag_api->con->peek_row == NULL) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->con->peek_row(row, cells, max);
+}
+
 static inline uint16_t ag_codepage(void) { return g_ag_api->con->codepage(); }
 static inline ag_err_t ag_set_codepage(uint16_t number)
 {
@@ -419,6 +518,35 @@ static inline ag_pid_t ag_getpid(void) { return g_ag_api->proc->self(); }
 static inline bool ag_interrupted(void)
 {
     return g_ag_api->proc->interrupted();
+}
+
+/* ---- moving to another board, by consent (ABI 0.53) -------------------- */
+/*
+ * See AG_AXE_CAN_MIGRATE in abi.h for the promise these implement, and
+ * apps/migrant/migrant.c for the whole shape in twenty lines.  Each answers
+ * safely on a kernel older than 0.53: nothing is wanted, nothing can be saved,
+ * and restore says "a fresh start".
+ */
+static inline bool ag_migrate_wanted(void)
+{
+    if (!AG_HAS(g_ag_api->proc, migrate_wanted)) {
+        return false;
+    }
+    return g_ag_api->proc->migrate_wanted();
+}
+static inline ag_err_t ag_migrate_save(const void *state, uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->proc, migrate_save)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->proc->migrate_save(state, len);
+}
+static inline int32_t ag_migrate_restore(void *out, uint32_t cap)
+{
+    if (!AG_HAS(g_ag_api->proc, migrate_restore)) {
+        return 0;
+    }
+    return g_ag_api->proc->migrate_restore(out, cap);
 }
 
 /*
@@ -809,6 +937,48 @@ static inline ag_err_t ag_ble_adv_status(ag_ble_adv_status_t *out)
     return g_ag_api->ble->adv_status(out);
 }
 
+/* Push bytes to the connected client as a GATT notification (board->phone,
+ * ABI 0.52).  One packet (<= the ATT MTU, ~180 bytes usable); chunk anything
+ * larger.  -AG_ENODEV until a client is connected, -AG_ENOSYS on an older
+ * kernel or a build with no BLE peripheral. */
+static inline ag_err_t ag_ble_adv_notify(const void *data, uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_notify)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_notify(data, len);
+}
+
+/* The oldest write a client made, in order (ABI 0.64): its length, 0 when none
+ * is waiting.  -AG_ENOSYS on an older kernel or without the peripheral. */
+static inline int32_t ag_ble_adv_recv(uint8_t *out, uint32_t max)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_recv)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->ble->adv_recv(out, max);
+}
+
+/* Bytes one ag_ble_adv_notify carries to the client there now (ABI 0.64); 0
+ * with nobody connected and subscribed, or on a kernel that cannot say. */
+static inline uint32_t ag_ble_adv_mtu(void)
+{
+    if (!AG_HAS(g_ag_api->ble, adv_mtu)) {
+        return 0u;
+    }
+    return g_ag_api->ble->adv_mtu();
+}
+
+/* Whether the system has the Bluetooth radio up (ABI 0.64).  False on a kernel
+ * that cannot say - a driver then leaves the radio alone, which is right. */
+static inline bool ag_ble_radio_on(void)
+{
+    if (!AG_HAS(g_ag_api->ble, radio_on)) {
+        return false;
+    }
+    return g_ag_api->ble->radio_on();
+}
+
 /* ---- BLE general: observer + GATT client (ABI 0.38) --------------------- */
 
 /*
@@ -1008,6 +1178,40 @@ static inline ag_err_t ag_net_close(ag_handle_t sock)
         return -AG_ENOSYS;
     }
     return g_ag_api->net->close(sock);
+}
+
+/*
+ * Throw a connection away instead of closing it (ABI 0.50).
+ *
+ * `ag_net_close` promises TCP will deliver what is queued, and against a peer
+ * that has stopped reading that promise is kept for ever - the connection, its
+ * queue and every buffer on it are held until something takes the interface
+ * down.  This resets it: the far end is told, the queue goes, the memory comes
+ * back now.
+ *
+ * Only for a peer already judged gone.  -AG_ENOSYS on a kernel older than the
+ * call, so a caller that wants either may fall back to close.
+ */
+/*
+ * Bytes of stack this task has never used (ABI 0.51), or 0 on a kernel that
+ * does not offer it - so a caller that must have an answer treats 0 as "do not
+ * risk it" or as "cannot tell", whichever is safe for what it was about to do.
+ */
+static inline uint32_t ag_stack_left(void)
+{
+    const ag_task_api_t *t = g_ag_api->task;
+    if (t == NULL || !AG_HAS(t, stack_left)) {
+        return 0u;
+    }
+    return t->stack_left();
+}
+
+static inline ag_err_t ag_net_reset(ag_handle_t sock)
+{
+    if (g_ag_api->net == NULL || !AG_HAS(g_ag_api->net, reset)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->net->reset(sock);
 }
 
 static inline ag_err_t ag_net_set_nonblock(ag_handle_t sock, bool on)
@@ -1307,6 +1511,127 @@ static inline uint32_t ag_wifi_espnow_dropped(void)
         return 0;
     }
     return g_ag_api->wifi->espnow_dropped();
+}
+
+/* ------------------------------------------------------------------------ */
+/* Threads of one job, across the nodes (ABI 0.52)                          */
+/* ------------------------------------------------------------------------ */
+/*
+ * The shape of a program that uses these, whole:
+ *
+ *     static void grind(ag_clu_tid_t self, const void *arg, uint32_t len);
+ *     static const ag_clu_entry_t k_entries[] = { { "grind", grind } };
+ *
+ *     int ag_main(int argc, char **argv)
+ *     {
+ *         if (ag_clu_start(k_entries, 1)) {
+ *             return 0;   // this copy was a worker; it has done its share
+ *         }
+ *         ag_clu_node_t n[4];
+ *         const int32_t nodes = ag_clu_nodes(n, 4);
+ *         for (int32_t i = 0; i < nodes; i++) {
+ *             for (uint8_t c = 0; c < n[i].cores; c++) {
+ *                 ag_clu_spawn(i, "grind", &job, sizeof(job));
+ *             }
+ *         }
+ *         ...collect with ag_clu_recv()...
+ *     }
+ *
+ * Every one of these answers -AG_ENOSYS on a kernel older than 0.52 rather than
+ * calling through a NULL table, so a program may use them and still start on an
+ * older system - where nodes() reports one node and nothing spreads anywhere.
+ */
+static inline int32_t ag_clu_nodes(ag_clu_node_t *out, uint32_t max)
+{
+    if (!AG_HAS(g_ag_api->clu, nodes)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->nodes(out, max);
+}
+static inline bool ag_clu_start(const ag_clu_entry_t *tab, uint32_t n)
+{
+    if (!AG_HAS(g_ag_api->clu, start)) {
+        return false;
+    }
+    return g_ag_api->clu->start(tab, n);
+}
+static inline ag_clu_tid_t ag_clu_spawn(int32_t node, const char *entry,
+                                        const void *arg, uint32_t len)
+{
+    if (!AG_HAS(g_ag_api->clu, spawn)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->spawn(node, entry, arg, len);
+}
+static inline ag_err_t ag_clu_send(ag_clu_tid_t dst, const void *buf,
+                                   uint32_t len, uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->clu, send)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->send(dst, buf, len, timeout_ms);
+}
+static inline int32_t ag_clu_recv(ag_clu_tid_t *from, void *buf, uint32_t cap,
+                                  uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->clu, recv)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->recv(from, buf, cap, timeout_ms);
+}
+static inline ag_err_t ag_clu_join(ag_clu_tid_t t, uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->clu, join)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->join(t, timeout_ms);
+}
+static inline ag_clu_tid_t ag_clu_self(void)
+{
+    if (!AG_HAS(g_ag_api->clu, self)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->clu->self();
+}
+static inline void ag_clu_done(void)
+{
+    if (AG_HAS(g_ag_api->clu, done)) {
+        g_ag_api->clu->done();
+    }
+}
+
+/* ---- the board as a USB device (ABI 0.55+) ------------------------------ */
+
+/*
+ * The card reader, on demand.  api->usbd is NULL unless the build has
+ * CONFIG_ARGON_USB_MSC (off by default) - probe before calling, or read
+ * -AG_ENOSYS back.  start() takes the USB port away from the console and
+ * becomes a mass-storage device whose callbacks are the application's own
+ * (see ag_usbd_msc_cbs_t); stop() tears it down and restores the console.
+ * The console is unreachable from its USB port for the whole session, so the
+ * application must end it on a host eject or a timeout, never a typed command.
+ */
+static inline bool ag_usbd_available(void) { return g_ag_api->usbd != NULL; }
+static inline ag_err_t ag_usbd_start(const ag_usbd_msc_cbs_t *cbs)
+{
+    if (g_ag_api->usbd == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->usbd->start(cbs);
+}
+static inline ag_err_t ag_usbd_stop(void)
+{
+    if (g_ag_api->usbd == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->usbd->stop();
+}
+static inline ag_err_t ag_usbd_status(ag_usbd_status_t *out)
+{
+    if (g_ag_api->usbd == NULL || g_ag_api->usbd->status == NULL) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->usbd->status(out);
 }
 
 #ifdef __cplusplus

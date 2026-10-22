@@ -4,8 +4,12 @@
  * Several apps may open this device at once.  Each open gets a private ring;
  * write() pushes interleaved s16 frames into that ring.  Whenever any client
  * has a full mix period, samples are summed (int32 → saturating s16) and
- * written to a single exclusive sink: pcmvirt if present, else pcm0, else
- * pcmnull.  Missing clients contribute silence for that period.
+ * written to a single exclusive sink: pcmvirt if present, then pcmrem, then
+ * pcm0, else pcmnull.  Missing clients contribute silence for that period.
+ *
+ * Each of those is looked for HERE and then on the node next door, so a board
+ * with no converter of its own plays through its neighbour rather than into
+ * pcmnull - quality first, distance only as the tie-break.  See devdefault.c.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -14,22 +18,36 @@
 #include <string.h>
 
 #include <argon/port/mem.h>
+#include <argon/port/task.h>
 
 #include "argon/board.h"
 #include "argon/device.h"
+#include "argon/devdefault.h"
 #include "argon/log.h"
 
 #define TAG "pcmmix"
 
 #define PCMMIX_CLIENTS     4
-#define PCMMIX_RING_BYTES  (4u * 1024u)
+/* members of a room group played into beside the sink (multiroom) */
+#define PCMMIX_ALSO        3
+/*
+ * 16 KB per client, which is 186 ms of 22 kHz stereo, and not four.
+ *
+ * A client's ring is what stands between "the program produced sound" and "the
+ * sink was ready for it", and on this machine the two can be a long way apart:
+ * the kernel holds the device registry across a whole blit, so while a screen
+ * is being pushed down a serial link the task with the samples cannot get in.
+ * Four kilobytes is 46 ms and the surplus is dropped silently - which is where
+ * the game's music went while its picture was being sent.
+ */
+#define PCMMIX_RING_BYTES  (16u * 1024u)
 #define PCMMIX_PERIOD      256u /* frames per mix tick */
 
 typedef struct pcmmix_client {
     int            used;
     ag_audio_fmt_t fmt;
     int            fmt_set;
-    uint8_t       *ring; /* PCMMIX_RING_BYTES in PSRAM (or internal fallback) */
+    uint8_t       *ring; /* PCMMIX_RING_BYTES, allocated while the client is open */
     size_t         ring_r;
     size_t         ring_w;
     size_t         ring_used;
@@ -47,16 +65,25 @@ typedef struct {
     ag_device_t     *sink;
     int              sink_held;
     char             sink_name[AG_DEV_NAME_MAX];
+    /* the other members of a chosen group (multiroom), open beside `sink` */
+    ag_device_t     *also[PCMMIX_ALSO];
+    int              also_n;
+    /* revoked under us and not yet closed (on_revoke): closed by the mixer's
+     * own task, outside the registry lock */
+    ag_device_t     *stale[PCMMIX_ALSO + 1];
+    volatile uint32_t stale_w, stale_r;
 
     uint64_t         bytes_out;
     uint64_t         bytes_drop_nosink;
     uint32_t         underrun_events;
+    int              nosink_said; /* so a silence is reported once, not per period */
     int16_t         *mix_scratch; /* PCMMIX_PERIOD * 2, heap */
 } pcmmix_state_t;
 
+static void *pcmmix_alloc(size_t n); /* PSRAM first, then internal */
+
 static pcmmix_state_t *s_st; /* heap/PSRAM — keep DRAM BSS tight */
 static ag_device_t    *s_dev;
-static uint8_t        *s_ring_pool; /* PCMMIX_CLIENTS * PCMMIX_RING_BYTES */
 
 static void default_fmt(ag_audio_fmt_t *out)
 {
@@ -160,21 +187,164 @@ static void ring_clear(pcmmix_client_t *c)
     c->ring_used = 0;
 }
 
+/*
+ * Best first, and this order is a fact about SOUND rather than about devices:
+ * a helper on the development machine, the wire to a second board, then the
+ * board's own converter, then the one that swallows it.  The registry cannot
+ * derive this and should not try - which is why the list stays here and only
+ * the looking moved out.
+ *
+ * pcmmix itself is absent from the list deliberately.  It is of class
+ * AG_DEV_AUDIO too, and a mixer that could choose itself as its own output is
+ * a loop with no bottom.
+ *
+ * pcmvirt and pcmrem are both published by a loadable driver, and a driver was
+ * loaded on purpose: nobody installs one and then wants the built-in output
+ * instead.  pcmrem is the wire to a second board (apps/remdisp), which on a
+ * machine whose amplifier is unsoldered is the only output there is - so it has
+ * to come ahead of pcm0, which would otherwise win by existing and play to
+ * nothing at all, indistinguishably from working.
+ */
+static const char *const k_audio_prefer[] = {"pcmvirt", "pcmrem", "pcm0",
+                                             "pcmnull", NULL};
+
+/*
+ * HERE OR ON THE NODE NEXT DOOR, and the road back to that line was the whole
+ * point of the lock work below it.
+ *
+ * This asked only for local hardware for two days, and the retreat was written
+ * down rather than quietly made: the mixer did choose the neighbour's
+ * converter, it worked, and then it intermittently froze the board - console
+ * stops answering and does not come back, in about half of runs.
+ *
+ * The cause, now proved rather than suspected: the registry held ONE recursive
+ * mutex across the whole of a driver's call, and the mixer's reach across the
+ * wire happens inside one.  While it waited for a round trip, nothing on this
+ * board could touch any device at all, the console included.  Bounding the
+ * wait to a second and a half changed nothing, which was the clue that the
+ * waiting was not the problem - the LOCK ACROSS THE WAITING was.
+ *
+ * An application opening a far device itself was never affected, and that is
+ * the same fact from the other side: it holds no other device's lock while it
+ * waits.
+ *
+ * The registry now lets its lock go for the length of a driver call and holds
+ * that device's own lock instead - open and close included, which is what this
+ * path uses.  So the question can be asked of the whole system again.
+ */
 static ag_device_t *pick_sink(void)
 {
-    ag_device_t *d = ag_dev_find("pcmvirt");
-    if (d != NULL) {
-        return d;
+    return ag_dev_default(AG_DEV_AUDIO, k_audio_prefer);
+}
+
+/*
+ * The sink went away under us.
+ *
+ * This was safe to leave out for as long as a sink was a kernel device that
+ * outlives everything.  It stopped being safe the moment the sink can be the
+ * NODE NEXT DOOR: a proxy disappears when the link drops or when somebody
+ * detaches it, and a held pointer into a slot that has been cleared is the
+ * use-after-free this tree has already had twice - the kind that does not
+ * crash, but answers with zeros.
+ *
+ * The registry lock is held here, so nothing in the registry may be called:
+ * not even the close that release_sink would do.  Drop the pointer and return.
+ * The mixer picks again on its next period, which is where the recovery
+ * belongs anyway - "the sound moved to the other board" should not need anyone
+ * to notice and act.
+ */
+/* A revoked handle still open keeps its device's slot AND ITS NAME until it is
+ * closed - so dropping the pointer without closing it kept /dev/cyd.pcm0
+ * taken for good: the CYD restarted, came back, and its converter "could not
+ * be registered here: -17" while the sound went to pcmnull (2 Oct 2026). */
+static void stale_add(ag_device_t *dev)
+{
+    const uint32_t n = PCMMIX_ALSO + 1u;
+    if (s_st->stale_w - s_st->stale_r < n) {
+        s_st->stale[s_st->stale_w % n] = dev;
+        s_st->stale_w++;
     }
-    d = ag_dev_find("pcm0");
-    if (d != NULL) {
-        return d;
+}
+
+static void stale_close(pcmmix_state_t *st)
+{
+    const uint32_t n = PCMMIX_ALSO + 1u;
+    while (st->stale_r != st->stale_w) {
+        (void)ag_dev_close(st->stale[st->stale_r % n]);
+        st->stale_r++;
     }
-    return ag_dev_find("pcmnull");
+}
+
+static void on_revoke(ag_device_t *dev)
+{
+    if (s_st != NULL && s_st->sink == dev) {
+        if (s_st->sink_held) {
+            stale_add(dev);
+        }
+        s_st->sink = NULL;
+        s_st->sink_held = 0;
+        s_st->sink_name[0] = '\0';
+    }
+    /* a room of a group left: the others play on */
+    for (int i = 0; s_st != NULL && i < s_st->also_n; i++) {
+        if (s_st->also[i] == dev) {
+            stale_add(dev);
+            s_st->also[i] = s_st->also[--s_st->also_n];
+            i--;
+        }
+    }
+}
+
+static void release_also(pcmmix_state_t *st)
+{
+    for (int i = 0; i < st->also_n; i++) {
+        (void)ag_dev_close(st->also[i]);
+    }
+    st->also_n = 0;
+}
+
+/*
+ * THE REST OF A GROUP, beside the sink.  Opened, set to the mixer's format
+ * and written every period after the sink - so each member is paced by its
+ * own write, as the one sink is (a neighbour's converter by its proxy's
+ * clock, noderdev.c pace_audio).  Asked every period like the sink, so a
+ * member that appears joins and one that goes is let go.
+ */
+static void ensure_also(pcmmix_state_t *st)
+{
+    ag_device_t *g[1 + PCMMIX_ALSO];
+    const int    n = ag_dev_default_group(AG_DEV_AUDIO, g, 1 + PCMMIX_ALSO);
+    int          want_n = 0;
+    ag_device_t *want[PCMMIX_ALSO];
+    for (int i = 0; i < n; i++) {
+        if (g[i] != st->sink && want_n < PCMMIX_ALSO) {
+            want[want_n++] = g[i];
+        }
+    }
+    bool same = (want_n == st->also_n);
+    for (int i = 0; same && i < want_n; i++) {
+        same = (want[i] == st->also[i]);
+    }
+    if (same) {
+        return;
+    }
+    release_also(st);
+    for (int i = 0; i < want_n; i++) {
+        if (ag_dev_open(want[i], AG_O_WRONLY) != AG_OK) {
+            continue;
+        }
+        ag_audio_fmt_t fmt = st->mix_fmt;
+        (void)ag_dev_ioctl(want[i], AG_IOC_AUDIO_SETFMT, &fmt, sizeof(fmt));
+        st->also[st->also_n++] = want[i];
+        ag_log(AG_LOG_INFO, TAG, "and /dev/%s, as the same room group",
+               want[i]->name);
+    }
 }
 
 static void release_sink(pcmmix_state_t *st)
 {
+    stale_close(st);
+    release_also(st);
     if (st->sink_held && st->sink != NULL) {
         (void)ag_dev_close(st->sink);
     }
@@ -238,6 +408,21 @@ static int client_has_period(const pcmmix_client_t *c, size_t fb)
     return c->used && c->fmt_set && c->ring_used >= fb * PCMMIX_PERIOD;
 }
 
+/*
+ * A PERIOD NOT PLAYED STILL TAKES ITS TIME (2 Oct 2026).  A sink paces its
+ * writers; without one, or with one that refuses, a period was gone in
+ * microseconds and a tone, writing as fast as it was taken, spun the board
+ * with the mixer's lock in its hand - beside a neighbour answering -12 the S3
+ * had no console left.  Dropped, it lasts as long as it would have played.
+ */
+static void period_pause(const pcmmix_state_t *st)
+{
+    if (st->mix_fmt.rate != 0u) {
+        const uint32_t ms = PCMMIX_PERIOD * 1000u / st->mix_fmt.rate;
+        ag_port_task_delay(ag_port_ms_to_ticks(ms > 0u ? ms : 1u));
+    }
+}
+
 static void mix_one_period(pcmmix_state_t *st)
 {
     const size_t fb = frame_bytes(&st->mix_fmt);
@@ -250,6 +435,7 @@ static void mix_one_period(pcmmix_state_t *st)
     int          any_data = 0;
     int32_t      n;
 
+    stale_close(st);
     memset(st->mix_scratch, 0, period_bytes);
 
     for (i = 0; i < PCMMIX_CLIENTS; i++) {
@@ -290,15 +476,37 @@ static void mix_one_period(pcmmix_state_t *st)
         return;
     }
 
-    if (ensure_sink(st) != AG_OK) {
-        st->bytes_drop_nosink += (uint64_t)period_bytes;
-        return;
+    {
+        const ag_err_t serr = ensure_sink(st);
+        if (serr != AG_OK) {
+            st->bytes_drop_nosink += (uint64_t)period_bytes;
+            /*
+             * Once per spell of silence, not once per period - a mixer that
+             * cannot place its output produces a period every few milliseconds
+             * and would bury the console.  Said at all because the symptom
+             * otherwise is silence, and silence is the one symptom that says
+             * nothing about its cause: a counter nobody reads is not an answer.
+             */
+            if (!st->nosink_said) {
+                st->nosink_said = 1;
+                ag_log(AG_LOG_WARN, TAG, "nowhere to send sound: %d",
+                       (int)serr);
+            }
+            period_pause(st);
+            return;
+        }
+        st->nosink_said = 0;
     }
     n = ag_dev_write(st->sink, st->mix_scratch, period_bytes, 0);
     if (n > 0) {
         st->bytes_out += (uint64_t)n;
     } else {
         st->bytes_drop_nosink += (uint64_t)period_bytes;
+        period_pause(st);
+    }
+    ensure_also(st);
+    for (i = 0; i < (size_t)st->also_n; i++) {
+        (void)ag_dev_write(st->also[i], st->mix_scratch, period_bytes, 0);
     }
 }
 
@@ -332,7 +540,10 @@ static pcmmix_client_t *alloc_client(pcmmix_state_t *st)
     for (i = 0; i < PCMMIX_CLIENTS; i++) {
         if (!st->clients[i].used) {
             pcmmix_client_t *c = &st->clients[i];
-            uint8_t         *ring = c->ring;
+            uint8_t *ring = (uint8_t *)pcmmix_alloc(PCMMIX_RING_BYTES);
+            if (ring == NULL) {
+                return NULL; /* no memory for a ring is no client */
+            }
             memset(c, 0, sizeof(*c));
             c->ring = ring;
             c->used = 1;
@@ -377,6 +588,8 @@ static ag_err_t mix_close_session(ag_device_t *dev, void *session)
     }
     c->used = 0;
     ring_clear(c);
+    ag_port_free(c->ring);
+    c->ring = NULL;
     if (s_st->client_count > 0) {
         s_st->client_count--;
     }
@@ -437,6 +650,10 @@ static ag_err_t mix_ioctl_session(ag_device_t *dev, void *session, uint32_t cmd,
         if (s_st->sink_held && s_st->sink != NULL) {
             ag_audio_fmt_t f = s_st->mix_fmt;
             (void)ag_dev_ioctl(s_st->sink, AG_IOC_AUDIO_SETFMT, &f, sizeof(f));
+        }
+        for (int k = 0; k < s_st->also_n; k++) {
+            ag_audio_fmt_t f = s_st->mix_fmt;
+            (void)ag_dev_ioctl(s_st->also[k], AG_IOC_AUDIO_SETFMT, &f, sizeof(f));
         }
         return AG_OK;
     }
@@ -519,8 +736,6 @@ static void *pcmmix_alloc(size_t n)
 
 ag_err_t ag_pcmmix_init(void)
 {
-    const size_t pool_bytes =
-        (size_t)PCMMIX_CLIENTS * (size_t)PCMMIX_RING_BYTES;
     const size_t scratch_bytes = PCMMIX_PERIOD * 2u * sizeof(int16_t);
     ag_dev_desc_t desc;
     ag_err_t      err;
@@ -534,21 +749,23 @@ ag_err_t ag_pcmmix_init(void)
     default_fmt(&s_st->mix_fmt);
     s_st->mix_fmt_set = 1;
 
+    /*
+     * No ring pool here any more.  Four clients' rings at sixteen kilobytes
+     * each is sixty-four, taken at boot whether anything ever opens the mixer
+     * or not - and on the CYD, which has 179 KB and plays its sound through
+     * pcm0 directly, that was the memory the picture receiver needed to load
+     * at all (`load remterm.axe failed (-12)`).  A ring is allocated when a
+     * client opens and freed when it closes; a board that never mixes never
+     * pays.
+     */
     s_st->mix_scratch = (int16_t *)pcmmix_alloc(scratch_bytes);
-    s_ring_pool = (uint8_t *)pcmmix_alloc(pool_bytes);
-    if (s_st->mix_scratch == NULL || s_ring_pool == NULL) {
-        ag_port_free(s_st->mix_scratch);
-        ag_port_free(s_ring_pool);
+    if (s_st->mix_scratch == NULL) {
         ag_port_free(s_st);
         s_st = NULL;
-        s_ring_pool = NULL;
         return -AG_ENOMEM;
     }
     memset(s_st->mix_scratch, 0, scratch_bytes);
-    memset(s_ring_pool, 0, pool_bytes);
-    for (i = 0; i < PCMMIX_CLIENTS; i++) {
-        s_st->clients[i].ring = s_ring_pool + i * PCMMIX_RING_BYTES;
-    }
+    (void)i;
 
     memset(&desc, 0, sizeof(desc));
     desc.name = "pcmmix";
@@ -560,14 +777,14 @@ ag_err_t ag_pcmmix_init(void)
     err = ag_dev_register(&desc, &s_dev);
     if (err != AG_OK) {
         ag_port_free(s_st->mix_scratch);
-        ag_port_free(s_ring_pool);
         ag_port_free(s_st);
         s_st = NULL;
-        s_ring_pool = NULL;
         return err;
     }
+    (void)ag_dev_on_revoke(on_revoke);
     ag_log(AG_LOG_INFO, TAG,
-           "pcmmix ready (sum %u clients → pcmvirt|pcm0|pcmnull)",
+           "pcmmix ready (sum %u clients → pcmvirt|pcmrem|pcm0|pcmnull, here "
+           "or on the node next door)",
            (unsigned)PCMMIX_CLIENTS);
     return AG_OK;
 }

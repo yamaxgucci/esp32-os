@@ -9,10 +9,15 @@
  */
 #include <stdarg.h>
 #include <stdio.h>
+#include <argon/session.h>
+#include <argon/shell.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
+#include <argon/cfg.h>
 #include <argon/journal.h>
+#include "core/sysconfig.h"
 
 #include <argon/codepage.h>
 #include <argon/console.h>
@@ -24,15 +29,20 @@
 #include <argon/input.h>
 #include <argon/kernel.h>
 #include <argon/keys.h>
+#include <argon/cfg.h>
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/module.h>
 #include <argon/net.h>
 #include <argon/power.h>
+#include <argon/clu.h>
+#include <argon/migrate.h>
 #include <argon/proc.h>
 #include <argon/shell.h>
 #include <argon/filemap.h>
 #include <argon/vfs.h>
+
+#include "core/sysconfig.h"
 
 #include <argon/port/config.h>
 
@@ -42,10 +52,37 @@
 #include <argon/port/task.h>
 #include <argon/port/wifi.h>
 #include <argon/port/camera.h>
+#include <argon/port/usbd.h>
+#include <argon/port/flash.h>
 
+#include "console/uart_console.h"
 #include "dev/io.h"
 #include "net/espnow.h"
 #include "net/wifimon.h"
+
+#if defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET
+#include <argon/netprov.h>
+#endif
+
+/*
+ * A radio the SYSTEM can reach, which since ABI 0.48 is not the same question
+ * as a radio on this chip: one bound with `net use` counts.  Whether there is
+ * one right now is a runtime matter (ag_netprov_has_wifi), and api->wifi cannot
+ * follow it - k_api is const, in flash, and shared read-only with every loaded
+ * application.  So the table is present whenever a radio is REACHABLE in
+ * principle, and each station call answers -AG_ENODEV while there is none.
+ *
+ * That is a real change of meaning for `api->wifi != NULL`, which used to say
+ * "this chip has a radio" and now says "this system could have one".  An
+ * application that wants the old answer asks wifi->status() and reads
+ * -AG_ENODEV; there was never a way to ask it without a call anyway, because a
+ * radio that is switched off looks the same from a table of pointers.
+ */
+#if AG_PORT_HAS_WIFI || (defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET)
+#define ARGON_API_HAS_WIFI 1
+#else
+#define ARGON_API_HAS_WIFI 0
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* sys                                                                    */
@@ -125,6 +162,15 @@ static void api_module_on_unload(void (*fn)(void))
     ag_module_on_unload(fn);
 }
 
+static bool api_module_task(void (*fn)(void *), void *arg, const char *name,
+                            uint32_t stack, int priority, uint32_t flags)
+{
+    return ag_module_task(fn, arg, name, stack, priority, flags);
+}
+
+/* Defined below, next to the other session-facing calls. */
+static int32_t api_prompt_in_slot(int slot, const char *cwd);
+
 static const ag_sys_api_t k_sys = {
     .size = sizeof(ag_sys_api_t),
     .info = api_info,
@@ -136,6 +182,8 @@ static const ag_sys_api_t k_sys = {
     .strerror = api_strerror,
     .heartbeat = api_heartbeat,
     .module_on_unload = api_module_on_unload,
+    .prompt_in_slot = api_prompt_in_slot,
+    .module_task = api_module_task,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -216,9 +264,30 @@ static void bg_stdout_write(const char *buf, size_t len)
     ag_log_app_write(me, name, buf, len);
 }
 
+/*
+ * May this process's WORDS go out through the console, rather than into the
+ * journal?  Only about output: the screen and the keyboard are asked about
+ * separately, below, and a guest gets neither.
+ *
+ * Focus is the right test for a program on this board - a background one must
+ * not scribble on the user's screen.  It is the wrong test for a program with
+ * somewhere of its own to write: a guest running here for another node is not
+ * asking for the shared screen at all, and putting its words in the journal
+ * instead means the node that asked for it hears nothing.
+ *
+ * This is exactly why the guest used to be started in the FOREGROUND here - to
+ * pass a test it should never have been sitting.  That cost this board its
+ * keyboard for as long as the guest lived, which for a migrated program is for
+ * ever.
+ */
+static bool words_reach_the_console(void)
+{
+    return ag_proc_out_sink(NULL, NULL) || has_console_focus();
+}
+
 static int32_t api_con_write(const char *buf, size_t len)
 {
-    if (!has_console_focus()) {
+    if (!words_reach_the_console()) {
         bg_stdout_write(buf, len);
         return (int32_t)len;
     }
@@ -231,7 +300,7 @@ static int32_t api_con_puts(const char *s)
     if (s == NULL) {
         return 0;
     }
-    if (!has_console_focus()) {
+    if (!words_reach_the_console()) {
         bg_stdout_write(s, strlen(s));
         if (s[0] != '\0' && s[strlen(s) - 1] != '\n') {
             bg_stdout_write("\n", 1);
@@ -244,7 +313,7 @@ static int32_t api_con_puts(const char *s)
 
 static int32_t api_con_vprintf(const char *fmt, va_list ap)
 {
-    if (!has_console_focus()) {
+    if (!words_reach_the_console()) {
         char buf[AG_JOURNAL_LINE_MAX];
         const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
         if (n <= 0) {
@@ -388,6 +457,154 @@ static void api_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, char ch,
     ag_console_unlock();
 }
 
+/*
+ * The console's cells, read back (ABI 0.43).
+ *
+ * Under the console lock, because a row is copied out of the live screen and
+ * the console writes to it from another task - a torn row would be a line of
+ * text with half of two different messages in it, which is the kind of thing
+ * that gets blamed on the reader.
+ */
+/*
+ * A row of another slot's screen.
+ *
+ * The permission is the same one api_peek_row asks for and it is asked for
+ * the same reason: the console belongs to the foreground, and a program
+ * that is not in front has no business reading what is on it.  What is
+ * different is WHICH screen - a slot with a prompt of its own has one
+ * nobody is looking at, and a window that draws it is the only way to see
+ * it.
+ */
+static int32_t api_peek_row_slot(int slot, uint16_t row, ag_textcell_t *cells,
+                                 uint16_t max)
+{
+    if (cells == NULL || max == 0) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t written = -AG_ENODEV;
+
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen_of_slot(slot);
+    if (sc != NULL && row < sc->rows) {
+        const ag_cell_t *src = ag_screen_row(sc, row);
+        if (src != NULL) {
+            uint16_t n = sc->cols;
+            if (n > max) {
+                n = max;
+            }
+            for (uint16_t i = 0; i < n; i++) {
+                cells[i].ch = (uint8_t)src[i].ch;
+                cells[i].attr = src[i].attr;
+            }
+            written = (int32_t)n;
+        }
+    }
+    ag_console_unlock();
+    return written;
+}
+
+/*
+ * Where the cursor is on another slot's screen.
+ *
+ * Same permission as reading its rows, and for the same reason: this is
+ * somebody else's screen, and only whatever is holding the glass has any
+ * business drawing it.
+ */
+static int32_t api_cursor_of_slot(int slot, uint16_t *x, uint16_t *y)
+{
+    if (x == NULL || y == NULL) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t err = -AG_ENODEV;
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen_of_slot(slot);
+    if (sc != NULL) {
+        *x = sc->cur_x;
+        *y = sc->cur_y;
+        err = 0;
+    }
+    ag_console_unlock();
+    return err;
+}
+
+/*
+ * Give a slot a shell of its own.  A slot below zero means any free one -
+ * a window asking for a prompt has no business choosing a number, and
+ * nothing in the ABI lets it see which are taken.
+ */
+static int32_t api_prompt_in_slot(int slot, const char *cwd)
+{
+    if (slot >= 0) {
+        const ag_err_t err = ag_shell_start_in_slot_at(slot, cwd);
+        return (err == AG_OK) ? (int32_t)slot : (int32_t)err;
+    }
+
+    /*
+     * A free slot is one with nothing RUNNING in it, not merely one with
+     * no prompt.  Asking only about the prompt put the first one in the
+     * caller's own slot - the desktop asks for this, and the desktop is
+     * itself the application sitting in slot 1.
+     */
+    ag_session_slot_t slots[AG_SESSION_SLOTS];
+    ag_session_info(slots);
+    for (int i = 0; i < AG_SESSION_SLOTS; i++) {
+        if (slots[i].pid != AG_PID_KERNEL) {
+            continue;
+        }
+        if (ag_shell_start_in_slot_at(i, cwd) == AG_OK) {
+            return (int32_t)i;
+        }
+    }
+    return -AG_ENOSPC;
+}
+
+static bool api_inp_post_to_slot(int slot, const ag_event_t *ev)
+{
+    if (ev == NULL || !has_console_focus()) {
+        return false;
+    }
+    return ag_console_post_to_slot(slot, ev);
+}
+
+static int32_t api_peek_row(uint16_t row, ag_textcell_t *cells, uint16_t max)
+{
+    if (cells == NULL || max == 0) {
+        return -AG_EINVAL;
+    }
+    if (!has_console_focus()) {
+        return -AG_EPERM;
+    }
+
+    int32_t written = -AG_ENODEV;
+
+    ag_console_lock();
+    const ag_screen_t *sc = ag_console_screen();
+    if (sc != NULL && row < sc->rows) {
+        const ag_cell_t *src = ag_screen_row(sc, row);
+        if (src != NULL) {
+            uint16_t n = sc->cols;
+            if (n > max) {
+                n = max;
+            }
+            for (uint16_t i = 0; i < n; i++) {
+                cells[i].ch = (uint8_t)src[i].ch;
+                cells[i].attr = src[i].attr;
+            }
+            written = (int32_t)n;
+        }
+    }
+    ag_console_unlock();
+    return written;
+}
+
 static uint16_t api_codepage(void) { return ag_cp_number(ag_cp_active()); }
 
 static ag_err_t api_set_codepage(uint16_t number)
@@ -423,6 +640,9 @@ static const ag_con_api_t k_con = {
     .fill = api_fill,
     .codepage = api_codepage,
     .set_codepage = api_set_codepage,
+    .peek_row = api_peek_row,
+    .peek_row_slot = api_peek_row_slot,
+    .cursor_of_slot = api_cursor_of_slot,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -603,6 +823,52 @@ static ag_err_t api_get_datetime(ag_datetime_t *out)
     return AG_OK;
 }
 
+/*
+ * Set the wall clock, UTC.
+ *
+ * The entry beside this one said `NULL, needs an RTC driver` for as long
+ * as it has existed, and that was two different questions treated as one.
+ * Keeping time across a power cut needs an RTC and none of these boards
+ * has one; KNOWING what the time is only needs somebody to say so, and
+ * until now the only somebody was a network time server - which the CYD
+ * cannot reach at all, because bringing its radio up damages its
+ * SYSTEM.CFG.  A machine that cannot be told the time by the person
+ * sitting in front of it is worse than one with no clock.
+ *
+ * It is lost at every power cut, and that is honest rather than
+ * regrettable: the shell draws an unset clock as --:-- rather than as
+ * half past midnight in 1970.
+ */
+static ag_err_t api_set_datetime(const ag_datetime_t *dt)
+{
+    if (dt == NULL || dt->year < 1970u || dt->month < 1u || dt->month > 12u ||
+        dt->day < 1u || dt->day > 31u || dt->hour > 23u || dt->minute > 59u ||
+        dt->second > 60u) {
+        return -AG_EINVAL;
+    }
+
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_year = (int)dt->year - 1900;
+    tm.tm_mon = (int)dt->month - 1;
+    tm.tm_mday = (int)dt->day;
+    tm.tm_hour = (int)dt->hour;
+    tm.tm_min = (int)dt->minute;
+    tm.tm_sec = (int)dt->second;
+    tm.tm_isdst = 0;
+
+    /* No timezone is set on the board, so mktime's "local" is UTC. */
+    const time_t t = mktime(&tm);
+    if (t == (time_t)-1) {
+        return -AG_EINVAL;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = t;
+    tv.tv_usec = 0;
+    return (settimeofday(&tv, NULL) == 0) ? AG_OK : -AG_EIO;
+}
+
 static const ag_time_api_t k_time = {
     .size = sizeof(ag_time_api_t),
     .us = api_us,
@@ -611,7 +877,7 @@ static const ag_time_api_t k_time = {
     .delay_ms = api_delay_ms,
     .delay_us = api_delay_us,
     .get_datetime = api_get_datetime,
-    .set_datetime = NULL, /* needs an RTC driver */
+    .set_datetime = api_set_datetime,
     .timer_create = NULL,
     .timer_delete = NULL,
 };
@@ -626,6 +892,30 @@ static const ag_time_api_t k_time = {
  * carry them.  Anything that draws its own screen - a file manager, an editor -
  * needs this rather than that.
  */
+/*
+ * One event from the console, if this process still has the keyboard when it
+ * arrives.
+ *
+ * A process waits inside ag_console_read_event for as long as it asked to, and
+ * the keyboard can move to another slot while it is in there.  What arrives
+ * next is then the new slot's, not this process's - and the first thing a slot
+ * switch sends is the QUIT that wakes the shell it lands on.  Taken by the
+ * application it left, that QUIT closed the application: the amplifier on the
+ * Audio Kit exited on Alt+2, "returned 0", for no reason it had.  So an event
+ * read after the keyboard has gone goes back for whoever has it now.
+ */
+static bool read_own_event(ag_event_t *out, uint32_t timeout_ms)
+{
+    if (!ag_console_read_event(out, timeout_ms)) {
+        return false;
+    }
+    if (has_the_keyboard()) {
+        return true;
+    }
+    (void)ag_console_inject_event(out);
+    return false;
+}
+
 static bool api_inp_poll(ag_event_t *out, uint32_t timeout_ms)
 {
     if (ag_proc_take_focus_event(out)) {
@@ -648,12 +938,12 @@ static bool api_inp_poll(ag_event_t *out, uint32_t timeout_ms)
                 return true;
             }
             if (has_the_keyboard()) {
-                return ag_console_read_event(out, left);
+                return read_own_event(out, left);
             }
         }
         return false;
     }
-    return ag_console_read_event(out, timeout_ms);
+    return read_own_event(out, timeout_ms);
 }
 
 static void api_inp_flush(void) { ag_console_flush_input(); }
@@ -685,6 +975,7 @@ static const ag_inp_api_t k_inp = {
     .btn = api_inp_btn,
     .btnp = api_inp_btnp,
     .inject = api_inp_inject,
+    .post_to_slot = api_inp_post_to_slot,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -846,7 +1137,11 @@ static ag_pid_t api_spawn(const char *path, int argc, const char **argv,
                           uint32_t flags)
 {
     ag_pid_t       pid = 0;
-    const ag_err_t err = ag_proc_spawn(path, argc, (char **)argv, flags, &pid);
+    /* The kernel's own bit is not for applications: their children are kept
+     * for them by parentage instead (held_for_collecting in proc.c), and one
+     * that set it and never waited would leave a zombie nothing collects. */
+    const ag_err_t err = ag_proc_spawn(path, argc, (char **)argv,
+                                       flags & ~AG_SPAWN_KERNEL_WAITS, &pid);
 
     return (err == AG_OK) ? pid : (ag_pid_t)err;
 }
@@ -894,6 +1189,111 @@ static ag_err_t api_power_declare(ag_power_fitness_t fitness, const char *why)
     return err;
 }
 
+/*
+ * Raw flash stores (ABI 0.45).
+ *
+ * A thin pass-through to the port, with one rule enforced here and nowhere
+ * else: only subtype 0x41 may be opened.  ag_port_part_find already refuses
+ * anything that is not a data partition, so the firmware is safe from a typo,
+ * but C: (littlefs, subtype 0x82) and nvs are data partitions too and an
+ * application that could erase those could wipe the machine's configuration.
+ * One comparison is the entire difference between "a store of my own" and
+ * "any storage on the machine".
+ */
+#define AG_STORE_SUBTYPE 0x41u
+
+static ag_store_t api_store_open(const char *label)
+{
+    if (label == NULL || *label == '\0') {
+        return NULL;
+    }
+
+    ag_port_part_t p = ag_port_part_find(label);
+
+    if (p == NULL || ag_port_part_subtype(p) != AG_STORE_SUBTYPE) {
+        return NULL;
+    }
+    return (ag_store_t)p;
+}
+
+static uint64_t api_store_bytes(ag_store_t s)
+{
+    return ag_port_part_size((ag_port_part_t)s);
+}
+
+static uint32_t api_store_erase_size(ag_store_t s)
+{
+    return ag_port_part_erase_size((ag_port_part_t)s);
+}
+
+/* Every call re-checks the handle: it came from an application, so it is a
+ * number the application can make up, and a made-up one must not reach the
+ * flash driver. */
+static bool store_ok(ag_store_t s)
+{
+    return s != NULL && ag_port_part_subtype((ag_port_part_t)s) == AG_STORE_SUBTYPE;
+}
+
+static ag_err_t api_store_read(ag_store_t s, uint64_t off, void *buf,
+                               size_t len)
+{
+    if (!store_ok(s) || buf == NULL) {
+        return AG_EINVAL;
+    }
+    return ag_port_part_read((ag_port_part_t)s, off, buf, len);
+}
+
+static ag_err_t api_store_write(ag_store_t s, uint64_t off, const void *buf,
+                                size_t len)
+{
+    if (!store_ok(s) || buf == NULL) {
+        return AG_EINVAL;
+    }
+    return ag_port_part_write((ag_port_part_t)s, off, buf, len);
+}
+
+static ag_err_t api_store_erase(ag_store_t s, uint64_t off, size_t len)
+{
+    if (!store_ok(s)) {
+        return AG_EINVAL;
+    }
+    return ag_port_part_erase((ag_port_part_t)s, off, len);
+}
+
+static ag_err_t api_store_map(ag_store_t s, uint64_t off, size_t len,
+                              const void **addr, ag_store_map_t *out)
+{
+    if (!store_ok(s) || addr == NULL || out == NULL) {
+        return AG_EINVAL;
+    }
+
+    ag_port_map_t h = 0;
+    const ag_err_t err = ag_port_part_map_data((ag_port_part_t)s, off, len,
+                                               addr, &h);
+
+    *out = (ag_store_map_t)h;
+    return err;
+}
+
+static void api_store_unmap(ag_store_map_t h)
+{
+    if (h != 0) {
+        ag_port_part_unmap((ag_port_map_t)h);
+    }
+}
+
+static const ag_store_api_t k_store = {
+    .size = sizeof(ag_store_api_t),
+    .open = api_store_open,
+    .bytes = api_store_bytes,
+    .erase_size = api_store_erase_size,
+    .read = api_store_read,
+    .write = api_store_write,
+    .erase = api_store_erase,
+    .map = api_store_map,
+    .unmap = api_store_unmap,
+};
+
 static const ag_power_api_t k_power = {
     .size = sizeof(ag_power_api_t),
     .status = api_power_status,
@@ -915,6 +1315,9 @@ static const ag_proc_api_t k_proc = {
     .interrupted = ag_proc_interrupted,
     .watchdog = ag_proc_watchdog,
     .focused = ag_proc_focused,
+    .migrate_wanted = ag_migrate_wanted,
+    .migrate_save = ag_migrate_save,
+    .migrate_restore = ag_migrate_restore,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -993,7 +1396,31 @@ static ag_err_t api_ble_adv_status(ag_ble_adv_status_t *out)
 {
     return ag_port_ble_adv_status(out);
 }
+
+static ag_err_t api_ble_adv_notify(const void *data, uint32_t len)
+{
+    return ag_port_ble_adv_notify(data, len);
+}
+
+static int32_t api_ble_adv_recv(uint8_t *out, uint32_t max)
+{
+    return ag_port_ble_adv_recv(out, max);
+}
+
+static uint32_t api_ble_adv_mtu(void) { return ag_port_ble_adv_mtu(); }
 #endif /* AG_PORT_HAS_BLE_PERIPH */
+
+/*
+ * Whether the system has the radio up.  Asked by a driver that serves over BLE
+ * and must not raise the radio itself: `bt on` and `[bt] on` are the system's
+ * decision, as `wifi on` is, and a driver that turned it on would be taking
+ * about a hundred kilobytes nobody gave it.
+ */
+static bool api_ble_radio_on(void)
+{
+    ag_port_bt_status_t st;
+    return ag_port_bt_status(&st) == AG_OK && st.state != AG_BT_OFF;
+}
 
 #if AG_PORT_HAS_BLE_CENTRAL
 static ag_err_t api_ble_scan(ag_ble_dev_t *out, uint32_t max, uint32_t *found,
@@ -1075,7 +1502,11 @@ static const ag_ble_api_t k_ble = {
 #endif
 #if AG_PORT_HAS_BLE_PERIPH
     .adv_raw = api_ble_adv_raw,
+    .adv_notify = api_ble_adv_notify,
+    .adv_recv = api_ble_adv_recv,
+    .adv_mtu = api_ble_adv_mtu,
 #endif
+    .radio_on = api_ble_radio_on,
 };
 #endif /* AG_PORT_HAS_BLE_PERIPH || AG_PORT_HAS_BLE_CENTRAL */
 
@@ -1166,16 +1597,48 @@ static const ag_wifimon_api_t k_wifimon = {
 };
 #endif /* AG_PORT_HAS_WIFIMON */
 
-#if AG_PORT_HAS_WIFI
+#if ARGON_API_HAS_WIFI
 /*
  * The rest of the radio for applications (ABI 0.39): station, access point and
- * ESP-NOW.  Each call is a thin pass to the same port and kernel layer the
- * shell's `wifi` and `espnow` commands drive (src/shell/shell.c), so an
- * application and the prompt reach the radio through one implementation.  The
- * only work done here is raising the radio when a call needs it and converting
- * the port's structs into the ABI's - the ABI cannot name the GPL port types,
- * so the two are kept field-for-field parallel and copied across.
+ * ESP-NOW.  Each call is a thin pass to the same layer the shell's `wifi` and
+ * `espnow` commands drive, so an application and the prompt reach the radio
+ * through one implementation.
+ *
+ * The station six go through ag_netprov_wifi_* (ABI 0.48), which is why this
+ * block is no longer gated on this chip having a radio: the radio may be a
+ * coprocessor on a wire, bound with `net use`, and an application must not be
+ * able to tell.  The port conversion that used to live here moved to
+ * netprov.c, where it is now one provider among two.
+ *
+ * The access point and ESP-NOW halves did NOT move.  They stay gated on the
+ * built-in radio because there is nothing yet on the far end of a wire to ask -
+ * RLINK carries the station half and no more - and a stub answering -AG_ENOTSUP
+ * is worse than an entry AG_HAS reports as absent.
  */
+static ag_err_t api_wifi_start(void) { return ag_netprov_wifi_start(); }
+static ag_err_t api_wifi_stop(void) { return ag_netprov_wifi_stop(); }
+
+static ag_err_t api_wifi_scan(ag_wifi_ap_t *out, uint32_t max, uint32_t *found)
+{
+    return ag_netprov_wifi_scan(out, max, found);
+}
+
+static ag_err_t api_wifi_connect(const char *ssid, const char *pass,
+                                 const uint8_t bssid[6])
+{
+    return ag_netprov_wifi_connect(ssid, pass, bssid);
+}
+
+static ag_err_t api_wifi_disconnect(void) { return ag_netprov_wifi_disconnect(); }
+
+static ag_err_t api_wifi_status(ag_wifi_status_t *out)
+{
+    return ag_netprov_wifi_status(out);
+}
+#endif /* ARGON_API_HAS_WIFI */
+
+#if AG_PORT_HAS_WIFI
+/* Raising this chip's own radio, for the two halves that only it has. */
 static ag_err_t api_wifi_radio_up(void)
 {
     ag_powerctl_bus_needed();
@@ -1183,78 +1646,6 @@ static ag_err_t api_wifi_radio_up(void)
     if (ag_port_wifi_status(&st) != AG_OK || st.state == AG_WIFI_OFF) {
         return ag_net_init();
     }
-    return AG_OK;
-}
-
-static ag_err_t api_wifi_start(void) { return api_wifi_radio_up(); }
-static ag_err_t api_wifi_stop(void) { return ag_port_wifi_stop(); }
-
-static ag_err_t api_wifi_scan(ag_wifi_ap_t *out, uint32_t max, uint32_t *found)
-{
-    if (out == NULL || max == 0u) {
-        return -AG_EINVAL;
-    }
-    const ag_err_t up = api_wifi_radio_up();
-    if (up != AG_OK) {
-        return up;
-    }
-    /*
-     * No heap here.  The port fills at most sixteen records from a stack buffer
-     * of its own, so a matching stack buffer converts them without an
-     * allocation - which matters because with the radio up and an application
-     * resident on this board, a few hundred spare bytes of heap is exactly what
-     * there is not, and a scan that failed only because the conversion buffer
-     * could not be allocated read as -AG_ENOMEM for a scan that would have
-     * worked.  `found` still reports every access point the radio heard.
-     */
-    ag_port_wifi_ap_t tmp[16];
-    uint32_t          cap = (max < 16u) ? max : 16u;
-    uint32_t          n = 0;
-    const ag_err_t    err = ag_port_wifi_scan(tmp, cap, &n);
-    if (err == AG_OK) {
-        const uint32_t copy = (n < cap) ? n : cap;
-        for (uint32_t i = 0; i < copy; i++) {
-            memcpy(out[i].ssid, tmp[i].ssid, sizeof(out[i].ssid));
-            memcpy(out[i].bssid, tmp[i].bssid, 6u);
-            out[i].rssi = tmp[i].rssi;
-            out[i].channel = tmp[i].channel;
-            out[i].auth = (uint8_t)tmp[i].auth;
-        }
-        if (found != NULL) {
-            *found = n;
-        }
-    }
-    return err;
-}
-
-static ag_err_t api_wifi_connect(const char *ssid, const char *pass,
-                                 const uint8_t bssid[6])
-{
-    ag_powerctl_bus_needed();
-    return ag_port_wifi_connect(ssid, pass, bssid);
-}
-
-static ag_err_t api_wifi_disconnect(void) { return ag_port_wifi_disconnect(); }
-
-static ag_err_t api_wifi_status(ag_wifi_status_t *out)
-{
-    if (out == NULL) {
-        return -AG_EINVAL;
-    }
-    ag_port_wifi_status_t st;
-    const ag_err_t        err = ag_port_wifi_status(&st);
-    if (err != AG_OK) {
-        return err;
-    }
-    memset(out, 0, sizeof(*out));
-    out->state = (uint8_t)st.state;
-    memcpy(out->ssid, st.ssid, sizeof(out->ssid));
-    memcpy(out->bssid, st.bssid, 6u);
-    out->pinned = st.pinned;
-    out->rssi = st.rssi;
-    out->channel = st.channel;
-    out->attempts = st.attempts;
-    out->last_reason = (int32_t)st.last_reason;
     return AG_OK;
 }
 
@@ -1340,7 +1731,9 @@ static int32_t api_wifi_espnow_recv(uint8_t mac[6], void *buf, uint32_t max,
 }
 static uint32_t api_wifi_espnow_dropped(void) { return ag_espnow_dropped(); }
 #endif /* AG_PORT_HAS_ESPNOW */
+#endif /* AG_PORT_HAS_WIFI */
 
+#if ARGON_API_HAS_WIFI
 static const ag_wifi_api_t k_wifi = {
     .size = sizeof(ag_wifi_api_t),
     .start = api_wifi_start,
@@ -1365,7 +1758,7 @@ static const ag_wifi_api_t k_wifi = {
     .espnow_dropped = api_wifi_espnow_dropped,
 #endif
 };
-#endif /* AG_PORT_HAS_WIFI */
+#endif /* ARGON_API_HAS_WIFI */
 
 #if defined(CONFIG_ARGON_ENABLE_CAMERA) && CONFIG_ARGON_ENABLE_CAMERA
 /* The DVP transport, straight from the port - the sensor driver is a .SYS. */
@@ -1376,6 +1769,118 @@ static const ag_cam_api_t k_cam = {
     .stop = ag_port_cam_stop,
 };
 #endif
+
+#if AG_PORT_HAS_USBD
+/*
+ * The card reader, ABI 0.55.  The application owns everything - which device to
+ * lend, read-only versus writable, the stop condition, what to print - and the
+ * port owns only the drivers and the PHY.  This wrapper owns the one thing that
+ * is neither's: the console ENDPOINT.  It is detached before the port takes the
+ * PHY, so the console task stops writing to a peripheral that is about to vanish,
+ * and re-attached after the port restores it.  The detach/attach pair is why the
+ * stop condition must never be a typed command: while TinyUSB owns the PHY the
+ * console is unreachable, so the application ends the session on a host eject or
+ * a timeout.
+ */
+static ag_err_t api_usbd_start(const ag_usbd_msc_cbs_t *cbs)
+{
+    if (cbs == NULL) {
+        return -AG_EINVAL;
+    }
+    ag_uart_console_detach(AG_PORT_UART_CONSOLE);
+    const ag_err_t err = ag_port_usbd_start(cbs);
+    if (err != AG_OK) {
+        (void)ag_uart_console_attach(AG_PORT_UART_CONSOLE, 115200);
+    }
+    return err;
+}
+
+static ag_err_t api_usbd_stop(void)
+{
+    const ag_err_t err = ag_port_usbd_stop();
+    /* Re-attach the console even if the port teardown half-failed: a console
+     * that does not come back is the one failure the operator cannot recover
+     * from without a power cycle. */
+    (void)ag_uart_console_attach(AG_PORT_UART_CONSOLE, 115200);
+    return err;
+}
+
+static ag_err_t api_usbd_status(ag_usbd_status_t *out)
+{
+    return ag_port_usbd_status(out);
+}
+
+static const ag_usbd_api_t k_usbd = {
+    .size = sizeof(ag_usbd_api_t),
+    .start = api_usbd_start,
+    .stop = api_usbd_stop,
+    .status = api_usbd_status,
+};
+#endif /* AG_PORT_HAS_USBD */
+
+/* ----------------------------------------------------------------------- */
+/* cfg - read the system/board configuration (SYSTEM.CFG + BOARD.CFG).      */
+/*                                                                          */
+/* Read-only for now: a driver reads its own keys (a radio its ssid, a      */
+/* panel its rotation).  Writing back to SYSTEM.CFG is the owner's job      */
+/* through the shell, so set_str/commit answer -AG_ENOTSUP rather than      */
+/* pretend.  Without this table api->cfg was NULL and every `.SYS`/`.AXE`   */
+/* silently saw no configuration at all.                                    */
+/* ----------------------------------------------------------------------- */
+static ag_err_t api_cfg_get_str(const char *key, char *buf, size_t len)
+{
+    if (key == NULL || buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+    buf[0] = '\0';
+    const ag_cfg_t *cfg = ag_sysconfig();
+    if (cfg == NULL) {
+        return -AG_ENOENT;
+    }
+    const char *val = ag_cfg_get(cfg, key, NULL);
+    if (val == NULL) {
+        return -AG_ENOENT;
+    }
+    size_t i = 0;
+    for (; val[i] != '\0' && i + 1 < len; i++) {
+        buf[i] = val[i];
+    }
+    buf[i] = '\0';
+    return AG_OK;
+}
+
+static int32_t api_cfg_get_int(const char *key, int32_t def)
+{
+    const ag_cfg_t *cfg = ag_sysconfig();
+    return (cfg == NULL) ? def : ag_cfg_get_int(cfg, key, def);
+}
+
+static bool api_cfg_get_bool(const char *key, bool def)
+{
+    const ag_cfg_t *cfg = ag_sysconfig();
+    return (cfg == NULL) ? def : ag_cfg_get_bool(cfg, key, def);
+}
+
+static ag_err_t api_cfg_set_str(const char *key, const char *value)
+{
+    (void)key;
+    (void)value;
+    return -AG_ENOTSUP;
+}
+
+static ag_err_t api_cfg_commit(void)
+{
+    return -AG_ENOTSUP;
+}
+
+static const ag_cfg_api_t k_cfg = {
+    .size = sizeof(ag_cfg_api_t),
+    .get_str = api_cfg_get_str,
+    .get_int = api_cfg_get_int,
+    .get_bool = api_cfg_get_bool,
+    .set_str = api_cfg_set_str,
+    .commit = api_cfg_commit,
+};
 
 static const ag_api_t k_api = {
     .size = sizeof(ag_api_t),
@@ -1392,7 +1897,7 @@ static const ag_api_t k_api = {
     .time = &k_time,
     .task = &ag_task_api_table,
     .proc = &k_proc,
-    .cfg = NULL,
+    .cfg = &k_cfg,
 #if defined(CONFIG_ARGON_ENABLE_NET) && CONFIG_ARGON_ENABLE_NET
     .net = &ag_net_api_impl,
 #else
@@ -1405,12 +1910,13 @@ static const ag_api_t k_api = {
     .ble = NULL,
 #endif
     .power = &k_power,
+    .store = &k_store,
 #if AG_PORT_HAS_WIFIMON
     .wifimon = &k_wifimon,
 #else
     .wifimon = NULL,
 #endif
-#if AG_PORT_HAS_WIFI
+#if ARGON_API_HAS_WIFI
     .wifi = &k_wifi,
 #else
     .wifi = NULL,
@@ -1419,6 +1925,17 @@ static const ag_api_t k_api = {
     .cam = &k_cam,
 #else
     .cam = NULL,
+#endif
+    /*
+     * Never conditional.  A board with no link still has nodes() - itself - and
+     * still runs every thread of a job locally, so a program written against
+     * this runs on one board and on four without being rebuilt.
+     */
+    .clu = &ag_clu_api_table,
+#if AG_PORT_HAS_USBD
+    .usbd = &k_usbd,
+#else
+    .usbd = NULL,
 #endif
 };
 

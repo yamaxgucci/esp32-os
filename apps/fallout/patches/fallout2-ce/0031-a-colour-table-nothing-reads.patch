@@ -1,0 +1,66 @@
+--- a/src/color.cc
++++ b/src/color.cc
+@@ -1,6 +1,7 @@
+ #include "color.h"
+ 
+ #include <math.h>
++#include <stdio.h>   // ARGON: SEEK_CUR, for the table this no longer reads
+ #include <string.h>
+ 
+ #include <algorithm>
+@@ -68,7 +69,13 @@
+ Color intensityColorTable[256][256];
+ 
+ // 0x6938D0
+-Color colorMixMulTable[256][256];
++// ARGON: colorMixMulTable is gone.  It was 64 KB of the image's data, and the
++// image's data and the process arena come out of the same eight megabytes -
++// every kilobyte here is a kilobyte the map cannot have.  The engine fills this
++// table twice over, from the palette and again from the file, and then reads it
++// nowhere: `grep colorMixMulTable` over the whole tree finds the definition,
++// three stores, one fileRead and the extern, and no load at all.  Its sibling
++// colorMixAddTable *is* read - once, in object.cc - and stays.
+ 
+ // 0x6A38D0
+ unsigned char _colorTable[32768];
+@@ -276,15 +283,13 @@
+             v27 = (v21 * v24) >> 5;
+             v28 = (v22 * v25) >> 5;
+ 
+-            v29 = (v26 << 10) | (v27 << 5) | v28;
+-            colorMixMulTable[a1][i] = _colorTable[v29];
++            // ARGON: the multiply half of this is computed and then dropped;
++            // the table it was written to no longer exists.
+         } else {
+             if (_mappedColor[i]) {
+                 colorMixAddTable[a1][i] = i;
+-                colorMixMulTable[a1][i] = i;
+             } else {
+                 colorMixAddTable[a1][i] = a1;
+-                colorMixMulTable[a1][i] = a1;
+             }
+         }
+     }
+@@ -347,8 +352,10 @@
+         // NOTE: Uninline.
+         fileRead(colorMixAddTable, sizeof(colorMixAddTable), 1, stream);
+ 
+-        // NOTE: Uninline.
+-        fileRead(colorMixMulTable, sizeof(colorMixMulTable), 1, stream);
++        // ARGON: stepped over rather than read.  The bytes are still in the
++        // file and anything after them would land in the wrong place, so the
++        // seek has to happen even though the table is gone.
++        fileSeek(stream, 256 * 256, SEEK_CUR);
+     } else {
+         _setIntensityTables();
+ 
+--- a/src/color.h
++++ b/src/color.h
+@@ -15,7 +15,6 @@
+ extern unsigned char _mappedColor[256];
+ extern Color colorMixAddTable[256][256];
+ extern Color intensityColorTable[256][256];
+-extern Color colorMixMulTable[256][256];
+ extern unsigned char _colorTable[32768];
+ 
+ int _calculateColor(int intensity, Color color);

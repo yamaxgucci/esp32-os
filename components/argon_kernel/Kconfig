@@ -1,5 +1,27 @@
 menu "ArgonOS"
 
+    config ARGON_DEV_MAX
+        int "Devices the registry can hold"
+        range 16 64
+        default 24
+        help
+            How many devices can exist at once, this board's own and any it
+            has borrowed from a neighbour.
+
+            A bound rather than a list that grows, on purpose: a bound that is
+            reached is a diagnosable event, and the registry has to work when
+            memory is short.  Each entry is about seventy bytes of internal
+            SRAM, and every board pays for all of them - so this is a number to
+            raise for a board that is in a cluster, and to leave alone for one
+            that is not.
+
+            Twenty-four is exactly one short of the pair on the desk: a C3 with
+            ten of its own, pulling fifteen from a CYD, registers thirteen and
+            refuses the last two - which were the SCREEN and the touchscreen,
+            because loadable drivers register after built-in ones and what
+            falls off the end is always the interesting half.  It refused them
+            with -AG_ENFILE and, until this was found, without a word.
+
     config ARGON_APP_ARENA_KB
         int "Application code arena, KB"
         range 4 192
@@ -64,6 +86,25 @@ menu "ArgonOS"
             the tree several times over.  The internal-SRAM static buffer is not
             linked at all in this mode, which is the point - the internal memory
             it would have taken stays free for the radios.
+
+    config ARGON_PLACE_KERNEL_STATIC_PSRAM
+        bool "[memory] kernel.static = psram"
+        default n
+        help
+            The kernel's static tables - the VFS's, the configuration's, the
+            pins', the key stamps', the small cluster buffers - in PSRAM
+            rather than internal SRAM.  Written by `argon target` / `argon
+            build` from the board pack's [memory] section, not by hand: see
+            argon/place.h.  Needs SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY, which
+            also moves Wi-Fi's and lwIP's tables (IDF does that itself).
+
+    config ARGON_PLACE_DEV_TABLE_PSRAM
+        bool "[memory] dev.table = psram"
+        default n
+        help
+            The device table in PSRAM.  Every device call reads it, so on the
+            S3-Zero this cost a program crunching PSRAM tables 2% of a core
+            (9 Oct 2026).  From the board pack's [memory] section.
 
     config ARGON_APP_STACK_KB
         int "Default application stack, KB"
@@ -618,6 +659,28 @@ menu "ArgonOS"
             `argon target esp32s3-kvm` selects).  Without one the interface is
             still published and the drive simply has no media - a state a host
             understands and a person can see.
+    config ARGON_USB_MSC
+        bool "USB device: mass-storage card reader (read-only)"
+        depends on SOC_USB_OTG_SUPPORTED
+        default n
+        help
+            The USB-OTG peripheral as a DEVICE that exposes the SD card as a
+            USB mass-storage volume, so a PC can copy files off the card with
+            no card reader.  Stage 1 is read-only on purpose: the write hook is
+            refused and the host mounts the volume read-only, which cannot
+            corrupt the card.
+
+            This takes the one USB port the board has away from the console.
+            On a board whose console is the native USB-Serial-JTAG the two
+            cannot run at once (one internal PHY, two owners), so starting a
+            session silently drops the console until it ends.  The session is
+            therefore started by an operator command - the usbmsc application -
+            never from the boot path, and it ends on a host eject or a timeout,
+            never a typed command.
+
+            Off by default and only on chips with the OTG peripheral.  Not
+            verifiable in QEMU, which models no USB device - the gate is the
+            board.
 
     config ARGON_CONSOLE_COLS
         int "Console width, characters"
@@ -637,9 +700,17 @@ menu "ArgonOS"
             forty by thirty, and a console wider than the only screen attached
             to the machine is one whose right-hand half nobody ever sees.
 
-            Not a runtime setting, and not in BOARD.CFG: the console is built
-            three stages before any file has been read, and everything printed
-            during those stages would be lost by rebuilding it afterwards.
+            This is the size the console STARTS at, not the size it keeps.
+            It is a build option because the console is built three stages
+            before any file has been read, and everything printed during those
+            stages would be lost by rebuilding it afterwards.
+
+            What a flashed board changes is `[console] cols/rows` in
+            SYSTEM.CFG, applied once the devices are up; `auto` there takes
+            the size from the panel that is actually attached.  `mode con
+            cols=40 lines=25` at the prompt tries a size without a reset.
+            So leave this at 80x25 unless the board's built-in screen is the
+            only one it will ever have.
 
     config ARGON_ENABLE_HOSTFS
         bool "HostFS (H:, live host folder over UART1)"

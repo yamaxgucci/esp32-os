@@ -1,0 +1,126 @@
+# ArgonOS - Waveshare ESP32-S3-Touch-LCD-2 (SKU 29667/29668).
+#
+#   argon target esp32s3-lcd2
+#
+# An overlay on sdkconfig.defaults.esp32s3, which is the primary target and the
+# one QEMU runs.  What differs is a real board's flash size and partition
+# layout, and one question about the console at the bottom.
+
+# 16 MB, NOT 8.  sdkconfig.defaults.esp32s3 says in its own comment that it
+# assumes an N16R8 module - 16 MB flash, 8 MB octal PSRAM - and then sets
+# CONFIG_ESPTOOLPY_FLASHSIZE_8MB, which is what the emulator and the S3-CAM
+# board have been built with.  This board's part really is 16 MB: the vendor's
+# own generated sdkconfig for their examples says CONFIG_ESPTOOLPY_FLASHSIZE
+# "16MB".  Left at 8 the top half of the part would be unreachable, and the
+# partition table below is laid out into that half.
+#
+# The 8MB -> 16MB override is written the way sdkconfig.esp32s3.zero writes its
+# 8MB -> 4MB one: later files in SDKCONFIG_DEFAULTS win, but only if the symbol
+# being turned off is named as well.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=n
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb_lcd2.csv"
+
+# PSRAM is left exactly as the primary target has it - octal mode, 80 MHz,
+# SPIRAM_USE_CAPS_ALLOC - and that is this board rather than a coincidence: the
+# module is an R8, 8 MB of OCTAL PSRAM, and the vendor's examples confirm it
+# (CONFIG_SPIRAM_MODE_OCT in their generated sdkconfig).  The pack's [display]
+# leans on it: the 320x240 soft framebuffer comes out of PSRAM, not out of the
+# internal SRAM the system lives in.
+#
+# The 192 KB arena, the 32 KB instruction cache, 240 MHz and MEMPROT off all
+# come from the primary target untouched.  This board would take the S3-CAM's
+# PSRAM arena (CONFIG_ARGON_APP_ARENA_PSRAM, sdkconfig.esp32s3.board) if it ever
+# had to run both radios and a full-size application at once; that is a decision
+# for the day a radio is switched on here, not for the day the pack is written.
+
+# ---------------------------------------------------------------------------
+# NETWORKING - MEASURED: THE PRIMARY TARGET'S QEMU PATH STOPS THIS BOARD.
+#
+# sdkconfig.defaults, which is the primary esp32s3 target, turns on
+# CONFIG_ARGON_ENABLE_NET together with CONFIG_ETH_USE_OPENETH, because that
+# target is QEMU and its networking is the emulated OpenEth device.  On real
+# silicon that MAC does not exist and the devices stage blocks in
+# ag_net_init(): measured on this unit 2026-09-21, the boot prints as far as
+#
+#   I (39) input: joy0 ready (pad layer)
+#
+# and then nothing for thirty seconds - no `dev: N devices`, no media stage, no
+# reset, no watchdog line.  The S3-Zero pack walked into the same wall and wrote
+# the answer down, but this overlay did not inherit it: it layers on
+# sdkconfig.defaults.esp32s3 alone, and that fix lives in
+# sdkconfig.esp32s3.zero.
+#
+# So the same real-radio path is taken here.  With ARGON_NET_WIFI set the port
+# brings up the radio rather than OpenEth, and it starts nothing at boot unless
+# [wifi]/[ap] in BOARD.CFG (or `wifi on`) asks for it - which this pack never
+# does, so the board boots headless and pays no RAM for a network it is not on.
+# ---------------------------------------------------------------------------
+CONFIG_ARGON_ENABLE_NET=y
+CONFIG_ARGON_NET_WIFI=y
+CONFIG_ARGON_NET_WIFI_AP=y
+
+# ---------------------------------------------------------------------------
+# THE CODE ARENA MOVES TO PSRAM - THE PRICE OF THE RADIO, MEASURED.
+#
+# The section above is what this board needed to boot at all; this is what it
+# needed to boot WITH a network.  Turning the real-radio path on pulls the
+# Wi-Fi stack's DRAM in, and with the primary target's 192 KB arena in internal
+# SRAM the link failed on this unit, 2026-09-21:
+#
+#   ld: region `dram0_0_seg' overflowed by 42416 bytes
+#
+# On this chip instruction RAM and DMA-capable data RAM are one physical SRAM,
+# which is what makes the arena and a radio compete for the same bytes.
+#
+# The day this would be needed, and the answer, were already written down above:
+# the S3-CAM's PSRAM arena (sdkconfig.esp32s3.board).  PSRAM reaches the
+# instruction bus on this S3 and this board has 8 MB of it, so the arena moves
+# out of the way - 32 KB stays internal as a fallback, 512 KB of code space
+# comes from PSRAM, and the internal SRAM it used to hold goes to the radio.
+# The cost is speed on a cache miss, not capability.  Measured after the move:
+# the firmware links and the board boots with the radio path compiled in; the
+# radio itself still starts only when something asks for it.
+# ---------------------------------------------------------------------------
+CONFIG_ARGON_APP_ARENA_KB=32
+CONFIG_ARGON_APP_ARENA_PSRAM=y
+CONFIG_ARGON_APP_ARENA_PSRAM_KB=512
+
+# ---------------------------------------------------------------------------
+# THE CONSOLE - MEASURED ON THIS UNIT, AND IT IS THE CHIP'S OWN USB.
+#
+# The board has one Type-C socket, and the vendor pin map gives two paths on
+# this board: UART0 on GPIO 43/44, and the chip's own native USB on GPIO 19/20.
+# Which of the two the socket carries is not written down anywhere I found, and
+# the vendor's own generated sdkconfig does not settle it either - it keeps
+# IDF's default of UART0 with the USB-Serial-JTAG as a SECOND endpoint, which
+# prints over either wiring.  ArgonOS has no secondary console yet (the primary
+# target's defaults say so), so the pack has to choose one.
+#
+# It first chose UART0, and that choice does not work here.  Measured on this
+# unit, 2026-09-21: esptool reports "USB mode: USB-Serial/JTAG", so the socket
+# IS the chip's own USB; the IDF boot log comes through it (the peripheral
+# bridges UART0 to USB), and the first ArgonOS image built for a UART0 console
+# then came up with no banner and no prompt at all.  With the project's own
+# bring-up switch (ARGON_BOOT_TRACE=1) the boot reaches
+#
+#   argon-trace: kernel entry
+#   argon-trace: console init 80x25
+#   argon-trace: attaching uart0
+#   argon-trace: uart attached
+#
+# and from there the wire carries nothing: no banner, no prompt, no watchdog
+# reset, no reboot.  The console attaches and the take-over of UART0 is what
+# kills the path - the port reprograms the divider and the clock source
+# (uart_hw.c, which drains the shift register first), and the USB-Serial-JTAG
+# bridge does not follow that reconfiguration.  So this is not a hang in the
+# kernel; it is the console that stops being readable.
+#
+# Hence the move that was written down here for exactly this day, the way
+# sdkconfig.esp32s3.zero does it: the console is the chip's own USB, and
+# AG_PORT_UART_CONSOLE becomes the JTAG pseudo-port (port/impl/uart.h) - no
+# GPIOs, nothing to reconfigure, nothing to wedge.  uart0's pads 43/44 are then
+# free, which is what BOARD.CFG's wire discussion assumes.
+# ---------------------------------------------------------------------------
+# CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

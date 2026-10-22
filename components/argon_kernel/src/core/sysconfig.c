@@ -11,11 +11,17 @@
 
 #include <argon/board.h>
 #include <argon/codepage.h>
+#include <argon/console.h>
+#include <argon/place.h>
 #include <argon/loader.h>
 #include <argon/log.h>
+#include <argon/nodename.h>
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
+#include <argon/port/place.h>
+
+#include "core/place_bss.h"
 
 #define TAG "cfg"
 
@@ -32,7 +38,7 @@
  */
 #define AG_CFG_TEXT_BYTES 4096
 
-static ag_cfg_t s_cfg;
+static ag_cfg_t s_cfg AG_KERNEL_STATIC;
 static char    *s_text;
 static size_t   s_text_used;
 static char     s_sources[64];
@@ -156,9 +162,23 @@ static ag_err_t load_one(const char *path, const char *label)
                label, (unsigned)AG_CFG_LINE_MAX);
     }
 
+    const uint16_t lost_before = s_cfg.dropped;
     const ag_err_t err = ag_cfg_parse(sk.out, &s_cfg);
     if (err == AG_OK) {
         note_source(label);
+    }
+    /*
+     * Settings that did not fit the table are COUNTED, and were never said.
+     * A count nobody reads is the same as no count: a key that is present in
+     * the file and absent from the system is the hardest kind of fault to
+     * look at, because every explanation you try is about the code.
+     */
+    if (s_cfg.dropped > lost_before) {
+        ag_log(AG_LOG_WARN, TAG,
+               "%s: %u setting(s) did not fit - the table holds %u, and the "
+               "ones past that are not in effect",
+               label, (unsigned)(s_cfg.dropped - lost_before),
+               (unsigned)AG_CFG_MAX_ENTRIES);
     }
     return err;
 }
@@ -188,6 +208,9 @@ ag_err_t ag_sysconfig_init(void)
      */
     (void)load_one("/sys/BOARD.CFG", "BOARD.CFG");
     (void)load_one("/sys/SYSTEM.CFG", "SYSTEM.CFG");
+
+    /* What this node is called, before anything can be addressed by it. */
+    (void)ag_node_name_init();
 
     /*
      * The code page is applied here rather than in the console stage, which runs
@@ -228,5 +251,11 @@ ag_err_t ag_sysconfig_init(void)
 
     /* Hardware description reaches the board layer even if nothing was read:
      * it is then a no-op, and the defaults stand. */
-    return ag_board_apply_config(&s_cfg);
+    const ag_err_t err = ag_board_apply_config(&s_cfg);
+
+    /* Where things live ([memory], argon/place.h) - and the console, made in
+     * an earlier stage by the default, moves there now. */
+    ag_place_configure();
+    ag_console_place();
+    return err;
 }

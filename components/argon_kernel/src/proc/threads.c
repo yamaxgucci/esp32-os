@@ -19,8 +19,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/budget.h>
 #include <argon/kernel.h>
 #include <argon/log.h>
+#include <argon/service.h>
 
 #include <argon/port/mem.h>
 #include <argon/port/sync.h>
@@ -53,6 +55,15 @@ bool ag_thread_owns(const void *record, ag_port_task_t task)
     return rec != NULL && rec->task == task;
 }
 
+/*
+ * How long a dying thread is given to come out of the kernel, and how often it
+ * is asked.  Ten milliseconds is longer than any console write on this board
+ * and the loop is bounded at two seconds, which is far longer than anything
+ * that holds one of these locks legitimately.
+ */
+#define AG_THREAD_UNLOCK_WAIT_MS 10u
+#define AG_THREAD_UNLOCK_TRIES   200u
+
 void ag_thread_release(void *record)
 {
     ag_thread_rec_t *rec = (ag_thread_rec_t *)record;
@@ -65,6 +76,58 @@ void ag_thread_release(void *record)
      * handle is stale and must not be deleted twice.
      */
     if (!rec->finished && rec->task != NULL) {
+        /*
+         * ARGON: not while it is inside the kernel holding a lock.
+         *
+         * Pitfall 21, applied in only one of the two places it had to be.
+         * ag_proc_kill asks holds_kernel_lock before deleting a process's MAIN
+         * task and refuses when the answer is yes - "killing it here would
+         * trade a hung application for a hung system" - and this path, which
+         * deletes the process's THREADS, asked nothing at all.
+         *
+         * It cost a dead board on 16 September 2026, in the middle of Maxim's
+         * game.  Fallout faulted (a null picture handed to a blit), the fault
+         * was recovered as designed, and then the reclaim deleted the port's
+         * report-printer thread - whose whole job is writing blocks to the
+         * console, and which therefore holds the console's recursive mutex for
+         * milliseconds at a time.  FreeRTOS lets only the owner release a
+         * recursive mutex, so a deleted owner holds it for ever: from that
+         * instant nothing in the system could print, including the shell, and
+         * the board looked hung while it was running.  The [fault] line got
+         * out only because it is written with esp_rom_printf, which does not
+         * go through the console at all.
+         *
+         * So the thread is given a bounded while to come out, and if it will
+         * not, it is left alone and said so.  A leaked task is a line in the
+         * journal; a lost console is a board that has to be power-cycled, and
+         * Maxim had to do exactly that.
+         */
+        /*
+         * And stopped before it is asked, not asked and then deleted: the
+         * thread runs on in between, and can walk into a lock in the moment
+         * after the answer (see stop_outside_kernel in proc.c).
+         */
+        bool stopped = false;
+        for (unsigned i = 0; i < AG_THREAD_UNLOCK_TRIES; i++) {
+            stopped = ag_proc_task_stop_outside_kernel(rec->task);
+            if (stopped) {
+                break;
+            }
+            ag_port_task_delay(AG_THREAD_UNLOCK_WAIT_MS);
+        }
+
+        if (!stopped) {
+            ag_log(AG_LOG_ERROR, "thread",
+                   "a thread (task %p) is inside the kernel holding a lock "
+                   "after 2 s; left running rather than killed - deleting it "
+                   "would take the console down with it",
+                   (void *)rec->task);
+            rec->finished = true;   /* nobody is to try again */
+            ag_port_free(rec);
+            return;
+        }
+
+        ag_budget_forget(rec->task);
         ag_port_task_delete(rec->task);
     }
     ag_port_free(rec);
@@ -90,14 +153,26 @@ static void thread_entry(void *arg)
      * race with a joiner reading the flag.
      */
     rec->finished = true;
+    ag_budget_forget(ag_port_task_self());
     ag_port_task_delete(NULL);
 }
 
-static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
-                              size_t stack, int priority, uint32_t flags)
+/*
+ * The body of create(), with the process named rather than taken from whoever
+ * is calling.
+ *
+ * Both are needed and they are not the same question.  An application creating
+ * a thread of its own is the caller's process, always.  A thread of a CLUSTER
+ * job is asked for by the node next door, and it arrives on the link's task -
+ * which belongs to no process at all, so "the caller's" would be NULL and the
+ * thread could not be owned by anything.  Naming the process is what lets the
+ * thread still belong to the program it runs inside, and therefore still be
+ * reclaimed when that program ends.
+ */
+static ag_thread_t thread_create_in(proc_t *p, void (*fn)(void *), void *arg,
+                                    const char *name, size_t stack,
+                                    int priority, uint32_t flags)
 {
-    proc_t *p = ag_proc_current();
-
     if (fn == NULL) {
         return NULL;
     }
@@ -168,8 +243,8 @@ static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
     snprintf(label, sizeof(label), "%.11s/t", (name != NULL) ? name : p->name);
 
     ag_port_task_t task = NULL;
-    if (!ag_proc_task_create(thread_entry, label, (uint32_t)want, rec,
-                             (unsigned)prio, core, &task)) {
+    if (!ag_proc_task_create_app(thread_entry, label, (uint32_t)want, rec,
+                                 (unsigned)prio, core, &task)) {
         (void)ag_reslist_remove(&p->res, AG_RES_THREAD, rec, NULL);
         ag_port_free(rec);
         ag_proc_table_unlock();
@@ -178,9 +253,43 @@ static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
         return NULL;
     }
     rec->task = task;
+    /*
+     * A thread says what it needs by its priority, and pays for it (2 Oct
+     * 2026): one above applications is charged a budget like a driver's
+     * task and held below them once it overruns; one at the ordinary
+     * priority is watched for fairness like the process's own task.
+     */
+    if ((unsigned)prio > AG_BUDGET_FAIR_PRIO) {
+        (void)ag_budget_watch(task, label, (unsigned)prio, 0u);
+    } else if ((unsigned)prio == AG_BUDGET_FAIR_PRIO) {
+        (void)ag_budget_fair(task, label);
+    }
 
     ag_proc_table_unlock();
     return (ag_thread_t)rec;
+}
+
+static ag_thread_t api_create(void (*fn)(void *), void *arg, const char *name,
+                              size_t stack, int priority, uint32_t flags)
+{
+    return thread_create_in(ag_proc_current(), fn, arg, name, stack, priority,
+                            flags);
+}
+
+ag_thread_t ag_thread_create_in(ag_pid_t pid, void (*fn)(void *), void *arg,
+                                const char *name, size_t stack, int priority,
+                                uint32_t flags)
+{
+    ag_proc_table_lock();
+    proc_t *p = ag_proc_by_pid(pid);
+    ag_proc_table_unlock();
+    /*
+     * The pointer is used after the lock is dropped, which is safe for the one
+     * thing it is used for: a slot is only freed once its process's task has
+     * gone, and the caller here is asking on behalf of a process it has just
+     * seen alive.  thread_create_in takes the lock again for the change itself.
+     */
+    return thread_create_in(p, fn, arg, name, stack, priority, flags);
 }
 
 /*
@@ -215,6 +324,7 @@ static void api_exit(void)
      * simply returned takes.
      */
     ag_thread_mark_self_finished();
+    ag_budget_forget(ag_port_task_self());
     ag_port_task_delete(NULL);
 }
 
@@ -453,6 +563,15 @@ static bool api_queue_recv(ag_queue_t q, void *item, uint32_t timeout_ms)
 static void api_critical_enter(void) { ag_port_sched_lock(); }
 static void api_critical_exit(void) { ag_port_sched_unlock(); }
 
+/*
+ * The low tide of this task's stack.  See task->stack_left: it is asked by code
+ * running on a stack somebody else sized.
+ */
+static uint32_t api_stack_left(void)
+{
+    return (uint32_t)ag_port_task_stack_unused(NULL);
+}
+
 const ag_task_api_t ag_task_api_table = {
     .size = sizeof(ag_task_api_t),
     .create = api_create,
@@ -473,6 +592,9 @@ const ag_task_api_t ag_task_api_table = {
     .queue_delete = api_queue_delete,
     .queue_send = api_queue_send,
     .queue_recv = api_queue_recv,
+    .svc_start = ag_svc_start,
+    .svc_stopping = ag_svc_stopping,
     .critical_enter = api_critical_enter,
     .critical_exit = api_critical_exit,
+    .stack_left = api_stack_left,
 };

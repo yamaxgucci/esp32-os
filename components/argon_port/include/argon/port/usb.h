@@ -21,6 +21,7 @@
  *   ag_err_t ag_port_usb_stop(void)
  *   ag_err_t ag_port_usb_status(ag_port_usb_status_t *out)
  *   void     ag_port_usb_on_report(ag_port_usb_report_fn fn)
+ *   void     ag_port_usb_on_descriptor(ag_port_usb_desc_fn fn)
  *
  * Contract, not advice:
  *
@@ -33,6 +34,13 @@
  *   queue.  A report is the raw boot payload - deciding that byte 2 is the
  *   first keycode is the business of whoever knows the report layout, which for
  *   a boot keyboard is a fixed fact the parser holds, not the port.
+ * - A mouse's report descriptor goes up before its first report.  If the
+ *   callback returns true the kernel can read the device's own layout, and
+ *   the port leaves that interface in report protocol instead of asking for
+ *   boot - what a PC does, and the only thing that works for a receiver that
+ *   ignores SET_PROTOCOL(boot) (046d:c542, 8 Oct 2026).  False, or no
+ *   callback: boot protocol, as before.  Keyboards are always boot.  A
+ *   descriptor that could not be read is passed as NULL, 0.
  * - The board powers the device.  Host mode sources 5 V on the OTG port's VBUS;
  *   a keyboard that draws more than the port can give will not enumerate, and
  *   that is a wiring fact, not a fault the port hides.
@@ -71,6 +79,31 @@ typedef struct {
     uint16_t       vid;
     uint16_t       pid;
     uint32_t       reports; /* how many have arrived since it attached         */
+    /* Laps of the port's own event loop.  A count that is not moving means the
+     * port has stopped handling anything at all, which is a different fault
+     * from a device that has gone quiet with a healthy endpoint - and the two
+     * were indistinguishable from outside until this existed. */
+    uint32_t       loops;
+    /* Milliseconds since the last report, and how many times a silent pipe has
+     * been prodded back to life.  "495 reports, endpoint completed" said
+     * nothing about whether that was a second ago or ten minutes. */
+    uint32_t       silent_ms;
+    uint32_t       prods;
+    /*
+     * ARGON: and what each of the device's HID interfaces is doing, because
+     * "open, 249 reports" was true of a mouse that had stopped for good and
+     * there was no way to see that from outside.  `pipes` is how many are
+     * filled in.
+     */
+    uint32_t pipes;
+    struct {
+        uint8_t        itf;
+        uint8_t        ep;
+        ag_usb_usage_t usage;
+        const char    *last;   /* the last transfer status, in words          */
+        uint32_t       errors; /* how many times it had to be cleared         */
+        bool           dead;   /* cleared and still refusing                  */
+    } pipe[4];
 } ag_port_usb_status_t;
 
 /*
@@ -81,12 +114,21 @@ typedef struct {
 typedef void (*ag_port_usb_report_fn)(ag_usb_usage_t usage, uint8_t report_id,
                                       const uint8_t *data, uint32_t len);
 
+/* One interface's HID report descriptor; true = "keep it in report protocol". */
+typedef bool (*ag_port_usb_desc_fn)(ag_usb_usage_t usage, uint8_t itf,
+                                    const uint8_t *desc, uint32_t len);
+
 #if AG_PORT_HAS_USB_HID
 
 ag_err_t ag_port_usb_start(void);
 ag_err_t ag_port_usb_stop(void);
 ag_err_t ag_port_usb_status(ag_port_usb_status_t *out);
 void     ag_port_usb_on_report(ag_port_usb_report_fn fn);
+/* The internal memory a device's arrival takes (the host's pipes and the
+ * enumeration's transfers), measured on the board: what the kernel keeps
+ * away from applications while the host waits for a plug. */
+size_t   ag_port_usb_arrival_bytes(void);
+void     ag_port_usb_on_descriptor(ag_port_usb_desc_fn fn);
 
 #endif /* AG_PORT_HAS_USB_HID */
 

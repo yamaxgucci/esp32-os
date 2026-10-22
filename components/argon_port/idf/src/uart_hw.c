@@ -97,6 +97,15 @@ static void fill(uart_config_t *out, const ag_port_uart_cfg_t *cfg)
     out->parity = k_parity[(cfg->parity <= 2) ? cfg->parity : 0];
     out->stop_bits = (cfg->stop_bits == 2) ? UART_STOP_BITS_2 : UART_STOP_BITS_1;
     out->flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    /*
+     * With flow control off this threshold is unused, but uart_param_config
+     * validates it unconditionally (rx_flow_ctrl_thresh < the FIFO length), so
+     * a stack-garbage value fails the call with "rx flow thresh error".  It hid
+     * as long as ag_port_uart_config's uart_config_t happened to sit on zeroed
+     * stack; a loadable driver reaching UART2 through the io layer found the
+     * value that was not.  Set it, and zero the whole struct at the call site.
+     */
+    out->rx_flow_ctrl_thresh = 0;
 
     /*
      * Not the default clock, and this is the line that lets the processor slow
@@ -118,7 +127,25 @@ static void fill(uart_config_t *out, const ag_port_uart_cfg_t *cfg)
      * a file transfer at 921600 is not a thing to do at 40 MHz anyway.
      */
 #if SOC_UART_SUPPORT_XTAL_CLK
-    out->source_clk = UART_SCLK_XTAL;
+    /*
+     * ...and above 2.5 Mbaud the crystal is the wrong clock, measured on
+     * 23 Sep 2026.  A UART divides its clock by a whole number of cycles per
+     * bit plus sixteenths, and 40 MHz does not divide into 16 Mbaud: 2.5, so
+     * the bits came out alternately 50 and 75 ns long and the receiver, also at
+     * 40 MHz, sampled each one two and a half times.  What the Zero-C3 wire
+     * showed was a lone 1 between two 0s read as 0, at the phase where the two
+     * crystals' 24 ppm beat put the sample on the short bit - one damaged byte
+     * every 840 bytes - and 12 Mbaud (3.33) not working at all, while 8 and
+     * 10 Mbaud (5 and 4, whole numbers) were clean.  The peripheral bus is
+     * 80 MHz and divides 16 Mbaud by exactly 5, sampled five times a bit.
+     *
+     * The price is the one the ESP32 branch below already pays: a fast port
+     * follows the bus down if the processor is run off the crystal.  Sixteen
+     * cycles a bit (the most the receiver can use) at 40 MHz is 2.5 Mbaud, so
+     * that is the line.
+     */
+    out->source_clk =
+        (cfg->baud <= 2500000u) ? UART_SCLK_XTAL : UART_SCLK_APB;
 #elif SOC_UART_SUPPORT_REF_TICK
     out->source_clk =
         (cfg->baud <= 115200u) ? UART_SCLK_REF_TICK : UART_SCLK_APB;
@@ -156,9 +183,50 @@ ag_err_t ag_port_uart_open(int port, const ag_port_uart_cfg_t *cfg,
         /*
          * Already installed is not a failure: two subsystems may both want the
          * port up and neither knows about the other.
+         *
+         * The transmit buffer is asked for and then halved until it fits,
+         * rather than being a number that is right on one board.  What it buys
+         * is overlap: with a buffer, uart_write_bytes copies and returns, and
+         * the peripheral's interrupt drains it while the caller gets on with
+         * the next frame; without one the caller sits in the write for as long
+         * as the wire takes.  On the link between the two boards that is the
+         * difference between a game that draws while the picture is going out
+         * and a game that waits for it.
+         *
+         * Halving rather than a fixed size because the two ends are not the
+         * same machine: the S3 has PSRAM and internal memory to spare, and the
+         * CYD has 179 KB, no PSRAM, and after a `wifi off` the free memory is
+         * there but not in one piece.  A board that cannot have the big one
+         * gets the small one and works, instead of failing to open the port -
+         * which is what a fixed 32 KB did, and it came out as a screen that
+         * stayed dark.
          */
-        const esp_err_t rc = uart_driver_install(port, (int)rx_bytes,
-                                                 (int)tx_bytes, 0, NULL, 0);
+        /*
+         * Receive first, transmit second: the transmit buffer is halved all
+         * the way down before the receive buffer gives up a byte.  On the
+         * board that is short of memory - the CYD, the far end of the picture
+         * link - what matters is not losing what arrives at four megabaud
+         * while a band is being written to the panel, and what it sends back
+         * is a byte now and then.  A receiver with 32 KB of ring and 256 bytes
+         * of transmit is the right shape for it; the other way round was the
+         * shape it had, and it lost eight per cent of the bands under load.
+         */
+        esp_err_t rc = ESP_FAIL;
+        uint32_t  rx = rx_bytes ? rx_bytes : 1024u;
+        for (;;) {
+            uint32_t tx = tx_bytes ? tx_bytes : 256u;
+            for (;;) {
+                rc = uart_driver_install(port, (int)rx, (int)tx, 0, NULL, 0);
+                if (rc == ESP_OK || rc == ESP_ERR_INVALID_STATE || tx <= 256u) {
+                    break;
+                }
+                tx /= 2u;
+            }
+            if (rc == ESP_OK || rc == ESP_ERR_INVALID_STATE || rx <= 1024u) {
+                break;
+            }
+            rx /= 2u;
+        }
         if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
             return from_esp(rc);
         }
@@ -197,9 +265,26 @@ ag_err_t ag_port_uart_config(int port, const ag_port_uart_cfg_t *cfg)
     esp_rom_output_tx_wait_idle((uint8_t)port);
 #endif
 
-    uart_config_t hw;
+    uart_config_t hw = {0};
     fill(&hw, cfg);
-    return from_esp(uart_param_config(port, &hw));
+    const esp_err_t rc = uart_param_config(port, &hw);
+    if (rc != ESP_OK) {
+        return from_esp(rc);
+    }
+    /*
+     * THE RECEIVE FIFO IS 128 BYTES, and the driver is woken when 120 of them
+     * are full.  The last eight take 10 us at 8 Mbaud and 5 at 16: an interrupt
+     * any later than that and bytes are lost in the FIFO, whole frames with
+     * them - the CYD took 67 KB/s of the C3's 8 Mbaud with 0 bad frames and
+     * hundreds missing, where the same wires carried 786 KB/s raw in the
+     * test of 4 Sep (26 Sep 2026).  Woken at a quarter full on a fast line,
+     * the interrupt has three quarters of the FIFO to be late by.
+     */
+    if (cfg->baud >= 1000000u && uart_is_driver_installed(port)) {
+        (void)uart_set_rx_full_threshold(port, 32);
+        (void)uart_set_rx_timeout(port, 4);
+    }
+    return AG_OK;
 }
 
 ag_err_t ag_port_uart_pins(int port, int tx, int rx)
@@ -212,6 +297,61 @@ ag_err_t ag_port_uart_pins(int port, int tx, int rx)
     }
     return from_esp(uart_set_pin(port, tx, rx, UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE));
+}
+
+ag_err_t ag_port_uart_close(int port)
+{
+    if (!valid(port)) {
+        return -AG_EINVAL;
+    }
+#ifdef AG_PORT_UART_JTAG
+    if (is_jtag(port)) {
+        /*
+         * Not closed.  The USB-JTAG serial IS the console on the boards that
+         * have one, and tearing its driver down would take the console with it
+         * - which is a far worse outcome than a port that stays up.  Nothing
+         * needs the pins back: there are none.
+         */
+        return AG_OK;
+    }
+#endif
+    if (port == AG_PORT_UART_CONSOLE) {
+        /* Same reason, said in the other place it is true. */
+        return -AG_EBUSY;
+    }
+    if (!uart_is_driver_installed(port)) {
+        return AG_OK; /* closing what is not open is not an error */
+    }
+    /*
+     * Let what was accepted actually leave before the driver goes.
+     *
+     * A write returns once the bytes are in the transmit ring, not once they
+     * are on the wire, and uart_driver_delete throws that ring away - so a
+     * program that writes and exits loses its own tail, silently, having been
+     * told the bytes were taken.  Measured: the wire test reported a receiver
+     * short by a few dozen random bytes with zero corrupt and zero lost, which
+     * reads as a lossy line and was nothing of the sort.
+     *
+     * Bounded, because a port whose far end is not reading must not make
+     * closing it hang; a tail that cannot leave in a second is a tail that is
+     * not going to.
+     */
+    (void)uart_wait_tx_done(port, pdMS_TO_TICKS(1000));
+    return from_esp(uart_driver_delete(port));
+}
+
+ag_err_t ag_port_uart_tx_wait(int port, uint32_t timeout_ms)
+{
+    if (!valid(port)) {
+        return -AG_EINVAL;
+    }
+    if (is_jtag(port)) {
+        return AG_OK;
+    }
+    if (!uart_is_driver_installed(port)) {
+        return AG_OK; /* nothing of ours is queued if there is no driver */
+    }
+    return from_esp(uart_wait_tx_done(port, pdMS_TO_TICKS(timeout_ms)));
 }
 
 bool ag_port_uart_is_open(int port)

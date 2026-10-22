@@ -1,0 +1,175 @@
+diff --git a/src/combat_ai.cc b/src/combat_ai.cc
+--- a/src/combat_ai.cc
++++ b/src/combat_ai.cc
+@@ -144,6 +144,8 @@
+ static int _ai_print_msg(Object* critter, int type);
+ static int _combatai_rating(Object* obj);
+ static int aiMessageListInit();
++/* ARGON: the battle cries, loaded on the first line anybody says. */
++static MessageList* aiMsgs();
+ static int aiMessageListFree();
+ 
+ // 0x51805C
+@@ -3365,7 +3367,7 @@
+ 
+     MessageListItem messageListItem;
+     messageListItem.num = randomBetween(start, end);
+-    if (!messageListGetItem(&gCombatAiMessageList, &messageListItem)) {
++    if (!messageListGetItem(aiMsgs(), &messageListItem)) {
+         debugPrint("\nERROR: combatai_msg: Couldn't find message # %d for %s", messageListItem.num, critterGetName(critter));
+         return -1;
+     }
+@@ -3555,24 +3557,65 @@
+ // Load combatai.msg and apply language filter.
+ //
+ // 0x42BB34
+-static int aiMessageListInit()
+-{
+-    if (!messageListInit(&gCombatAiMessageList)) {
+-        return -1;
++/*
++ * ARGON: combatai.msg is loaded when somebody says something, not at startup.
++ *
++ * It is the battle cries - 176541 bytes of them, 3537 lines, whose file begins
++ * "FALLOUT BATTLECRIES" - and they are read in exactly one place, from
++ * _combatai_msg, when a critter taunts or yelps. Measured resident on the
++ * board, 7 September 2026: 167 KB in 29 blocks, on every map, from the main
++ * menu to the end of the game, whether anything has ever fought or not.
++ *
++ * The same treatment as the world map's texts in patch 0041: loaded on the
++ * first line anybody needs, and given back when a map loads. A fight that
++ * starts after a map change pays one file read for its first shout.
++ *
++ * messageListFree leaves the list as messageListInit does, so this can happen
++ * as often as the player changes maps.
++ */
++static bool gCombatAiMsgLoaded = false;
++
++static MessageList* aiMsgs()
++{
++    if (!gCombatAiMsgLoaded) {
++        char path[COMPAT_MAX_PATH];
++        snprintf(path, sizeof(path), "%s%s", asc_5186C8, "combatai.msg");
++        if (!messageListLoad(&gCombatAiMessageList, path)) {
++            debugPrint("\naiMsgs: combatai.msg would not load\n");
++            return &gCombatAiMessageList;
++        }
++        if (settings.preferences.language_filter) {
++            messageListFilterBadwords(&gCombatAiMessageList);
++        }
++        gCombatAiMsgLoaded = true;
++        messageListRepositorySetStandardMessageList(
++            STANDARD_MESSAGE_LIST_COMBAT_AI, &gCombatAiMessageList);
+     }
++    return &gCombatAiMessageList;
++}
+ 
+-    char path[COMPAT_MAX_PATH];
+-    snprintf(path, sizeof(path), "%s%s", asc_5186C8, "combatai.msg");
+-
+-    if (!messageListLoad(&gCombatAiMessageList, path)) {
+-        return -1;
++/* Called from mapLoad, beside the art, sound and world map releases: nothing
++ * shouts while a map is being built. */
++void aiMessagesRelease()
++{
++    if (!gCombatAiMsgLoaded) {
++        return;
+     }
++    messageListRepositorySetStandardMessageList(STANDARD_MESSAGE_LIST_COMBAT_AI,
++        nullptr);
++    messageListFree(&gCombatAiMessageList);
++    messageListInit(&gCombatAiMessageList);
++    gCombatAiMsgLoaded = false;
++}
+ 
+-    if (settings.preferences.language_filter) {
+-        messageListFilterBadwords(&gCombatAiMessageList);
++static int aiMessageListInit()
++{
++    if (!messageListInit(&gCombatAiMessageList)) {
++        return -1;
+     }
+ 
+-    messageListRepositorySetStandardMessageList(STANDARD_MESSAGE_LIST_COMBAT_AI, &gCombatAiMessageList);
++    /* ARGON: not loaded here.  See aiMsgs() - 167 KB that a game which never
++     * enters combat never needs. */
+ 
+     return 0;
+ }
+@@ -3598,13 +3641,16 @@
+     if (languageFilter != gLanguageFilter) {
+         gLanguageFilter = languageFilter;
+ 
++        /* ARGON: and nothing to do while the list is not loaded - aiMsgs()
++         * applies the filter itself when it reads the file. */
++        if (!gCombatAiMsgLoaded) {
++            return;
++        }
++
+         if (languageFilter == 1) {
+             messageListFilterBadwords(&gCombatAiMessageList);
+         } else {
+-            // NOTE: Uninline.
+-            aiMessageListFree();
+-
+-            aiMessageListInit();
++            aiMessagesRelease();
+         }
+     }
+ }
+diff --git a/src/combat_ai.h b/src/combat_ai.h
+--- a/src/combat_ai.h
++++ b/src/combat_ai.h
+@@ -66,6 +66,9 @@
+ void _combatai_check_retaliation(Object* a1, Object* a2);
+ bool isWithinPerception(Object* a1, Object* a2);
+ void aiMessageListReloadIfNeeded();
++/* ARGON: drop the battle cries - 167 KB that only a fight reads.  mapLoad
++ * calls it; aiMsgs() brings them back on the first line anybody says. */
++void aiMessagesRelease();
+ void _combatai_notify_onlookers(Object* a1);
+ void _combatai_notify_friends(Object* a1);
+ void _combatai_delete_critter(Object* obj);
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -9,6 +9,8 @@
+ #include "art.h"
+ #include "automap.h"
+ #include "character_editor.h"
++/* ARGON: for aiMessagesRelease; see the release below. */
++#include "combat_ai.h"
+ #include "color.h"
+ #include "combat.h"
+ #include "critter.h"
+@@ -922,12 +924,28 @@
+      * few seconds.  Nothing is playing during a load and every entry is a copy
+      * of a file on the card, so this is the cheapest 257 KB in the program.
+      */
+-    soundEffectsCacheFlush();
++    /*
++     * ARGON: parked, not flushed.
++     *
++     * The flush that used to be here frees the entries *inside* the cache and
++     * returns nothing at all to the arena - the cache is one internal_malloc
++     * of cache_size, 257 KB in a single block, and it kept it. So the map
++     * load's peak included the whole of it while the cache was empty.
++     * Parking hands the block back and fallout_reserve_tick takes it again
++     * once the load is over and there is room to spare. See patch 0045.
++     */
++    if (!soundEffectsCachePark()) {
++        soundEffectsCacheFlush();
++    }
+ 
+     /* And the world map's messages: 739 KB in 1585 blocks that no local map
+      * reads.  They come back the moment the world map is opened. */
+     wmMessagesRelease();
+ 
++    /* And the battle cries, 167 KB: nothing shouts while a map is built, and
++     * the first thing that does will read them back.  See patch 0047. */
++    aiMessagesRelease();
++
+     if (gMapHeader.globalVariablesCount < 0) {
+         gMapHeader.globalVariablesCount = 0;
+     }

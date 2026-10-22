@@ -1,0 +1,37 @@
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -20,6 +20,7 @@
+ #include "game_mouse.h"
+ #include "game_movie.h"
+ #include "game_sound.h"
++#include "sound_effects_cache.h"
+ #include "input.h"
+ #include "interface.h"
+ #include "item.h"
+@@ -904,6 +905,25 @@
+      */
+     artCacheFlush();
+ 
++    /*
++     * ARGON: and the sound cache with it, for the same reason and a measured
++     * price.
++     *
++     * Two figures, taken at the same place on the starting map with one config
++     * line between them (7 September 2026):
++     *
++     *     sound on   5257 KB used of 6000, largest hole  94 KB
++     *     sound off  4961 KB used of 6000, largest hole 512 KB
++     *
++     * So sound costs 296 KB while it is held, and it fragments as much as it
++     * occupies.  A map change wants about 720 KB more than standing still -
++     * 5257 + 720 = 5977, which is exactly what was on the console before each
++     * temple crash - so the shortfall is a couple of hundred kilobytes for a
++     * few seconds.  Nothing is playing during a load and every entry is a copy
++     * of a file on the card, so this is the cheapest 257 KB in the program.
++     */
++    soundEffectsCacheFlush();
++
+     if (gMapHeader.globalVariablesCount < 0) {
+         gMapHeader.globalVariablesCount = 0;
+     }

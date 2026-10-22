@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
+#include <argon/proc.h>
 #include <argon/console.h>
 #include <argon/input.h>
 
@@ -11,12 +12,19 @@
 
 #include <argon/codepage.h>
 #include <argon/display.h>
+#include <argon/log.h>
+#include <argon/session.h>
 #include <argon/textpanel.h>
 
 #include <argon/port/mem.h>
 #include <argon/port/time.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
+#include <argon/port/place.h>
+
+#include "core/place_bss.h"
+
+#include <argon/place.h>
 
 /*
  * A lone ESC only becomes the Escape key once nothing follows it.  30 ms is
@@ -69,11 +77,83 @@ typedef struct {
 #define AG_CON_XOFF 0x13
 #define AG_CON_XON 0x11
 
-static ag_screen_t        s_screen;
+/*
+ * One screen per slot, and why the console owns them rather than the slots.
+ *
+ * A slot switch used to clear the screen, because there was one screen: the
+ * only way to stop slot 2 reading like the tail of slot 1 was to wipe it.
+ * So everything a program said was gone the moment you looked at something
+ * else - and on this machine "something else" is usually the graphical shell,
+ * which is where you go to run the next thing.
+ *
+ * Everything above reaches the screen through ag_console_screen(), all
+ * thirty-odd call sites, so making that answer with the focused slot's screen
+ * is the whole of the change.  They live here and not in the session module
+ * for two reasons: a resize has to reshape every one of them, and the console
+ * is what a screen is FOR - a slot is a stack of processes and does not
+ * otherwise care what a cell is.
+ *
+ * Lazily: index 0 is the system's and exists from boot; a user slot gets its
+ * own the first time it is looked at, so a machine that never leaves slot 1
+ * pays for one.
+ */
+#define CON_SCREENS (AG_SESSION_SLOTS + 1)
+
+static ag_screen_t        s_screens[CON_SCREENS];
+static bool               s_screen_up[CON_SCREENS];
+static int                s_active; /* index into s_screens */
+
+#define s_screen (s_screens[s_active])
+
+/*
+ * Tasks that write to a screen of their own rather than to the visible one.
+ *
+ * The console has always been one place: whoever called wrote where the
+ * person was looking.  That is right for everything that exists today and
+ * wrong for the one thing that does not - a second shell, running in a slot
+ * nobody is looking at, whose output belongs to that slot's screen and must
+ * not appear over the top of whatever is in front.
+ *
+ * Keyed by task rather than by session, because that is the question being
+ * answered: not "whose slot is this" but "who is speaking".  Four entries
+ * because there are four user slots, and a task that never registers gets
+ * today's answer, which is why nothing else in the system has to change.
+ *
+ * The wire falls out of it for free.  Only the visible screen is rendered to
+ * the terminal, so a write to a hidden one stays in its buffer until
+ * somebody looks - which is exactly what a background prompt should do.
+ */
+#define CON_BINDS AG_SESSION_SLOTS
+
+static struct {
+    ag_port_task_t  task;
+    int             index;
+    /*
+     * And where its keys come from.
+     *
+     * Output was the easy half: a bound task writes to its own screen and
+     * the visible one is unaffected.  Input is the half that decides
+     * whether a prompt can live in a window at all - there is one
+     * keyboard, it belongs to whoever is in front, and a prompt behind a
+     * desktop would otherwise never read a character.  So a bound task
+     * reads from a queue of its own, and whoever is in front puts things
+     * there on its behalf.
+     */
+    ag_port_queue_t q;
+} s_bind[CON_BINDS];
+
+/* Deep enough for a held key to arrive faster than a prompt reads it. */
+#define CON_SLOT_QUEUE 16
 static ag_con_endpoint_t  s_endpoints[AG_CON_MAX_ENDPOINTS];
 static ag_port_mutex_t         s_lock;
 static ag_port_queue_t s_events;
+/* The painter's stack. */
+#define AG_CON_STACK 3072u
+
 static ag_port_task_t       s_task;
+static ag_place_kind_t      s_task_kind;     /* where its stack is          */
+static volatile bool        s_painter_stop;  /* asked to end, for a move    */
+static volatile bool        s_painter_gone;  /* and it has                  */
 static bool               s_ready;
 static ag_con_sink_fn     s_redirect;
 static void              *s_redirect_ctx;
@@ -86,7 +166,7 @@ static bool (*s_hotkeys)(ag_event_t *ev);
 /* HID usage page 0x07 keycodes fit in a byte; sticky TTL covers auto-repeat. */
 #define AG_KEY_STICKY_MS 150u
 static uint8_t  s_key_down[32];
-static uint32_t s_key_stamp[256];
+static uint32_t s_key_stamp[256] AG_KERNEL_STATIC;
 
 /* ---------------------------------------------------------------------- */
 
@@ -116,7 +196,229 @@ void *ag_console_lock_holder(void)
     return (void *)ag_port_mutex_holder(s_lock);
 }
 
-ag_screen_t *ag_console_screen(void) { return &s_screen; }
+/* AG_SESSION_SYSTEM is index 0; user slots 0..3 are 1..4.  Defined below. */
+static int screen_index(int slot);
+
+static ag_screen_t *write_screen(void);
+
+/*
+ * The screen this caller writes to, which is not always the visible one.
+ *
+ * Same rule as every other write: a task bound to a slot gets that slot's
+ * screen, and everyone else gets what is on the glass.  It used to return
+ * the visible screen flatly, and that is what made a prompt window empty -
+ * ag_console_puts went to the slot's own screen while the shell's prompt
+ * and its line, which are drawn through this, went onto the screen the
+ * desktop was sitting on top of.  The window looked at the slot, nothing
+ * had ever been written there, and the prompt was invisible on both.
+ *
+ * Drivers and the session layer have no bind, so they still get the glass.
+ */
+ag_screen_t *ag_console_screen(void) { return write_screen(); }
+
+/*
+ * The screen belonging to a slot, or NULL when that slot has never had one
+ * of its own - in which case it is sharing the visible screen and there is
+ * nothing separate to look at.
+ */
+const ag_screen_t *ag_console_screen_of_slot(int slot)
+{
+    const int want = screen_index(slot);
+
+    if (want < 0 || !s_screen_up[want]) {
+        return NULL;
+    }
+    return &s_screens[want];
+}
+
+/*
+ * A screen's cells, where [memory] console says (argon/place.h).  Eighty by
+ * twenty-five is 8 KB per slot, held for the life of the board - on a headless
+ * S3-Zero nobody ever looks at, PSRAM is the place for it.  Only tasks read it
+ * - the painter, the prompt, a program's output - never an interrupt or a
+ * flash write.
+ */
+static void *screen_alloc(size_t need) { return ag_place_alloc("console", need); }
+
+/*
+ * Give a slot its own screen if it has not got one, at the size the console
+ * is now.
+ *
+ * Out of memory is not a failure worth stopping a slot switch for: the
+ * slots share the one screen again, which is what they all did until the
+ * per-slot screens existed.
+ */
+static ag_err_t ensure_screen(int want)
+{
+    if (s_screen_up[want]) {
+        return AG_OK;
+    }
+
+    const size_t need = ag_screen_memsize(s_screens[s_active].cols,
+                                          s_screens[s_active].rows);
+    void        *mem = screen_alloc(need);
+    if (mem == NULL) {
+        ag_log(AG_LOG_WARN, "console", "no memory for screen %d; sharing",
+               want);
+        return -AG_ENOMEM;
+    }
+    if (ag_screen_init(&s_screens[want], mem, need, s_screens[s_active].cols,
+                       s_screens[s_active].rows) != AG_OK) {
+        ag_place_free("console", mem);
+        return -AG_ENOMEM;
+    }
+    s_screen_up[want] = true;
+    return AG_OK;
+}
+
+/* The bound entry of the CALLING task, or NULL when it has none. */
+static int bind_of_self(void)
+{
+    const ag_port_task_t me = ag_port_task_self();
+
+    for (int i = 0; i < CON_BINDS; i++) {
+        if (s_bind[i].task == me) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* The screen the CALLING task writes to: its own, or the visible one. */
+static ag_screen_t *write_screen(void)
+{
+    const int b = bind_of_self();
+
+    return (b >= 0) ? &s_screens[s_bind[b].index] : &s_screens[s_active];
+}
+
+/* AG_SESSION_SYSTEM is index 0; user slots 0..3 are 1..4. */
+static int screen_index(int slot)
+{
+    if (slot == AG_SESSION_SYSTEM) {
+        return 0;
+    }
+    if (slot < 0 || slot >= AG_SESSION_SLOTS) {
+        return -1;
+    }
+    return slot + 1;
+}
+
+ag_err_t ag_console_adopt_slot(int slot)
+{
+    const int want = screen_index(slot);
+    if (!s_ready || want < 0) {
+        return -AG_EINVAL;
+    }
+    ag_console_lock();
+    if (want != s_active) {
+        /*
+         * The screen that exists changes hands; nothing is allocated and
+         * nothing is drawn.
+         *
+         * The console comes up long before there are slots and its screen
+         * is the one the boot report is written on.  Whoever is focused
+         * when the slots appear has been writing to that screen all along,
+         * so it is theirs - and saying otherwise is not a bookkeeping
+         * detail: going back to that slot would then make it a screen it
+         * had never used, which is to say a blank one, with the boot report
+         * filed under a slot nobody had been looking at.
+         */
+        s_screens[want] = s_screens[s_active];
+        s_screen_up[want] = true;
+        s_screen_up[s_active] = false;
+        memset(&s_screens[s_active], 0, sizeof(s_screens[s_active]));
+        s_active = want;
+    }
+    ag_console_unlock();
+    return AG_OK;
+}
+
+ag_err_t ag_console_bind_task(int slot)
+{
+    const ag_port_task_t me = ag_port_task_self();
+
+    ag_console_lock();
+    /* Unbind first, so a second call replaces rather than duplicates. */
+    for (int i = 0; i < CON_BINDS; i++) {
+        if (s_bind[i].task == me) {
+            s_bind[i].task = NULL;
+        }
+    }
+    if (slot < 0) {
+        ag_console_unlock();
+        return AG_OK;
+    }
+
+    const int want = screen_index(slot);
+    if (want < 0) {
+        ag_console_unlock();
+        return -AG_EINVAL;
+    }
+    /* The screen has to exist before anything writes to it. */
+    if (ensure_screen(want) != AG_OK) {
+        ag_console_unlock();
+        return -AG_ENOMEM;
+    }
+
+    for (int i = 0; i < CON_BINDS; i++) {
+        if (s_bind[i].task == NULL) {
+            if (s_bind[i].q == NULL) {
+                s_bind[i].q = ag_port_queue_new(CON_SLOT_QUEUE,
+                                                   sizeof(ag_event_t));
+                if (s_bind[i].q == NULL) {
+                    ag_console_unlock();
+                    return -AG_ENOMEM;
+                }
+            }
+            s_bind[i].task = me;
+            s_bind[i].index = want;
+            ag_console_unlock();
+            return AG_OK;
+        }
+    }
+    ag_console_unlock();
+    return -AG_ENOSPC;
+}
+
+ag_err_t ag_console_use_slot(int slot)
+{
+    const int want = screen_index(slot);
+    if (!s_ready || want < 0) {
+        return -AG_EINVAL;
+    }
+
+    ag_console_lock();
+    if (want == s_active) {
+        ag_console_unlock();
+        return AG_OK;
+    }
+
+    if (ensure_screen(want) != AG_OK) {
+        ag_console_unlock();
+        return -AG_ENOMEM;
+    }
+
+    s_active = want;
+
+    /*
+     * Everything that draws the console holds a picture of what is on it and
+     * sends only what changed, so a switch has to say that all of it did -
+     * to the panel, to the framebuffer, and to every terminal on the far end
+     * of a wire.
+     */
+    ag_screen_mark_all_dirty(&s_screens[s_active]);
+    for (int i = 0; i < AG_CON_MAX_ENDPOINTS; i++) {
+        ag_con_endpoint_t *ep = &s_endpoints[i];
+        if (ep->used) {
+            ag_vtout_mark_all(&ep->out);
+        }
+    }
+    ag_display_console_dirty();
+    ag_textpanel_owe_full();
+    ag_console_unlock();
+    return AG_OK;
+}
 
 bool ag_console_ready(void) { return s_ready; }
 
@@ -167,6 +469,32 @@ void ag_console_set_live(ag_con_live_fn fn, void *ctx)
     ag_console_unlock();
 }
 
+/*
+ * Where this write goes, and the order of the two questions is the point.
+ *
+ * A PROCESS'S OWN SINK COMES FIRST.  A node running a program for another node
+ * gives that program a sink of its own, so the guest's output - and the
+ * loader's lines about it - go down the wire while the board's own shell keeps
+ * its screen.  The global redirect below cannot do that: it catches every
+ * writer on the board, which for a guest that never ends (a migrated program)
+ * means the board never speaks to its own user again.  It did exactly that.
+ *
+ * The global one stays for what it was written for: the shell redirecting a
+ * single command it is itself waiting for, `dir > files.txt`.
+ */
+static bool sink_for_this_write(ag_con_sink_fn *fn, void **ctx)
+{
+    if (ag_proc_out_sink(fn, ctx)) {
+        return true;
+    }
+    if (s_redirect != NULL) {
+        *fn = s_redirect;
+        *ctx = s_redirect_ctx;
+        return true;
+    }
+    return false;
+}
+
 void ag_console_write(const char *buf, size_t len)
 {
     if (!s_ready || buf == NULL) {
@@ -174,10 +502,12 @@ void ag_console_write(const char *buf, size_t len)
     }
 
     ag_console_lock();
-    if (s_redirect != NULL) {
-        s_redirect(s_redirect_ctx, buf, len);
+    ag_con_sink_fn sink = NULL;
+    void          *sink_ctx = NULL;
+    if (sink_for_this_write(&sink, &sink_ctx)) {
+        sink(sink_ctx, buf, len);
     } else {
-        ag_screen_write(&s_screen, buf, len);
+        ag_screen_write(write_screen(), buf, len);
     }
     ag_console_unlock();
 }
@@ -189,23 +519,26 @@ void ag_console_write_log(const char *buf, size_t len)
     }
 
     ag_console_lock();
-    if (s_redirect != NULL) {
-        s_redirect(s_redirect_ctx, buf, len);
+    ag_con_sink_fn sink = NULL;
+    void          *sink_ctx = NULL;
+    if (sink_for_this_write(&sink, &sink_ctx)) {
+        sink(sink_ctx, buf, len);
     } else if (s_live != NULL) {
         /*
          * The prompt leaves the cursor mid-line.  Break away, print the
          * message, then hand the row back to whoever is editing.
          */
-        if (s_screen.cur_x != 0) {
-            ag_screen_puts(&s_screen, "\n");
+        ag_screen_t *sc = write_screen();
+        if (sc->cur_x != 0) {
+            ag_screen_puts(sc, "\n");
         }
-        ag_screen_write(&s_screen, buf, len);
+        ag_screen_write(sc, buf, len);
         if (buf[len - 1] != '\n') {
-            ag_screen_puts(&s_screen, "\n");
+            ag_screen_puts(sc, "\n");
         }
         s_live(s_live_ctx);
     } else {
-        ag_screen_write(&s_screen, buf, len);
+        ag_screen_write(write_screen(), buf, len);
     }
     ag_console_unlock();
 }
@@ -466,7 +799,34 @@ bool ag_console_read_event(ag_event_t *ev, uint32_t timeout_ms)
     const ag_port_ticks_t ticks = (timeout_ms == UINT32_MAX)
                                  ? AG_PORT_FOREVER
                                  : ag_port_ms_to_ticks(timeout_ms);
+
+    /*
+     * A bound task reads its own queue and nothing else - not even when
+     * its slot is the one in front.  Two readers of one queue do not take
+     * turns, they take a character each, and that is a bug you can type.
+     * Whoever is in front feeds it with ag_console_post_to_slot.
+     */
+    const int b = bind_of_self();
+    if (b >= 0) {
+        return ag_port_queue_recv(s_bind[b].q, ev, ticks);
+    }
     return ag_port_queue_recv(s_events, ev, ticks);
+}
+
+bool ag_console_post_to_slot(int slot, const ag_event_t *ev)
+{
+    if (!s_ready || ev == NULL) {
+        return false;
+    }
+
+    const int want = screen_index(slot);
+    for (int i = 0; i < CON_BINDS; i++) {
+        if (s_bind[i].task != NULL && s_bind[i].index == want &&
+            s_bind[i].q != NULL) {
+            return ag_port_queue_send(s_bind[i].q, ev, 0);
+        }
+    }
+    return false; /* nothing is listening there */
 }
 
 bool ag_console_key_pressed(uint16_t keycode)
@@ -629,6 +989,13 @@ static void console_task(void *arg)
         ag_console_unlock();
 
         ag_port_task_delay(ag_port_ms_to_ticks(AG_CON_TICK_MS));
+
+        /* Asked to make way for a painter whose stack is elsewhere
+         * (ag_console_place): end here, between two paints, holding nothing. */
+        if (s_painter_stop) {
+            s_painter_gone = true;
+            ag_port_task_delete(NULL);
+        }
     }
 }
 
@@ -639,21 +1006,23 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
     }
 
     const size_t need = ag_screen_memsize(cols, rows);
-    void *mem = ag_port_alloc(need, AG_MEM_FAST | AG_MEM_BYTE);
+    void *mem = screen_alloc(need);
     if (mem == NULL) {
         return -AG_ENOMEM;
     }
 
-    const ag_err_t err = ag_screen_init(&s_screen, mem, need, cols, rows);
+    s_active = 0;
+    const ag_err_t err = ag_screen_init(&s_screens[0], mem, need, cols, rows);
+    s_screen_up[0] = (err == AG_OK);
     if (err != AG_OK) {
-        ag_port_free(mem);
+        ag_place_free("console", mem);
         return err;
     }
 
     s_lock = ag_port_mutex_new_recursive();
     s_events = ag_port_queue_new(AG_CON_EVENT_QUEUE, sizeof(ag_event_t));
     if (s_lock == NULL || s_events == NULL) {
-        ag_port_free(mem);
+        ag_place_free("console", mem);
         return -AG_ENOMEM;
     }
 
@@ -661,15 +1030,166 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
 
     /*
      * The console task lives on the system core: the application core is
-     * meant to stay free for the application.
+     * meant to stay free for the application.  Its stack goes to PSRAM where
+     * there is some (8 Oct 2026): it paints text, and nothing it does wants
+     * internal memory held for the life of the board.
      */
-    if (!ag_port_task_create(console_task, "ag_con", 3072, NULL, 10, 0, 0,
-                             &s_task)) {
+    if (!ag_place_task("console", console_task, "ag_con", AG_CON_STACK, NULL,
+                       10, 0, (void **)&s_task, &s_task_kind)) {
         s_ready = false;
-        ag_port_free(mem);
+        ag_place_free("console", mem);
         return -AG_ENOMEM;
     }
 
+    return AG_OK;
+}
+
+/*
+ * After the configuration is read (ag_place_configure), the console moves to
+ * where [memory] console says - it was made in the console stage, before any
+ * file could be read, by the default.  The screens are copied under the lock;
+ * the painter is asked to end between two paints and a new one is started
+ * with its stack in the new place, never two at once (two painters hung the
+ * CYD's console once, 29 Sep 2026).
+ */
+void ag_console_place(void)
+{
+    if (!s_ready) {
+        return;
+    }
+    const ag_place_kind_t want = ag_place_first("console");
+
+    ag_console_lock();
+    for (int i = 0; i < CON_SCREENS; i++) {
+        if (!s_screen_up[i]) {
+            continue;
+        }
+        ag_screen_t *const s = &s_screens[i];
+        void *const        old = (void *)s->dirty; /* the block's start */
+        const bool old_slow = ag_port_ptr_is_slow(old);
+        if ((want == AG_PLACE_PSRAM) == old_slow) {
+            continue;
+        }
+        const size_t need = ag_screen_memsize(s->cols, s->rows);
+        uint8_t *const nm = (uint8_t *)ag_place_alloc("console", need);
+        if (nm == NULL) {
+            continue;
+        }
+        if (ag_port_ptr_is_slow(nm) == old_slow) {
+            ag_place_free("console", nm); /* nothing better to be had */
+            continue;
+        }
+        memcpy(nm, old, need);
+        s->cells = (ag_cell_t *)(nm + ((uint8_t *)s->cells - (uint8_t *)old));
+        s->dirty = (uint32_t *)nm;
+        ag_place_free("console", old);
+    }
+    ag_console_unlock();
+
+    if (want == s_task_kind || want == AG_PLACE_NONE) {
+        return;
+    }
+    s_painter_gone = false;
+    s_painter_stop = true;
+    for (int waited = 0; !s_painter_gone && waited < 100; waited++) {
+        ag_port_task_delay(ag_port_ms_to_ticks(5));
+    }
+    s_painter_stop = false;
+    if (!s_painter_gone) {
+        ag_log(AG_LOG_WARN, "console", "the painter did not stop; it stays");
+        return;
+    }
+    if (!ag_place_task("console", console_task, "ag_con", AG_CON_STACK, NULL,
+                       10, 0, (void **)&s_task, &s_task_kind)) {
+        ag_log(AG_LOG_ERROR, "console", "no room for a new painter");
+        return;
+    }
+}
+
+/*
+ * A new grid, with the old picture carried over.
+ *
+ * The size the console starts at is a build option because the console exists
+ * three stages before anything has read a file off the flash.  This is how it
+ * changes afterwards, once SYSTEM.CFG can be read and the panel has said how
+ * much glass it has - so a board that gets a different display plugged into it
+ * is a line in a file, not a rebuild.
+ *
+ * The overlap is copied rather than cleared, because the boot report is on
+ * that screen and it is the one screenful most worth keeping.  When the new
+ * grid is shorter, the rows copied are the ones ending at the cursor: that is
+ * what a terminal does when its window is dragged smaller, and it keeps the
+ * newest output rather than the oldest.
+ */
+ag_err_t ag_console_resize(uint16_t cols, uint16_t rows)
+{
+    if (!s_ready) {
+        return -AG_ENODEV;
+    }
+    if (cols == 0 || rows == 0 || cols > AG_SCREEN_MAX_COLS ||
+        rows > AG_SCREEN_MAX_ROWS) {
+        return -AG_EINVAL;
+    }
+    if (cols == s_screen.cols && rows == s_screen.rows) {
+        return AG_OK;
+    }
+
+    ag_console_lock();
+
+    /*
+     * Every screen that exists, not only the one being looked at: a slot
+     * left at eighty columns while the console moved to forty would come
+     * back the next time it was focused and hand the panel a picture of the
+     * wrong shape.  The one on view keeps its content (that is what
+     * recreate is for); the others are of no interest to anybody yet, so
+     * they are simply remade at the new size.
+     */
+    void *old = NULL;
+    for (int i = 0; i < CON_SCREENS; i++) {
+        if (!s_screen_up[i] && i != s_active) {
+            continue;
+        }
+        const size_t need = ag_screen_memsize(cols, rows);
+        void *mem = screen_alloc(need);
+        if (mem == NULL) {
+            ag_console_unlock();
+            return -AG_ENOMEM;
+        }
+        ag_screen_t    next;
+        const ag_err_t err = ag_screen_recreate(&next, mem, need, cols, rows,
+                                                &s_screens[i]);
+        if (err != AG_OK) {
+            ag_console_unlock();
+            ag_place_free("console", mem);
+            return err;
+        }
+        void *was = s_screens[i].dirty;
+        s_screens[i] = next;
+        s_screen_up[i] = true;
+        if (i == s_active) {
+            old = was;
+        } else {
+            ag_place_free("console", was);
+        }
+    }
+
+    /*
+     * Every endpoint is told the whole terminal again, not just the rows: a
+     * VT100 showing eighty columns has to be cleared, or the right-hand half
+     * of the old picture stays there for ever with nothing ever writing to it.
+     */
+    for (int i = 0; i < AG_CON_MAX_ENDPOINTS; i++) {
+        ag_con_endpoint_t *ep = &s_endpoints[i];
+        if (!ep->used) {
+            continue;
+        }
+        ag_vtout_init(&ep->out);
+        ag_vtout_hello(&ep->out, sink_to_transport, ep);
+        ag_vtout_mark_all(&ep->out);
+    }
+
+    ag_console_unlock();
+    ag_place_free("console", old);
     return AG_OK;
 }
 

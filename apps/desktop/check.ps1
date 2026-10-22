@@ -1,0 +1,1384 @@
+# Drive DESKTOP.AXE in QEMU with nobody at the desk, and photograph it.
+#
+#   .\apps\desktop\check.ps1
+#   .\apps\desktop\check.ps1 -NoBuild        # reuse the staged images
+#
+# What it proves, and why each step is here:
+#
+#   * the shell takes the display and paints - the picture is checked for being
+#     more than one flat colour, which is what a run that drew nothing gives
+#   * the pointer arrives and lands where it was aimed - the status strip
+#     prints the coordinates the shell believes, so the picture and the number
+#     can be compared without having to trust either on its own
+#   * the pointer leaves no trail - it is walked back and forth across the
+#     plate in the middle of the screen, which is the one place where a stale
+#     save-under would show
+#   * **the picture is the whole of what the shell drew** - a second photograph
+#     is taken after a forced full repaint (F5) and the two must be identical.
+#     Neither picture can show this on its own: a region the shell painted and
+#     the panel never received looks exactly like a region the shell forgot.
+#   * it exits when asked, and says how many events it saw on the way out
+#
+# The ordering trap, which cost a session on the board once already: the
+# virtual input drivers do not start listening until something opens the
+# device.  So the drivers are installed, the shell is started, and only then is
+# inputplay allowed to connect - before that the port is refused and the guest
+# looks dead.  See the header of tools\inputplay.py.
+#
+# ---- how the surface size is chosen ----------------------------------------
+#
+# C: is built here and merged into the flash image (tools\mksysfs.py, then
+# -SysFs), so the whole run is one boot: the surface size is in SYSTEM.CFG
+# before anything has started, the two input drivers are already in C:\DRV and
+# named in [modules], and the shell itself is on C:.  Nothing is written to
+# flash by the guest and nothing is rebooted.
+#
+# That is not tidiness.  The obvious version - write C:\SYSTEM.CFG from the
+# shell and reboot - was tried and is not reliable enough to build a test on:
+# over eight runs of that shape, three had a file written to C: read back
+# malformed afterwards (`-91`, AG_EFORMAT: once `c:\desktop.axe`, twice a
+# driver `drv install` had just copied), the boot after such a write took 128
+# seconds against the usual two, and HostFS did not always come back after the
+# reset either.
+[CmdletBinding()]
+param(
+    # The surface to give the shell.  320x240 is what the boards have; the
+    # default is what the firmware boots with when [display] says nothing.
+    [int]$Width = 0,
+    [int]$Height = 0,
+    # The shell's own deadline, so nothing can hang.  It has to cover the
+    # WHOLE scripted run, not one step: the sequence below is minutes of
+    # waits, and a deadline shorter than that ends the shell partway - which
+    # showed up as an empty photograph, a stray keystroke arriving at the
+    # console prompt, and a dialog counted as a window left open.  None of the
+    # three said anything about a deadline.
+    #
+    # Generous on purpose, and it costs nothing: the run ends when the
+    # marker arrives, not when this expires, and qemu-boot's own
+    # whole-run budget is what actually stops a hang.  Tuning this to
+    # just-enough is how the last two steps added here each broke the run
+    # in a way that pointed everywhere except at the clock.
+    [int]$Seconds = 300,
+    [string]$Out = 'build\desktop',
+    [switch]$NoBuild,
+    # Give the shell no surface at all, so it rasterises in bands straight to
+    # the panel (apps\desktop\dsk_paint_band.c).  Everything below then tests
+    # the OTHER backend, and the two-photograph rule is what makes it worth
+    # doing: a strip the shell drew and the panel never received looks exactly
+    # like a strip the shell forgot, and only the repaint comparison tells them
+    # apart.  It is how the kernel refusing every narrow band was found.
+    [switch]$Bands
+)
+
+$ErrorActionPreference = 'Stop'
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+Push-Location $root
+try {
+    . .\tools\idf-env.ps1
+
+    if (-not $NoBuild) {
+        & .\argon.cmd apps --only DESKTOP.AXE KBDVIRT.SYS MOUSEVIRT.SYS `
+                                 HELLO.AXE GFXDEMO.AXE |
+            Out-Host
+        if ($LASTEXITCODE -ne 0) { throw 'building the images failed' }
+    }
+
+    foreach ($f in @('DESKTOP.AXE', 'KBDVIRT.SYS', 'MOUSEVIRT.SYS',
+                     'HELLO.AXE', 'GFXDEMO.AXE')) {
+        if (-not (Test-Path (Join-Path $root "build\apps\$f"))) {
+            throw "$f is not built (build\apps\$f)"
+        }
+    }
+
+    New-Item -ItemType Directory -Force (Split-Path $Out) | Out-Null
+    $png = Join-Path $root "$Out.png"
+    $png2 = Join-Path $root "$Out-repaint.png"
+    $png3 = Join-Path $root "$Out-restored.png"
+    $log = "$Out.log"
+
+    $pyexe = if ($env:ARGON_PYTHON -and (Test-Path $env:ARGON_PYTHON)) {
+        $env:ARGON_PYTHON
+    } else {
+        $found = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH 'python_env') `
+            -Filter 'python.exe' -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $found) { throw 'no Python found for inputplay' }
+        $found.FullName
+    }
+
+    # ---- C: ---------------------------------------------------------------
+    $work = Join-Path $root 'build\dsk'
+    New-Item -ItemType Directory -Force $work | Out-Null
+    @('; built by apps\desktop\check.ps1 - the [display] section is appended',
+      '; by mksysfs --display-size',
+      '[modules]',
+      'device = c:\drv\kbdvirt.sys',
+      'device = c:\drv\mousevirt.sys') |
+        Set-Content -Encoding ascii (Join-Path $work 'SYSTEM.CFG')
+
+    $sysfs = Join-Path $work 'sysfs.bin'
+    $mkArgs = @('tools\mksysfs.py', '--board', 'none',
+                '--partitions', 'partitions.csv',
+                '--display', $(if ($Bands) { 'panel' } else { 'soft' }),
+                '--out', $sysfs,
+                '--add', ((Join-Path $work 'SYSTEM.CFG') + '=SYSTEM.CFG'),
+                '--add', 'build\apps\KBDVIRT.SYS=drv/kbdvirt.sys',
+                '--add', 'build\apps\MOUSEVIRT.SYS=drv/mousevirt.sys',
+                '--add', 'build\apps\DESKTOP.AXE=DESKTOP.AXE',
+                # Two programs to open from the desktop: one that prints and
+                # exits, one that takes the screen.  The pair is the whole of
+                # what launching has to get right.
+                '--add', 'build\apps\HELLO.AXE=HELLO.AXE',
+                '--add', 'build\apps\GFXDEMO.AXE=GFXDEMO.AXE')
+    if ($Width -gt 0 -and $Height -gt 0) {
+        $mkArgs += @('--display-size', "${Width}x${Height}")
+    }
+    # littlefs-python lives in the IDF venv, not necessarily in ARGON_PYTHON.
+    $mkpy = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH 'python_env') `
+        -Filter 'python.exe' -Recurse -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $mkpy) { throw 'no IDF python for mksysfs (needs littlefs-python)' }
+    & $mkpy.FullName @mkArgs | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'mksysfs failed' }
+
+    # ---- the sequence -----------------------------------------------------
+    #
+    # Coordinates are the surface's own pixels, and the ones below are worked
+    # out from the shell's own layout rather than read off a screenshot: the
+    # menu bar is `menubar_h` tall, a title starts `PAD_X` in, the first window
+    # opens eight pixels inside the work area.  Written out here so that a
+    # change to any of those makes this fail loudly rather than click on the
+    # wrong thing quietly.
+    $w = if ($Width -gt 0) { $Width } else { 640 }
+    $h = if ($Height -gt 0) { $Height } else { 400 }
+    $cx = [int]($w / 2)
+    $cy = [int]($h / 2)
+    $span = [int]($w / 4)
+
+    $menubarH = 18          # DSK_FONT_H + 2
+    $statusH  = 12          # DSK_SMALL_H + 4
+    $border   = 4
+    $titleH   = 18
+    $workY    = $menubarH
+    $workH    = $h - $menubarH - $statusH
+
+    # "File" is the first title: six pixels in, four characters of 8x16, and
+    # PAD_X either side.  The middle of it, and the middle of its first item.
+    $fileX  = 6 + [int]((8 * 4 + 12) / 2)
+    $fileY  = [int]($menubarH / 2)
+    $itemX  = 6 + 3 + 20
+    $itemY  = $menubarH + 3 + 8
+
+    # The first window: eight pixels inside the work area, 220x120 (or what
+    # fits).  Its caption, and the minimise box two boxes in from the right.
+    $winW = if ($w -lt 228) { $w - 8 } else { 220 }
+    $winX = 8
+    $winY = $workY + 8
+    $capY = $winY + $border + [int]($titleH / 2)
+    $capX = $winX + $border + 40
+    $minX = $winX + $border + $winW - 2 * $border - 32 + 8
+
+    # Where its plate goes once it is minimised: bottom-left of the work area.
+    $plateX = 36
+    $plateY = $workY + $workH - 20
+
+    # The drive icon: one cell in from the top-left of the work area.
+    $drvX = 4 + 28
+    $drvY = $workY + 4 + 22
+
+    # Where the dragged icon is dropped.  The position that should then be in
+    # DESKTOP.INI is checked numerically further down rather than by regex,
+    # because "did it move" is a comparison and not a spelling.
+    $dropX = 300
+    $dropY = $workY + 200
+
+    # The folder window it opens, and the middle of its first row.
+    $fwX = 8
+    $fwY = $workY + 8
+    $rowX = $fwX + $border + 40
+    $rowY = $fwY + $border + $titleH + 8
+
+    $moves = @(
+        'home',
+
+        # FIRST, while the icons can still be seen: drag the second drive icon
+        # off its column, which is the other half of what DESKTOP.INI
+        # remembers.  press / glide / release, because a click and a move are
+        # not a drag - see tools\inputplay.py.
+        #
+        # Before the windows, and that is the whole reason it is here: the
+        # icons live in a column down the left edge and the first folder window
+        # opens on top of them, so a press aimed at an icon after that lands on
+        # the window instead.  Which is what happened, and it looked exactly
+        # like a drag that was not recorded.
+        #
+        # The first cell is at (4,4) inside the work area and the second 44
+        # pixels below it, so the second icon's middle is around
+        # (32, menubar + 4 + 44 + 22).
+        "move 32,$($workY + 70)",
+        'press', 'wait 200',
+        "glide $($dropX),$($dropY)", 'wait 400',
+        'release', 'wait 800',
+
+        # The context menu, both ways in: the right button, and a press held
+        # still for longer than LONG_PRESS_MS - which is the only way a finger
+        # has, there being no second button on glass.  Each is closed by a
+        # click far away from it, on bare desk where a click does nothing.
+        "move $($dropX + 60),$($workY + 40)", 'rclick', 'wait 500',
+        "move 600,380", 'click', 'wait 300',
+        "move $($dropX + 60),$($workY + 90)",
+        'press', 'wait 800', 'release', 'wait 400',
+        "move 600,380", 'click', 'wait 300',
+
+        # A drive opens as a window onto its root.
+        "move $drvX,$drvY", 'click', 'wait 120', 'click', 'wait 1500',
+
+        # A rubber band down the list of the folder window that is open on
+        # C:\, then a plain click to put the selection back to one row.
+        #
+        # Pressed on a row rather than on empty space: a full window has no
+        # empty space, and a gesture that only works in a short directory
+        # is not the gesture.  Glided in steps of four pixels because the
+        # band is built out of the moves that arrive - one jump from start
+        # to finish would mark the same rows and prove nothing about the
+        # rectangle following the hand.
+        #
+        # Cleared afterwards, and that matters: the keyboard pass below
+        # marks two rows by hand and copies them, and rows left marked here
+        # would be copied with them.
+        # Down over four rows, then back up to two: the band has to give
+        # back what it took.  It did not - the hand leaves the window on
+        # the way up, the manager routes by what is under the pointer, and
+        # the window stopped hearing about the gesture it was drawing.  The
+        # marks froze half made and the release landed somewhere else, so
+        # nothing ever took them off.
+        #
+        # Rows are 16 apart and row 0's middle is $rowY, so pressing at
+        # +16 and ending at +32 leaves exactly two rows under the band
+        # whatever the directory happens to hold.
+        "move $rowX,$($rowY + 16)", 'press', 'wait 200',
+        "glide $rowX,$($rowY + 80),12", 'wait 300',
+        "glide $rowX,$($rowY + 32),12", 'wait 300', 'release', 'wait 400',
+        "move $rowX,$rowY", 'click', 'wait 300',
+
+        # And now drag the window itself by its caption, forty pixels to
+        # the right - sideways only.
+        #
+        # This was not tested at all until a rubber band broke it: while
+        # one gesture owns the pointer nothing else can have it, and a
+        # band that took the pointer from the press rather than from the
+        # rectangle swallowed the release that ends a window drag.  The
+        # window then stayed drawn where it had been until something else
+        # happened to repaint it - which is what Maxim saw and this file
+        # could not.
+        #
+        # Checked through DESKTOP.INI rather than by eye: the arrangement
+        # holds the frame, so a drag that did not finish leaves the old
+        # position written down.
+        # Sideways only, because x is the coordinate this file knows
+        # exactly: the work area starts at 0 and the window opens eight
+        # pixels into it.  The height of the menu bar is a guess here and
+        # is two pixels out, which does not matter for clicking a row and
+        # would matter for comparing a y.
+        #
+        # A move to the target before the release, so the landing place
+        # is not whichever glide step happened to be delivered last: the
+        # window goes where the outline was, and the outline follows the
+        # moves.
+        "move $($fwX + 60),$($fwY + 8)", 'press', 'wait 200',
+        "glide $($fwX + 100),$($fwY + 8),12", 'wait 300',
+        "move $($fwX + 100),$($fwY + 8)", 'wait 200',
+        'release', 'wait 600',
+
+        # Into the only directory there is, and back out of it by "..".
+        "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
+        "move $rowX,$rowY", 'click', 'wait 120', 'click', 'wait 1500',
+        # The same walk with the button held, which is the only way a finger
+        # moves a pointer at all: on glass there is no such thing as hovering,
+        # so every pixel of movement a touchscreen produces is movement with
+        # the button down.  A scenario that only ever glides with it up tests
+        # the half of the code a touch machine never runs.
+        'move 40,300', 'press', 'glide 130,300,90', 'glide 40,300,90',
+        'release', 'wait 300',
+
+        # A pointer walked one pixel at a time, which is how a hand on a
+        # touchscreen moves it and what this scenario never tried: every
+        # other glide here steps in tens, so anything that goes wrong
+        # between two neighbouring pixels was invisible.  Maxim found dots
+        # left behind on the CYD that this could not see.
+        'move 180,300', 'glide 260,300,80', 'glide 180,300,80', 'wait 300',
+
+
+        # A context menu opened and shut on bare desk, LAST, so that the two
+        # photographs can see it.  They could not before: the menus were
+        # opened early and windows were opened over the place they had been,
+        # which is how a menu that erased itself in the wrong place got past
+        # this check and was found by hand on the board instead.  A rectangle
+        # left on the glass is identical in the first photograph and gone from
+        # the second, which is exactly what the forced repaint compares.
+        'move 40,330', 'rclick', 'wait 500',
+        'move 520,330', 'click', 'wait 400',
+
+        # Park the pointer where it hides nothing before the photograph.
+        "move $($w - 30),$($workY + 30)",
+        'wait 1200'
+    )
+
+    # The two photographs have to be of the SAME state, so everything that
+    # changes the screen happens before the first of them - the launches
+    # included.  Taken between them, a moved selection alone put nine thousand
+    # pixels of honest difference into a test whose whole subject is pixels
+    # that differ for dishonest reasons.
+
+    # ---- launching, which is the other half of a shell -------------------
+    #
+    # Two programs, because they fail differently.  A console one has to have
+    # its output reach the screen; a graphical one has to receive a key, which
+    # is the only way it can be told to give the screen back.  Both were
+    # broken by the same thing and neither showed the other's symptom.
+    #
+    # Launched from the folder window that is already open on C:\, by
+    # selecting a row and pressing Enter - which is how anyone would do it,
+    # and needs no menu coordinates.
+    #
+    # Do NOT open DESKTOP.AXE from here: a desktop starting a desktop works,
+    # and a second shell over the first is not what is being measured.
+
+    # ---- which row is which ----------------------------------------------
+    #
+    # Every step below picks an entry by counting Downs from Home, so every
+    # step depends on what C:\ holds and in what order the window sorts it -
+    # directories first, then files by name.  Counting them by hand is how a
+    # run launched GFXDEMO where it meant to launch HELLO, and then quit the
+    # shell with the 'q' that was meant for GFXDEMO, and then typed the rest
+    # of the script at the console prompt.  None of which mentioned rows.
+    #
+    # So the listing is written down once and the indices come out of it.
+    # DESKTOP.INI is in it because the icon drag above CREATED it: dragging an
+    # icon writes the arrangement, the file lands on C:, and it sorts between
+    # DESKTOP.AXE and GFXDEMO.AXE - shifting everything below it by one.
+    $rows = @('drv', 'DESKTOP.AXE', 'DESKTOP.INI', 'GFXDEMO.AXE',
+              'HELLO.AXE', 'SYSTEM.CFG')
+
+    # Home, then one Down per row: a selection that starts from a known place
+    # rather than from wherever the last step left it.
+    function Pick($list, $name) {
+        $at = [array]::IndexOf($list, $name)
+        if ($at -lt 0) { throw "no row called $name in the listing" }
+        $keys = @('key home')
+        if ($at -gt 0) { $keys += (1..$at | ForEach-Object { 'key down' }) }
+        # `,$keys` and not `$keys`: PowerShell unrolls a returned array, and a
+        # ONE-element array comes back as a plain string.  The caller then
+        # writes `Pick ... + @(...)`, which on a string is text concatenation -
+        # so row 0 produced one item reading "key homewait 200 key f8..." and
+        # inputplay stopped at "no key called 'homewait 200 ke'".  Everything
+        # after that step silently did not happen, and the disk checks passed
+        # because they were checking that a copy which never happened was not
+        # there.
+        return ,$keys
+    }
+
+    $runHello = (Pick $rows 'HELLO.AXE') +
+                @('wait 300', 'key enter',
+                  # Loading off flash, running, printing, and then sitting on
+                  # "finished with 0" until a key.
+                  'wait 4000',
+                  # The key that dismisses the report.  It must not also
+                  # arrive at the desktop underneath.
+                  'key enter', 'wait 1500')
+
+    $runGfx = (Pick $rows 'GFXDEMO.AXE') +
+              @('wait 300', 'key enter', 'wait 4000',
+                # 'q' is how gfxdemo exits, and it only gets there if a child
+                # of an application can be typed at.
+                'say q', 'wait 2500')
+
+    # ---- the file operations ---------------------------------------------
+    #
+    # On the window that is already open on C:\, with the keyboard: F8 copies,
+    # F2 renames, Delete deletes.  The destination is typed as a BARE NAME
+    # ("drv2", not "c:\drv2") for two reasons - it is the rule that a name with
+    # no directory in it means "beside the original", which is worth
+    # exercising, and inputplay cannot type a colon or a backslash: they need
+    # shift, and the key table deliberately fakes no modifiers.
+    #
+    # What is NOT asserted here is stopping one halfway.  There is nothing on
+    # this image slow enough to catch: the two files in C:\DRV copy in one
+    # tick, and a copy that finished before Escape could be sent would make the
+    # test pass whether cancelling worked or not.  Interrupting is pinned down
+    # on the host instead, where the tick count is the clock -
+    # test_cancelled_copy_keeps_what_it_finished and
+    # test_failed_move_keeps_the_source in host-tests\test_fsops.c.
+    #
+    $clear = 1..12 | ForEach-Object { 'key backspace' }
+
+    # File > Create directory..., from the keyboard.  F10 puts the shell on the
+    # bar and opens the first menu; Down steps over the separators by itself,
+    # so the seventh stop is Create directory (New window, Run, Copy, Move,
+    # Rename, Delete, Create directory) and the eighth is Properties.
+    #
+    # Two traps live in that sentence, and both have already been walked
+    # into.  Down skips a DISABLED item as well as a separator, so the count
+    # depends on the state the menu is in and not only on what is written in
+    # it; and every one of these numbers moves when a menu is reorganised -
+    # marking and the clipboard now live under Edit, which is why this is
+    # back to seven and eight.  Wrong by one put an operation into the
+    # Properties box, which is modal, and every keystroke after it went into
+    # a dialog: 123 of 154 arrived and eight assertions failed at once.
+    #
+    # It runs FIRST of the operations, because it changes what is on which
+    # row: `newdir` sorts in as the second directory, so $rowsAfterMkdir is
+    # what everything after this counts against.
+    $opsMkdir = @('key f10', 'wait 500') +
+                (1..7 | ForEach-Object { 'key down' }) +
+                @('wait 300', 'key enter', 'wait 800',
+                  'say newdir', 'wait 200', 'key enter', 'wait 1500')
+
+    $rowsAfterMkdir = @('drv', 'newdir') +
+                      ($rows | Where-Object { $_ -ne 'drv' })
+
+    # `drv` is copied to `drv2`, which then sorts in beside it.
+    $opsCopy = (Pick $rowsAfterMkdir 'drv') +
+               @('wait 200', 'key f8', 'wait 800') + $clear +
+               @('say drv2', 'wait 200', 'key enter', 'wait 3000')
+
+    $rowsAfterCopy = @('drv', 'drv2') +
+                     ($rowsAfterMkdir | Where-Object { $_ -ne 'drv' })
+
+    # Enter answers Yes, which is the first button of a yes/no box.
+    $opsDelete = (Pick $rowsAfterCopy 'drv2') +
+                 @('wait 300', 'key delete', 'wait 800', 'key enter',
+                   'wait 3000')
+
+    # And drv2 is gone again, so the rows are the ones after the mkdir.
+    $opsRename = (Pick $rowsAfterMkdir 'HELLO.AXE') +
+                 @('wait 300', 'key f2', 'wait 800') + $clear +
+                 @('say hi.axe', 'wait 200', 'key enter', 'wait 2000')
+
+    # File > Properties, from the keyboard: F10 puts the shell on the bar and
+    # opens the first menu, and Down steps over the separators by itself.
+    # Eight stops in: New window, Run, Copy, Move, Rename, Delete, Create
+    # directory, Properties.
+    # How long to let the shell catch up before a photograph is taken.
+    #
+    # One number for both backends, which it took a fix to be able to say.
+    # Band mode used to be fifteen times slower under the emulator - a drag
+    # step of 339 ms against 22 ms on a real CYD - because every strip waited
+    # for the emulated panel to acknowledge the last one.  A wait sized for the
+    # surface path then photographed a shell still working through its queue: a
+    # dialog missing its button, and a different pixel count every run (8936,
+    # 20724, 5800).  The panel is now told once per frame instead of once per
+    # strip (ag_gfx_flush in surfaceless mode), which took the same drag step
+    # to 8 ms and a full repaint from 1542 ms to 15.
+    $settle = 1200
+    $opsProps = @('key f10', 'wait 500') +
+                (1..8 | ForEach-Object { 'key down' }) +
+                @('wait 300', 'key enter', "wait $settle")
+
+    # Window > System console, the last item of that menu (Cascade, Tile,
+    # Close, Close all, Arrange icons, System console - the arrows skip
+    # separators).  Inside the one keyboard pass rather than a step of its own,
+    # and that is not tidiness: every invocation of inputplay opens a fresh
+    # connection to KBDVIRT, and this file's own header records what a run with
+    # six of them delivered - eleven keystrokes of sixty-nine.  It also puts
+    # the console window in BOTH photographs, so the repaint comparison covers
+    # a window whose content the shell does not own.
+    #
+    # Before the properties box rather than after: that box is modal, and while
+    # one is up the menu bar is fed nothing at all.  A console step after it
+    # photographed the dialog closing and called it a console window.
+    # Two Rights: File, Edit, Window.  Edit is new today and every one of
+    # these had to move with it.
+    $openConsole = @('key f10', 'wait 400', 'key right', 'wait 200',
+                     'key right', 'wait 300') +
+                   (1..6 | ForEach-Object { 'key down' }) +
+                   @('wait 300', 'key enter', 'wait 1200')
+
+    # Opening a window activates it, so the folder window has to be brought
+    # back before anything that acts on a selection: Properties on the console
+    # window is Properties on nothing, and the dialog never opens.  The Window
+    # menu lists the windows topmost first after its own items, so the ninth
+    # entry is the one underneath the console.
+    #
+    # Nine because the menu grew: 'Console' went in beside 'System
+    # console' and pushed every window entry down one.  Counting arrow keys
+    # into a menu whose length is a property of the program is a trap, and
+    # this is the bill for it: the folder never came back, so the clipboard,
+    # the marked rows, Properties and all four Options checks failed at once
+    # and looked like a keyboard that had died.
+    $backToFolder = @('key f10', 'wait 400', 'key right', 'wait 200',
+                      'key right', 'wait 300') +
+                    (1..9 | ForEach-Object { 'key down' }) +
+                    @('wait 300', 'key enter', 'wait 800')
+
+    # Options > Small font, then Options > Large font.  Two rights from File
+    # (File, Window, Options), first item and second.  The shell says which
+    # font it went to, so this is checked by what it did and not by the fact
+    # that a key was pressed.
+    #
+    # Both ways round on purpose: leaving the run in the small font would
+    # change every rectangle in the two photographs and every later count of
+    # rows in a window, and a test that quietly rewrites its own expectations
+    # is worth nothing.
+    # Two downs for the second item and one for the first: opening a menu
+    # highlights nothing, so the first down lands on the first item.  One
+    # down here picked "Large font", which was already the font - the shell
+    # correctly did nothing, and the step proved nothing.
+    # Options > Pattern: the item cycles, so one press moves the desk
+    # one tile along.  Seven stops in: Large, Small, Teal, Navy, Green,
+    # Black, Pattern.
+    $optPattern = @('key f10', 'wait 400', 'key right', 'wait 200',
+                    'key right', 'wait 200', 'key right', 'wait 300') +
+                  (1..7 | ForEach-Object { 'key down' }) +
+                  @('wait 300', 'key enter', 'wait 900')
+
+    # Options > Keyboard, three times round: automatic -> always ->
+    # never -> automatic.
+    #
+    # Eight stops each time, because it is ONE item now that says its value
+    # in its own label and steps on when it is chosen.  Three settings used
+    # to be three rows with a tick beside the live one; nine such rows
+    # filled the menu and left no room for Dim.
+    #
+    # Three presses rather than one is not thoroughness: the item only
+    # cycles, so the only way back to automatic is all the way round.
+    #
+    # What this can check from here is the wiring - the setting is read, the
+    # shell says which way it went - and not whether a finger can hit a key,
+    # which is a question for a hand on the board.  The keys themselves are
+    # a host test (test_desktop.c), pressed at the centre of every cell.
+    #
+    # Automatic is the right thing to leave behind: the emulator HAS a
+    # keyboard (KBDVIRT), so a run that ended with "always" would put a
+    # keyboard into every later box and move the buttons that the rest of
+    # this scenario clicks.
+    $optKbdOnce = @('key f10', 'wait 400', 'key right', 'wait 200',
+                    'key right', 'wait 200', 'key right', 'wait 300') +
+                  (1..8 | ForEach-Object { 'key down' }) +
+                  @('wait 300', 'key enter', 'wait 800')
+    $optKbd = $optKbdOnce + $optKbdOnce + $optKbdOnce
+
+    # Options > Dim, four times round: never -> 1 min -> 5 -> 15 -> never.
+    #
+    # Ten stops: it is the last item.  All the way round on purpose - a run
+    # that left an idle period behind would put the backlight out in the
+    # middle of a later scenario, and on the emulator, where there is no
+    # backlight to see, nothing would say why the picture had stopped.
+    $optDimOnce = @('key f10', 'wait 400', 'key right', 'wait 200',
+                    'key right', 'wait 200', 'key right', 'wait 300') +
+                  (1..10 | ForEach-Object { 'key down' }) +
+                  @('wait 300', 'key enter', 'wait 600')
+    $optDim = $optDimOnce + $optDimOnce + $optDimOnce + $optDimOnce
+
+    # Options > Set time..., the eleventh stop, and then a date typed
+    # into it.
+    #
+    # This is the whole path in one go: the menu, the dialog, the
+    # on-screen keyboard's field, the ABI entry that was NULL until
+    # today, and the system clock underneath it.  The console is asked
+    # for the date afterwards, so what is checked is what the machine
+    # believes rather than what the dialog said.
+    #
+    # A year nobody could arrive at by accident: the emulator's clock
+    # starts in 1970 and no other step here touches it.
+    $optTime = @('key f10', 'wait 400', 'key right', 'wait 200',
+                 'key right', 'wait 200', 'key right', 'wait 300') +
+               (1..11 | ForEach-Object { 'key down' }) +
+               @('wait 300', 'key enter', 'wait 900') +
+               (1..20 | ForEach-Object { 'key backspace' }) +
+               @('say 2031-03-04 05:06', 'wait 300', 'key enter',
+                 'wait 900')
+
+    # Last in the pass, and now for a plain reason: it opens a window that
+    # nothing after it would want in front.
+    #
+    # It spent three runs looking like a defect in the window - 151 of 365
+    # keystrokes delivered, to the keystroke, and everything after it dead.
+    # The window was innocent.  Adding 'Console' to the Window menu
+    # made that menu one item longer, and $backToFolder walks that menu by
+    # counting Down keys: its eighth stop had been the folder and became
+    # the console.  The folder never came back, so every later step acted
+    # on the wrong window.  The moral is in the comment on $backToFolder,
+    # and it is why the same number came back when the step was moved: the
+    # count was a property of the program, not of the run.
+    #
+    # What this step proves is the whole point of the window, and it proves
+    # it through the file system rather than the screen: the directory
+    # below exists afterwards or the keys never reached a shell.
+    #
+    # Window > Console, the seventh stop, and a command typed
+    # into it.
+    #
+    # This is the one thing the console window beside it cannot do.
+    # That one is a view: it shows what the machine said and takes no
+    # keys, because there is one keyboard and the desktop is holding
+    # it.  This one is somebody's prompt - a slot with a shell of its
+    # own - and the desktop passes the keys along.
+    #
+    # Checked by what the command DID, not by what the window shows:
+    # the prompt writes to its own slot's screen, which never reaches
+    # this transcript.  A directory made in there is on C: afterwards
+    # or the keys never arrived.
+    # ONE cycle of Options > Keyboard first, which lands on "always".
+    #
+    # The emulator has a keyboard (KBDVIRT), so "automatic" - which is what
+    # the step above deliberately leaves behind - means the keys drawn on the
+    # glass are not merely hidden but refused, and the tap that should raise
+    # them does nothing at all.  On the board it is the other way round:
+    # there is no keyboard there, and automatic turns them on.  So the state
+    # this needs is asked for, used, and handed back below.
+    $opsPrompt = $optKbdOnce +
+                 @('key f10', 'wait 500', 'key right', 'wait 200',
+                   'key right', 'wait 300') +
+                 (1..7 | ForEach-Object { 'key down' }) +
+                 @('wait 300', 'key enter', 'wait 1500',
+                   'say md c:\fromwin', 'wait 400', 'key enter',
+                   'wait 1500')
+
+    # Shutting it again is a step of its own, because between this pass and
+    # it comes the one thing a keyboard pass cannot do: type on the keyboard
+    # drawn on the glass.  While a prompt window is in front it takes every
+    # key but F10, which is what it is for, so the rest of the pass cannot
+    # run until it is shut.
+    # Two more cycles put Keyboard back to automatic, and then the window
+    # goes.  Back to automatic because that is what the rest of this file
+    # was written against, and because a setting a test leaves behind is a
+    # setting the next test starts with.
+    $shutPrompt = (($optKbdOnce + $optKbdOnce |
+                    ForEach-Object { '"' + $_ + '"' }) -join ' ') +
+                  ' "down leftctrl" "key f4" "up leftctrl" "wait 600"'
+
+    # Three Rights now: File, Edit, Window, Options.
+    $optFont = @('key f10', 'wait 400', 'key right', 'wait 200', 'key right',
+                 'wait 200', 'key right',
+                 'wait 300', 'key down', 'key down', 'wait 300', 'key enter',
+                 'wait 1200',
+                 'key f10', 'wait 400', 'key right', 'wait 200', 'key right',
+                 'wait 200', 'key right',
+                 'wait 300', 'key down', 'wait 300', 'key enter', 'wait 1200')
+
+    # Two rows marked with Space, then File > Copy, which with more than one
+    # mark asks for a DIRECTORY and puts both in it under their own names.
+    # Space marks and steps down, so two of them mark two neighbours.
+    #
+    # Home lands on "..", which cannot be marked - a mark on the way up is a
+    # mark on the parent directory - so the first Down is what gets onto a
+    # real row.
+    $opsMarked = @('key home', 'key down', 'wait 200',
+                   'key space', 'key space', 'wait 300',
+                   'key f10', 'wait 400') +
+                 (1..3 | ForEach-Object { 'key down' }) +
+                 @('wait 300', 'key enter', 'wait 800') + $clear +
+                 @('say c:\picked', 'wait 200', 'key enter',
+                   'wait 3000')
+
+    # Edit > Copy, walk into a directory, Edit > Paste.  This is the whole
+    # point of a clipboard on this machine: not one letter is typed, which
+    # is what a board with a touchscreen and no keyboard can actually do.
+    #
+    # Edit is one Right from File; Cut, Copy, Paste are its first three
+    # stops.  Backspace walks the window back up out of newdir afterwards so
+    # that everything after this still counts rows in C:.
+    # After the rename the listing is directories first and then files in
+    # order, with hi.axe where HELLO.AXE was - which is a different row,
+    # since h sorts after G and before S.  Written out rather than derived,
+    # because deriving it hides exactly the sort question a wrong row would
+    # have asked.
+    $rowsAfterRename = @('drv', 'newdir', 'DESKTOP.AXE', 'DESKTOP.INI',
+                         'GFXDEMO.AXE', 'hi.axe', 'SYSTEM.CFG')
+
+    $opsClip = (Pick $rowsAfterRename 'hi.axe') +
+               @('wait 200', 'key f10', 'wait 400', 'key right', 'wait 300',
+                 'key down', 'key down', 'wait 300', 'key enter',
+                 'wait 600') +
+               (Pick $rowsAfterRename 'newdir') +
+               @('wait 200', 'key enter', 'wait 1500',
+                 'key f10', 'wait 400', 'key right', 'wait 300',
+                 'key down', 'key down', 'key down', 'wait 300',
+                 'key enter', 'wait 2500',
+                 'key backspace', 'wait 1500')
+
+    $keyboard = $runHello + $runGfx + $opsMkdir + $opsCopy + $opsDelete +
+                $opsRename + $openConsole + $backToFolder + $opsClip +
+                $opsMarked + $optPattern + $optKbd + $optDim + $optTime +
+                $optFont + $opsProps + $opsPrompt
+    $quoted = ($moves | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $after = @('"key f5"', ('"wait ' + $settle + '"')) -join ' '
+    # The properties box is deliberately still up for both photographs - it is
+    # a modal window, and whether a full repaint puts it back is exactly the
+    # kind of thing the two-photograph criterion is for.  Enter dismisses it
+    # afterwards, leaving the folder window and the console window: what each
+    # of those is worth is asserted at the bottom.
+    $closing = @('"key enter"', '"wait 600"') -join ' '
+
+    $send = @(
+        # The lease FIRST, because the virtual mouse cannot exist without it.
+        #
+        # Both virtual drivers open their sockets only once the network has
+        # an address, and QEMU's lease is usually instant - usually.  Three
+        # runs of this file died with `nothing listening on 5560 after 60 s`
+        # and a transcript holding five copies of "interface up (waiting for
+        # an address)" and no address at all.  That is not a driver fault and
+        # not a port in use: it is a boot that had not finished the part the
+        # gesture depends on.  Waiting for the line that says the address
+        # arrived costs nothing when it is already there.
+        '=net: ip ',
+        # Nothing to install: the drivers came up from C:\DRV with the boot,
+        # because SYSTEM.CFG on the baked image names them in [modules].
+        'dev',
+        # `dev` is the synchronisation, and its own prompt is the proof.
+        #
+        # A run that typed the next line while the modules were still
+        # loading had it swallowed: the transcript shows `run
+        # c:\desktop.axe 120` echoed in the middle of "modules: loaded
+        # KBDVIRT", and the command never ran - everything after it played
+        # into a shell that had started nothing, and the photographs were
+        # of a console.  A command sent as a plain item waits for the
+        # prompt that follows it, and that prompt cannot come until the
+        # listing is over.
+        #
+        # There used to be a `=mouse0` wait here as well, meant to catch
+        # the last line of that listing.  It never once matched: a wait
+        # only sees what arrives AFTER it is armed, and `dev` had already
+        # printed and returned to the prompt by then.  So every run of
+        # this file sat for its four-minute step timeout at the very first
+        # step, said "warning: 'mouse0' never appeared", and carried on -
+        # which is also how a run whose virtual mouse was not up yet got
+        # as far as playing a gesture into nothing.
+        # Raw, so the harness does not sit waiting for a prompt that cannot
+        # come until the shell's own deadline expires.
+        #
+        # The Enter goes in its own write, three hundred milliseconds after
+        # the text.  Sent together it is occasionally lost - the line arrives
+        # and is echoed, the command never runs, and the screenshot shows it
+        # sitting at the prompt untouched.  One run in three, which is not a
+        # thing to leave in a test.
+        # Text and Enter in ONE write, which is the form qemu-boot's own
+        # header shows and the form every other command here uses (a
+        # plain item is sent as text plus a carriage return, together).
+        #
+        # They were split apart with a note saying that together they
+        # were lost one run in three.  Whatever that was, splitting them
+        # is worse and measurably so: today the line sat echoed at the
+        # prompt with its Enter gone four times, and the two facts added
+        # to catch it - wait for the listing to finish, wait for the
+        # echo - both passed while it happened.  A lone carriage return
+        # in its own write is the thing that goes missing; nothing else
+        # in this file sends one.
+        "~run c:\desktop.axe $Seconds\x0d",
+        '=desktop: surface',
+        # Sixty seconds, not twenty: this is the real wait for the virtual
+        # mouse, and it is a wait for the driver's socket rather than for a
+        # line of text.  The socket opens when the network has an address,
+        # so under a loaded machine it can be late - and late is what the
+        # dead marker above used to hide.
+        "!& '$pyexe' 'tools\inputplay.py' --wait 60 $quoted",
+        # ONE keyboard pass for all of it, and that is not tidiness.
+        #
+        # Every invocation of inputplay opens a fresh socket to KBDVIRT, and
+        # the driver has to accept it and install it while an application is
+        # already reading from the old one.  Six of those in a row is six
+        # chances at that race: a run that did it that way delivered the first
+        # six keystrokes and then eleven of sixty-nine, with every connection
+        # reporting success.  One connection has no race to lose.
+        ("!& '$pyexe' 'tools\inputplay.py' --wait 20 " +
+         (($keyboard | ForEach-Object { '"' + $_ + '"' }) -join ' ')),
+        # The keyboard on the glass, hit with the virtual mouse.
+        #
+        # On the board this is the ONLY way to type - that desk has no
+        # keys of its own - and until now "it works" meant somebody had
+        # tried it.  Where to click is asked of the program (it prints
+        # its geometry at startup and when a prompt window opens)
+        # rather than worked out here; see tools\oskbd-poke.ps1.
+        "!.\tools\oskbd-poke.ps1 -Log '$log' -Python '$pyexe'",
+        "!& '$pyexe' 'tools\inputplay.py' --wait 20 $shutPrompt",
+        "!.\tools\grab-window.ps1 -Out '$png'",
+        "!& '$pyexe' 'tools\inputplay.py' --wait 20 $after",
+        "!.\tools\grab-window.ps1 -Out '$png2'",
+        "!& '$pyexe' 'tools\inputplay.py' --wait 20 $closing",
+        # 'q' rather than Escape: a lone 0x1b is held back by the console's
+        # escape-sequence parser and never arrives as a key on its own.
+        '~q',
+        '=pointer events',
+
+        # ---- and now the whole point of DESKTOP.INI ----------------------
+        #
+        # The shell is started a second time and given NOTHING: no clicks, no
+        # keys, and a deadline so it leaves on its own.  Whatever is on the
+        # screen and in its counters therefore came out of the file, and the
+        # counters are what says so - "0 pointer events, 0 key events, 1
+        # window" cannot be produced by a shell that forgot.
+        #
+        # A photograph would show the window too, and would not distinguish a
+        # restored window from one this script had opened; the counters do.
+        # A backspace first, and it is not decoration.
+        #
+        # The 'q' above is aimed at the desktop, and the desktop is not
+        # always still there to catch it: it also leaves on its own
+        # deadline, and a 'q' that arrives a moment later lands in the
+        # console's line editor instead.  The next command then arrived
+        # as `qtype c:\desktop.ini` - "Bad command or file name: qtype" -
+        # the file was never printed, and the run reported that
+        # DESKTOP.INI held no icon position.  Four checks downstream of
+        # this spent a while being blamed on the shell.
+        #
+        # (It is NOT two readers of one keystroke, which is what this
+        # comment claimed first: an application and the shell take events
+        # from the same queue, and has_the_keyboard() decides which of
+        # them a given one reaches.  One byte, one reader.)
+        #
+        # Sent as ONE write with the command and its carriage return: a lone
+        # control byte in a write of its own is the thing that goes missing
+        # (see the run line above).
+        "~\x08type c:\desktop.ini\x0d",
+        # What the clock believes, after the dialog set it.
+        'date',
+        '~run c:\desktop.axe 12\x0d',
+        '=desktop: surface',
+        # The surface line is printed before the first paint has reached the
+        # panel, so a photograph taken the moment it appears catches the
+        # console underneath - which is how the restored desktop came out as a
+        # screen full of DESKTOP.INI.  Three seconds is the arrangement being
+        # put back; the assertions below do not depend on this picture, it is
+        # there to be looked at.
+        '!Start-Sleep -Seconds 3',
+        "!.\tools\grab-window.ps1 -Out '$png3'",
+        '=pointer events',
+
+        # The disk, from the console rather than from the shell that changed
+        # it: a window drawing the right thing over a filesystem it did not
+        # actually change would pass a test that only asked the window.
+        #
+        # `type` and not `dir` for the file that should be gone, because it
+        # names the file it could not find and `dir` names the directory it
+        # searched - and here the interesting thing is the file.
+        #
+        # Nothing here types a file that might still be there: `type` on an
+        # .AXE that survived a failed rename puts a kilobyte of Xtensa onto the
+        # screen, and that hides every other answer on it.  The listing says
+        # both things at once - the new name present, the old one absent - so
+        # it is what is asked for the rename.
+        'type c:\drv2\kbdvirt.sys',
+        'dir c:\drv',
+        'dir c:\picked',
+        'dir c:\newdir',
+        'dir c:\',
+        # Wait for that listing to FINISH before the run is allowed to
+        # end.  Without this the transcript stopped in the middle of it
+        # - one run held the directory the prompt window had made, the
+        # next one ended two names earlier and said the prompt had
+        # never reached a shell.  The last line of a listing is the
+        # free-space count, so that is what is waited for.
+        '=dir(s)'
+    )
+
+    Write-Host "desktop: driving QEMU, transcript -> $log, picture -> $png"
+    # No -HostFs: everything the guest needs is on the C: image, which is one
+    # fewer moving part - and HostFS is one that has been seen not to come back.
+    & .\tools\qemu-boot.ps1 -Gfx -SysFs $sysfs -LogPath $log `
+        -TimeoutSec 240 -Send $send | Out-Host
+
+    # ---- what came back ---------------------------------------------------
+    if (-not (Test-Path $log)) { throw "no transcript at $log" }
+    $text = Get-Content -Raw $log
+
+    # A run that ran out of time is a failure, not a footnote.
+    #
+    # Per-step timeouts are multiplied by ten under icount, so one marker
+    # that never arrives can sit for forty minutes; qemu-boot now stops the
+    # whole thing at its budget and writes down where it was, and this makes
+    # sure nobody reads the rest of the output as if it meant anything.
+    $ranOut = [regex]::Match($text, '\[host\] out of time at: (.*)')
+    if ($ranOut.Success) {
+        $fail += ("the run ran out of its time budget at: " +
+                  $ranOut.Groups[1].Value.Trim())
+    }
+    $fail = @()
+
+    if (-not (Test-Path $png)) {
+        $fail += 'no picture was taken'
+    } elseif ($text -match 'one flat colour') {
+        $fail += 'the picture is one flat colour - nothing was drawn'
+    }
+    if ($text -match 'desktop: this display has no surface') {
+        $fail += 'the display had no surface (the band renderer is not built)'
+    }
+    if ($Bands) {
+        if ($text -notmatch 'desktop: surface \d+x\d+ bands') {
+            $fail += 'asked for no surface, but the shell did not go into bands'
+        }
+        # A refused present is invisible in the picture: it looks like a
+        # region nothing was drawn in.  The backend says it once, and this is
+        # the only place that would ever read it.
+        if ($text -match 'present .* refused') {
+            $fail += 'the panel refused a band - see the transcript for the code'
+        }
+    } elseif ($text -match 'desktop: surface \d+x\d+ bands') {
+        $fail += 'the shell went into bands with a surface available'
+    }
+    if ($text -match 'desktop: cannot take the display') {
+        $fail += 'the display was already owned by something else'
+    }
+    # The soft path says "as fb0 + QEMU RGB window" when it attaches the
+    # emulated screen; the surfaceless path says "panel0 takes rectangles"
+    # about the same screen, so each mode is asked for its own line.
+    if ($Bands) {
+        if ($text -notmatch 'panel0 takes rectangles') {
+            $fail += 'the emulator gave no rectangle-taking panel - graphics=on?'
+        }
+    } elseif ($text -notmatch 'QEMU RGB window') {
+        $fail += 'the emulator has no RGB panel - was it started without graphics=on?'
+    }
+    # ---- launching -------------------------------------------------------
+    #
+    # Each of these was a symptom of one bug (a child of an application was
+    # bound to a session slot of its own instead of on top of its parent's), so
+    # they are asserted separately rather than as one "launching works".
+
+    # The console program's own output.  It went to the journal instead of the
+    # screen while the child was not the top of a focused slot, so a match here
+    # is the console routing and nothing else.
+    if ($text -notmatch 'pid \d+, arena \d+ KB') {
+        $fail += 'HELLO.AXE ran but its output never reached the console'
+    }
+    if ($text -notmatch 'finished with 0') {
+        $fail += 'the desktop never reported HELLO.AXE finishing'
+    }
+    # The graphical one prints nothing of its own when it goes, so the proof
+    # is the desktop's line about it - and its loop has no way out except a
+    # key.  A child that never saw one would still be running, holding the
+    # screen, and there would be no such line anywhere.
+    if ($text -notmatch '(?i)GFXDEMO\.AXE finished with 0') {
+        $fail += 'GFXDEMO.AXE was started but never saw the key that ends it'
+    }
+    # Its own greeting is NOT asserted, and that is worth writing down.
+    #
+    # GFXDEMO prints it after ag_gfx_acquire - while it holds the glass - and
+    # what a program prints while it holds the glass goes to its slot's text
+    # screen, which is not what the wire is mirroring.  The line reached this
+    # transcript in some runs and not others, purely on when the mirror
+    # happened to catch that screen, and a check that turns on a race teaches
+    # everybody to ignore a red gate.
+    #
+    # What a child's console output actually reaching the screen is proved by
+    # is HELLO.AXE, above: it prints without taking the glass.  What is left
+    # for the graphical one is that it ran and was ended by a key, which the
+    # line above asserts.
+    if ($text -notmatch 'Esc/Q/Enter quit') {
+        Write-Host ('desktop: note - GFXDEMO''s greeting is not in the ' +
+                    'transcript, which is expected: it prints it while it ' +
+                    'holds the glass')
+    }
+
+    # ---- the file operations ---------------------------------------------
+    #
+    # Read off the last console screen, which is what the guest ended up
+    # showing after the shell exited.  The transcript itself is a stream of
+    # whole-screen repaints and cannot answer an ordering question.
+    if (Test-Path 'build-host\vtdump.exe') {
+        $screen = (& cmd /c "build-host\vtdump.exe 80 25 437 < $log") -join "`n"
+
+        # The last screen AND the whole transcript.
+        #
+        # vtdump replays the console and hands back the 80x25 the guest ends
+        # up looking at, which is the right thing for "what does it say now"
+        # - and the wrong thing for evidence printed earlier: adding one more
+        # `dir` at the end scrolled two answers off the top and two
+        # assertions failed about operations that had worked perfectly.  The
+        # transcript still has every byte, so both are searched.
+        $seen = $screen + "`n" + $text
+        Write-Host $screen
+
+        # Renamed: the listing has the new name and not the old one.
+        if ($seen -notmatch '(?i)HI\.AXE') {
+            $fail += 'F2 did not rename HELLO.AXE'
+        }
+        if ($screen -match '(?i)HELLO\.AXE') {
+            $fail += 'the old name is still there after the rename'
+        }
+        # Copied and then deleted: the copy is gone and the original is not.
+        if ($seen -notmatch '(?i)drv2.kbdvirt\.sys: file not found') {
+            $fail += 'Delete did not remove the copied tree'
+        }
+        if ($seen -notmatch '(?i)kbdvirt\.sys') {
+            $fail += 'the delete took the original C:\DRV as well as the copy'
+        }
+        # Created: the listing has it, and as a directory.
+        # Two files, marked and copied in one go, under their own names.
+        # The count is the point: one arriving would look like success to
+        # anything that only asks whether a copy happened at all.
+        $listing = [regex]::Match($seen,
+                   '(?is)Directory of C:\\picked(.{0,400}?)file\(s\)')
+        $picked = if ($listing.Success) {
+            ([regex]::Matches($listing.Groups[1].Value, '<DIR>|\d+')).Count
+        } else { 0 }
+        if ($picked -lt 2) {
+            $fail += "the two marked rows did not both reach c:\picked ($picked of 2)"
+        }
+
+        # Copied through the clipboard, with nothing typed: hi.axe was put
+        # on it in C: and pasted inside newdir.
+        # On the rendered screen and not in the transcript: between two
+        # lines of a listing the transcript carries cursor moves and colour
+        # changes, so "within N characters of" means nothing there.  The
+        # screen is what a person would be reading.
+        #
+        # Three hundred and not a hundred: vtdump pads every line to eighty
+        # columns, so the blank line between a listing's heading and its
+        # first row is a hundred and sixty characters of nothing.  The
+        # generous window is the point - this asks "in this listing", and
+        # the listing is at most a dozen rows.
+        if ($screen -notmatch
+            '(?i)Directory of C:\\newdir[\s\S]{0,300}hi\.axe') {
+            $fail += 'Edit > Copy then Paste did not put hi.axe into newdir'
+        }
+
+        if ($seen -notmatch '(?i)newdir +<DIR>') {
+            $fail += 'Create directory did not make it'
+        }
+    } else {
+        Write-Host 'desktop: no vtdump, so the disk itself is not checked'
+    }
+
+    # The picture as it stood, against the same picture after a forced full
+    # repaint.  Any difference is the shell's own output failing to reach the
+    # panel - a torn present, a stale save-under - and it is invisible in
+    # either picture alone.
+    if ((Test-Path $png) -and (Test-Path $png2)) {
+        Add-Type -AssemblyName System.Drawing
+        $a = New-Object System.Drawing.Bitmap $png
+        $b = New-Object System.Drawing.Bitmap $png2
+        if ($a.Width -ne $b.Width -or $a.Height -ne $b.Height) {
+            $fail += 'the two pictures are different sizes'
+        } else {
+            # Two counts, not one, and the split is the whole point.
+            #
+            # The status strip along the bottom carries counters that move -
+            # the key and pointer totals go up between the two shots because
+            # F5 is itself a key - so a difference there is expected and says
+            # nothing.  ANYWHERE ELSE a difference means the first paint did
+            # not all reach the panel, and the tolerance for it is zero.
+            #
+            # It used to be one number against a budget of "about a strip's
+            # worth of pixels", and that let a real bug through: a window
+            # caption left half navy and half grey came to 1330 pixels,
+            # comfortably under the budget, and the check said ok.  A budget
+            # measured in pixels cannot tell a moving counter from a stale
+            # window; a budget measured in ROWS can.
+            $stripTop = $a.Height - 20
+            $inStrip = 0
+            $above = 0
+            $firstX = -1
+            $firstY = -1
+            for ($y = 0; $y -lt $a.Height; $y++) {
+                for ($x = 0; $x -lt $a.Width; $x++) {
+                    if ($a.GetPixel($x, $y) -ne $b.GetPixel($x, $y)) {
+                        if ($y -ge $stripTop) {
+                            $inStrip++
+                        } else {
+                            $above++
+                            if ($firstX -lt 0) { $firstX = $x; $firstY = $y }
+                        }
+                    }
+                }
+            }
+            Write-Host ("desktop: after a forced repaint, {0} pixels differ in the status strip and {1} above it" -f
+                        $inStrip, $above)
+            if ($above -gt 0) {
+                $fail += ("the forced repaint changed $above pixels outside the status strip, from ($firstX,$firstY) - " +
+                          'the first paint did not all reach the panel')
+            }
+        }
+        $a.Dispose()
+        $b.Dispose()
+    }
+
+    # ---- the console window ----------------------------------------------
+    #
+    # It shows the kernel's console inside a window of the shell's own, which
+    # nothing else here does: every other window draws what the shell itself
+    # decided.  Two things say it worked.  This line, which the shell prints
+    # when the window opens - and prints ON the console, so it lands inside the
+    # window it is announcing.  And the two photographs above, which now
+    # include the window: cells that reached the panel once and not on a
+    # repaint would show up there, and the console's content is static by this
+    # point (the last thing to print was a program that has already exited).
+    if ($text -notmatch 'desktop: console window opened') {
+        $fail += 'the console window never opened'
+    }
+
+    $m = [regex]::Match($text,
+                        'desktop: surface (\d+)x(\d+) (\w+), focus (\w+)')
+    if ($m.Success) {
+        Write-Host ("desktop: surface {0}x{1} {2}, focus {3}" -f
+                    $m.Groups[1].Value, $m.Groups[2].Value,
+                    $m.Groups[3].Value, $m.Groups[4].Value)
+        if ($Width -gt 0 -and [int]$m.Groups[1].Value -ne $Width) {
+            $fail += ("asked for a {0}x{1} surface and got {2}x{3}" -f $Width,
+                      $Height, $m.Groups[1].Value, $m.Groups[2].Value)
+        }
+        # Painting before the slot has focus is painting into a flush the
+        # kernel discards.  The shell waits for it; if it gave up waiting, the
+        # picture below is not to be trusted.
+        if ($m.Groups[4].Value -ne 'yes') {
+            $fail += 'the shell started painting without focus'
+        }
+    } else {
+        $fail += 'the shell never said what surface it got'
+    }
+
+    # The numbers it printed on its way out.  Zero pointer events with a good
+    # picture means the drawing works and the input does not, and telling those
+    # two apart is most of why this script exists.
+    # Two patterns, because the shell prints two lines - and it prints two
+    # lines because a single one grew past the console's eighty columns and
+    # was wrapped, with escape sequences through the middle of it.
+    # The shell runs TWICE in this scenario and prints these on the way out
+    # each time, so which match is wanted depends on which run is being asked
+    # about: the first is the one that was driven, the last is the one that was
+    # given nothing and had to remember.
+    $mm = [regex]::Matches($text,
+                        'desktop: (\d+) pointer events, (\d+) key events, (\d+) repaints')
+    $mm2 = [regex]::Matches($text,
+                         'desktop: (\d+) windows, (\d+) reflushes, (\d+) moves coalesced')
+    $m = if ($mm.Count -gt 0) { $mm[0] } else { $mm }
+    $m2 = if ($mm2.Count -gt 0) { $mm2[0] } else { $mm2 }
+    if ($m.Success -and $m2.Success) {
+        $ptr = [int]$m.Groups[1].Value
+        $key = [int]$m.Groups[2].Value
+        $rep = [int]$m.Groups[3].Value
+        $win = [int]$m2.Groups[1].Value
+        Write-Host ("desktop: {0} pointer events, {1} key events, {2} repaints, {3} windows left" -f
+                    $ptr, $key, $rep, $win)
+        if ($ptr -lt 5) { $fail += "only $ptr pointer events arrived" }
+        if ($key -lt 1) { $fail += 'no key ever arrived' }
+        # Both ways of asking for the context menu, counted.  A right button
+        # that reached nothing and a long press that was taken for a drag both
+        # look like a passing run otherwise.
+        # The desk pattern changed, and the shell says which tile it is
+        # on now.  The two-photograph criterion covers the rest: a desk
+        # whose repaint does not line up with the tile already drawn
+        # shows up there, not here.
+        # The rubber band marked more than one row.  The number itself is
+        # not fixed - it depends on how many entries C:\ has by then - but
+        # "more than one" is the whole claim: one row is what a click does.
+        # Exactly two, and the number is the whole point: the band passed
+        # over five rows on the way down and came back to two, so a count
+        # of five would mean the marks were accumulated rather than
+        # recomputed, and a count of one would mean the gesture never
+        # became a band at all.
+        # The window drag landed where it was dropped.  The folder window
+        # is the only one in the arrangement - the console window has no
+        # path and is not part of one - so there is exactly one line to
+        # read, and it is read as numbers rather than matched as a
+        # spelling.
+        $winline = [regex]::Match($text, '1 = (-?\d+),(-?\d+),\d+,\d+,\d+,c:')
+        if (-not $winline.Success) {
+            $fail += 'DESKTOP.INI holds no frame for the folder window'
+        } else {
+            $wx = [int]$winline.Groups[1].Value
+            if ($wx -ne ($fwX + 40)) {
+                $fail += ('the dragged window was written down at x=' +
+                          "$wx, not at " + ($fwX + 40))
+            }
+        }
+
+        # The clock was set from the desktop, through an ABI entry that
+        # was a stub this morning.  The date is checked and the time is
+        # not: seconds pass between the dialog and the question.
+        if ($text -notmatch '2031-03-04') {
+            $fail += 'Set time... did not reach the system clock'
+        }
+
+        # The prompt window took a command and its shell ran it.  Both
+        # halves matter: a window that draws somebody else's screen is
+        # a view, and a view cannot make a directory.
+        # As a directory in the listing, and that is the whole trick.
+        #
+        # The first version of this was `$text -notmatch 'fromwin'`, and it
+        # passed a run in which nothing was created: inputplay echoes the
+        # keys it is about to send, so the word was in the transcript before
+        # the guest saw a key.  An assertion its own command satisfies is not
+        # an assertion.  The second version asked for FROMWIN in capitals, on
+        # the theory that a DOS listing shouts - it does not; the name is
+        # kept as it was typed.  What the echo cannot contain is the name
+        # followed by the <DIR> column, so that is what is asked for.  A
+        # regex shaped around 'Directory of C:\' is no use either: the
+        # listing arrives full of escape codes.
+        if ($seen -notmatch 'fromwin\s+<DIR>') {
+            $fail += 'the Console window never reached a shell'
+        }
+
+        # A directory whose name was typed entirely on the glass.
+        #
+        # Not a screenshot of a keyboard: a dozen clicks on drawn keys, a
+        # click on the drawn Enter, and the name on the disk afterwards or
+        # the keys did nothing.  Same trap as fromwin - the listing keeps
+        # the name as it was typed - so the <DIR> column is what proves it
+        # is the listing and not an echo.
+        if ($seen -notmatch 'bykeys\s+<DIR>') {
+            $fail += 'the keyboard drawn on the glass never reached a shell'
+        }
+
+        # And what the desktop's own counters say about the same step, which
+        # is what tells a window that never opened from a shell that never
+        # read: see the ID_PROMPT case in desktop.c.
+        $fwd = [regex]::Match($text,
+               'prompt window (opened|never opened), (\d+) key\(s\) forwarded, (\d+) taken')
+        if (-not $fwd.Success -or $fwd.Groups[1].Value -ne 'opened') {
+            $fail += 'the Console window never opened'
+        } elseif ($fwd.Groups[2].Value -eq '0') {
+            $fail += 'the Console window got no keys'
+        } elseif ($fwd.Groups[3].Value -ne $fwd.Groups[2].Value) {
+            $fail += ("the prompt's slot refused keys: " +
+                      $fwd.Groups[3].Value + ' of ' + $fwd.Groups[2].Value + ' taken')
+        }
+
+        $band = [regex]::Match($text, 'desktop: band marked (\d+)')
+        if (-not $band.Success) {
+            $fail += 'the rubber band never reported a selection'
+        } elseif ([int]$band.Groups[1].Value -ne 2) {
+            $fail += ('the rubber band ended with ' + $band.Groups[1].Value +
+                      ' row(s) marked, not the two it came back to')
+        }
+
+        if ($text -notmatch 'desktop: desk pattern [1-9]') {
+            $fail += 'Options > Pattern did not change the desk'
+        }
+
+        # The keyboard setting was read and acted on, both ways.  The
+        # shell says which way it went, so this is checked by what it did
+        # and not by the fact that a menu item exists.
+        if ($text -notmatch 'desktop: on-screen keyboard on') {
+            $fail += 'Options > Keyboard: always did not switch it on'
+        }
+        if ($text -notmatch 'desktop: on-screen keyboard off \(automatic\)') {
+            $fail += 'Keyboard: automatic did not come back (the emulator has a keyboard, so it should be off)'
+        }
+
+        # Dim went all the way round and came back to never.  The shell
+        # prints the period it landed on, so the last of these lines is the
+        # proof that a later scenario keeps its screen.
+        foreach ($d in @('1 min', '5 min', '15 min', 'never')) {
+            if ($text -notmatch ('desktop: dim after ' + [regex]::Escape($d))) {
+                $fail += ('Options > Dim never reached ' + $d)
+            }
+        }
+
+        # The font item did what it says: to 8x8 and back to 8x16.  A menu
+        # item that only *opens* is not a setting, and this shell had no way
+        # to change the font from the board at all until it existed.
+        if ($text -notmatch 'desktop: font 8x8') {
+            $fail += 'Options > Small font never took effect'
+        }
+        if ($text -notmatch 'desktop: font 8x16') {
+            $fail += 'Options > Large font never came back'
+        }
+
+        $ctx = ([regex]::Matches($text, 'desktop: context menu at')).Count
+        Write-Host "desktop: the context menu opened $ctx time(s)"
+        if ($ctx -lt 2) {
+            $fail += "the context menu opened $ctx time(s), wanted 2 (right button and long press)"
+        }
+        if ($rep -lt 1) {
+            $fail += 'F5 never reached the shell, so the second picture is not a fresh paint'
+        }
+        # Every keystroke the script sends, counted, against what the shell
+        # says it saw.
+        #
+        # This is the assertion that catches a run which quietly did half the
+        # sequence.  Without it, a step that never happened is invisible: the
+        # disk checks below then confirm that a copy which was never made is
+        # not there, and the whole thing passes.  One run delivered thirty of
+        # ninety keys and failed on nothing but the rename.
+        $wantKeys = 0
+        foreach ($k in $keyboard) {
+            if ($k -like 'key *') {
+                $wantKeys++
+            } elseif ($k -like 'say *') {
+                $wantKeys += $k.Substring(4).Length
+            }
+        }
+        if ($key -lt $wantKeys) {
+            $fail += "only $key of $wantKeys keystrokes reached the shell, so the sequence did not all run"
+        }
+        # Four opened from the menu, two closed with Alt+F4.  A different
+        # number means a menu that did not open, a click that missed, or a
+        # close that did not close - and the picture alone would not say which.
+        # Two, still, although five windows are opened now and not four: the
+    # prompt window is the one in front when the closing keys arrive, so it
+    # is the one they close.  That it opened at all is checked above, by the
+    # desktop's own counters, and what it did is checked on the disk.
+    #
+    # The folder window this sequence opened and the console window,
+        # which is deliberately left open - what the second run then restores
+        # says whether a window with no folder behind it stays out of the
+        # arrangement, which is the rule DESKTOP.INI is written by.
+        if ($win -ne 2) {
+            $fail += "$win windows were left open, not the two the sequence should leave"
+        }
+    } else {
+        $fail += 'the shell did not print its counts (it may have been killed)'
+    }
+
+    # ---- what the second run remembered ---------------------------------
+    #
+    # It was given no input at all and left on its own deadline, so everything
+    # it reports came out of C:\DESKTOP.INI.
+    if ($mm.Count -lt 2 -or $mm2.Count -lt 2) {
+        $fail += 'the shell did not start a second time, so nothing was restored'
+    } else {
+        $r = $mm[$mm.Count - 1]
+        $r2 = $mm2[$mm2.Count - 1]
+        $rPtr = [int]$r.Groups[1].Value
+        $rKey = [int]$r.Groups[2].Value
+        $rWin = [int]$r2.Groups[1].Value
+        Write-Host ("desktop: the restored run saw {0} pointer and {1} key events, and had {2} window(s)" -f
+                    $rPtr, $rKey, $rWin)
+        if ($rPtr -ne 0 -or $rKey -ne 0) {
+            $fail += "the second run was not left alone ($rPtr pointer, $rKey key events), so it proves nothing"
+        }
+        # One, not two: the console window is not part of an arrangement -
+        # it shows a thing the machine has rather than a place on a disk, and
+        # DESKTOP.INI records places.  A second run with two windows would mean
+        # the shell had written down a window it cannot put back.
+        if ($rWin -ne 1) {
+            $fail += "the second run had $rWin windows open, not the one folder window it should restore"
+        }
+    }
+
+    # And the icon: DESKTOP.INI was typed to the console, so the position it
+    # holds can be compared with where the drag actually dropped it.  A regex
+    # for "some big number" would pass on the default position too; this is
+    # the comparison itself.
+    # No ^ anchor and no multiline: the transcript is a stream of cursor
+    # positioning, not of lines, so there is nothing for ^ to anchor to.  The
+    # writer emits exactly "T: = x,y", which is specific enough on its own.
+    $iniLine = [regex]::Match($text, 'T:\s*=\s*(-?\d+)\s*,\s*(-?\d+)')
+    if (-not $iniLine.Success) {
+        $fail += 'DESKTOP.INI holds no position for the icon that was dragged'
+    } else {
+        $ix = [int]$iniLine.Groups[1].Value
+        $iy = [int]$iniLine.Groups[2].Value
+        Write-Host ("desktop: DESKTOP.INI puts the dragged icon at {0},{1}" -f $ix, $iy)
+        # It started at 4,48.  Anything near there means the drag was not
+        # recorded; the drop was at 300,menubar+200.
+        if ($ix -lt 100 -or $iy -lt 100) {
+            $fail += "the dragged icon was written down at $ix,$iy - close to where it started, so the drag was not recorded"
+        }
+    }
+    if (-not (Test-Path $png3)) {
+        $fail += 'no picture of the restored desktop'
+    }
+
+
+    if ($fail.Count -gt 0) {
+        Write-Host ''
+        foreach ($f in $fail) { Write-Host "FAIL: $f" }
+        Write-Host "transcript: $log"
+        exit 1
+    }
+    Write-Host "desktop: ok - $png, $png2, transcript $log"
+} finally {
+    Pop-Location
+}

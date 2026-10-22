@@ -11,6 +11,45 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Handing arguments on to another PowerShell script, BY NAME.
+#
+# `& $script @Rest` looks exactly like it does this, and does not: splatting an
+# ARRAY binds POSITIONALLY.  So `argon nodetest -Scenario link` put the string
+# "-Scenario" into nodetest's first positional parameter, which is -TimeoutSec,
+# and failed with a message about converting a string to an integer that
+# mentions neither -Scenario nor this file.  It was written down for months as
+# "the wrapper eats the first argument; run the script directly", and it is not
+# nodetest's problem: every named argument to every subcommand went this way.
+#
+# A HASHTABLE splat binds by name, so the pairs are rebuilt here.  Native
+# programs (idf.py, python) are left on the array splat, which is right for
+# them: they take their arguments as plain strings and do their own parsing.
+function Invoke-Ps1 {
+    param([string]$Script, [string[]]$Argv)
+
+    $named = @{}
+    $positional = @()
+    for ($i = 0; $i -lt $Argv.Count; $i++) {
+        $a = $Argv[$i]
+        if ($a -notmatch '^-[A-Za-z]') {
+            $positional += $a
+            continue
+        }
+        $name = $a.Substring(1)
+        $next = if ($i + 1 -lt $Argv.Count) { $Argv[$i + 1] } else { $null }
+        # Its value, or a switch with none.  Something starting with '-' counts
+        # as a value only when it is a number, so -Baud -1 works and
+        # -Scenario -Verbose does not silently eat the second flag.
+        if ($null -ne $next -and $next -notmatch '^-[A-Za-z]') {
+            $named[$name] = $next
+            $i++
+        } else {
+            $named[$name] = $true
+        }
+    }
+    & $Script @named @positional
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
@@ -41,7 +80,13 @@ ArgonOS
                            (FAT16 snapshot; then: argon run -Sd)
   argon get GUEST [OUT]    copy a file out of build\sdcard.img to the host
                            (e.g. argon get shot.ppm)
+  argon fallout [args]     build FALLOUT2.AXE (apps/fallout/build.py) with
+                           the IDF toolchain on PATH; -game 1 for Fallout 1
   argon test [-Send ...]   automated boot test; prints the resulting screen
+                           (a guest command must not END in a backslash:
+                            PowerShell escapes it into the next argument and
+                            the guest sees the two glued together.  Write
+                            "copy a:\x.cfg c:\x.cfg", never "... c:\")
   argon test -cp 866 ...   the same, when the screen is in another code page
   argon tests              host unit tests (needs a host C compiler)
   argon match CAPTURE.nam  fit a model's voicing to a capture of the real
@@ -55,7 +100,9 @@ ArgonOS
                            add `picture` to run the agent and check the screen
                            as well (`keep` leaves the emulator up)
   python tools/netfixture.py serve   the same servers, to try things by hand
-  argon check              local CI: host tests, then firmware build
+  argon check              local CI: host tests, firmware, apps, relocations
+  argon remote CMD ...     run any argon command on the test PC with this
+                           working tree (docs\16-test-pc.md); -Probe: is it up
   argon target             which chip the firmware is built for
   argon target esp32c6     the RISC-V board (docs\12-esp32-c6-lcd.md)
   argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
@@ -75,6 +122,18 @@ Machine specific paths live in tools\local-env.ps1, which is not committed.
 }
 
 function Resolve-HostPython {
+    # A path given by hand wins over anything found by searching: on a machine
+    # where PATH leads to the Windows Store stub, the search below burns a
+    # process and prints "Python" to stderr before failing, which reads like a
+    # broken interpreter rather than an absent one.  tools\local-env.ps1 sets
+    # this; ARGON_PYTHON is its name there, IDF_PYTHON is what an IDF shell
+    # leaves behind.
+    foreach ($named in @($env:ARGON_PYTHON, $env:IDF_PYTHON)) {
+        if ($named -and (Test-Path -LiteralPath $named)) {
+            return @{ Exe = $named; Prefix = @() }
+        }
+    }
+
     # Prefer a real interpreter over the Windows Store stub (exit 9009).
     foreach ($name in @('python', 'python3', 'py')) {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue
@@ -163,6 +222,142 @@ function Build-HostTools {
 # `argon target <chip>` removes sdkconfig first, which is why switching targets
 # has always worked.  So this does not fix anything; it says which command to
 # run.
+# ---------------------------------------------------------------------------
+# [memory] in a board pack's BOARD.CFG, the build-time half (argon/place.h).
+#
+# Code and the kernel's static tables are placed by the linker, so where they
+# go is an sdkconfig switch - and the board pack is where a board says what
+# it wants.  `argon target` remembers which pack goes with the chip variant
+# (.argon-board, not in git) and both `target` and `build` write the pack's
+# build-time pieces into sdkconfig, so editing the pack and running
+# `argon build` is all a change takes.  The kernel reads the same section at
+# boot and says, in `mem /p`, if what was built is not what it asks for.
+#
+# Each piece's value is a list in order of preference ("psram, iram"; `only`
+# first means nothing else).  The first kind this build can have wins: psram
+# needs CONFIG_SPIRAM, rom needs a ROM flash driver.
+# ---------------------------------------------------------------------------
+$script:BoardPackOf = @{
+    'esp32'         = 'esp32-cyd'
+    'esp32-cyd'     = 'esp32-cyd'
+    'esp32s3-board' = 'esp32s3-cam'
+    'esp32s3-cam'   = 'esp32s3-cam'
+    'esp32s3-zero'  = 'esp32s3-zero'
+    'esp32s3-lcd2'  = 'esp32s3-touch-lcd-2'
+    'esp32s3-touch-lcd-2' = 'esp32s3-touch-lcd-2'
+    'esp32c6'       = 'esp32-c6-lcd-1.47'
+    'esp32c3'       = 'esp32c3-supermini'
+}
+
+# piece -> kinds it may take -> the sdkconfig switches each kind means.
+$script:MemoryPieces = [ordered]@{
+    'freertos'      = @{ flash = @{ FREERTOS_PLACE_FUNCTIONS_INTO_FLASH = 'y' }
+                         iram  = @{ FREERTOS_PLACE_FUNCTIONS_INTO_FLASH = 'n' } }
+    'heap.code'     = @{ flash = @{ HEAP_PLACE_FUNCTION_INTO_FLASH = 'y' }
+                         iram  = @{ HEAP_PLACE_FUNCTION_INTO_FLASH = 'n' } }
+    'ringbuf.code'  = @{ flash = @{ RINGBUF_PLACE_FUNCTIONS_INTO_FLASH = 'y' }
+                         iram  = @{ RINGBUF_PLACE_FUNCTIONS_INTO_FLASH = 'n' } }
+    'wifi.fast'     = @{ flash = @{ ESP_WIFI_IRAM_OPT = 'n'; ESP_WIFI_RX_IRAM_OPT = 'n' }
+                         iram  = @{ ESP_WIFI_IRAM_OPT = 'y'; ESP_WIFI_RX_IRAM_OPT = 'y' } }
+    'phy.fast'      = @{ flash = @{ ESP_PHY_IRAM_OPT = 'n' }
+                         iram  = @{ ESP_PHY_IRAM_OPT = 'y' } }
+    'libc.locks'    = @{ flash = @{ LIBC_LOCKS_PLACE_IN_IRAM = 'n' }
+                         iram  = @{ LIBC_LOCKS_PLACE_IN_IRAM = 'y' } }
+    'driver.isr'    = @{ flash = @{ I2C_MASTER_ISR_HANDLER_IN_IRAM = 'n'; GPTIMER_ISR_HANDLER_IN_IRAM = 'n'
+                                    MCPWM_ISR_HANDLER_IN_IRAM = 'n'; RMT_TX_ISR_HANDLER_IN_IRAM = 'n'
+                                    RMT_RX_ISR_HANDLER_IN_IRAM = 'n'; RMT_ENCODER_FUNC_IN_IRAM = 'n' }
+                         iram  = @{ I2C_MASTER_ISR_HANDLER_IN_IRAM = 'y'; GPTIMER_ISR_HANDLER_IN_IRAM = 'y'
+                                    MCPWM_ISR_HANDLER_IN_IRAM = 'y'; RMT_TX_ISR_HANDLER_IN_IRAM = 'y'
+                                    RMT_RX_ISR_HANDLER_IN_IRAM = 'y'; RMT_ENCODER_FUNC_IN_IRAM = 'y' } }
+    'flash.driver'  = @{ rom   = @{ SPI_FLASH_ROM_IMPL = 'y' }
+                         iram  = @{ SPI_FLASH_ROM_IMPL = 'n' } }
+    'kernel.static' = @{ psram = @{ SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = 'y'; ARGON_PLACE_KERNEL_STATIC_PSRAM = 'y' }
+                         iram  = @{ ARGON_PLACE_KERNEL_STATIC_PSRAM = 'n' } }
+    'dev.table'     = @{ psram = @{ SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = 'y'; ARGON_PLACE_DEV_TABLE_PSRAM = 'y' }
+                         iram  = @{ ARGON_PLACE_DEV_TABLE_PSRAM = 'n' } }
+}
+
+function Read-BoardMemory([string]$cfgPath) {
+    $out = [ordered]@{}
+    if (-not (Test-Path -LiteralPath $cfgPath)) { return $out }
+    $section = ''
+    foreach ($raw in Get-Content -LiteralPath $cfgPath) {
+        $line = ($raw -replace '[;#].*$', '').Trim()
+        if ($line -eq '') { continue }
+        if ($line -match '^\[(.+)\]$') { $section = $Matches[1].Trim().ToLowerInvariant(); continue }
+        if ($section -ne 'memory') { continue }
+        if ($line -match '^([^=]+)=(.*)$') { $out[$Matches[1].Trim()] = $Matches[2].Trim() }
+    }
+    return $out
+}
+
+function Sync-BoardMemory {
+    if (-not (Test-Path 'sdkconfig') -or -not (Test-Path '.argon-board')) { return $true }
+    $pack = (Get-Content '.argon-board' -TotalCount 1).Trim()
+    if ($pack -eq '') { return $true }
+    $cfgPath = Join-Path 'boards' (Join-Path $pack 'BOARD.CFG')
+    $asked = Read-BoardMemory $cfgPath
+    if ($asked.Count -eq 0) { return $true }
+
+    $lines = [System.Collections.Generic.List[string]](Get-Content 'sdkconfig')
+    $text = $lines -join "`n"
+    $hasPsram = $text -match '(?m)^CONFIG_SPIRAM=y$'
+    $hasRomFlash = $text -match '(?m)^CONFIG_ESP_ROM_HAS_SPI_FLASH=y$'
+
+    $want = [ordered]@{}
+    $ok = $true
+    foreach ($piece in $asked.Keys) {
+        if (-not $script:MemoryPieces.Contains($piece)) { continue } # a boot-time piece
+        $words = @(($asked[$piece] -split '[,\s]+') | Where-Object { $_ -ne '' } |
+                   ForEach-Object { $_.ToLowerInvariant() })
+        $only = $false
+        if ($words.Count -gt 0 -and $words[0] -eq 'only') { $only = $true; $words = @($words | Select-Object -Skip 1) }
+        $words = @($words | ForEach-Object { if ($_ -in 'sram', 'internal') { 'iram' } else { $_ } })
+        $kinds = $script:MemoryPieces[$piece]
+        $chosen = $null
+        foreach ($w in $words) {
+            if (-not $kinds.ContainsKey($w)) {
+                Write-Host "memory: $piece = $($asked[$piece]): it cannot live in $w ($pack\BOARD.CFG)" -ForegroundColor Red
+                $ok = $false; break
+            }
+            if ($w -eq 'psram' -and -not $hasPsram) { continue }
+            if ($w -eq 'rom' -and -not $hasRomFlash) { continue }
+            $chosen = $w; break
+        }
+        if (-not $ok) { break }
+        if ($null -eq $chosen) {
+            if ($only) {
+                Write-Host "memory: $piece = $($asked[$piece]), and this build has none of them" -ForegroundColor Red
+                $ok = $false; break
+            }
+            continue # nothing listed is possible here: the build's own default stands
+        }
+        foreach ($sym in $kinds[$chosen].Keys) { $want[$sym] = $kinds[$chosen][$sym] }
+    }
+    if (-not $ok) { return $false }
+
+    $changed = @()
+    foreach ($sym in $want.Keys) {
+        $set = if ($want[$sym] -eq 'y') { "CONFIG_$sym=y" } else { "# CONFIG_$sym is not set" }
+        $idx = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "^CONFIG_$sym=" -or $lines[$i] -eq "# CONFIG_$sym is not set") { $idx = $i; break }
+        }
+        if ($idx -ge 0) {
+            if ($lines[$idx] -ne $set) { $lines[$idx] = $set; $changed += $set }
+        } else {
+            $lines.Add($set); $changed += $set
+        }
+    }
+    if ($changed.Count -gt 0) {
+        Set-Content -Path 'sdkconfig' -Value $lines -Encoding ascii
+        Write-Host "memory: $pack\BOARD.CFG [memory] -> sdkconfig:"
+        foreach ($c in $changed) { Write-Host "  $c" }
+    }
+    return $true
+}
+
+
 function Warn-StaleSdkconfig {
     if (-not (Test-Path 'sdkconfig')) { return }
     $cfg = (Get-Item 'sdkconfig').LastWriteTimeUtc
@@ -197,6 +392,7 @@ switch ($Command.ToLowerInvariant()) {
     'build' {
         Initialize-Environment
         Warn-StaleSdkconfig
+        if (-not (Sync-BoardMemory)) { exit 1 }
         & idf.py build @Rest
         exit $LASTEXITCODE
     }
@@ -226,9 +422,12 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32s3-zero   ESP32-S3-Zero: 4 MB flash, USB-JTAG console, I2S DAC, no display/SD'
             Write-Host '                esp32s3-kvm    esp32s3-board with the OTG port as a keyboard, pointer,'
             Write-Host '                               serial pipe and flash drive (KVM.AXE, partitions_kvm.csv)'
+            Write-Host '                esp32s3-lcd2   Waveshare ESP32-S3-Touch-LCD-2: 16 MB flash, ST7789 panel and TF card on one SPI bus'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
+            Write-Host '                esp32c3     hardware: RISC-V, USB console, one core, 400 KB - the C3 SuperMini'
+        Write-Host '                esp32c3-qemu  the same in the emulator: console on UART0, no radio'
             exit 0
         }
 
@@ -244,6 +443,8 @@ switch ($Command.ToLowerInvariant()) {
                           $chip = 'esp32' }
             'esp32-probe' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.probe'
                             $chip = 'esp32' }
+            'esp32-cyd' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.cyd'
+                          $chip = 'esp32' }
             'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
             'esp32s3-board' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board'
                               $chip = 'esp32s3' }
@@ -253,7 +454,16 @@ switch ($Command.ToLowerInvariant()) {
                              $chip = 'esp32s3' }
             'esp32s3-kvm' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board;sdkconfig.esp32s3.kvm'
                             $chip = 'esp32s3' }
+            # Waveshare ESP32-S3-Touch-LCD-2.  main called the same board
+            # esp32s3-touch-lcd-2 (sdkconfig.esp32s3.wslcd2) while this line
+            # called it esp32s3-lcd2; the merge of 25 Sep 2026 kept one build
+            # and both names.
+            { $_ -in 'esp32s3-lcd2', 'esp32s3-touch-lcd-2' } { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.lcd2'
+                             $chip = 'esp32s3' }
             'esp32c6'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c6' }
+            'esp32c3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3' }
+            'esp32c3-qemu' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3;sdkconfig.esp32c3.qemu'
+                             $chip = 'esp32c3' }
             default {
                 Write-Host "argon target: no defaults for '$chip'."
                 Write-Host 'Add sdkconfig.defaults.<chip> before building for it.'
@@ -297,8 +507,15 @@ switch ($Command.ToLowerInvariant()) {
             }
         }
 
+        # Which board pack goes with this variant, for [memory] (Sync-BoardMemory).
+        $variant = $Rest[0]
+        $pack = if ($script:BoardPackOf.ContainsKey($variant)) { $script:BoardPackOf[$variant] } else { '' }
+        Set-Content -Path '.argon-board' -Value $pack -Encoding ascii
+
         & idf.py -D "SDKCONFIG_DEFAULTS=$defaults" set-target $chip
-        exit $LASTEXITCODE
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        if (-not (Sync-BoardMemory)) { exit 1 }
+        exit 0
     }
 
     'get' {
@@ -329,11 +546,30 @@ switch ($Command.ToLowerInvariant()) {
         exit 0
     }
 
+    'fallout' {
+        # apps/fallout/build.py wants xtensa-esp32s3-elf-gcc on PATH, which is
+        # what Initialize-Environment is for.  Doing it by hand is three lines
+        # of PowerShell that have to be right, and getting them wrong fails as
+        # 'FileNotFoundError' from inside subprocess with no mention of a
+        # compiler.
+        Initialize-Environment
+        # Resolve-HostPython hands back the interpreter and the arguments it
+        # needs in front of a script ('py -3'), not a bare path.
+        $py = Resolve-HostPython
+        $script = Join-Path $PSScriptRoot '../apps/fallout/build.py'
+        & $py.Exe @($py.Prefix + @($script) + $Rest)
+        exit $LASTEXITCODE
+    }
+
     'sync' {
         # idf-env often puts a working Python on PATH (avoids the Store stub).
         Initialize-Environment
         if ($Rest.Count -lt 1) {
-            Write-Host 'Usage: argon sync <host-folder> [-SizeMB 64] [-Out build\sdcard.img]'
+            # -Image, not -Out: PowerShell binds -Out to its own common
+            # parameters before this script sees it, and the error it gives is
+            # "AmbiguousParameter" with no hint that the option was ours.  -Out
+            # still works when it survives that far.
+            Write-Host 'Usage: argon sync <host-folder> [-SizeMB 64] [-Image build\sdcard.img]'
             exit 1
         }
         $dir = $Rest[0]
@@ -342,7 +578,8 @@ switch ($Command.ToLowerInvariant()) {
         for ($i = 1; $i -lt $Rest.Count; $i++) {
             if ($Rest[$i] -match '^(?i)-SizeMB$' -and ($i + 1) -lt $Rest.Count) {
                 $sizeMb = [int]$Rest[$i + 1]; $i++
-            } elseif ($Rest[$i] -match '^(?i)-Out$' -and ($i + 1) -lt $Rest.Count) {
+            } elseif ($Rest[$i] -match '^(?i)-(Out|Image)$' -and
+                      ($i + 1) -lt $Rest.Count) {
                 $out = $Rest[$i + 1]; $i++
             } elseif ($Rest[$i] -like '-*') {
                 throw "Unknown sync option: $($Rest[$i])"
@@ -382,6 +619,8 @@ switch ($Command.ToLowerInvariant()) {
                 $runOpts['NoBuild'] = $true
             } elseif ($a -match '^(?i)-NoNet$') {
                 $runOpts['NoNet'] = $true
+            } elseif ($a -match '^(?i)-Lan$') {
+                $runOpts['Lan'] = $true
             } elseif ($a -match '^(?i)-NetPort$' -and ($i + 1) -lt $Rest.Count) {
                 $runOpts['NetPort'] = [int]$Rest[$i + 1]
                 $i++
@@ -390,6 +629,9 @@ switch ($Command.ToLowerInvariant()) {
                 $i++
             } elseif ($a -match '^(?i)-SdImage$' -and ($i + 1) -lt $Rest.Count) {
                 $runOpts['SdImage'] = $Rest[$i + 1]
+                $i++
+            } elseif ($a -match '^(?i)-Psram$' -and ($i + 1) -lt $Rest.Count) {
+                $runOpts['Psram'] = [int]$Rest[$i + 1]
                 $i++
             } else {
                 throw "Unknown run option: $a"
@@ -400,6 +642,13 @@ switch ($Command.ToLowerInvariant()) {
     }
 
     'virt' {
+        # local-env.ps1 is where the machine's real interpreter is named, and
+        # without it this command lands on the Store stub.  Sourced directly
+        # rather than through Initialize-Environment: the input helpers need
+        # Python and nothing else, and pulling in the whole IDF environment to
+        # start them takes seconds that a person is sitting through.
+        $localEnv = Join-Path $PSScriptRoot 'local-env.ps1'
+        if (Test-Path $localEnv) { . $localEnv }
         $py = Resolve-HostPython
         $script = Join-Path $PSScriptRoot 'virt.py'
         & $py.Exe @($py.Prefix) $script @Rest
@@ -425,7 +674,7 @@ switch ($Command.ToLowerInvariant()) {
         # first positional parameter instead of as a switch.
         #
         $valued = @('marker', 'timeoutsec', 'port', 'sdimage', 'quietms',
-                    'logpath', 'put', 'hostfs', 'hostfsport')
+                    'logpath', 'put', 'hostfs', 'hostfsport', 'radioport', 'psram')
         $send = @()
         $opts = @{}
         # -cp says which code page the screen bytes are in, for the dump only:
@@ -467,7 +716,12 @@ switch ($Command.ToLowerInvariant()) {
         # after being right on every earlier one.
         $wasOut = [Console]::OutputEncoding
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-        & cmd /c "build-host\vtdump.exe 80 25 $codepage < build\qemu-boot.log"
+        # The log this run was told to write, not the default one.  Printing
+        # build\qemu-boot.log whatever -LogPath said shows the screen of some
+        # earlier run - confidently, and with nothing to say it has done so.
+        $screen = 'build\qemu-boot.log'
+        if ($opts.ContainsKey('logpath')) { $screen = $opts['logpath'] }
+        & cmd /c "build-host\vtdump.exe 80 25 $codepage < ""$screen"""
         [Console]::OutputEncoding = $wasOut
         exit $bootStatus
     }
@@ -526,7 +780,74 @@ switch ($Command.ToLowerInvariant()) {
         # The network in the emulator, against servers this PC runs.  Not part
         # of `check`: it wants two ports and a Python that can bind them, and a
         # firewall prompt is not a test failure.
-        & (Join-Path $PSScriptRoot 'nettest.ps1') @Rest
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'nettest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'rlinktest' {
+        # The same network, but over an external radio: EXTRADIO.SYS bound with
+        # `net use extradio`, talking RLINK to a fake coprocessor (rlinkd.py) on
+        # a UART.  Proves the external-radio socket path with no hardware.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'rlinktest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'xclutest' {
+        # Two guests of DIFFERENT instruction sets as one cluster - an Xtensa S3
+        # under qemu-system-xtensa and a RISC-V C3 under qemu-system-riscv32.
+        # What needed both boards on the desk until the C3 emulator existed.
+        # Switches the target twice and leaves it on esp32s3.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'xclutest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'xcluprobe' {
+        # Not a check - a measurement.  Two remote runs on that pair with the
+        # frame counters printed between them, for the one-remote-run fault
+        # written up at the top of xclutest.ps1.  Reuses the last xclutest's
+        # banked C3 image and builds nothing.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'xcluprobe.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'rvtest' {
+        # The other instruction set, with no board plugged in: a CC-written
+        # RISC-V image run on an emulated ESP32-C3, and an emulated S3 writing
+        # one that matches the host build of the same compiler byte for byte.
+        # Switches the target twice and leaves it on esp32s3.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'rvtest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'attest' {
+        # The AT variant of rlinktest: ATRADIO.SYS bound with `net use atradio`,
+        # talking the stock ESP-01 AT command set to a fake modem (atmodemd.py)
+        # on a UART.  Proves the same socket path over a radio's own firmware.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'attest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'proctest' {
+        # Who collects a finished process: a parent slow to wait still gets its
+        # child's code, a killed child is kept for it, an orphan is swept up.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'proctest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'nodetest' {
+        # Two whole ArgonOS kernels in two emulators, their UART1 ports joined
+        # to each other, measured with apps\link - the cluster's wire, with no
+        # second board and nothing pretending to be a node.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'nodetest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'remote' {
+        # Any argon command on the test PC, with this working tree as it is
+        # (docs\16-test-pc.md).  Exit 3: the PC does not answer.  The array
+        # splat on purpose: every word, -Scenario included, goes through to
+        # the PC as it was typed, which is exactly what binds positionally.
+        & (Join-Path $PSScriptRoot 'remote.ps1') @Rest
         exit $LASTEXITCODE
     }
 
@@ -603,8 +924,31 @@ switch ($Command.ToLowerInvariant()) {
             exit $LASTEXITCODE
         }
 
+        # Does the relocation table actually move an image?
+        #
+        # Not "does it look right": the same source is linked twice at
+        # different pairs of bases, the first image is relocated onto the
+        # second's addresses using nothing but its own table, and the bytes
+        # must come out equal.  Both architectures, because they relocate
+        # differently - xtensa fixes absolute words in a literal pool, RISC-V
+        # re-encodes the immediates of instruction pairs - and the second kind
+        # had no test at all until a board was the only thing that could say.
         Write-Host ''
-        Write-Host 'check: OK (host tests + firmware + apps)'
+        Write-Host '== relocations =='
+        $relargs = @('--include', 'apps/hello', '--include', 'sdk/include',
+                     'apps/hello/hello.c')
+        foreach ($pair in @(@('xtensa', 'xtensa-esp32s3-elf-gcc'),
+                            @('riscv32', 'riscv32-esp-elf-gcc'))) {
+            & python (Join-Path $PSScriptRoot 'check_axe_relocs.py') `
+                --arch $pair[0] --gcc $pair[1] @relargs
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host 'check: an image does not survive being relocated.'
+                exit $LASTEXITCODE
+            }
+        }
+
+        Write-Host ''
+        Write-Host 'check: OK (host tests + firmware + apps + relocations)'
         exit 0
     }
 

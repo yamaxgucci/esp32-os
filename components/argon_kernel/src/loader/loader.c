@@ -17,9 +17,14 @@
 #include <argon/log.h>
 #include <argon/module.h>
 #include <argon/proc.h>
+#include <argon/path.h>
+#include <argon/place.h>
+#include <argon/port/place.h>
+#include <argon/libc.h>
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
+#include <argon/port/execmem.h>
 #include "loader/appfs.h"
 
 /*
@@ -269,14 +274,76 @@ static void copy_image(void *dst, const void *src, size_t bytes)
  */
 static void *data_alloc(size_t bytes)
 {
-    void *p = ag_port_alloc_aligned(16, bytes, AG_MEM_SLOW | AG_MEM_BYTE);
-    if (p == NULL) {
-        p = ag_port_alloc_aligned(16, bytes, AG_MEM_IRAM8);
+    /* Room for the guard, and the guard written into it: see guard_arm. */
+    const size_t want = bytes + AG_APP_GUARD_BYTES;
+
+    /* [memory] app.data: psram, iram by default.  "iram" means the D/IRAM
+     * the DMA path does not use first, then ordinary internal RAM. */
+    ag_place_kind_t kinds[AG_PLACE_KINDS];
+    const unsigned  n = ag_place_order("app.data", kinds);
+    for (unsigned k = 0; k < n; k++) {
+        void *p = NULL;
+        if (kinds[k] == AG_PLACE_PSRAM) {
+            p = ag_port_alloc_aligned(16, want, AG_MEM_SLOW | AG_MEM_BYTE);
+        } else if (kinds[k] == AG_PLACE_IRAM) {
+            p = ag_port_alloc_aligned(16, want, AG_MEM_IRAM8);
+            if (p == NULL) {
+                p = ag_port_alloc_aligned(16, want, AG_MEM_FAST | AG_MEM_BYTE);
+            }
+        }
+        if (p != NULL) {
+            ag_place_note("app.data", kinds[k], (int32_t)want);
+            return p;
+        }
     }
-    if (p == NULL) {
-        p = ag_port_alloc_aligned(16, bytes, AG_MEM_FAST | AG_MEM_BYTE);
+    return NULL;
+}
+
+/*
+ * The pattern, and where it went.
+ *
+ * `end` is the first byte past the application's data.  For an image with its
+ * own data allocation that is inside the block data_alloc reserved; for a
+ * contiguous image it is inside the code allocation, which place_arena sizes
+ * with the same allowance.  Either way the bytes belong to us, which is the
+ * whole point - a guard written into somebody else's block would be the very
+ * corruption it is meant to catch.
+ */
+static void guard_arm(ag_loaded_app_t *out, void *end)
+{
+    if (end == NULL) {
+        out->guard = NULL;
+        return;
     }
-    return p;
+    memset(end, AG_APP_GUARD_BYTE, AG_APP_GUARD_BYTES);
+    out->guard = end;
+}
+
+bool ag_loader_guard_broken(const ag_loaded_app_t *app, size_t *bytes_past)
+{
+    if (app == NULL || app->guard == NULL) {
+        return false;
+    }
+    const uint8_t *g = (const uint8_t *)app->guard;
+    size_t         last = 0;
+    bool           broken = false;
+
+    for (size_t i = 0; i < AG_APP_GUARD_BYTES; i++) {
+        if (g[i] != AG_APP_GUARD_BYTE) {
+            broken = true;
+            last = i + 1u;
+        }
+    }
+    if (broken && bytes_past != NULL) {
+        /*
+         * At least this far: the furthest disturbed byte inside the guard.  A
+         * write that cleared the whole guard went further still, and the guard
+         * cannot say how much - what it can say is that it happened and who
+         * did it, which is what was missing.
+         */
+        *bytes_past = last;
+    }
+    return broken;
 }
 
 static void *scratch_alloc(size_t bytes)
@@ -294,8 +361,21 @@ static void *scratch_alloc(size_t bytes)
 static void release_image(ag_loaded_app_t *app)
 {
     if (app->data_owned != NULL) {
+        ag_place_note("app.data",
+                      ag_port_ptr_is_slow(app->data_owned) ? AG_PLACE_PSRAM
+                                                           : AG_PLACE_IRAM,
+                      -(int32_t)(app->header.data.size + AG_APP_GUARD_BYTES));
         ag_port_free(app->data_owned);
         app->data_owned = NULL;
+    }
+    if (app->place.code != NULL) {
+        ag_place_note("app.code",
+                      app->code_from_xip     ? AG_PLACE_FLASH
+                      : app->code_from_psram ? AG_PLACE_PSRAM
+                                             : AG_PLACE_IRAM,
+                      app->code_from_xip
+                          ? -(int32_t)app->header.code.size
+                          : -(int32_t)app->place.code_capacity);
     }
     if (app->code_scratch != NULL) {
         ag_port_free(app->code_scratch);
@@ -316,7 +396,10 @@ static void release_image(ag_loaded_app_t *app)
         }
     } else
 #endif
-    if (app->place.code != NULL && !app->code_from_xip) {
+    if (app->code_heap != NULL) {
+        ag_port_execmem_free(app->code_heap);
+        app->code_heap = NULL;
+    } else if (app->place.code != NULL && !app->code_from_xip) {
         if (!ag_arena_free(&s_code, app->place.code)) {
             ag_log(AG_LOG_ERROR, "loader", "arena does not own %p",
                    app->place.code);
@@ -326,6 +409,9 @@ static void release_image(ag_loaded_app_t *app)
     app->code_from_xip = false;
     app->code_from_psram = false;
 }
+
+static ag_err_t place_data(const ag_axe_header_t *header, ag_loaded_app_t *out,
+                           void *code, size_t code_bytes);
 
 /*
  * IRAM arena path: code is writable and executable in place.
@@ -337,7 +423,8 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
 
     const bool contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
     const size_t code_bytes =
-        contiguous ? (size_t)header->code.size + header->data.size
+        contiguous ? (size_t)header->code.size + header->data.size +
+                         AG_APP_GUARD_BYTES
                    : (size_t)header->code.size;
 
     void *code = ag_arena_alloc(&s_code, code_bytes, 16);
@@ -351,6 +438,24 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
         return -AG_ENOMEM;
     }
 
+    const ag_err_t err = place_data(header, out, code, code_bytes);
+    if (err != AG_OK) {
+        (void)ag_arena_free(&s_code, code);
+    }
+    return err;
+}
+
+/*
+ * The half of placing an image that does not depend on where its code went:
+ * the code block is given, and the data goes inside it (contiguous) or into
+ * an allocation of its own.  On failure `out->place` is cleared and the code
+ * block is the caller's to give back.
+ */
+static ag_err_t place_data(const ag_axe_header_t *header, ag_loaded_app_t *out,
+                           void *code, size_t code_bytes)
+{
+    const bool contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
+
     out->place.code = code;
     out->place.code_capacity = code_bytes;
     out->place.code_writable = NULL;
@@ -363,6 +468,7 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
     if (contiguous) {
         out->place.data = (uint8_t *)code + header->code.size;
         out->place.data_capacity = header->data.size;
+        guard_arm(out, (uint8_t *)out->place.data + header->data.size);
         return AG_OK;
     }
 
@@ -383,7 +489,6 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
                (unsigned)(ag_port_mem_free(AG_MEM_SLOW) +
                           ag_port_mem_free(AG_MEM_FAST)),
                (unsigned)ag_port_mem_largest(AG_MEM_FAST));
-        (void)ag_arena_free(&s_code, code);
         memset(&out->place, 0, sizeof(out->place));
         return -AG_ENOMEM;
     }
@@ -391,6 +496,67 @@ static ag_err_t place_arena(const ag_axe_header_t *header, ag_loaded_app_t *out)
     out->place.data = data;
     out->place.data_capacity = header->data.size;
     out->data_owned = data;
+    guard_arm(out, (uint8_t *)data + header->data.size);
+    return AG_OK;
+}
+
+/*
+ * CODE FROM THE INTERNAL HEAP (9 Oct 2026).
+ *
+ * The link-time arena is internal SRAM reserved for code whether a program
+ * runs or not.  On the S3-Zero it was cut to 16 KB to give that memory back -
+ * and then DX7, 29 KB of code, went to the PSRAM arena while 250 KB of
+ * internal SRAM stood free, which is the memory that had been freed for
+ * exactly such programs (Maxim, 9 Oct).  So a program that does not fit the
+ * arena takes its code from the internal heap when the port can make heap
+ * memory executable (the S3), and gives it back when it ends.
+ *
+ * Only while that leaves what is kept for arriving devices
+ * (ag_proc_keep_internal) and AG_LOADER_HEAP_CODE_FLOOR on top: a radio
+ * brought up later wants one ~36 KB contiguous block of the same memory, and
+ * a program's code must not be what refuses it.  Past that the PSRAM arena,
+ * then flash, as before.
+ */
+#define AG_LOADER_HEAP_CODE_FLOOR (40u * 1024u)
+
+static bool heap_code_room(size_t bytes)
+{
+    /* The ESP32's instruction RAM is nobody's data memory: the heap's own
+     * answer is the only one that matters there. */
+    if (!ag_port_execmem_from_data()) {
+        return true;
+    }
+    return ag_port_mem_free(AG_MEM_FAST) >=
+           bytes + 16u + AG_LOADER_HEAP_CODE_FLOOR + ag_proc_kept_internal();
+}
+
+static ag_err_t place_heap(const ag_axe_header_t *header, ag_loaded_app_t *out)
+{
+    const bool   contiguous = (header->flags & AG_AXE_CONTIGUOUS) != 0;
+    /* A contiguous image's data lives in the code block, and the ESP32's
+     * instruction RAM takes no byte stores. */
+    if (contiguous && !ag_port_execmem_from_data()) {
+        return -AG_ENOTSUP;
+    }
+    const size_t code_bytes =
+        contiguous ? (size_t)header->code.size + header->data.size +
+                         AG_APP_GUARD_BYTES
+                   : (size_t)header->code.size;
+
+    void *raw = NULL;
+    void *writable = NULL;
+    void *code = ag_port_execmem_alloc(code_bytes, &writable, &raw);
+    if (code == NULL) {
+        return -AG_ENOMEM;
+    }
+    const ag_err_t err = place_data(header, out, code, code_bytes);
+    if (err != AG_OK) {
+        ag_port_execmem_free(raw);
+        return err;
+    }
+    /* Filled through the data bus, run through the instruction bus. */
+    out->place.code_writable = writable;
+    out->code_heap = raw;
     return AG_OK;
 }
 
@@ -433,6 +599,7 @@ static ag_err_t place_psram(const ag_axe_header_t *header, ag_loaded_app_t *out)
     out->place.data = data;
     out->place.data_capacity = header->data.size;
     out->data_owned = data;
+    guard_arm(out, (uint8_t *)data + header->data.size);
     out->code_from_psram = true;
     return AG_OK;
 }
@@ -492,6 +659,7 @@ static ag_err_t place_xip(const ag_axe_header_t *header, ag_loaded_app_t *out)
     out->place.data = data;
     out->place.data_capacity = header->data.size;
     out->data_owned = data;
+    guard_arm(out, (uint8_t *)data + header->data.size);
     out->code_scratch = NULL;
     out->xip_slot = slot;
     out->code_from_xip = true;
@@ -521,15 +689,29 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
             ? (uint32_t)(uintptr_t)out->place.data - data_base
             : 0u;
     const uint32_t code_bias = code_addr - code_base;
+    const uint32_t data_addr = (uint32_t)(uintptr_t)out->place.data;
     const uint32_t api_val = (uint32_t)(uintptr_t)ag_loader_api();
     const uint32_t api_at = header->api_slot;
     const bool     api_in_code =
         api_at >= code_base && api_at + 4u <= code_base + header->code.size;
 
+    /*
+     * The relocation table, whole, and it grows with the image: a 449 KB
+     * application brought 5109 of them, which is 20 KB.  It used to be asked
+     * of internal SRAM, and that is the one budget flash XIP is chosen to
+     * avoid - the image only got this far because the arena could not hold it.
+     * With a 16 KB task stack already taken out of internal memory there were
+     * 15 KB left in one piece, and the load failed with -ENOMEM after the
+     * appfs slot had been reserved.
+     *
+     * scratch_alloc asks extended memory first, which is where a table this
+     * size belongs; it is read once and then walked per page, so its latency
+     * is not on any path that matters.
+     */
     uint32_t *rel = NULL;
     if (header->reloc_count > 0) {
         const size_t rbytes = (size_t)header->reloc_count * sizeof(uint32_t);
-        rel = (uint32_t *)ag_port_alloc(rbytes, AG_MEM_FAST | AG_MEM_BYTE);
+        rel = (uint32_t *)scratch_alloc(rbytes);
         if (rel == NULL) {
             return -AG_ENOMEM;
         }
@@ -540,14 +722,43 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
         }
     }
 
+    /*
+     * The instruction relocations, all of them at once.
+     *
+     * Thirteen kilobytes for the desktop shell, against the whole image this
+     * path exists to avoid holding - and they cannot be streamed alongside the
+     * code, because the pages are programmed in order while the table is
+     * sorted by nothing the pages agree with.
+     */
+    const uint32_t inum = ag_axe_ireloc_count(header);
+    ag_axe_ireloc_t *irel = NULL;
+    if (inum > 0) {
+        const size_t ibytes = (size_t)inum * sizeof(ag_axe_ireloc_t);
+        irel = (ag_axe_ireloc_t *)ag_port_alloc(ibytes,
+                                                AG_MEM_FAST | AG_MEM_BYTE);
+        if (irel == NULL) {
+            ag_port_free(rel);
+            return -AG_ENOMEM;
+        }
+        const ag_err_t e = read_at(h, ag_axe_ireloc_offset(header), irel,
+                                   ibytes);
+        if (e != AG_OK) {
+            ag_port_free(irel);
+            ag_port_free(rel);
+            return e;
+        }
+    }
+
     uint8_t *buf = (uint8_t *)ag_port_alloc(AG_XIP_CHUNK, AG_MEM_FAST | AG_MEM_BYTE);
     if (buf == NULL) {
+        ag_port_free(irel);
         ag_port_free(rel);
         return -AG_ENOMEM;
     }
 
     /* Data part into RAM, its bss zeroed (data_alloc does not clear). */
     ag_err_t err = AG_OK;
+    uint32_t n = 0;
     if (out->place.data != NULL && header->data.file_size > 0) {
         err = read_at(h, header->data.offset, out->place.data,
                       header->data.file_size);
@@ -559,10 +770,35 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
     }
 
     for (uint32_t off = 0; err == AG_OK && off < header->code.size;
-         off += AG_XIP_CHUNK) {
-        uint32_t n = header->code.size - off;
+         off += n) {
+        n = header->code.size - off;
         if (n > AG_XIP_CHUNK) {
             n = AG_XIP_CHUNK;
+        }
+
+        /*
+         * Never cut an instruction in half.
+         *
+         * A word relocation is four-byte aligned and a page is four-byte
+         * aligned, so one can never straddle the boundary.  An instruction
+         * can: compressed instructions make two-byte alignment legal, so a
+         * four-byte instruction may begin two bytes before the end of a page.
+         * Patching half of it here and half in the next page would need the
+         * other half's original bytes, which are in the other page.
+         *
+         * So the page stops short instead.  Only the very last instruction of
+         * a full page can be affected, so this costs four bytes of a page and
+         * happens rarely; programming a shorter run is something appfs allows,
+         * and the next page picks up where this one stopped.
+         */
+        if (n == AG_XIP_CHUNK) {
+            const uint32_t edge = off + n - 2u;
+            for (uint32_t i = 0; i < inum; i++) {
+                if (AG_AXE_I_OFFSET(irel[i].site) == edge) {
+                    n -= 4u;
+                    break;
+                }
+            }
         }
         uint32_t fn = 0;
         if (off < header->code.file_size) {
@@ -596,9 +832,21 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
             w += (entry & AG_AXE_R_TO_DATA) ? data_bias : code_bias;
             memcpy(buf + (at - off), &w, 4);
         }
+        for (uint32_t i = 0; i < inum; i++) {
+            const uint32_t at = AG_AXE_I_OFFSET(irel[i].site);
+            if (at < off || at + 4u > off + n) {
+                continue;
+            }
+            if (!ag_axe_ireloc_apply(header, buf, header->code.file_size,
+                                     code_addr, data_addr, off, irel[i])) {
+                err = -AG_EFORMAT;
+                break;
+            }
+        }
         err = ag_appfs_program_at((ag_appfs_slot_t *)out->xip_slot, off, buf, n);
     }
     ag_port_free(buf);
+    ag_port_free(irel);
 
     if (err == AG_OK && out->place.data != NULL) {
         for (uint32_t i = 0; i < header->reloc_count; i++) {
@@ -655,30 +903,76 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
         contiguous ? (size_t)header->code.size + header->data.size
                    : (size_t)header->code.size;
 
-    if (!want_xip && ag_arena_largest_free(&s_code, 16) >= want) {
-        /* place_arena says which of its two allocations failed; there is no
-         * one sentence that covers both, and guessing produced the wrong one. */
-        return place_arena(header, out);
-    }
-
-#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
     /*
-     * S-1: the internal arena did not take it (on this board it is deliberately
-     * tiny, so that is the common case), so try the PSRAM arena before flash.
-     * PSRAM execution is slower than internal SRAM but far faster than flash for
-     * a working set that does not fit the cache, and it leaves the internal
-     * memory to the radios - which is the whole reason the arena moved.
+     * [memory] app.code (argon/place.h): iram, psram, flash by default.  iram
+     * is the link-time arena, then the internal heap for as long as the
+     * program runs; psram the PSRAM arena where this build has one; flash is
+     * XIP from the appfs partition.  An image that asked for flash XIP goes
+     * straight there, as it always did.
      */
-    if (!want_xip && !contiguous && psram_ready() &&
-        ag_arena_largest_free(&s_psram, 16) >= (size_t)header->code.size) {
-        const ag_err_t perr = place_psram(header, out);
-        if (perr == AG_OK) {
-            return AG_OK;
-        }
-        /* Out of PSRAM-arena or data memory: fall through to flash XIP, which
-         * needs neither. */
-    }
+    ag_place_kind_t kinds[AG_PLACE_KINDS];
+    const unsigned  n = want_xip ? 0u : ag_place_order("app.code", kinds);
+    bool            flash_allowed = want_xip;
+    for (unsigned k = 0; k < n && !flash_allowed; k++) {
+        switch (kinds[k]) {
+        case AG_PLACE_IRAM:
+            if (ag_arena_largest_free(&s_code, 16) >= want) {
+                /* place_arena says which of its two allocations failed; there
+                 * is no one sentence that covers both, and guessing produced
+                 * the wrong one. */
+                const ag_err_t aerr = place_arena(header, out);
+                if (aerr == AG_OK) {
+                    ag_place_note("app.code", AG_PLACE_IRAM,
+                                  (int32_t)out->place.code_capacity);
+                }
+                return aerr;
+            }
+            /* Internal SRAM the program can have for as long as it runs. */
+            if (heap_code_room(want) && place_heap(header, out) == AG_OK) {
+                ag_place_note("app.code", AG_PLACE_IRAM,
+                              (int32_t)out->place.code_capacity);
+                return AG_OK;
+            }
+            break;
+        case AG_PLACE_PSRAM:
+#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
+            /*
+             * S-1: the PSRAM arena, mapped into the instruction window.
+             * Slower than internal SRAM, far faster than flash for a working
+             * set that does not fit the cache.
+             */
+            /* Mapped only for code that can go into it: the arena maps
+             * once for the life of the system, 64 KB-aligned, and on
+             * 8 Oct 2026 the hole under it kept Fallout's 6000 KB arena
+             * from starting although its 788 KB of code never goes there
+             * (the heap rounds a request that large up to 6016). */
+            if (!contiguous &&
+                (size_t)header->code.size <= AG_PSRAM_ARENA_BYTES &&
+                psram_ready() &&
+                ag_arena_largest_free(&s_psram, 16) >=
+                    (size_t)header->code.size &&
+                place_psram(header, out) == AG_OK) {
+                ag_place_note("app.code", AG_PLACE_PSRAM,
+                              (int32_t)out->place.code_capacity);
+                return AG_OK;
+            }
 #endif
+            break;
+        case AG_PLACE_FLASH:
+            flash_allowed = true;
+            break;
+        default:
+            break;
+        }
+    }
+    if (!flash_allowed) {
+        char wanted[32];
+        ag_place_format(ag_place_policy("app.code"), wanted, sizeof(wanted));
+        ag_log(AG_LOG_ERROR, "loader",
+               "%u bytes of code: app.code = %s, and none of them has room",
+               (unsigned)want, wanted);
+        return -AG_ENOMEM;
+    }
 
     if (want_xip && ag_arena_largest_free(&s_code, 16) >= want) {
         ag_log(AG_LOG_INFO, "loader",
@@ -715,6 +1009,9 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
     }
 
     const ag_err_t err = place_xip(header, out);
+    if (err == AG_OK) {
+        ag_place_note("app.code", AG_PLACE_FLASH, (int32_t)header->code.size);
+    }
     if (err != AG_OK) {
         /*
          * The heap, not the arena.  Flash XIP has already given up on the arena
@@ -857,10 +1154,24 @@ static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
         }
     }
 
+    const uint32_t inum = ag_axe_ireloc_count(header);
+    ag_axe_ireloc_t *irel = NULL;
+    if (err == AG_OK && inum > 0) {
+        const size_t ibytes = (size_t)inum * sizeof(ag_axe_ireloc_t);
+        irel = (ag_axe_ireloc_t *)ag_port_alloc(ibytes,
+                                                AG_MEM_FAST | AG_MEM_BYTE);
+        if (irel == NULL) {
+            err = -AG_ENOMEM;
+        } else {
+            err = read_at(h, ag_axe_ireloc_offset(header), irel, ibytes);
+        }
+    }
+
     if (err == AG_OK) {
         err = ag_axe_apply(&out->header, &out->place, rel,
-                           header->reloc_count, &out->binding);
+                           header->reloc_count, irel, inum, &out->binding);
     }
+    ag_port_free(irel);
     ag_port_free(rel);
 
 #if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
@@ -939,7 +1250,10 @@ static ag_err_t load_whole(const char *path, const char *cwd,
 
     err = ag_axe_apply(&out->header, &out->place,
                        (const uint32_t *)(file + header->reloc_offset),
-                       header->reloc_count, &out->binding);
+                       header->reloc_count,
+                       (const ag_axe_ireloc_t *)(void *)
+                           (file + ag_axe_ireloc_offset(header)),
+                       ag_axe_ireloc_count(header), &out->binding);
     ag_port_free(file);
 
     if (err != AG_OK) {
@@ -987,6 +1301,129 @@ ag_err_t ag_loader_peek(const char *path, const char *cwd,
     }
     return ag_axe_validate(out, (size_t)size, ag_axe_native_arch(),
                            AG_ABI_MAJOR, AG_ABI_MINOR);
+}
+
+/*
+ * Why an image would not load, in words, once.
+ *
+ * It lived in the shell, which meant the shell's `run` explained itself and
+ * everything else printed a number.  On a board that mattered: an image built
+ * for the other instruction set is refused with -AG_ENOTSUP, and what reached
+ * the screen was "nodehirv.axe (pid 2) returned -45".  Correct, useless, and
+ * indistinguishable from a program that chose to return -45.
+ *
+ * Here rather than in the shell because these are the loader's own answers,
+ * and a second copy of the table is a second copy to drift.
+ */
+/*
+ * MY OWN BUILD OF THAT PROGRAM, found by what it IS rather than by what it is
+ * called.
+ *
+ * A cluster spanning two instruction sets passes messages and shares devices
+ * without noticing the line; code stops at it dead.  The answer is not to
+ * carry one binary that runs on both - there is no such thing for Xtensa and
+ * RISC-V - but to stop sending code at all: send the program's IDENTITY and
+ * let each board use the copy it can execute.
+ *
+ * The identity is already in every image: name, version, author and the
+ * instruction set, in the header, and until now nothing read them for this.
+ *
+ * Searched rather than indexed because the set is small - a board's C: holds
+ * tens of images, not thousands - and because an index is a second thing to
+ * keep true.  If that ever stops being cheap, the place to put the index is
+ * here, behind this function, and nothing above it changes.
+ */
+ag_err_t ag_loader_find_by_name(const char *want, char *out, size_t cap)
+{
+    if (want == NULL || want[0] == '\0' || out == NULL || cap == 0) {
+        return -AG_EINVAL;
+    }
+
+    const ag_handle_t d = ag_vfs_opendir("/sys", "/sys");
+    if (d < 0) {
+        return -AG_ENOENT;
+    }
+
+    ag_err_t found = -AG_ENOENT;
+    /*
+     * A bytecode build of the same program, kept aside in case there is no
+     * native one.  That is the cascade's third rung and it costs this much:
+     * the second-best answer is remembered while the best one is looked for,
+     * and only used if the search ends without it.
+     *
+     * Second-best on purpose.  Bytecode runs five to fifty times slower, so a
+     * board that has its own build must never be given the portable one -
+     * which is exactly what would happen if this took the first match.
+     */
+    char     bc[AG_PATH_MAX];
+    bool     have_bc = false;
+
+    for (;;) {
+        ag_dirent_t e;
+        if (ag_vfs_readdir(d, &e) != AG_OK) {
+            break;
+        }
+        if ((e.st.attr & (uint32_t)AG_A_DIR) != 0u) {
+            continue;
+        }
+
+        char path[AG_PATH_MAX];
+        if (snprintf(path, sizeof(path), "/sys/%s", e.name) >= (int)sizeof(path)) {
+            continue;
+        }
+
+        ag_axe_header_t h;
+        const ag_err_t  pk = ag_loader_peek(path, "/sys", &h);
+        /*
+         * -AG_ENOTSUP is "read and understood, not for this machine", which is
+         * what a bytecode image always answers - ag_axe_native_arch() is never
+         * AG_ARCH_BC.  Anything else that cannot be read is not an image.
+         */
+        if (pk != AG_OK && pk != -AG_ENOTSUP) {
+            continue;
+        }
+        if (ag_path_icmp(h.name, want) != 0) {
+            continue;
+        }
+
+        if ((ag_axe_arch_t)h.arch == ag_axe_native_arch()) {
+            ag_strlcpy(out, path, cap);
+            found = AG_OK;
+            break;
+        }
+        if ((ag_axe_arch_t)h.arch == AG_ARCH_BC && !have_bc) {
+            ag_strlcpy(bc, path, sizeof(bc));
+            have_bc = true;
+        }
+        /*
+         * And anything else is an image of the OTHER instruction set, which is
+         * exactly what sent us looking: taking one would be a loop.
+         */
+    }
+    ag_vfs_closedir(d);
+
+    if (found != AG_OK && have_bc) {
+        ag_strlcpy(out, bc, cap);
+        found = AG_OK;
+    }
+    return found;
+}
+
+const char *ag_loader_why(ag_err_t err)
+{
+    switch (-err) {
+    case AG_ENOENT:  return "file not found";
+    case AG_EFORMAT: return "not an ArgonOS application";
+    case AG_ENOTSUP: return "built for a different processor";
+    case AG_EABI:    return "built for a different version of this system";
+    case AG_ENOMEM:  return "not enough memory (task stack / heap / code arena)";
+    case AG_EBUSY:   return "too many applications are loaded";
+    case AG_ERANGE:  return "too many arguments";
+    case AG_EINVAL:  return "is a driver; use 'drv load'";
+    case AG_EEXIST:  return "already loaded";
+    case AG_ENFILE:  return "too many modules are loaded";
+    default:         return "could not be loaded";
+    }
 }
 
 ag_err_t ag_loader_load(const char *path, const char *cwd,

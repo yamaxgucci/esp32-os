@@ -1,0 +1,42 @@
+--- a/src/sound.cc
++++ b/src/sound.cc
+@@ -569,6 +569,26 @@
+     }
+ 
+     buf = (unsigned char*)gSoundMallocProc(size);
++    // ARGON: and if it did not fit, stop here instead of reading into nothing.
++    //
++    // The pointer was used unchecked, and on a machine where the arena can
++    // actually run out that is not a leak or a slow map - it is the game
++    // ending, three hours in, on a footstep.  What the board recorded:
++    //
++    //   Loading sound file HMWARRAA.ACM...
++    //   malloc: out of arena asking for 70066 bytes; 163 KB free, largest 65536
++    //   FALLOUT2 killed: write to an invalid address at pc ..., address 0
++    //   pc is offset 0xb7720 in its own code        (memcpy)
++    //
++    // A sound effect that will not fit is a sound effect that does not play,
++    // which every caller of soundLoad already copes with - it is the same
++    // answer as a missing file.
++    if (buf == nullptr) {
++        sound->io.close(sound->io.fd);
++        sound->io.fd = -1;
++        gSoundLastError = SOUND_NO_MEMORY_AVAILABLE;
++        return gSoundLastError;
++    }
+     bytes_read = sound->io.read(sound->io.fd, buf, size);
+     if (bytes_read != size) {
+         if ((sound->soundFlags & SOUND_LOOPING) == 0 || (sound->soundFlags & SOUND_FLAG_0x100) != 0) {
+@@ -597,6 +617,12 @@
+     } else {
+         if (sound->data == nullptr) {
+             sound->data = (unsigned char*)gSoundMallocProc(sound->dataSize);
++            // ARGON: the same again, for the streaming buffer.  Left unchecked
++            // it is a null dereference one call later rather than one line.
++            if (sound->data == nullptr) {
++                gSoundLastError = SOUND_NO_MEMORY_AVAILABLE;
++                return gSoundLastError;
++            }
+         }
+     }
+ 

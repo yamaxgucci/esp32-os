@@ -82,6 +82,16 @@ typedef struct {
 
     /* Bumped on every change; lets a renderer skip work when nothing moved. */
     uint32_t generation;
+
+    /*
+     * Rows the picture has moved up since the dirty set was last cleared.
+     *
+     * Renderers are all served in one pass and the set is cleared after it, so
+     * one number serves them all.  Zero means no scroll; `rows` or more means
+     * one too large to express - the dirty set is then simply everything, as
+     * it always was.
+     */
+    uint16_t scrolled;
 } ag_screen_t;
 
 /* Bytes ag_screen_init() needs for a grid of this size. */
@@ -93,6 +103,23 @@ size_t ag_screen_memsize(uint16_t cols, uint16_t rows);
  */
 ag_err_t ag_screen_init(ag_screen_t *s, void *mem, size_t memsize,
                         uint16_t cols, uint16_t rows);
+
+/*
+ * Like ag_screen_init, but carries the picture over from `src` - what a
+ * resize is.  `dst` and `src` may be the same struct only if they do not share
+ * memory; the caller frees the old block afterwards.
+ *
+ * The overlap is copied rather than cleared, because the screenful worth
+ * keeping is the one already on it.  When the new grid is shorter, the rows
+ * kept are the ones ENDING at the cursor: that is what a terminal does when
+ * its window is dragged smaller, and it keeps the newest output instead of
+ * the oldest.  Attributes, the cursor and its visibility come across, clamped
+ * into the new grid; the generation is bumped so a renderer that skips work
+ * when nothing moved does not skip this.
+ */
+ag_err_t ag_screen_recreate(ag_screen_t *dst, void *mem, size_t memsize,
+                            uint16_t cols, uint16_t rows,
+                            const ag_screen_t *src);
 
 /* Writes text, interpreting control characters and escape sequences. */
 void ag_screen_write(ag_screen_t *s, const char *buf, size_t len);
@@ -124,6 +151,21 @@ ag_cell_t ag_screen_at(const ag_screen_t *s, uint16_t x, uint16_t y);
  * set without clearing it for the others.
  */
 bool ag_screen_row_dirty(const ag_screen_t *s, uint16_t y);
+
+/*
+ * How far the picture moved up since the last ag_screen_clear_dirty(), and
+ * whether that is worth acting on.
+ *
+ * A renderer that can scroll its own output - a terminal, a page, a
+ * framebuffer - moves by this much and then repaints only the rows the dirty
+ * set still names.  One that cannot repaints everything, which is what every
+ * renderer did before this existed.  Measured on the CYD: an application
+ * printing eleven lines a second had the console sending each of them 23
+ * times, 9.4 KB/s of an 11.5 KB/s line, because a scroll said every row had
+ * changed.
+ */
+uint16_t ag_screen_scrolled(const ag_screen_t *s);
+bool     ag_screen_scroll_usable(const ag_screen_t *s);
 void ag_screen_mark_row_dirty(ag_screen_t *s, uint16_t y);
 void ag_screen_mark_all_dirty(ag_screen_t *s);
 void ag_screen_clear_dirty(ag_screen_t *s);

@@ -1,0 +1,39 @@
+diff --git a/src/art.cc b/src/art.cc
+index 205b360..8480550 100644
+--- a/src/art.cc
++++ b/src/art.cc
+@@ -152,7 +152,14 @@ int artInit()
+         snprintf(path, sizeof(path), "%s%s%s\\%s.lst", _cd_path_base, "art\\", gArtListDescriptions[objectType].name, gArtListDescriptions[objectType].name);
+ 
+         if (artReadList(path, &(gArtListDescriptions[objectType].fileNames), &(gArtListDescriptions[objectType].fileNamesLength)) != 0) {
+-            debugPrint("art_read_lst failed in art_init\n");
++            // ARGON: which one, and why.  This has failed once, at
++            // startup, and once only - and "art_read_lst failed" is the
++            // same sentence whether the archive did not have the name,
++            // the card did not answer, or the arena was full.
++            // artReadList returns -1 for exactly two reasons, so naming
++            // the file and the reason costs two lines and makes the next
++            // occurrence an answer rather than a guess.
++            debugPrint("art_read_lst failed in art_init: %s\n", path);
+             cacheFree(&gArtCache);
+             return -1;
+         }
+@@ -672,6 +679,8 @@ static int artReadList(const char* path, char** artListPtr, int* artListSizePtr)
+ {
+     File* stream = fileOpen(path, "rt");
+     if (stream == nullptr) {
++        /* ARGON: see the note at the call site. */
++        debugPrint("artReadList: could not open %s\n", path);
+         return -1;
+     }
+ 
+@@ -688,6 +697,9 @@ static int artReadList(const char* path, char** artListPtr, int* artListSizePtr)
+     char* artList = (char*)internal_malloc(13 * count);
+     *artListPtr = artList;
+     if (artList == nullptr) {
++        /* ARGON: see the note at the call site. */
++        debugPrint("artReadList: no memory for %d names in %s\n",
++                   count, path);
+         fileClose(stream);
+         return -1;
+     }

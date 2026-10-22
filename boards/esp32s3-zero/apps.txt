@@ -1,0 +1,44 @@
+# What goes on this board's C:, staged by tools\mksysfs.py.
+#
+# The rule, the same as on the other two: a board carries the images its
+# NEIGHBOURS can execute as well as its own.  This one is a LEAF with a single
+# neighbour, the C3, so its own Xtensa LX7 and the C3's RISC-V are what it
+# needs to hand anything over.
+#
+# THE CYD'S LX6 BUILDS ARE HERE ANYWAY, and that is deliberate: the CYD is two
+# hops away, a program sent there passes through the C3, and the board that
+# ASKS is the one that must carry an image the far board can run.  Three small
+# files against a 4 MB flash is not a saving worth a journey that fails at the
+# far end.
+#
+# Xtensa LX7, for this board itself:
+NODEHI.AXE
+MIGRANT.AXE
+GRIND.AXE
+# RISC-V, for the C3 next door:
+NODEHIRV.AXE
+MIGRANRV.AXE
+GRINDRV.AXE
+# Xtensa LX6, for the CYD two hops away:
+NODEHI32.AXE
+MIGRAN32.AXE
+GRIND32.AXE
+# And the reason this board's C: is bigger than the other 4 MB boards': it is
+# the FLASHER of the C3, which sits on a power bank with no data cable of its
+# own.  ESPFLASH talks the ROM loader's protocol down [uart2]; the firmware it
+# writes is a file on this C:, put there with boardput over the network.
+ESPFLASH.AXE
+#
+# Something to LOOK at, for the board whose screen is on the other end of a
+# cable: GFXDEMO draws, and where it lands is the whole demonstration.
+GFXDEMO.AXE
+# And a picture that will NOT compress, because the one above does: the demo
+# frame crossed the wire as 3 KB for 75 000 pixels, so measuring a transport on
+# it measures the encoder.  GFXNOISE sends every band whole.
+GFXNOISE.AXE
+# And the same wire carrying something that is not a picture at all: writes to
+# /dev/wire0, which REMDISP publishes beside its display.
+WIREBENCH.AXE
+# Blocks across the wire, counted: tools/wireblk.py.
+WIREBLK.AXE
+PINS.AXE

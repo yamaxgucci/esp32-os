@@ -1,0 +1,78 @@
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -940,11 +940,38 @@ static void ag_map_inventory(void)
+      * are not drawn" can be told from "there are no exits here". */
+     ag_exit_on_map = 0;
+ 
++    /*
++     * ARGON: and what the misc objects on this map actually are.
++     *
++     * The exit grids are supposed to be misc protos 16..23 and the count of
++     * them came out zero, which is either a wrong predicate or a map with no
++     * exits - and the map itself can settle it.  Every distinct misc pid,
++     * with how many of each.
++     */
++    static int      misc_pid[24];
++    static unsigned misc_n[24];
++    unsigned        misc_kinds = 0;
++
+     for (Object* obj = objectFindFirst(); obj != nullptr;
+             obj = objectFindNext()) {
+         if (isExitGridPid(obj->pid)) {
+             ag_exit_on_map++;
+         }
++        if (PID_TYPE(obj->pid) == OBJ_TYPE_MISC) {
++            unsigned k = 0;
++
++            while (k < misc_kinds && misc_pid[k] != obj->pid) {
++                k++;
++            }
++            if (k < 24u) {
++                if (k == misc_kinds) {
++                    misc_pid[k] = obj->pid;
++                    misc_n[k] = 0;
++                    misc_kinds++;
++                }
++                misc_n[k]++;
++            }
++        }
+         /*
+          * ARGON: a critter is not one picture.
+          *
+@@ -1003,6 +1030,7 @@ static void ag_map_inventory(void)
+     }
+ 
+     ag_map_inventory_note(n, total_kb, skipped, n_by_kind, kb_by_kind);
++    ag_misc_pids_note(misc_pid, misc_n, misc_kinds);
+ 
+     /* Floors, then what stands on them, then critters, then walking. */
+     if (ag_map_fill != 0) {
+diff --git a/src/object.cc b/src/object.cc
+--- a/src/object.cc
++++ b/src/object.cc
+@@ -2,6 +2,7 @@
+ 
+ /* ARGON: why the exit grids are not on the screen; see the counters
+  * in _obj_render_object. */
++extern "C" int ag_draw_cull;
+ extern "C" unsigned ag_exit_calls, ag_exit_hidden, ag_exit_early;
+ extern "C" unsigned ag_exit_noart, ag_exit_missed, ag_exit_drew;
+ extern "C" unsigned ag_exit_w, ag_exit_h, ag_exit_flags;
+@@ -5304,6 +5305,16 @@ static void ag_size_note(int fid, int dleft, int dright, int dtop, int dbottom)
+  */
+ static bool ag_cannot_touch(Object* object, Rect* rect)
+ {
++    /* ARGON: -cull 0 turns this shortcut off entirely.
++     *
++     * It is the only thing in the port that can drop an object before the
++     * engine's own intersection test runs, so when something is missing from
++     * the screen it has to be possible to take it out of the question with a
++     * launch argument rather than a rebuild. */
++    if (ag_draw_cull == 0) {
++        return false;
++    }
++
+     if (object->tile == -1) {
+         return false; /* positioned in screen coordinates; leave it alone */
+     }

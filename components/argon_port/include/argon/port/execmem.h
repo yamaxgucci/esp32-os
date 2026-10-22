@@ -31,11 +31,23 @@
  * A port with no such memory - the original ESP32, or any build without PSRAM -
  * returns -AG_ENOTSUP from map(), and the loader keeps its internal SRAM arena.
  *
+ *   void    *ag_port_execmem_alloc(size_t bytes, void **writable, void **raw)
+ *       A block of INTERNAL SRAM that code can run from, 16-aligned, taken
+ *       from the ordinary heap.  Returns where it runs; `writable` receives
+ *       where the loader writes it (the same memory through the data bus,
+ *       twice as fast to fill on the S3 as the instruction bus, measured),
+ *       and `raw` what to hand back to free().  NULL where
+ *       the chip cannot do it or the port has not been shown to (9 Oct 2026:
+ *       the S3 only).
+ *   void     ag_port_execmem_free(void *raw)
+ *       Give such a block back to the heap.
+ *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_PORT_EXECMEM_H
 #define ARGON_PORT_EXECMEM_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -46,5 +58,10 @@ ag_err_t ag_port_execmem_map(size_t bytes, void **exec, void **writable,
                              ag_port_map_t *out);
 void     ag_port_execmem_sync(void *writable, size_t bytes);
 void     ag_port_execmem_unmap(ag_port_map_t h);
+void    *ag_port_execmem_alloc(size_t bytes, void **writable, void **raw);
+void     ag_port_execmem_free(void *raw);
+/* Does that executable memory come out of the data memory everything else
+ * uses (the S3's one SRAM), or is it its own (the ESP32's instruction RAM)? */
+bool     ag_port_execmem_from_data(void);
 
 #endif /* ARGON_PORT_EXECMEM_H */

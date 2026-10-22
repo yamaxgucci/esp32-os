@@ -9,6 +9,10 @@
  *   run t:\crash.axe read     read through a null pointer
  *   run t:\crash.axe jump     call a null function pointer
  *   run t:\crash.axe thread   fault on a thread instead of the main task
+ *   run t:\crash.axe locked   fault inside a kernel call that holds a lock
+ *
+ * The last one is not recovered, and must not be: it is there to prove that the
+ * panic path leaves a record too.
  *
  * Either way the shell should come back with a prompt, ps should be empty, and
  * the journal should say where in this application the fault was.
@@ -58,6 +62,42 @@ static void crashing_thread(void *arg)
     write_through_null();
 }
 
+/*
+ * A fault the recovery path has to REFUSE, and the reason it has to.
+ *
+ * The kernel writes into a buffer this application handed it, and it does that
+ * holding the console lock.  A buffer that cannot be written to therefore faults
+ * inside the kernel with that lock held - and unwinding the task out of the
+ * fault would leave the lock held for ever, which is a hung board rather than
+ * one dead application.  So this fault is left to take its normal course: the
+ * panic handler prints, the board reboots, and the only thing that can survive
+ * that is the record the port keeps in RTC memory.
+ *
+ * It is also the shape of the real thing: a load or store access fault in code
+ * that was called with the kernel's lock in hand, mid-transfer.
+ *
+ * ag_coninfo AND NOT ag_con_peek_row, which is what this was first written
+ * with, and the difference is measured rather than preferred.  peek_row asks for
+ * the console focus before it takes the lock and answers -AG_EPERM without it -
+ * and a program that has only just started does not have the focus yet: a
+ * process is "adopted into its slot a little after it starts running"
+ * (src/proc/session.c), and this image is small enough to reach the call inside
+ * that window.  Measured on the C3:
+ *
+ *   I (11407) app/CRASH:1: peek row answered -1 without faulting (no console focus?)
+ *
+ * which is a deliberate panic that does not panic - the worst kind of test,
+ * because it looks like a fault the port recovered.  ag_coninfo has no focus to
+ * ask for: it takes the lock and writes into the caller's structure, every time,
+ * so the fault is the kernel storing through a bad pointer with the lock held.
+ */
+static void fault_under_a_kernel_lock(void)
+{
+    ag_coninfo((ag_coninfo_t *)0x10);
+
+    ag_print("coninfo answered without faulting\n");
+}
+
 int ag_main(int argc, char **argv)
 {
     const char *what = (argc > 1) ? argv[1] : "write";
@@ -73,6 +113,8 @@ int ag_main(int argc, char **argv)
         for (int i = 0; i < 100; i++) {
             ag_delay(50);
         }
+    } else if (what[0] == 'l') {
+        fault_under_a_kernel_lock();
     } else {
         write_through_null();
     }

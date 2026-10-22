@@ -77,6 +77,11 @@ extern "C" {
  * 0.28 defined ag_input_ops_t: an AG_DEV_INPUT driver the kernel polls for
  *      events, for hardware that has to be asked rather than interrupting.
  * 0.29 appended io->spi_config: the clock for one chip on a shared bus.
+ * 0.44 appended units / span_w / span_h to ag_input_ops_t: an input driver
+ *      that measures in pixels rather than console cells says so, and the
+ *      kernel scales its span to the surface instead of multiplying a cell.
+ *      A touchscreen under a graphical shell loses eight pixels in nine
+ *      otherwise, and has to agree with the kernel about whose grid it is.
  * 0.30 appended blit_rect to ag_display_ops_t: a rectangle of pixels the
  *      kernel owns, for a panel whose glass is larger than any framebuffer
  *      the machine driving it can afford.
@@ -144,27 +149,330 @@ extern "C" {
  *      changed is that a pointer is a position on a surface and is now reported
  *      as one.  A terminal has no pixels of its own, so the kernel scales its
  *      column and row by the cell size on the way in.
- * 0.43 the other direction of USB: /dev/usbhid0, the keyboard and mouse this
- *      board pretends to be when its OTG port is plugged into somebody else's
- *      computer.  No new vtable slot - it is a character device an application
- *      writes reports to (ag_usbhid_frame_t) and asks about with
- *      AG_IOC_USBHID_STATUS.  Absent unless CONFIG_ARGON_USB_DEVICE, which is
- *      the same peripheral CONFIG_ARGON_USB_HOST uses and therefore excludes.
- * 0.44 /dev/usbcdc0 beside it: a serial pipe to the machine the OTG port is
- *      plugged into, with AG_IOC_USBCDC_STATUS.  It is how a program on that
- *      machine sends its screen back, because USB has no way for the machine
- *      to send it by itself.  Absent unless CONFIG_ARGON_USB_DEVICE_CDC.
- * 0.45 the relative mouse interface is gone, and with it AG_USBHID_MOUSE.  Not
- *      a simplification - an endpoint budget: the S3 has five device IN
- *      endpoints, and the keyboard, the pointer, the serial pipe's two and the
- *      mass-storage drive that carries the agent to the far machine are five.
- *      A relative step now becomes an absolute one against a remembered
- *      position, in apps/common/kvm where the position already lived.  The
- *      enumerator keeps 3 for the pointer and leaves 2 empty, so a frame from
- *      something built earlier is refused rather than reinterpreted.
+ * 0.43 ag_net_ops_t: the class vtable for an AG_DEV_NET device, and the first
+ *      time dev->ops() means anything for a class other than a display.  A .SYS
+ *      that speaks to an external radio coprocessor (Wi-Fi, GSM/LTE...) over a
+ *      wire publishes it, and the kernel routes its whole socket path through
+ *      it when the operator says `net use <dev>` - so a board can carry no
+ *      built-in radio at all and still reach the network, the radio being a
+ *      chip on a bus like any other .SYS.  One provider is active at a time; the
+ *      built-in stack is the default.  Append-only: nothing an existing image
+ *      calls has moved.
+ * 0.47 the two lines above, merged.  0.43's ag_net_ops_t came off the radio
+ *      line and 0.44-0.46 - input units, another slot's screen and its
+ *      cursor, a prompt in a slot of its own - off the desktop line, and
+ *      each line had bumped this number for itself while the other was
+ *      being written.  An image built from this carries all of them, so it
+ *      needs a number larger than either, and that is all 0.47 means.
+ *
+ *      The numbers were handed out in parallel and some are spoken for
+ *      twice: worktree-cluster calls its own additions 0.47 and
+ *      worktree-usb-kvm calls its 0.45.  Whichever of those lands next has
+ *      to RENUMBER rather than assume its number is free - and the check is
+ *      one line: `git show <branch>:sdk/include/argon/abi.h | grep MINOR`.
+ *
+ *      ---- worktree-cluster's line, 0.48-0.62 (the numbers it used) ----
+ * 0.48 ag_net_ops_t grew a station half - wifi_start/stop/scan/connect/
+ *      disconnect/status - so that a radio at the far end of a wire answers
+ *      `wifi scan` and `wifi connect` too, not only sockets.  Without it the
+ *      operator has to know which board holds the radio, which is exactly what
+ *      an external radio exists to avoid.  The six are NULL on a provider that
+ *      is not a Wi-Fi radio - a GSM modem has sockets and no networks to list -
+ *      so probe with AG_HAS.
+ *
+ *      It is 0.48 and not 0.47 because the line above says to check, and the
+ *      check said no: this branch had called its own additions 0.47 while 0.47
+ *      was being spent on merging the radio and desktop lines.  Renumbered
+ *      rather than assumed, which is the whole point of that note.
+ *
+ *      api->wifi changed meaning with it.  It is no longer NULL merely because
+ *      the image has no built-in radio, because a build that can BIND one could
+ *      grow a radio at any moment and k_api is const, in flash, shared
+ *      read-only with every application - it cannot follow.  It now means "this
+ *      system could reach a radio", and station calls answer -AG_ENODEV while
+ *      none is there.  An application that wants the old answer calls
+ *      wifi->status() and reads that code, which it needed to do anyway: a
+ *      radio switched off looked identical from a table of pointers.  The
+ *      access-point and ESP-NOW halves are unchanged and still need this chip's
+ *      own radio; RLINK carries the station half and no more.
+ *      AG_WIFI_SSID_MAX and the ap/status structs moved up the header to sit
+ *      above both users; nothing about them changed.
+
+ * 0.49 AG_DEV_LINK and ag_link_ops_t: the wire to another node of the same
+ *      system, as a device class of its own.  Not AG_DEV_NET and not
+ *      AG_DEV_CHAR, and the difference is the reason it exists - a net device
+ *      reaches somebody else's machine over somebody else's protocol, a char
+ *      device is a stream with no idea what is in it, and this carries
+ *      MESSAGES between two halves of one system, each with a channel and a
+ *      deadline.  A byte stream cannot express that: by the time the bytes are
+ *      on the wire, whatever knew which of them were urgent is gone.  The
+ *      class is appended, so no existing one moves - a class is a number
+ *      inside a .SYS built months ago.
+
+ * 0.50 task->svc_start / svc_stopping: a task a loadable driver may own.
+ *      create() refuses a caller with no process, so until now a .SYS could
+ *      only poll from callbacks the kernel happened to make - which cannot
+ *      watch a wire.  A service task belongs to the MODULE, the kernel stops
+ *      it when the module is unloaded, and it runs BELOW every application
+ *      because a driver task above them has already cost this project a game.
+ *
+ * 0.51 ag_link_stats_t gained rto_ms and srtt_ms: the retransmission timeout
+ *      the link measured, and the round trip behind it.  Without them a
+ *      retransmit count cannot be read - frames going out twice with nothing
+ *      lost, corrupt or duplicated means the acknowledgement was late, not
+ *      that the wire dropped anything, and the two have opposite cures.
+ *      Appended, so a .SYS built before this reads exactly what it did.
+ *
+ * 0.52 api->clu, and ag_link_ops_t gained info().
+ *
+ *      api->clu is one program running on every core of every node - threads
+ *      of one job, spread over the boards, passing data to each other by
+ *      message because there is no memory they share.  Everything before it
+ *      moved whole PROGRAMS between nodes; this is the first thing that lets
+ *      ONE program have the second board's cores.  See ag_clu_api_t.
+ *
+ *      info() is what makes that portable across wires.  Everything above the
+ *      link had the UART's numbers built in - 232-byte payloads and timeouts
+ *      sized for 400 KB/s - and a quad SPI or a parallel bus would have had to
+ *      pretend to be a UART to fit.  A driver now states its largest message
+ *      and its nominal rate, and the layers above ask instead of assuming.
+ *      NULL on a driver built before this: probe with AG_HAS and fall back to
+ *      the conservative pair, which is exactly what the UART gives.
+*
+ * 0.53 AG_AXE_CAN_MIGRATE and proc->migrate_wanted/save/restore: moving a
+ *      running program to another board, by CONSENT.  A program promises it
+ *      can be moved, notices the request where it is safe to, packs what it
+ *      needs, and reopens its own files and devices on the other side -
+ *      because those are different objects there and nothing else can know
+ *      what it was holding.  Only the bytes it hands over travel; the arena,
+ *      the handles and the screen do not.  See AG_AXE_CAN_MIGRATE.
+ *
+ * 0.54 ag_link_ops_t gained send_a() and recv_a(): the same two calls with the
+ *      addressing a relay needs.
+ *
+ *      Until now a frame had a channel and a class and no destination, so a
+ *      board could only ever talk to the neighbour on the other end of its
+ *      wire - and a leaf of a three-board cluster could not reach the leaf on
+ *      the other side of the middle one at all.  The middle board now RELAYS a
+ *      message addressed past it, and to do that it must be told the
+ *      destination, the source and the class: the destination to decide
+ *      whether to relay and out of which wire, the source because that is what
+ *      the far end addresses its answer to and a relay that overwrote it would
+ *      send every answer to itself, and the class because CONTROL, BULK and
+ *      STREAM have independent sequence spaces - a relayed frame promoted or
+ *      demoted between them would be acknowledged by one end and invisible to
+ *      the other.  See ag_link_addr_t.
+ *
+ *      APPENDED, not substituted, and that is not tidiness: flashing is per
+ *      partition, so there is a window where this kernel is running with the
+ *      driver image still on C: from the build before.  A changed signature
+ *      would have that kernel call the old function with the new arguments -
+ *      no error, wrong arguments, on the wire everything else depends on.  The
+ *      pair is therefore new entries past `info`, and a driver that does not
+ *      provide them is REFUSED at bind with a line saying so rather than bound
+ *      in a degraded mode: a driver that accepts but cannot address is the
+ *      worst of the three outcomes, because the cluster looks alive, the
+ *      direct-neighbour traffic works, and only the frames addressed past the
+ *      middle are delivered locally or addressed wrongly.
+ *
+ * 0.55 api->usbd: the USB-OTG peripheral as a DEVICE, lent to an application
+ *      for a session it owns.  The port installs TinyUSB on demand, cycles the
+ *      internal PHY away from the console and back, and forwards the MSC
+ *      callbacks to a table the application registers; the application decides
+ *      which block device to lend, whether it is writable, when the session
+ *      ends, and what to print.  NULL unless CONFIG_ARGON_USB_MSC (off by
+ *      default) - probe with AG_HAS.  Stage 1 is read-only: the write hook is
+ *      refused and the host mounts the volume read-only.
+ *
+ * 0.56 api->spi_slave_open and spi_slave_xfer: the same three wires from the
+ *      other end of the clock.
+ *
+ *      Until now every SPI bus in the system was a master's: the clock was
+ *      always ours to drive and a chip select always ours to pull.  A cluster
+ *      wire between two of these boards is the cheapest link either of them
+ *      has, and it needs the other half - a board that the neighbour clocks.
+ *      So slave_open takes the select as an INPUT pin the peer drives, and it
+ *      takes it there rather than on a transfer, because the driver holds that
+ *      pin from the moment it is initialized; slave_xfer then waits for the
+ *      peer and reports a timeout as a timeout, since a slave that returned
+ *      success for a block nobody clocked would hand its caller a frame
+ *      assembled out of nothing.  See ag_port_spi_slave_open.
+ *
+ *      APPENDED past spi_config, for the reason written out at 0.54: a kernel
+ *      can be running against a driver image from the build before, so the two
+ *      entries go past the end of the struct and a driver built before them
+ *      leaves them NULL.  Probe with AG_HAS - a NULL here says this driver's
+ *      SPI cannot be a slave, which is a fact about the driver and not a
+ *      failure of the call.
+ *
+ *      The pad drive strength that makes such a link carry frames at all is
+ *      not an ABI entry: it is a property of one board's wiring and is set per
+ *      bus from BOARD.CFG - `spi<bus>.drive` in docs/03-board-config.md.
+ *
+ * 0.57 api->spi_link_open / close / write / read: the slave end of a bus kept
+ *      ARMED, which is what turns "a bus that can be a slave" into a link.
+ *
+ *      0.56 gave a driver the slave's half of the clock and one transaction of
+ *      its own to wait on.  That is the whole of what a slave is, and it is not
+ *      enough to carry a link: the peer owns the select, so a block that arrives
+ *      while the driver is between one transfer and the next is not delayed, it
+ *      is LOST.  Measured, on this project's own two boards: the receiving slave
+ *      accepted 92 frames while logging 238 gaps and 99 bad, and the master
+ *      retransmitted 87% of what it sent.  Nothing was wrong with the wire - the
+ *      driver simply could not be back in a transfer before the next select
+ *      pulse, and no amount of care in a driver fixes that, because the driver's
+ *      loop is application time and the wire's rate is not.
+ *
+ *      So the queue is kept armed by the kernel, at a PRIORITY THE KERNEL
+ *      CHOOSES, and what a driver gets is bytes.  That split is the point of
+ *      these four and not a detail of them: the service knows nothing about
+ *      frames, channels or classes - a block boundary is not a frame boundary -
+ *      and the driver knows nothing about transactions, DMA-capable buffers or
+ *      the window.  A .SYS cannot have the priority (0.50 says why, and the
+ *      reason stands), so the listening end of a wire belongs to the system.
+ *
+ *      spi_link_open takes the bus as a slave with the select INPUT its peer
+ *      drives, the block every transaction carries in both directions, and the
+ *      rate the peer is expected to clock at; the pins and the clock come from
+ *      BOARD.CFG's spi<bus> section exactly as the master path gets them, which
+ *      is why there is no pin argument here.  write returns the bytes it took,
+ *      or -AG_EAGAIN when the transmit ring is full rather than blocking or
+ *      dropping; read waits up to its timeout for bytes the peer clocked.
+ *      close stops the service task, waits for it and gives the bus back.
+ *
+ *      APPENDED past spi_slave_xfer, for the reason written out at 0.54 and
+ *      0.56: an image from the build before leaves them NULL.  A driver that
+ *      finds them NULL has the slave bus of 0.56 and no more - probe with
+ *      AG_HAS, and expect the gaps above if it uses it that way.
+ *
+ *      spi_link_stats and ag_spilink_stats_t came with them, in this same
+ *      number, after the first hardware round in which the slave wedged and the
+ *      close line - the whole instrument for the gap question - printed
+ *      nothing, because the board never got far enough to close the link.  What
+ *      the wedge was: with the peer quiet, the armed transactions are never
+ *      completed, so they are never reaped, so the pool stays full and there is
+ *      nothing for the task to do.  A task that retries in that state without
+ *      blocking is a task SPINNING AT A PRIORITY ABOVE EVERY APPLICATION, and
+ *      the board it starves looks hung - every command timing out at the
+ *      console of a machine that is otherwise fine.  The service now blocks on
+ *      every path that has nothing to do, and rebuilds the slave interface when
+ *      nothing has been clocked for a whole second, because a slot is freed
+ *      only by its owner reaping it and armed-but-never-clockable blocks are
+ *      otherwise a pool that stays full until the board is reflashed.  The
+ *      counters are readable while it happens because this is the failure that
+ *      cannot be caught after the fact.
+ *
+ *      ag_link_stats_t gained rx_refused and rx_dropped under this same number
+ *      rather than one of its own, because they answer the question that entry
+ *      is about - was the wire working - for the half of it no counter could
+ *      previously see.
+ *
+ *      What they could not see: a link was acknowledging frames whose message
+ *      it then dropped because its own receive queue was full.  That is
+ *      permanent loss reported to the layers above as success, and it showed up
+ *      as nothing but a file transfer that wrote a short file and said it had
+ *      finished.  Every counter on the wire was clean, because the loss was
+ *      after the wire.  The pair tells the two kinds apart, and their cures are
+ *      opposite: a message REFUSED is the peer's to send again and a message
+ *      DROPPED is not.  See the fields themselves.
+ *
+ *      Neither field is safe to append on its own, and that is worth stating
+ *      where the next person will append: ag_link_stats_t carries no size and
+ *      no version, so a driver built before this writes only the fields it
+ *      knows and leaves these two holding whatever was in the caller's struct.
+ *      The caller's struct is the larger one, which is the safe direction - but
+ *      only if it is ZEROED first.  The kernel's wrapper
+ *      (ag_linkprov_stats, src/net/linkprov.c) now does that before it calls a
+ *      driver's stats(), so an older driver leaves zeros here and not stack
+ *      garbage.  Any future append needs the same guarantee and has it.
+ *
+ *      ---- main's line, 0.48-0.52 (fallout-cxx, phone, BLE) ----
+ * 0.52 appended ble->adv_notify: the peripheral pushes bytes to the connected
+ *      client as a GATT notification (board->phone), the direction the phone
+ *      link over BLE needs - a client cannot poll fast enough for a screen.
+ * 0.51 appended task->stack_left: how much of the current task's stack has
+ *      never been touched, for code that runs on a stack it does not own.  A
+ *      driver called from a display callback spends the drawing application's,
+ *      and PHONE.SYS on a board with no framebuffer spends a band encoder and
+ *      all of lwIP of it - three board resets in seventeen runs, each one a
+ *      stack overflow in the application that drew.  A rectangle not sent is a
+ *      screen that does not update; a stack overflow is a board that reboots.
+ * 0.50 appended net->reset: a connection thrown away rather than closed, for
+ *      a peer that has stopped reading.  `close` promises to deliver what is
+ *      queued and TCP keeps that promise indefinitely, so a deaf peer holds the
+ *      block and every buffer on it - 11520 bytes queued and 32 KB of heap,
+ *      measured, returned only by taking the interface down.  Needs
+ *      CONFIG_LWIP_SO_LINGER, now on in sdkconfig.defaults.
+ * 0.49 appended text_scroll to ag_display_ops_t: the console moved up by so
+ *      many rows, for a panel that can move its own picture.  Before it, a
+ *      scroll was reported to every renderer as damage to every row - true,
+ *      and the most expensive true thing available: on the CYD an application
+ *      printing eleven lines a second made the console send each of them 23
+ *      times, 9.4 KB/s of an 11.5 KB/s line, with the shell's own echo queued
+ *      behind it.  Optional; a driver that leaves it NULL is sent every row as
+ *      before.
+ * 0.48 sys->module_task: a task that belongs to a loadable driver rather than
+ *      to a process, so a driver can do work that takes milliseconds without
+ *      charging it to whoever called in.  Until this, every driver was a
+ *      collection of callbacks on the caller's thread, and a screen at the end
+ *      of a wire made the game that drew a frame wait for the frame to go out.
+ *      The module owns the task and unload waits for it.
+ *
+ *      This is the renumbering the paragraph above asks for: the work is
+ *      commit 2ec139a on `worktree-fallout-cxx`, where it was written as 0.43
+ *      and board-verified in that shape, and 0.43 was spoken for here by
+ *      ag_net_ops_t before it could land.  Nothing about it changed but the
+ *      number.
+ *
+ * 0.63 the two lines above, merged (25 Sep 2026), as 0.47 merged two before
+ *      them: each had numbered 0.48 onwards for itself.  main's members
+ *      keep their places - Fallout's engine is built outside the tree and
+ *      carries main's offsets - and the cluster's come after them in every
+ *      struct both lines grew: io (uart_dma_* then spi_slave/spi_link/
+ *      uart_link), task (stack_left then svc_start/svc_stopping) and the
+ *      api root (store then clu, usbd).  Every in-tree image is rebuilt;
+ *      one built on the cluster line before this reads the wrong members.
+ *
+ * 0.64 appended ble->adv_recv, adv_mtu and radio_on: every write a client made,
+ *      in order (adv_last_write keeps one, and a key's down and up arrive
+ *      milliseconds apart), how much one notification carries, and whether
+ *      the system has the radio up - so PHONE.SYS can serve over BLE without
+ *      raising the radio itself.  Numbered past worktree-cluster's 0.63, which
+ *      already spent 0.52-0.63 on its own line; 0.53-0.63 are not in main.
+ *
+ * 0.65 AG_LINK_BACKGROUND, and AG_LINK_CLASSES is 4 (27 Sep 2026): reliable,
+ *      and only on what the other classes leave - a file beside a picture and
+ *      sound.  Behind every other class on every board it crosses, and
+ *      windowed from end to end.  A link driver built before this refuses
+ *      class 3 as one it does not know, so NODELINK and LINKSPI are rebuilt
+ *      with it.
+ *
+ * 0.66 AG_SPILINK_IDLE: a block only into a wire with nothing waiting to go.
+ * 0.67 ag_link_addr_t.budget_ms and AG_SPILINK_BUDGET: how long a message
+ *      may wait to go, said by whoever sends it; the link sends the soonest
+ *      due first and knows nothing of what the bytes are.
+ *      Background written this way takes the wire's idle time and nothing
+ *      else, so a picture behind it waits for one block of it, not a window.
+ *      A flag an older driver never sets; nothing moves.
+ *
+ * 0.68 appended ag_display_ops_t::held: the kernel tells each display driver
+ *      when an application takes the screen and when it lets it go, so a
+ *      screen at the end of a wire says "picture" or "console" from the board
+ *      instead of guessing from traffic.  Optional; NULL is the old behaviour.
+ *
+ * 0.69 the USB-KVM branch landing on main at last - renumbered from the
+ *      0.43-0.45 it used on its own line, which main had long since spent.
+ *      The board as a keyboard and absolute pointer for another computer
+ *      (/dev/usbhid0, ag_usbhid_frame_t, AG_IOC_USBHID_STATUS); a WinUSB
+ *      vendor pipe beside it that carries the far machine's picture back
+ *      (/dev/usbcdc0, AG_IOC_USBCDC_STATUS); and an MSC flash drive that
+ *      carries the agent onto a machine that has never seen the device.  No
+ *      relative mouse - a relative step becomes an absolute one a layer up
+ *      (apps/common/kvm).  No new api-table slot: these are character devices
+ *      and ioctls, so nothing an existing image calls has moved.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 45u
+#define AG_ABI_MINOR 69u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -274,6 +582,53 @@ typedef struct ag_sys_api {
      * sockets, etc.) before the image is unmapped on drv unload/replace.
      */
     void (*module_on_unload)(void (*fn)(void));
+
+    /*
+     * ABI 0.45: give a session slot a shell of its own, and say which slot
+     * got it.
+     *
+     * For a desktop that wants a prompt in a window.  `slot` below zero
+     * means any free one, which is what a window asking for a prompt
+     * actually wants - it has no business choosing a slot number, and
+     * nothing else in the ABI lets it enumerate them.  `cwd` may be NULL
+     * for the root.
+     *
+     * Returns the slot, or a negative error: -AG_ENOSPC when every slot
+     * already has something in it.
+     */
+    int32_t (*prompt_in_slot)(int slot, const char *cwd);
+
+    /*
+     * ABI 0.48: during ag_driver_init only — a task of the module's own.
+     *
+     * task->create is the application's, and it refuses a caller with no
+     * process: a thread belongs to a process and dies with it, and a driver has
+     * no process to belong to.  So every driver in this system has been a
+     * collection of callbacks running on whoever called in - which is right for
+     * a register write and wrong for anything that takes milliseconds.  A
+     * screen at the end of a serial wire is the case that forced this: three
+     * hundred milliseconds of a frame going out, charged to the game that drew
+     * it, when the wire could just as well be fed from a task of its own.  A
+     * screen at the end of a network is the same case again, with an accept()
+     * and an HTTP request in it.
+     *
+     * The module owns it.  Unload calls the module_on_unload hook first - which
+     * is where the driver tells its task to stop - and then waits for the task
+     * to return before the image is unmapped, because unmapping code a task is
+     * still inside is a fault that names the wrong culprit.  A task that will
+     * not return refuses the unload rather than taking the machine down.
+     *
+     * The task must therefore watch a flag and return.  Do not call exit.
+     *
+     * `flags` is ag_thread_flags, the same three an application's thread gets,
+     * and the choice is not cosmetic: the foreground application is pinned to
+     * the app core, so a driver doing real work there is a second runnable task
+     * on the one core already busy.  A driver that takes milliseconds asks for
+     * AG_THREAD_SYS_CORE.  `priority` at 5 or below cannot starve an
+     * application; above that it can, and nothing in this build says so.
+     */
+    bool (*module_task)(void (*fn)(void *), void *arg, const char *name,
+                        uint32_t stack, int priority, uint32_t flags);
 } ag_sys_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -419,6 +774,17 @@ enum ag_color {
     AG_LRED, AG_LMAGENTA, AG_YELLOW, AG_WHITE,
 };
 
+/*
+ * One cell of a text screen: the byte and its CGA attribute.
+ *
+ * Declared here rather than beside the display vtable that first needed it,
+ * because the console reads its own screen back into these too (peek_row).
+ */
+typedef struct {
+    uint8_t ch;
+    uint8_t attr;
+} ag_textcell_t;
+
 /* Attribute byte, CGA-compatible layout: bg << 4 | fg. */
 #define AG_ATTR(fg, bg) ((uint8_t)(((bg) << 4) | ((fg) & 0x0f)))
 
@@ -483,6 +849,56 @@ typedef struct ag_con_api {
      */
     uint16_t (*codepage)(void);
     ag_err_t (*set_codepage)(uint16_t number);
+
+    /*
+     * Read the screen back, one row at a time (ABI 0.43).
+     *
+     * The console draws itself, on whatever it has: a framebuffer, a panel's
+     * text cells, a serial terminal.  An application that wants to show the
+     * console inside a window of its own - a desktop shell with a console
+     * window in it - cannot use any of those; it needs the cells.
+     *
+     * A row rather than the whole screen, because the caller decides what to
+     * keep: eighty cells is a hundred and sixty bytes, where a screen is two
+     * kilobytes that a caller redrawing one changed line would throw away.
+     *
+     * Returns the number of cells written (never more than `max` or the
+     * screen's width), or a negative error.  Refused for a process that is not
+     * the console's - the same rule ag_poke follows, and for the same reason:
+     * the console belongs to the foreground.
+     */
+    int32_t (*peek_row)(uint16_t row, ag_textcell_t *cells, uint16_t max);
+
+    /*
+     * The same, from the screen of a session slot that is not this one.
+     *
+     * For a window showing somebody else's prompt.  A slot with a shell of
+     * its own (`prompt 2`) has a screen of its own, and that screen is
+     * nowhere on the glass while a desktop is in front - reading it is the
+     * only way to draw it.
+     *
+     * Slots are numbered from zero here, as they are everywhere inside the
+     * system; the shell writes them from one because that is what the
+     * Alt+digit on the keyboard says.
+     */
+    /* ABI 0.45. */
+    int32_t (*peek_row_slot)(int slot, uint16_t row, ag_textcell_t *cells,
+                             uint16_t max);
+
+    /*
+     * Where that screen's cursor is.
+     *
+     * A window drawing somebody else's prompt has no way to ask: coninfo
+     * answers about the CALLER's console, so a window that drew a caret from
+     * it would be drawing its own cursor on another screen's text - and one
+     * that drew none, as this did first, shows a prompt with nothing
+     * blinking in it, which does not look like a prompt at all.
+     *
+     * Zero on success; the coordinates are cells.
+     */
+    /* ABI 0.46. */
+    int32_t (*cursor_of_slot)(int slot, uint16_t *x, uint16_t *y);
+
 } ag_con_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -591,6 +1007,21 @@ typedef struct ag_inp_api {
      * Returns false if the queue is full or the event type is refused.
      */
     bool (*inject)(const ag_event_t *ev);
+
+    /*
+     * Hand an event to the prompt living in a session slot.
+     *
+     * There is one keyboard and it belongs to whoever is in front, so a
+     * prompt behind a window never reads a character on its own: the
+     * window in front reads them and passes them along.  That is the
+     * whole of how a shell can live in a window while a desktop holds
+     * the screen.
+     *
+     * False when that slot has no prompt of its own, or its queue is
+     * full.
+     */
+    /* ABI 0.45. */
+    bool (*post_to_slot)(int slot, const ag_event_t *ev);
 } ag_inp_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -778,36 +1209,58 @@ typedef struct ag_gfx_api {
  * Class vtable for AG_DEV_INPUT devices that have to be asked (ABI 0.28).
  *
  * A touchscreen on a slow bus does not interrupt with an event; it holds a
- * voltage, and somebody has to read it.  Doing that from the driver would need
- * a task inside a loadable module - the one thing a .SYS has no way to own -
- * so the kernel asks instead, from the console tick it already runs.
+ * voltage, and somebody has to read it.  So the kernel asks, from the console
+ * tick it already runs, rather than each such driver keeping a task to sleep
+ * and wake on a clock.  (When this was written a .SYS had no way to own a task
+ * at all; since 0.48 it has - sys->module_task - and that is the right answer
+ * for a driver whose work takes milliseconds.  A device that only needs looking
+ * at ten times a second is still better served here.)
  *
  * poll() fills at most `max` events and returns how many, or a negative error.
  * Zero is the normal answer and must be cheap: it is called ten times a second
  * forever.  The events go into the same queue the terminal decoder feeds, so
  * nothing above can tell a finger from a mouse on the other end of a cable.
  *
- * Coordinates are console cells, like the terminal's mouse reports, because
- * what is on this kind of screen is the console.  A driver for a panel with a
- * framebuffer under it would want pixels; there is no such panel yet, and
- * inventing the second convention before there is something to point at is how
- * both end up wrong.
+ * Coordinates are console cells by default, like the terminal's mouse
+ * reports, because what is on that kind of screen is the console - and a
+ * driver written before ABI 0.44 says nothing about units, so cells is what
+ * silence means.
+ *
+ * There is now something to point at, which is why the other convention
+ * exists (0.44): the CYD runs a graphical shell on a panel with no system
+ * framebuffer, and a touch controller that reports cells throws away eight
+ * pixels in nine before anybody sees it.  Worse, the round trip has to agree
+ * with the kernel about which grid - the console's, not the panel's - and
+ * when it did not, the pointer sat below the stylus and the bottom of the
+ * glass could not be pressed at all.  A driver that measures in pixels says
+ * so and hands over pixels, and no grid is involved.
+ *
+ *   .units  AG_PTR_CELLS (0, and what an older driver means by saying
+ *           nothing) or AG_PTR_PIXELS.
+ *   .span_w Pixels across and down of whatever the driver measured against -
+ *   .span_h its own glass.  The kernel scales that to the surface, so a touch
+ *           panel and a screen of different sizes still agree.  Zero means
+ *           "the same as the surface", which is the usual case.
  */
 typedef struct ag_input_ops {
     uint32_t size;
     int32_t (*poll)(ag_handle_t h, ag_event_t *out, uint32_t max);
+    /* ABI 0.44 */
+    uint16_t units;
+    uint16_t span_w;
+    uint16_t span_h;
 } ag_input_ops_t;
+
+enum ag_ptr_units {
+    AG_PTR_CELLS = 0,
+    AG_PTR_PIXELS = 1,
+};
 
 /*
  * One cell of the text console: the byte on the screen and its colours, high
  * nibble background, low nibble foreground, as they have been since CGA.  What
  * the byte means is the code page's business (con->codepage).
  */
-typedef struct {
-    uint8_t ch;
-    uint8_t attr;
-} ag_textcell_t;
-
 /*
  * Class vtable for AG_DEV_DISPLAY devices, returned by dev->ops(h).
  * Compact subset of ag_gfx_api_t keyed by the open handle — for drivers that
@@ -873,6 +1326,49 @@ typedef struct ag_display_ops {
      * with something to say says it from ag_driver_init.
      */
     void (*blit_rect)(ag_handle_t h, const ag_blit_t *b);
+
+    /*
+     * ABI 0.49: the console moved up, rather than every row of it changing.
+     *
+     * A scroll used to reach a panel as text_row for every row on the glass,
+     * because that is what the screen model reported and it is true - each row
+     * now holds different characters.  It is also the most expensive way to
+     * say it.  Measured on the CYD: an application printing eleven lines a
+     * second had the console sending each of them 23 times, 9.4 KB/s of an
+     * 11.5 KB/s serial line, and over the phone link thirty rows of Wi-Fi
+     * traffic per printed line.
+     *
+     * `lines` rows leave the top, the same number of blank rows arrive at the
+     * bottom, and nothing else about the picture has changed.  A driver that
+     * can move its own pixels - a memmove of a framebuffer, a hardware
+     * scrolling region, a page moving its own rows - does that and then takes
+     * the text_row calls that follow for the rows that genuinely changed.
+     *
+     * Optional, and its absence costs nothing but speed: a driver that leaves
+     * it NULL is sent every row exactly as before.  Called on the console tick
+     * with `h` zero and the registry held, before the text_row calls for the
+     * same tick, and under the same rule as those - it must not print.
+     */
+    void (*text_scroll)(ag_handle_t h, uint16_t lines);
+
+    /*
+     * ABI 0.68: an application has taken the screen (true) or let it go
+     * (false).
+     *
+     * A driver that only ever sees rectangles cannot tell an application's
+     * picture from the console's: on a board with a framebuffer the console
+     * reaches it as rectangles too.  A remote screen then has to guess which
+     * one is in front, and guessing by time - "no picture for two seconds, so
+     * it must be the console" - takes a still picture away from whoever is
+     * looking at it.  Measured on the Audio Kit: the amplifier's panel showed
+     * for two seconds and then turned into the console, while the amplifier
+     * was running and holding the screen.
+     *
+     * Called with `h` zero from the task that acquired or released, after the
+     * kernel's own state has changed.  Under the same rule as blit_rect: it
+     * must not print and must not wait.
+     */
+    void (*held)(ag_handle_t h, bool held);
 } ag_display_ops_t;
 
 /* ------------------------------------------------------------------------ */
@@ -892,6 +1388,18 @@ typedef enum {
     AG_DEV_AUDIO,
     AG_DEV_STORAGE,
     AG_DEV_MOTOR,
+    /*
+     * ABI 0.49: the wire to another node of the same system.  Appended, so no
+     * existing value moves - a class is a number in a .SYS built months ago.
+     *
+     * Not AG_DEV_NET and not AG_DEV_CHAR, and the difference is the point of
+     * having it.  A net device reaches somebody else's machine over somebody
+     * else's protocol; a char device is a stream with no idea what is in it.
+     * This carries messages between two kernels that are halves of one system,
+     * and what it has to know about them is which channel they belong to and
+     * which deadline they have - see ag_link_ops_t.
+     */
+    AG_DEV_LINK,
 } ag_dev_class_t;
 
 enum ag_dev_flags {
@@ -938,6 +1446,26 @@ enum ag_ioctl_cmd {
      * which is not an error - it is the answer.
      */
     AG_IOC_DISPLAY_BACKLIGHT = AG_IOC(AG_DEV_DISPLAY, 1),
+
+    /*
+     * Optional: arg is a pointer to an int, non-zero to let the driver send
+     * only the part of a rectangle that differs from what it believes the
+     * screen already has.
+     *
+     * It exists to be turned *off*.  A driver at the end of a wire keeps a
+     * record of the far end so that a screen which has not changed costs
+     * nothing, and that record is the only piece of state in the whole path
+     * that can be wrong: when it says the far end has a block it does not, the
+     * picture stays wrong until some slow repair reaches it.  Turning the
+     * trimming off sends every rectangle whole - one full screen is a quarter
+     * of a second of a four megabaud line, and it cannot be wrong.  That is
+     * the floor to measure everything else against, and the answer when a
+     * picture is misbehaving and nobody knows whose fault it is.
+     *
+     * A driver that always sends everything anyway answers -AG_ENOTSUP, which
+     * is not an error - it is the answer.
+     */
+    AG_IOC_DISPLAY_TRIM = AG_IOC(AG_DEV_DISPLAY, 2),
 
     AG_IOC_AUDIO_GETFMT = AG_IOC(AG_DEV_AUDIO, 1),
     AG_IOC_AUDIO_SETFMT = AG_IOC(AG_DEV_AUDIO, 2),
@@ -1131,6 +1659,264 @@ typedef struct {
     void               *priv;
 } ag_dev_add_t;
 
+/* ------------------------------------------------------------------------ */
+/* link - the wire to another node of the same system (ABI 0.49)            */
+/* ------------------------------------------------------------------------ */
+/*
+ * Class vtable for an AG_DEV_LINK device: the second live dev->ops class after
+ * ag_net_ops_t, and published the same way, as class_ops in ag_dev_add.
+ *
+ * WHAT IT CARRIES, and why it is messages rather than bytes.  A cluster's wire
+ * has to hold a screen, a sound card, a file being read and the control traffic
+ * that starts a process, all at once and with different deadlines.  A byte
+ * stream cannot express that: by the time the bytes are on the wire the thing
+ * that knew which were urgent is gone.  So the unit here is a message with a
+ * channel and a service class, and the driver underneath decides the order.
+ *
+ * THE CLASSES are apps/common/nlink's, and the reasoning is written out there
+ * rather than repeated: CONTROL is small, prompt and reliable; STREAM has a
+ * reserved rate and is dropped rather than delayed, because a retransmitted
+ * audio frame arrives after the moment it was for; BULK is reliable, windowed
+ * and may wait as long as necessary, and it is the class that pays for the
+ * other two being bounded.
+ *
+ * A CHANNEL is one conversation - a remote device, one process's console, one
+ * file being read.  Channels are independent: a stalled one does not hold up
+ * the others.  Channel 0 is the link talking about itself.
+ *
+ * PUMPING.  recv() may be given a timeout, and while it waits it is what drives
+ * the link: a loadable driver has no task of its own (api->task->create refuses
+ * one - a thread must belong to a process that can be made to end, and a driver
+ * is not that), so the wire advances on the caller's task.  That is the same
+ * bind HostFS and the external radio are in.  It is enough while somebody is
+ * asking; it is not enough for a node that must hear an unsolicited request
+ * with nobody calling in, and closing that gap is a service task the ABI does
+ * not have yet.
+ */
+/* What the link has carried and what it cost.  Counters rather than rates: a
+ * rate is a property of the moment it was taken, and these are meant to be
+ * compared across a run. */
+typedef struct ag_link_stats {
+    uint32_t sent;        /* frames put on the wire, retransmissions included */
+    uint32_t retransmits; /* of those, ones that had been sent before         */
+    uint32_t received;    /* frames accepted and delivered, in order          */
+    uint32_t gaps;        /* frames discarded because one ahead of them was lost */
+    uint32_t dups;        /* frames already had: an acknowledgement was lost     */
+    uint32_t bad;         /* frames whose header or payload did not check out    */
+    /*
+     * Frames that carried nothing but an acknowledgement, sent because the
+     * wire was idle and something was owed.  Counted apart from `sent`: they
+     * are real frames and real bytes, and they are not work anybody asked for,
+     * so adding them to the same number would make a quiet link look busy.
+     */
+    uint32_t acks;
+    uint32_t tx_bytes;
+    uint32_t rx_bytes;
+    /*
+     * The retransmission timeout in use, in milliseconds, and the smoothed
+     * round trip it was computed from.  Measured, not configured (ABI 0.51).
+     *
+     * Here because without them a retransmit count cannot be interpreted.
+     * Frames going out twice with nothing lost, nothing corrupt and nothing
+     * duplicated means the acknowledgement arrived after the timeout, not that
+     * the wire dropped anything - and those have opposite cures.  The pair of
+     * numbers is what tells them apart at a glance.
+     *
+     * Zero srtt means nothing has been measured yet: every frame so far went
+     * out more than once, or none has been acknowledged.
+     */
+    uint32_t rto_ms;
+    uint32_t srtt_ms;
+    /*
+     * Messages this end refused because its receive queue had no room for them,
+     * and the peer kept ownership: it will send them again, so under load a
+     * non-zero count here is NORMAL and is not a fault.  It is back-pressure
+     * arriving a layer later than would have been free.
+     *
+     * The fault it can show is a climb with a peer that is not sending much:
+     * then the queue is not being drained, and the number says so before
+     * anything above notices that it has stopped hearing.
+     *
+     * ABI 0.57.
+     */
+    uint32_t rx_refused;
+    /*
+     * Messages thrown away instead of acknowledged.  STREAM only, and there it
+     * is the class working as designed - STREAM drops rather than blocks, and
+     * nobody asks the peer to send it again.  So for STREAM this is NOT a fault.
+     *
+     * For any class that promises delivery it is permanent loss, and it is the
+     * counter this pair was added for: a message read off the wire, counted as
+     * received and then dropped is loss that every other number here reports as
+     * success.  Non-zero there is the fault, and it is the one to chase.
+     *
+     * The two are apart because their cures are opposite: refused messages come
+     * back, dropped ones do not.
+     *
+     * ABI 0.57.  Zeroed by the caller before the driver is asked (see the note
+     * at 0.57), so a driver built before this leaves zeros and not garbage.
+     */
+    uint32_t rx_dropped;
+} ag_link_stats_t;
+
+/*
+ * What this wire IS, as opposed to what it has done (ABI 0.52).
+ *
+ * Written because the wire is going to be replaced and everything above it had
+ * the UART's numbers built in.  The tree holds 232-byte payloads in four
+ * different files, timeouts sized for 400 KB/s, and a window chosen for a
+ * millisecond of round trip; on a quad SPI at 40 MHz every one of those is
+ * wrong by an order of magnitude in a different direction, and a driver that
+ * had to satisfy them all would be a fast wire pretending to be a slow one.
+ *
+ * So the driver states its own shape and the layers above ask.  Three numbers
+ * are enough for every decision they actually make: how much to put in one
+ * message, how long to wait before calling it lost, and whether a block of
+ * work is worth sending away at all.
+ *
+ * `bytes_per_sec` is the PAYLOAD rate, after framing and after whatever the
+ * line loses - the number an application can divide a block size by and get a
+ * time.  For the hand-soldered UART at 16 Mbaud that is 1 132 730 and not
+ * 1 599 966: a quarter of the frames arrive corrupt and are sent again, and a
+ * caller told the line rate would plan against bandwidth that does not exist.
+ *
+ * `rtt_us` is the driver's own estimate for a SMALL message and back, to be
+ * used before anything has been measured; once traffic is flowing, srtt_ms in
+ * the stats above is the better number and supersedes it.
+ */
+typedef struct ag_link_info {
+    uint32_t mtu;           /* largest payload one send() will accept       */
+    uint32_t bytes_per_sec; /* sustained payload rate, both ends counted once */
+    uint32_t rtt_us;        /* small message there and back, unloaded       */
+    char     wire[16];      /* "uart", "spi", "spi-quad", "par8"...         */
+} ag_link_info_t;
+
+/*
+ * The service classes, and they are apps/common/nlink's NL_CLS_* under another
+ * name and with deliberately the same numbers.
+ *
+ * Two names for one set because the two must not depend on each other: the ABI
+ * cannot include a driver's private header, and nlink is written to know
+ * nothing of ArgonOS so that its whole codec can be tested on a development
+ * machine.  So they are mirrored, exactly as the Wi-Fi security and link-state
+ * enums mirror the port's - and as there, renumbering one alone silently
+ * mislabels everything that crosses.
+ */
+enum ag_link_class {
+    AG_LINK_CONTROL = 0, /* small, prompt, reliable - a spawn, a device call  */
+    AG_LINK_STREAM = 1,  /* reserved rate, dropped rather than delayed        */
+    AG_LINK_BULK = 2,    /* reliable, windowed, may wait as long as it must   */
+    /*
+     * Reliable, and only on what the others leave (27 Sep 2026): a file sent
+     * beside a picture and sound.  Behind every other class on every board it
+     * crosses, and windowed from end to end - a sender has at most a few
+     * kilobytes of it unanswered - so it can fill no queue on the way.  A
+     * driver built before it refuses it as a class it does not know.
+     */
+    AG_LINK_BACKGROUND = 3,
+    AG_LINK_CLASSES = 4,
+};
+
+/*
+ * Where a message is going, where it came from, and how it is travelling
+ * (ABI 0.54) - the three things about it that are not its channel and not its
+ * bytes.
+ *
+ * `dst` is a node NAME as a number, and the kernel is the only thing that
+ * knows how a name becomes one; a driver neither hashes nor interprets either
+ * field, it stamps what it is given on the way out and reports what it read on
+ * the way in.  Zero means "whoever is reading this", which is what every frame
+ * meant before a board had a neighbour it could not reach directly, so a driver
+ * that has never heard of addressing and stamps zeros is doing the old thing
+ * rather than a wrong one.
+ *
+ * `src` must survive a relay UNCHANGED.  It is the node that wrote the
+ * message, not the board that last put it on a wire, and it is what the
+ * receiver addresses its answer to; a middle board that stamped itself would
+ * have every answer arrive at the middle.
+ */
+typedef struct ag_link_addr {
+    uint16_t dst; /* node it is for, 0 = whoever is reading it             */
+    uint16_t src; /* node that sent it, same encoding, 0 = not stated      */
+    uint8_t  cls; /* ag_link_class it travels in                          */
+    uint8_t  rsv;
+    /* ABI 0.67: how long it may wait to go out, in ms, said by its sender (0:
+     * at once).  A driver passes it to its wire (AG_SPILINK_BUDGET) and does
+     * not look at it otherwise: what goes first is the wire's business, and
+     * what the bytes are is nobody's below the sender. */
+    uint16_t budget_ms;
+} ag_link_addr_t;
+
+typedef struct ag_link_ops {
+    uint32_t size;
+
+    /* Bring the wire up.  Idempotent. */
+    ag_err_t (*start)(ag_device_t *dev);
+    /* Has anything been heard from the far end. */
+    bool (*up)(ag_device_t *dev);
+
+    /*
+     * Queue one message.  Returns the bytes accepted, or -AG_EAGAIN when the
+     * window for that class is full - which is back-pressure and not an error:
+     * try again after pumping.  A message longer than the driver's limit is
+     * refused rather than split, because only the caller knows where its own
+     * message boundaries are.
+     *
+     * Unaddressed: this is the entry a kernel from before 0.54 knows, and a
+     * frame queued through it is meant for whoever is reading it.  Use send_a
+     * where it is there.
+     */
+    int32_t (*send)(ag_device_t *dev, uint8_t chan, uint8_t cls,
+                    const void *buf, size_t len);
+
+    /*
+     * Take one message that has arrived, waiting up to timeout_ms for one.
+     * Fills *chan with the channel it came in on.  Returns its length, or
+     * -AG_EAGAIN when nothing arrived in time.  Pumps the wire while it waits.
+     */
+    int32_t (*recv)(ag_device_t *dev, uint8_t *chan, void *buf, size_t max,
+                    uint32_t timeout_ms);
+
+    /* Advance the link without wanting anything: what a caller with nothing to
+     * say does so the far end is still heard.  Same as recv with no buffer. */
+    void (*poll)(ag_device_t *dev, uint32_t ms);
+
+    /*
+     * Counters.  Written to be read by a person: a link that is working and a
+     * link that is working hard look identical from throughput alone, and the
+     * retransmit count is the difference.
+     */
+    ag_err_t (*stats)(ag_device_t *dev, ag_link_stats_t *out);
+
+    /*
+     * ABI 0.52: the wire's own shape - see ag_link_info_t.  NULL on a driver
+     * built before it, and the caller then assumes the conservative pair (232
+     * bytes, 400 KB/s), which is what this tree's UART actually gives.
+     */
+    ag_err_t (*info)(ag_device_t *dev, ag_link_info_t *out);
+
+    /*
+     * ABI 0.54: the same two calls, with the addressing - see ag_link_addr_t.
+     *
+     * `to` is stamped on every frame the message becomes, and is copied rather
+     * than kept by pointer: the frame goes out on a later call than the one
+     * that queued it.  `from` is filled with what the arriving frames carried,
+     * so the layer above can tell a message for this board from one to relay,
+     * and can address an answer to whoever actually sent it.
+     *
+     * NULL on a driver built before this one, and the pair is APPENDED rather
+     * than substituted on purpose - see the 0.54 note at the top.  A kernel
+     * that finds them missing refuses the device with one line saying the
+     * driver predates addressing, because the alternative is quiet: the board
+     * would deliver every relayed frame to itself.
+     */
+    int32_t (*send_a)(ag_device_t *dev, uint8_t chan, const void *buf, size_t len,
+                      const ag_link_addr_t *to);
+    int32_t (*recv_a)(ag_device_t *dev, uint8_t *chan, void *buf, size_t max,
+                      uint32_t timeout_ms, ag_link_addr_t *from);
+} ag_link_ops_t;
+
+
 /*
  * What matched when the module was loaded by probe, not by an explicit
  * `drv load`.  NULL outside ag_driver_init, and NULL for a forced load.
@@ -1195,6 +1981,123 @@ enum ag_gpio_edge { AG_EDGE_RISING = 1, AG_EDGE_FALLING = 2, AG_EDGE_BOTH = 3 };
 
 typedef void (*ag_isr_fn)(void *arg);
 
+/*
+ * What one SPI slave link has done (ABI 0.57).  Read with io->spi_link_stats
+ * while the link is RUNNING, which is the point of it.
+ *
+ * The service already kept these numbers and printed them at close, and that
+ * was the wrong instrument: the first hardware round in which the slave wedged
+ * printed nothing at all, because nothing got far enough to close the link.  A
+ * fault that has to be shut down before it can be seen is a fault nobody sees,
+ * so the same counters are readable at any time - a driver can print them from
+ * its own listener loop, and the shell can ask.
+ *
+ * A reader can tell a working link from a wedged one without knowing anything
+ * about SPI:
+ *
+ *   blocks_clocked stops moving, or never moved  ->  the peer is not clocking
+ *                                                    this end, or the pool of
+ *                                                    armed transactions is
+ *                                                    stuck and a recovery is
+ *                                                    due;
+ *   timeouts and stalls rise                     ->  the wire is quiet for
+ *                                                    whole seconds at a time;
+ *   recoveries rises                             ->  the link has rebuilt
+ *                                                    itself; a rising count is
+ *                                                    a wire problem, not a
+ *                                                    service problem;
+ *   blocks_unarmed non-zero                      ->  a block completed with
+ *                                                    nothing armed, which the
+ *                                                    service exists to prevent;
+ *   errors / last_error                          ->  the port refused a call.
+ *
+ * `open` and `task_stuck` say whether the service is there at all: a closed
+ * link answers with everything zero and open == false, and task_stuck means a
+ * teardown could not stop the task and nothing was freed.
+ */
+typedef struct {
+    uint32_t blocks_clocked; /* transactions the peer completed            */
+    uint32_t blocks_data;    /* of those, the ones that carried real bytes */
+    uint32_t blocks_unarmed; /* completed with nothing of ours armed       */
+    uint32_t bytes_dropped;  /* received bytes with no room in the RX ring */
+    uint32_t timeouts;       /* reaps that found no block waiting          */
+    uint32_t stalls;         /* whole quiet windows with nothing clocked   */
+    uint32_t recoveries;     /* times the slave interface was rebuilt      */
+    uint32_t errors;         /* arm/reap failures, last_error is the first */
+    ag_err_t last_error;
+    bool     open;           /* the service is up and its task is running  */
+    bool     task_stuck;     /* a teardown could not stop the task         */
+    /* ABI 0.60, framed links only: */
+    uint32_t frames_bad;     /* clocked frames with no header in them      */
+    uint32_t seq_gaps;       /* frames of the peer's that never arrived    */
+    uint32_t wire_us;        /* master: time inside transfers, in total    */
+    uint32_t loop_us;        /* master: time of whole passes, in total     */
+    uint32_t reorders;       /* slave: blocks back out of the armed order  */
+    uint32_t short_frames;   /* slave: frames the master clocked short     */
+    uint32_t rewinds;        /* times this end went back and sent again    */
+    uint32_t naks;           /* times this end asked the other to          */
+    uint32_t starve_data;    /* frames sent empty: nothing unsent to send  */
+    uint32_t starve_credit;  /* frames sent empty: data, but no room/window*/
+    uint32_t frame;          /* the frame both ends agreed on, 0 not yet   */
+    uint32_t peer_restarts;  /* times the other end started a new session  */
+} ag_spilink_stats_t;
+
+/* uart_link_open (ABI 0.61): by the UART's DMA (UHCI) rather than through
+ * its driver - the S3, the C3, the C6; not the ESP32, not the emulator.  The
+ * wire's configuration says which. */
+#define AG_UARTLINK_DMA 16u
+/* ... and the receive never stopped: a ring of descriptors the DMA goes round
+ * (the port's own, not IDF's receive, which stops at every pause) */
+#define AG_UARTLINK_RING 32u
+
+/* spi_link_open2 flags (ABI 0.60). */
+#define AG_SPILINK_MASTER 1u /* this end holds the clock                   */
+#define AG_SPILINK_FRAMED 2u /* transactions carry a header: see spilink.c */
+/* test only: (N << 8) drops every Nth data frame on arrival, to prove the
+ * link sends it again */
+#define AG_SPILINK_DROP(n) (((uint32_t)(n) & 0xFFu) << 8)
+/* open2: the link carries numbered BLOCKS (spi_link_send / spi_link_recv)
+ * rather than bytes */
+#define AG_SPILINK_BLOCKS 4u
+/* spi_link_send: send this block again if it is lost or damaged */
+#define AG_SPILINK_RELIABLE 1u
+/*
+ * ... and (26 Sep 2026, kernels before ignore them) take it only if all of it
+ * fits now, answering -AG_EAGAIN at once otherwise - so a writer waiting for
+ * room holds nothing while it waits; and YIELD: only if room is left after it
+ * for another writer's message, a third of the transmit ring.  Bulk yields,
+ * so sound and control never wait behind a picture or a file.
+ */
+#define AG_SPILINK_WHOLE    2u
+#define AG_SPILINK_YIELD    4u
+/*
+ * With WHOLE (ABI 0.66): only into a wire with nothing waiting to go - every
+ * byte already in its ring sent at least once - or -AG_EAGAIN.  A wire sends
+ * its ring in order, so a file written at the rate the ring takes it put a
+ * picture behind a window of it on every hop; background written this way
+ * waits for the wire to be idle, and what comes after waits behind one block
+ * of it at most.
+ */
+#define AG_SPILINK_IDLE     8u
+/*
+ * With WHOLE (ABI 0.67): how long this block may wait to go out, in ms.  A
+ * wire that has room to hold blocks back sends the one due soonest first -
+ * a block of 10 ms goes ahead of a block of 100 queued before it - and one
+ * that has not sends in order, a block of more than WL_YIELD_BUDGET_MS
+ * leaving room behind it as YIELD does.  0 is at once.
+ */
+#define AG_SPILINK_BUDGET(ms)     (((uint32_t)((ms) > 0xFFFFu ? 0xFFFFu : (ms))) << 16)
+#define AG_SPILINK_BUDGET_OF(flags) ((uint32_t)(flags) >> 16)
+/* ag_spilink_block_t.flags: blocks no..last were lost and not sent again */
+#define AG_SPILINK_LOST 0x80u
+
+typedef struct {
+    uint16_t no;    /* the block's number, counted by the sender from 0 */
+    uint16_t last;  /* LOST: the last of the blocks lost; else == no     */
+    uint8_t  flags; /* AG_SPILINK_RELIABLE as sent, or AG_SPILINK_LOST   */
+    uint8_t  rsv[3];
+} ag_spilink_block_t;
+
 typedef struct ag_io_api {
     uint32_t size;
 
@@ -1231,6 +2134,197 @@ typedef struct ag_io_api {
      * once, before the first transfer to that chip.
      */
     ag_err_t (*spi_config)(int bus, int cs, uint32_t khz);
+
+    /*
+     * ABI 0.44: the same port, driven by the UART's own DMA.
+     *
+     * uart_write is a thread copying into a ring and waking whenever the
+     * peripheral has room, which is right for a console and wrong for a
+     * picture: a hundred and fifty kilobytes a frame is eighty wake-ups, and
+     * on a busy board that left the wire half idle - 172 KB/s carried of a
+     * possible 400 while a game ran.  dma_write hands the buffer to the
+     * hardware once and returns when the last byte has gone.
+     *
+     * dma_ready says whether this chip and port can: the original ESP32 and
+     * the S2 have no UHCI, and a caller must keep the ordinary write for them.
+     * The buffer may be in extended memory where the hardware allows it, but
+     * alignment is checked and refused rather than worked around - -AG_EINVAL
+     * means "give me an aligned buffer", not "it did not work".
+     *
+     * The two are different masters of one transmitter: do not have a write
+     * in flight on the same port when this is called.
+     */
+    /*
+     * Wait until everything given to this port has left it.  Not a flush -
+     * that word is taken by the call that throws away what has *arrived* -
+     * but the handover between the two masters of one transmitter: whoever
+     * mixes uart_write with uart_dma_write calls this in between.
+     */
+    ag_err_t (*uart_tx_wait)(int port, uint32_t timeout_ms);
+    bool (*uart_dma_ready)(int port);
+    int32_t (*uart_dma_write)(int port, const void *buf, size_t len);
+
+    /*
+     * The same in two halves, for a caller with more than one thing to send:
+     * submit hands a buffer to the hardware and returns, drain waits for
+     * everything still out.  Waiting for each transfer in turn leaves the wire
+     * idle between them - about a quarter of a frame, measured - because the
+     * next one cannot start until a task has been scheduled to start it.  The
+     * buffers stay the hardware's until drain returns.
+     */
+    int32_t (*uart_dma_submit)(int port, const void *buf, size_t len);
+    ag_err_t (*uart_dma_drain)(int port);
+    /*
+     * ABI 0.56: the bus from the other end of the clock, appended past
+     * spi_config so that a driver built before this reads exactly what it did.
+     *
+     * spi_slave_open brings the bus up as a slave and names the select INPUT
+     * the peer drives - that pin is part of the interface, so it is given once
+     * here rather than on every transfer.  khz is what the caller expects the
+     * peer to run at; a slave has no clock of its own to set it on.
+     *
+     * spi_slave_xfer is full duplex like spi_xfer: `tx` and `rx` are the same
+     * length and `len` is at most AG_PORT_SPI_MAX_XFER (8192).  It blocks until
+     * the peer has clocked the block or timeout_ms has passed, and a timeout is
+     * -AG_ETIMEDOUT with nothing written to `rx` - bytes nobody clocked are not
+     * a frame.  -AG_ENODEV means the bus was not opened as a slave first.
+     */
+    ag_err_t (*spi_slave_open)(int bus, int cs, uint32_t khz);
+    ag_err_t (*spi_slave_xfer)(int bus, const void *tx, void *rx, size_t len,
+                               uint32_t timeout_ms);
+
+    /*
+     * ABI 0.57: the same bus, kept armed by the kernel, as a byte stream.
+     *
+     * spi_slave_xfer is one transaction and the caller waits for it.  On a wire
+     * where the peer clocks blocks back to back, the time between one transfer
+     * completing and the next being queued is time with nobody listening, and a
+     * select pulse that falls inside it is lost silently.  The kernel does not
+     * have that window: it keeps several blocks armed and refills them as they
+     * complete, at a priority it chooses rather than one a driver is given.
+     *
+     * So a driver that wants the slave's bytes registers four calls instead.
+     * spi_link_open(bus, cs, khz, block) brings the bus up as a slave through
+     * exactly the path spi_slave_open uses - the pins and the clock from
+     * BOARD.CFG, the drive strength from `spi<bus>.drive` - and starts the
+     * service.  `block` is the unit of every transaction in both directions and
+     * has to be a whole number of words, because the engine writes words; it is
+     * at most AG_PORT_SPI_MAX_XFER.  `khz` is what the caller expects the peer
+     * to run at - a slave has no clock of its own to set it on.
+     *
+     * spi_link_write takes what fits of `buf` and returns the count, or
+     * -AG_EAGAIN when the transmit ring is full: it never blocks and never
+     * drops, so the remainder is the caller's to offer again.  spi_link_read
+     * waits up to timeout_ms for bytes the peer clocked and returns how many,
+     * or -AG_EAGAIN when nothing arrived.  0 polls; UINT32_MAX waits.
+     *
+     * spi_link_close stops the service task, waits for it, and gives the bus
+     * back, so a driver that closes on unload leaves no task behind.  Both it
+     * and a link the driver never closed are torn down when the driver's module
+     * is unloaded, the kernel taking back what a module forgot.
+     *
+     * The bytes are bytes: no framing, no channels, no classes, and a block
+     * carries as many of them as a block holds.  What arrived is counted in
+     * bytes and nothing more - the layer above owns every boundary.
+     */
+    ag_err_t (*spi_link_open)(int bus, int cs, uint32_t khz, uint32_t block);
+    ag_err_t (*spi_link_close)(int bus);
+    int32_t (*spi_link_write)(int bus, const void *buf, size_t len);
+    int32_t (*spi_link_read)(int bus, void *buf, size_t len,
+                             uint32_t timeout_ms);
+
+    /*
+     * The counters, while the link is alive, and this one is not a convenience.
+     *
+     * The first hardware round in which the slave wedged produced no evidence
+     * at all: the close line never printed, because nothing got far enough to
+     * unload the driver that would have closed the link.  An instrument that
+     * only reports at the end does not report on the failures that matter - the
+     * ones that hang the board - so the same numbers are readable at any time.
+     *
+     * -AG_ENODEV when no link has ever been opened on that bus; a link that was
+     * opened and has been closed answers AG_OK with open == false and the
+     * counters cleared.  See ag_spilink_stats_t for how to read them.
+     */
+    ag_err_t (*spi_link_stats)(int bus, ag_spilink_stats_t *out);
+
+    /* ABI 0.59: receive by DMA into the caller's buffer. */
+    int32_t (*uart_dma_read)(int port, void *buf, size_t len,
+                             uint32_t timeout_ms);
+    /*
+     * ABI 0.60: an SPI link at either end of the clock, and framed: every
+     * transaction is a `frame`-byte frame whose header says how much of it is
+     * data and how much room the sender has, so the stream carries no padding
+     * and never overruns the far end.  Read, write, close and stats are the
+     * spi_link_* calls above.  A master must be framed.  `frame` is this
+     * end's largest, a multiple of 64, or 0 for the board's own ([wire]
+     * frame in SYSTEM.CFG, 4096 if it says none); the link runs at the
+     * smaller of the two ends', which stats report once they have agreed.
+     */
+    ag_err_t (*spi_link_open2)(int bus, int cs, uint32_t khz, uint32_t frame,
+                               uint32_t flags);
+    /* ABI 0.60: write all of buf, waiting for room; returns what was taken
+     * once timeout_ms passes with nothing more accepted */
+    int32_t (*spi_link_write_wait)(int bus, const void *buf, size_t len,
+                                   uint32_t timeout_ms);
+    /*
+     * ABI 0.60, block mode: one block in, sent again if lost only when
+     * flags has AG_SPILINK_RELIABLE, of any size up to the link's transmit
+     * ring; one block out, in the order sent, or a LOST notice for blocks
+     * that were lost and not sent again.  One writer and one reader a link:
+     * once a call has begun a block it waits for the rest of it, whatever
+     * the timeout, as the stream cannot be cut inside a block.
+     */
+    int32_t (*spi_link_send)(int bus, const void *buf, size_t len,
+                             uint32_t flags, uint32_t timeout_ms);
+    int32_t (*spi_link_recv)(int bus, void *buf, size_t cap,
+                             ag_spilink_block_t *info, uint32_t timeout_ms);
+    /*
+     * ABI 0.61: the same framed link over a UART - the same frames, sent
+     * again when lost, blocks, sessions, the frame agreed as the smaller of
+     * the two boards' (`frame` 0: [wire] frame in SYSTEM.CFG) - carried by
+     * DMA (AG_UARTLINK_DMA) or through the port's driver, each frame the
+     * length it is, both ends equal.  The port comes up at `baud` with
+     * BOARD.CFG's pins.  flags are spi_link_open2's AG_SPILINK_BLOCKS and
+     * AG_SPILINK_DROP, and AG_UARTLINK_DMA; the stats are the SPI link's
+     * struct, with blocks_clocked frames sent, blocks_data frames received
+     * and timeouts the bytes skipped while looking for a frame; stalls the
+     * port's receive pieces lost to a reader behind; and each damaged frame
+     * told by where the next good one began: short_frames the ones bytes
+     * fell out of (wire_us those bytes), blocks_unarmed the ones the right
+     * length and wrong - bits the line turned.
+     */
+    ag_err_t (*uart_link_open)(int port, uint32_t baud, uint32_t frame,
+                               uint32_t flags);
+    ag_err_t (*uart_link_close)(int port);
+    ag_err_t (*uart_link_stats)(int port, ag_spilink_stats_t *out);
+    int32_t (*uart_link_write)(int port, const void *buf, size_t len);
+    int32_t (*uart_link_write_wait)(int port, const void *buf, size_t len,
+                                    uint32_t timeout_ms);
+    int32_t (*uart_link_read)(int port, void *buf, size_t len,
+                              uint32_t timeout_ms);
+    int32_t (*uart_link_send)(int port, const void *buf, size_t len,
+                              uint32_t flags, uint32_t timeout_ms);
+    int32_t (*uart_link_recv)(int port, void *buf, size_t cap,
+                              ag_spilink_block_t *info, uint32_t timeout_ms);
+    /*
+     * ABI 0.62: a block in two parts - a head the driver puts on, and the
+     * caller's bytes - one block on the wire, so a driver needs no buffer of
+     * its own to join or split them.  recv2 fills head first and returns the
+     * bytes placed in both; what does not fit is dropped.
+     */
+    int32_t (*spi_link_send2)(int bus, const void *head, size_t hlen,
+                              const void *buf, size_t len, uint32_t flags,
+                              uint32_t timeout_ms);
+    int32_t (*spi_link_recv2)(int bus, void *head, size_t hcap, void *buf,
+                              size_t cap, ag_spilink_block_t *info,
+                              uint32_t timeout_ms);
+    int32_t (*uart_link_send2)(int port, const void *head, size_t hlen,
+                               const void *buf, size_t len, uint32_t flags,
+                               uint32_t timeout_ms);
+    int32_t (*uart_link_recv2)(int port, void *head, size_t hcap, void *buf,
+                               size_t cap, ag_spilink_block_t *info,
+                               uint32_t timeout_ms);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1271,6 +2365,7 @@ typedef struct ag_time_api {
 /* ------------------------------------------------------------------------ */
 
 typedef void *ag_thread_t;
+typedef void *ag_svc_t; /* a service task owned by a module (ABI 0.50) */
 typedef void *ag_mutex_t;
 typedef void *ag_sem_t;
 typedef void *ag_queue_t;
@@ -1310,6 +2405,60 @@ typedef struct ag_task_api {
     /* Disable preemption on the current core; keep it short. */
     void (*critical_enter)(void);
     void (*critical_exit)(void);
+
+    /*
+     * ABI 0.51: bytes of stack the current task has never touched.
+     *
+     * For code that runs on a stack it does not own.  A driver called from a
+     * display callback, a filesystem hook or an input poll is spending the
+     * caller's, and the caller declared its size for its own work rather than
+     * for whatever a driver might do next.  PHONE.SYS on a board with no
+     * framebuffer sends the picture from inside blit_rect - the band encoder,
+     * the WebSocket framing and all of lwIP - and eight kilobytes, which is
+     * what an application gets by default, is not enough for that: three board
+     * resets in seventeen runs, every one a stack overflow in the drawing
+     * application.
+     *
+     * A watermark, not a live figure: it is the low tide of this task since it
+     * started, so it is conservative in the right direction.  Zero if the port
+     * cannot tell.
+     */
+    uint32_t (*stack_left)(void);
+
+    /*
+     * A TASK A LOADABLE DRIVER MAY OWN (ABI 0.50).
+     *
+     * create() above refuses a caller with no current process, and the reason
+     * is sound - a thread must belong to something that can be made to end, and
+     * a driver was not that.  So a .SYS polled from whatever callback the
+     * kernel happened to make: right for a panel that is asked to blit, wrong
+     * for anything whose job is to WATCH.  REMDISP says so in its own source; a
+     * node link cannot work at all that way, because ten polls a second is a
+     * ceiling of sixty kilobytes and a node has to hear what it did not ask
+     * for.
+     *
+     * A service task belongs to the MODULE, which is the owner create() could
+     * not point at.  ONLY VALID FROM ag_driver_init, the same rule dev->add
+     * follows: outside it there is nothing to own the task, and an unowned task
+     * is one nothing can ever stop.
+     *
+     * NO PRIORITY ARGUMENT, deliberately.  Applications run at three levels and
+     * a service task runs below all of them.  A driver task above applications
+     * has cost this project a game - the wire's own task sat there, never
+     * blocked, and 40 fps became unplayable until it was moved down - so the
+     * choice is not offered.  `flags` is reserved and must be 0.
+     *
+     * THE STOP PROTOCOL IS COOPERATIVE, and it must be: the task runs code
+     * inside the module's image, so the image cannot be freed under it.  Check
+     * svc_stopping() in the loop and return when it is true.  A task that never
+     * returns is not killed - killing it would leave whatever it holds held for
+     * ever - it is complained about, and its module stays mapped.  That is a
+     * leak, and it is enormously better than executing memory that has been
+     * given back.
+     */
+    ag_svc_t (*svc_start)(void (*fn)(void *), void *arg, const char *name,
+                          size_t stack, uint32_t flags);
+    bool (*svc_stopping)(ag_svc_t s);
 } ag_task_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1390,7 +2539,63 @@ typedef struct ag_proc_api {
      * focus.  Outside focus, apps should not flush/swap or run heavy redraw.
      */
     bool (*focused)(void);
+
+    /* ------------------------------------------------------------------ */
+    /* ABI 0.53: moving to another board, by consent                      */
+    /* ------------------------------------------------------------------ */
+    /*
+     * Three calls, and between them they are the whole of migration level 1.
+     * There is no callback and no hook: the program decides WHEN it is at a
+     * safe point, which is the one thing only it can know.  See
+     * AG_AXE_CAN_MIGRATE for the promise these implement.
+     *
+     * The shape, whole:
+     *
+     *     int ag_main(int argc, char **argv)
+     *     {
+     *         state_t s = {0};
+     *         (void)ag_migrate_restore(&s, sizeof s);   // 0 = a fresh start
+     *         reopen_whatever_this_needs();             // OURS to do
+     *         for (;;) {
+     *             work(&s);
+     *             if (ag_interrupted()) {
+     *                 if (ag_migrate_wanted()) ag_migrate_save(&s, sizeof s);
+     *                 return 0;
+     *             }
+     *         }
+     *     }
+     *
+     * WHAT IS NOT MOVED, and it is most things: the arena, open handles, the
+     * screen, threads.  Only the bytes handed to save() travel.  That is a
+     * deliberate floor rather than a first draft - four megabytes of arena at
+     * five megabytes a second is eight tenths of a second of a frozen program,
+     * so a level that moved everything would be a level nobody would use.
+     */
+
+    /* True while the interruption that is being reported is a request to move
+     * rather than a request to stop.  Meaningless unless interrupted(). */
+    bool (*migrate_wanted)(void);
+
+    /*
+     * Hand over the state to carry across.  At most AG_MIGRATE_MAX bytes, once
+     * per request; -AG_ERANGE above that, -AG_EPERM when nobody asked.
+     *
+     * Small on purpose.  A program that needs megabytes moved is a program
+     * whose data should have been on a disc both boards can reach.
+     */
+    ag_err_t (*migrate_save)(const void *state, uint32_t len);
+
+    /*
+     * The state this copy was started with, or 0 if it was started fresh.
+     * Returns the bytes written, -AG_ERANGE if `cap` is too small to hold what
+     * was saved - which is a version mismatch between two builds of the same
+     * program, and worth failing loudly rather than truncating.
+     */
+    int32_t (*migrate_restore)(void *out, uint32_t cap);
 } ag_proc_api_t;
+
+/* The most that travels with a migrating program.  See migrate_save. */
+#define AG_MIGRATE_MAX 1024u
 
 /* ------------------------------------------------------------------------ */
 /* cfg - system / board configuration access                                */
@@ -1406,6 +2611,60 @@ typedef struct ag_cfg_api {
     ag_err_t (*set_str)(const char *key, const char *value);
     ag_err_t (*commit)(void);
 } ag_cfg_api_t;
+
+/* ------------------------------------------------------------------------ */
+/* radio vocabulary - shared by the net provider class and the wifi API      */
+/* ------------------------------------------------------------------------ */
+/*
+ * These sit above both users because both need them: ag_net_ops_t below
+ * carries the station half of an external radio, and ag_wifi_api_t further
+ * down is the same vocabulary as an application sees it.  They were declared
+ * with the wifi API until ABI 0.48 gave a provider on a wire a station to
+ * drive; nothing about them changed in the move.
+ */
+
+#define AG_WIFI_SSID_MAX 32 /* an SSID is at most 32 bytes, not NUL-counted   */
+#define AG_WIFI_PASS_MAX 63 /* a WPA key is 8..63 characters                  */
+
+/* Security of a network, ag_wifi_ap_t.auth.  Ordered as the port orders it. */
+enum {
+    AG_WIFI_SEC_OPEN = 0,
+    AG_WIFI_SEC_WEP,
+    AG_WIFI_SEC_WPA,
+    AG_WIFI_SEC_WPA2,
+    AG_WIFI_SEC_WPA3,
+    AG_WIFI_SEC_ENTERPRISE,
+    AG_WIFI_SEC_OTHER,
+};
+
+/* Station link state, ag_wifi_status_t.state. */
+enum {
+    AG_WIFI_ST_OFF = 0,   /* radio not started                               */
+    AG_WIFI_ST_IDLE,      /* on, joined to nothing                           */
+    AG_WIFI_ST_JOINING,   /* association or DHCP in progress                 */
+    AG_WIFI_ST_JOINED,    /* associated; an address may still be coming      */
+};
+
+/* One network a scan found. */
+typedef struct {
+    char    ssid[AG_WIFI_SSID_MAX + 1];
+    uint8_t bssid[6];
+    int8_t  rssi;    /* dBm, negative                                        */
+    uint8_t channel;
+    uint8_t auth;    /* AG_WIFI_SEC_*                                         */
+} ag_wifi_ap_t;
+
+/* Where the station half stands.  The key is never reported. */
+typedef struct {
+    uint8_t  state;      /* AG_WIFI_ST_*                                     */
+    char     ssid[AG_WIFI_SSID_MAX + 1]; /* joined or being joined          */
+    uint8_t  bssid[6];   /* the access point actually joined, or zeros       */
+    bool     pinned;     /* this access point was asked for by name          */
+    int8_t   rssi;
+    uint8_t  channel;
+    uint32_t attempts;   /* association attempts since the last join         */
+    int32_t  last_reason;/* the port's own disconnect reason code            */
+} ag_wifi_status_t;
 
 /* ------------------------------------------------------------------------ */
 /* net - TCP sockets (OpenEth in QEMU today; Wi-Fi later on hardware)       */
@@ -1446,7 +2705,98 @@ typedef struct ag_net_api {
      * resolve, -AG_EAGAIN before the interface has an address of its own.
      */
     ag_err_t (*resolve)(const char *host, uint32_t *addr_out);
+
+    /*
+     * ABI 0.50: throw this connection away instead of closing it.
+     *
+     * `close` is a promise to deliver what is already queued, and TCP keeps
+     * that promise for as long as it takes - which against a peer that has
+     * stopped reading is for ever.  Measured on the CYD: a client killed with
+     * its socket open left 11520 bytes queued on our side and 32 KB of heap
+     * held, and nothing but taking the interface down returned it.
+     *
+     * This sends a reset: the far end is told, the queue is discarded, the
+     * memory comes back now.  Use it only for a peer already judged gone - a
+     * send that has stalled past its deadline, a client that has proved
+     * nothing for half a minute.  Everything else should close.
+     */
+    ag_err_t (*reset)(ag_handle_t sock);
 } ag_net_api_t;
+
+/*
+ * Class vtable for an AG_DEV_NET device (ABI 0.43), read by the kernel's socket
+ * layer when `net use <dev>` binds this device as the active network provider.
+ * A .SYS talking to an external radio coprocessor publishes it as class_ops in
+ * ag_dev_add; it is not reached through dev->open/ops() by an application.
+ *
+ * It mirrors, function for function, what the built-in stack does - the same
+ * shape as components/argon_port/include/argon/port/net.h, because the kernel
+ * clients above it (net.c, netio.c, httpc.c, ftpc.c, ssh.c, ...) are written
+ * against exactly that shape and must not be able to tell which provider is
+ * underneath.  `dev` is the device the kernel bound; recover the driver's state
+ * with dev->get_priv(dev).
+ *
+ * SOCKET IDS.  listen/accept/connect hand back the coprocessor's own small
+ * integers; the kernel wraps them into ag_handle_t exactly as it wraps a port
+ * fd.  A negative return is an -AG_E* code.  Because only one provider is active
+ * at a time the id space belongs to whoever is bound, so no tagging is needed.
+ *
+ * THE recv_now / wait_readable SPLIT is the contract that matters: recv_now must
+ * return whatever has already arrived and never block (-AG_EAGAIN when nothing
+ * has), and wait_readable must answer within its timeout without a blocking
+ * read underneath.  A driver over a wire keeps a per-socket receive buffer fed
+ * by the coprocessor's unsolicited pushes and answers both out of it; recv()
+ * (which the ABI allows to block) may loop over the same buffer.
+ */
+typedef struct ag_net_ops {
+    uint32_t size;
+
+    ag_err_t (*start)(ag_device_t *dev);
+    bool (*ready)(ag_device_t *dev);
+    ag_err_t (*ifaddr)(ag_device_t *dev, uint32_t *addr_out); /* host-order */
+    ag_err_t (*resolve)(ag_device_t *dev, const char *host, uint32_t *addr_out);
+
+    int (*listen)(ag_device_t *dev, uint16_t port);
+    int (*accept)(ag_device_t *dev, int listen_fd, uint32_t timeout_ms);
+    int (*connect)(ag_device_t *dev, uint32_t addr, uint16_t port,
+                   uint32_t timeout_ms);
+
+    int32_t (*send)(ag_device_t *dev, int fd, const void *buf, size_t len);
+    int32_t (*recv)(ag_device_t *dev, int fd, void *buf, size_t len);
+    void (*net_close)(ag_device_t *dev, int fd);
+    ag_err_t (*nonblock)(ag_device_t *dev, int fd, bool on);
+
+    int (*wait_readable)(ag_device_t *dev, int fd, uint32_t timeout_ms);
+    int32_t (*recv_now)(ag_device_t *dev, int fd, void *buf, size_t len);
+
+    /*
+     * THE STATION HALF (ABI 0.48).  All six are NULL on a provider that is not
+     * a Wi-Fi radio - a GSM modem has sockets and no networks to list - so the
+     * kernel probes with AG_HAS before every call and reports no radio when
+     * they are absent.  A provider that fills them fills all six.
+     *
+     * Sockets alone do not make a remote radio indistinguishable from a local
+     * one.  `wifi scan` and `wifi connect` are how a person points at the air,
+     * and a board whose only radio is at the far end of a wire has to answer
+     * both, or the operator has to know which board is which - which is the
+     * whole thing this exists to avoid.
+     *
+     * The semantics are ag_wifi_api_t's, exactly, because that is what the
+     * kernel's own radio does and neither the shell nor an application may be
+     * able to tell which one answered: scan blocks a second or two and reports
+     * in `found` how many networks were SEEN, which may exceed the `max` it had
+     * room to return; connect returns when the attempt has been MADE, not when
+     * it has succeeded, and the caller polls status().
+     */
+    ag_err_t (*wifi_start)(ag_device_t *dev);
+    ag_err_t (*wifi_stop)(ag_device_t *dev);
+    ag_err_t (*wifi_scan)(ag_device_t *dev, ag_wifi_ap_t *out, uint32_t max,
+                          uint32_t *found);
+    ag_err_t (*wifi_connect)(ag_device_t *dev, const char *ssid,
+                             const char *pass, const uint8_t bssid[6]);
+    ag_err_t (*wifi_disconnect)(ag_device_t *dev);
+    ag_err_t (*wifi_status)(ag_device_t *dev, ag_wifi_status_t *out);
+} ag_net_ops_t;
 
 /* ------------------------------------------------------------------------ */
 /* audio - PCM output (built-in pcmnull discard; I2S/virt via .SYS)         */
@@ -1640,6 +2990,37 @@ typedef struct ag_ble_api {
      * adv_start and this share one advertising instance - use one at a time.
      */
     ag_err_t (*adv_raw)(const uint8_t addr[6], const void *data, uint32_t len);
+
+    /*
+     * ABI 0.52 - the peripheral pushes bytes to the connected client as a GATT
+     * notification on its read characteristic (NULL without the peripheral
+     * build).  This is the board->phone direction for a link over BLE: a client
+     * cannot be made to poll fast enough for a live screen.  One packet, at most
+     * an ATT MTU's worth (~180 bytes after overhead); the caller chunks more.
+     * -AG_ENODEV until a client is connected.
+     */
+    ag_err_t (*adv_notify)(const void *data, uint32_t len);
+
+    /*
+     * ABI 0.64 - what a link over BLE needs besides the push.
+     *
+     * adv_recv takes the oldest write a client made and returns its length (0
+     * when none is waiting).  adv_last_write keeps only the newest, and a key's
+     * down and up arrive milliseconds apart - a reader that polls slower than
+     * that sees only the up.  NULL without the peripheral build.
+     *
+     * adv_mtu is how many bytes one adv_notify can carry to the client there
+     * now, 0 when nobody is connected and subscribed; adv_notify answers
+     * -AG_EAGAIN when the radio has no buffer yet, which is "not now", and
+     * -AG_ERANGE past adv_mtu.  NULL without the peripheral build.
+     *
+     * radio_on says whether the system has the radio up.  A driver that serves
+     * over BLE asks it rather than calling adv_start, which raises the radio:
+     * the radio is the system's to raise (`bt on`, `[bt] on`), as Wi-Fi is.
+     */
+    int32_t  (*adv_recv)(uint8_t *out, uint32_t max);
+    uint32_t (*adv_mtu)(void);
+    bool     (*radio_on)(void);
 } ag_ble_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -1915,52 +3296,9 @@ typedef struct ag_wifimon_api {
  * anything else yet.
  */
 
-#define AG_WIFI_SSID_MAX 32 /* an SSID is at most 32 bytes, not NUL-counted   */
-#define AG_WIFI_PASS_MAX 63 /* a WPA key is 8..63 characters                  */
-
-/* Security of a network, ag_wifi_ap_t.auth.  Ordered as the port orders it. */
-enum {
-    AG_WIFI_SEC_OPEN = 0,
-    AG_WIFI_SEC_WEP,
-    AG_WIFI_SEC_WPA,
-    AG_WIFI_SEC_WPA2,
-    AG_WIFI_SEC_WPA3,
-    AG_WIFI_SEC_ENTERPRISE,
-    AG_WIFI_SEC_OTHER,
-};
-
-/* Station link state, ag_wifi_status_t.state. */
-enum {
-    AG_WIFI_ST_OFF = 0,   /* radio not started                               */
-    AG_WIFI_ST_IDLE,      /* on, joined to nothing                           */
-    AG_WIFI_ST_JOINING,   /* association or DHCP in progress                 */
-    AG_WIFI_ST_JOINED,    /* associated; an address may still be coming      */
-};
-
 /* ESP-NOW limits, mirroring the port. */
 #define AG_WIFI_ESPNOW_MAX 250 /* one datagram's payload, bytes              */
 #define AG_WIFI_ESPNOW_KEY 16  /* an encryption key, exactly this many bytes */
-
-/* One network a scan found. */
-typedef struct {
-    char    ssid[AG_WIFI_SSID_MAX + 1];
-    uint8_t bssid[6];
-    int8_t  rssi;    /* dBm, negative                                        */
-    uint8_t channel;
-    uint8_t auth;    /* AG_WIFI_SEC_*                                         */
-} ag_wifi_ap_t;
-
-/* Where the station half stands.  The key is never reported. */
-typedef struct {
-    uint8_t  state;      /* AG_WIFI_ST_*                                     */
-    char     ssid[AG_WIFI_SSID_MAX + 1]; /* joined or being joined          */
-    uint8_t  bssid[6];   /* the access point actually joined, or zeros       */
-    bool     pinned;     /* this access point was asked for by name          */
-    int8_t   rssi;
-    uint8_t  channel;
-    uint32_t attempts;   /* association attempts since the last join         */
-    int32_t  last_reason;/* the port's own disconnect reason code            */
-} ag_wifi_status_t;
 
 /* What the access-point half is offering, when one is up. */
 typedef struct {
@@ -2094,7 +3432,369 @@ typedef struct ag_cam_api {
 } ag_cam_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* clu - one program on every core of every node (ABI 0.52)                 */
+/* ------------------------------------------------------------------------ */
+/*
+ * WHAT THIS IS, AND WHAT IT DELIBERATELY IS NOT.
+ *
+ * Everything the cluster had before this moved whole PROGRAMS: `run` hands a
+ * program to the node that can serve it, its file stays here, its devices are
+ * reachable from there.  That gives every program a core; it does not give one
+ * program the cores of the other board.  This does.
+ *
+ * It is NOT api->task->create across the wire, and the difference is not an
+ * implementation detail to be closed later.  A thread in the ordinary sense is
+ * a stack and a program counter sharing one address space with its siblings -
+ * it reaches a global by name, a pointer means the same thing in every one of
+ * them.  Between two boards there is no such space.  A cache line fetched over
+ * this wire costs tens of microseconds against 1.26 for the worst local miss,
+ * so a shared-memory illusion here would not be slower in the way that
+ * profiling finds, it would be slower in the way that makes the machine
+ * useless.  That measurement is why this interface passes MESSAGES and has no
+ * call that dereferences anything on another board.
+ *
+ * So: a thread here runs a NAMED ENTRY of the same program, on some node, with
+ * a stack of its own and no memory in common with its siblings, and the only
+ * way it exchanges anything with them is send/recv.
+ *
+ * WHAT IT COSTS, so the caller can decide before it builds the wrong thing.
+ * Every byte a thread is given and every byte it answers with crosses the wire
+ * at whatever link->info() reports.  On the measured UART - 1.13 MB/s of
+ * payload at 16 Mbaud - a byte is 0.88 microseconds, which is about 210 cycles
+ * of a 240 MHz core.  A piece of work must therefore be worth more than ~210
+ * cycles for each byte it carries in and out, or it was cheaper to do at home;
+ * and it must be big enough that the round trip (milliseconds, not
+ * microseconds) disappears into it.  Both numbers are readable at run time -
+ * nodes() gives the cores, the link's info() and stats() give the rest - so a
+ * program that wants to decide for itself can, and grind.axe does.
+ *
+ * WHAT SHAPE OF WORK FITS.  The one that carries little and computes much:
+ * filter fitting, convolution, a rendered tile, a compressed frame, a search.
+ * The one that does not is a stream with a deadline shorter than the trip - a
+ * 44.1 kHz audio frame is 0.73 ms and the trip is several - and for that the
+ * answer is not this interface but a one-way pipeline, each node a stage.
+ *
+ * THE RULES, all four of which are arbitrary only in their limits:
+ *
+ *   - Exactly one program on a node may hold a job at a time.  The second gets
+ *     -AG_EBUSY.  A node hosts one worker process per job, processes are
+ *     capped at four, and a cluster that silently ran out of them mid-spawn
+ *     would be worse than one that says no at the start.
+ *   - Only the thread that started the job (tid 0, "the master") may spawn.
+ *     Every thread may send to every other.  Nested spawning needs routing
+ *     that two nodes and one wire cannot exercise, so it is refused rather
+ *     than written blind.
+ *   - A message is at most AG_CLU_MSG_MAX and arrives whole or not at all.
+ *     The wire splits and reassembles it; the caller never sees a fragment.
+ *   - A worker that is still running when the master ends is stopped with it.
+ *     A job outliving the program that owns it is a leak on somebody else's
+ *     board, which is the hardest kind to find.
+ */
+
+/* Longest entry-point name, including the terminator. */
+#define AG_CLU_ENTRY_MAX 16u
+
+/*
+ * The largest single message.  Big enough for a block of audio, a tile of
+ * pixels or a row of coefficients; small enough that a node's mailboxes cannot
+ * eat the heap.  A buffer of this size always fits whatever recv() has.
+ */
+#define AG_CLU_MSG_MAX 4096u
+
+/* Threads in one job, master included, over all nodes. */
+#define AG_CLU_THREADS_MAX 16u
+
+typedef int32_t ag_clu_tid_t;
+
+/* The master, always, on whichever node started the job. */
+#define AG_CLU_MASTER ((ag_clu_tid_t)0)
+
+/* As `node` to spawn(): let the system choose, or insist on this board. */
+#define AG_CLU_ANY   (-1)
+#define AG_CLU_LOCAL (-2)
+
+typedef struct ag_clu_node {
+    char     name[16];  /* what the node calls itself; see ag_node_name()   */
+    uint8_t  cores;     /* how many this board has                          */
+    uint8_t  here;      /* 1 when this entry is the board asking            */
+    uint16_t threads;   /* of this job, running there now                   */
+    uint32_t cpu_hz;
+} ag_clu_node_t;
+
+/*
+ * A thread's body.  `self` is its own tid, so it can say where an answer came
+ * from; `arg` is the blob spawn() was given, valid only for this call.
+ *
+ * Returning ends the thread.  There is no return value on purpose: a result
+ * that fits in an int is a result that should have been a message, and one
+ * that does not would have needed a second mechanism to carry it.  Send what
+ * you computed to whoever asked for it, then return.
+ */
+typedef void (*ag_clu_fn)(ag_clu_tid_t self, const void *arg, uint32_t len);
+
+typedef struct ag_clu_entry {
+    const char *name;
+    ag_clu_fn   fn;
+} ag_clu_entry_t;
+
+typedef struct ag_clu_api {
+    uint32_t size;
+
+    /*
+     * The nodes this job may use, `here` first.  Returns how many were written,
+     * or how many there are when `out` is NULL.  One means this board is alone,
+     * which is not an error and is the answer on most boards most of the time.
+     */
+    int32_t (*nodes)(ag_clu_node_t *out, uint32_t max);
+
+    /*
+     * Declare this program's entry points, and find out which half of the job
+     * this copy of it is.
+     *
+     * FALSE means "you are the master": the table is registered, spawn() will
+     * work, carry on with ag_main.
+     *
+     * TRUE means this copy was started by another node to serve its share of a
+     * job, and by the time it returns that share is finished - the call blocks,
+     * running whatever threads were asked for, until the job ends.  The right
+     * response is to return from ag_main without doing anything else, and the
+     * idiom is one line:
+     *
+     *     if (ag_clu_start(k_entries, 2)) return 0;
+     *
+     * `tab` must stay valid for as long as the job does; a static array is the
+     * normal answer.  The names are matched exactly and are case sensitive.
+     */
+    bool (*start)(const ag_clu_entry_t *tab, uint32_t n);
+
+    /*
+     * Start one thread running `entry`, on `node` - an index from nodes(), or
+     * AG_CLU_ANY to be placed, or AG_CLU_LOCAL to stay here.  Returns its tid,
+     * or a negative error; -AG_EPERM from anything but the master.
+     *
+     * `arg` is copied and must be small - one wire message, so at most a couple
+     * of hundred bytes; it is for what the thread needs to know, not for what
+     * it is to work on.  Anything larger is a send() after the spawn, which
+     * costs nothing extra and does not make start-up wait for a big transfer.
+     */
+    ag_clu_tid_t (*spawn)(int32_t node, const char *entry, const void *arg,
+                          uint32_t len);
+
+    /*
+     * One message to one thread, wherever it is.  Blocks up to timeout_ms if
+     * the far mailbox is full - that is back-pressure and not an error - and
+     * answers -AG_ETIMEDOUT if it stays full, -AG_ENOENT if the thread has
+     * ended, -AG_ERANGE above AG_CLU_MSG_MAX.
+     */
+    ag_err_t (*send)(ag_clu_tid_t dst, const void *buf, uint32_t len,
+                     uint32_t timeout_ms);
+
+    /*
+     * The next message for the calling thread.  Returns its length and fills
+     * *from with the sender, -AG_EAGAIN when none arrived in time.
+     *
+     * A message too big for `cap` is NOT discarded: recv answers -AG_ERANGE and
+     * leaves it at the head, so a caller that was given something unexpected
+     * can ask again with room for it rather than lose it.  A buffer of
+     * AG_CLU_MSG_MAX can never see that error.
+     */
+    int32_t (*recv)(ag_clu_tid_t *from, void *buf, uint32_t cap,
+                    uint32_t timeout_ms);
+
+    /*
+     * Wait for a thread to return.  -AG_ETIMEDOUT while it still runs.
+     * Joining one that has already finished succeeds at once; joining one that
+     * never existed is -AG_ENOENT.
+     */
+    ag_err_t (*join)(ag_clu_tid_t t, uint32_t timeout_ms);
+
+    /* The calling thread's own tid.  AG_CLU_MASTER in ag_main of the master. */
+    ag_clu_tid_t (*self)(void);
+
+    /*
+     * End the job: stop every worker, on every node, and forget the threads.
+     * Called for you when the master's process ends, so a program that simply
+     * returns leaves nothing behind; call it yourself to run a second job.
+     */
+    void (*done)(void);
+
+    /*
+     * THE BOARDS BEYOND THE ONES `nodes` LISTS.
+     *
+     * A leaf holds one wire and therefore has one neighbour, so `nodes` answers
+     * "only me and the one next door" while a third board is running two hops
+     * away.  The middle knows that and says so on the wire (net/nodeclu.c), and
+     * this is how it is read: `out` receives the far boards, `via` the index of
+     * the wire each one is seen through, and the return is how many there are
+     * (or, with `out` NULL, how many there are).
+     *
+     * DELIBERATELY NOT PART OF `nodes`, and the reason is not tidiness: every
+     * caller that PLACES work walks `nodes` - spawn(AG_CLU_ANY) picks the board
+     * with the most cores - and a frame carries no destination yet, so a thread
+     * aimed at a board two hops away would be started on the neighbour in hand.
+     * So these are shown and not used.
+     *
+     * NEW, SO TEST `size` (or AG_HAS) BEFORE CALLING IT: a kernel built before
+     * this field reports it as absent, not as NULL.
+     */
+    int32_t (*peers_seen)(ag_clu_node_t *out, int32_t *via, uint32_t max);
+} ag_clu_api_t;
+
+/* ------------------------------------------------------------------------ */
+/* usbd - the board as a USB device, on demand (ABI 0.55)                   */
+/* ------------------------------------------------------------------------ */
+/*
+ * The USB-OTG peripheral as a mass-storage DEVICE, owned by an application for
+ * a session.  The port does only what an application cannot: install TinyUSB,
+ * cycle the one internal PHY away from the USB-Serial-JTAG console and back,
+ * and forward the TinyUSB MSC callbacks to a table the application registers
+ * below.  The application owns everything else - which block device is lent
+ * (it reads /dev/sd0 itself), read-only versus writable, the stop condition,
+ * and what is printed - so nothing in the kernel has a policy about any of it.
+ *
+ * The callbacks in ag_usbd_msc_cbs_t are the application's own functions; the
+ * port calls them from TinyUSB's task.  They must not block and must not be
+ * re-entered, exactly like an interrupt handler - the port serialises the MSC
+ * command stream, but a callback that sleeps would stall the USB task and lose
+ * the host.  Stage 1 is read-only: the application's write10 answers 0 and its
+ * is_writable answers false, so the host mounts the volume read-only.
+ */
+
+/*
+ * One mass-storage LUN's worth of behaviour, all of it the application's.
+ *
+ * `capacity` must fill *block_count and *block_size (in bytes) and return 0;
+ * `read10` copies bufsize bytes of the volume starting at (lba * block_size +
+ * offset) into `buf` and returns the byte count; `write10` is the same in the
+ * other direction and is expected to return 0 in stage 1.  `is_writable` gates
+ * the host's own write path; `unit_ready` is the media-present probe (return
+ * false and the host sees an empty slot).  `start_stop` is the SCSI START STOP
+ * UNIT command - `start` loads, `eject` is the host asking the media to go -
+ * and `mounted`/`unmounted` are host attach and detach (USB unplug).  Any
+ * pointer may be NULL, and the port then supplies a safe no-op default.
+ */
+typedef struct ag_usbd_msc_cbs {
+    int32_t (*capacity)(uint32_t lun, uint32_t *block_count,
+                        uint32_t *block_size);
+    int32_t (*read10)(uint32_t lun, uint32_t lba, uint32_t offset, void *buf,
+                      uint32_t bufsize);
+    int32_t (*write10)(uint32_t lun, uint32_t lba, uint32_t offset,
+                       const void *buf, uint32_t bufsize);
+    bool    (*is_writable)(uint32_t lun);
+    bool    (*unit_ready)(uint32_t lun);
+    bool    (*start_stop)(uint32_t lun, bool start, bool eject);
+    void    (*mounted)(void);
+    void    (*unmounted)(void);
+} ag_usbd_msc_cbs_t;
+
+/* What status() reports: is the device up, and has a host attached. */
+typedef struct {
+    bool up;      /* TinyUSB installed, PHY taken from the console            */
+    bool mounted; /* a host has enumerated and attached                       */
+} ag_usbd_status_t;
+
+typedef struct ag_usbd_api {
+    uint32_t size;
+
+    /*
+     * Take the PHY and become a USB device with the callbacks in `cbs`.  The
+     * console is gone from its USB port from the moment this succeeds until
+     * stop() - there is no way to have both, so this is stated to the operator
+     * before it happens.  -AG_EBUSY when the device is already up.
+     */
+    ag_err_t (*start)(const ag_usbd_msc_cbs_t *cbs);
+
+    /*
+     * Tear the device down and restore the USB-Serial-JTAG console.  The
+     * callback table is cleared first, so an application that dies mid-session
+     * cannot leave the port calling its freed code.  A no-op when not up.
+     */
+    ag_err_t (*stop)(void);
+
+    ag_err_t (*status)(ag_usbd_status_t *out);
+} ag_usbd_api_t;
+
+/* ------------------------------------------------------------------------ */
 /* Root table                                                               */
+
+/* ------------------------------------------------------------------------ */
+/* Raw flash stores                                                         */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * A partition an application may use as its own storage, with no filesystem
+ * in the way: it reads, writes and erases bytes at offsets, and it may ask
+ * for a span to appear in the address space so that reading costs a load
+ * instruction instead of a call.
+ *
+ * This exists because a game's art, a synthesiser's samples and a logger's
+ * ring all want the same thing - a few megabytes of flash that survive a
+ * reboot and can be read without copying - and none of them wants a
+ * filesystem's directories, names or write amplification.
+ *
+ * Only partitions of type data with subtype 0x41 can be opened.  That is
+ * deliberate and it is the whole safety story: C: (littlefs), nvs and the
+ * firmware itself are all excluded, so a wrong label cannot destroy the
+ * machine's configuration or the OS.  Add a store to the partition table to
+ * create one; see partitions_16mb.csv.
+ *
+ * What the hardware costs, because it decides how a store may be used:
+ *
+ *   - reading is cheap, and mapped reading is nearly free: the bytes go
+ *     through the same cache the processor's own code does.
+ *   - writing needs the sector erased first, tens of milliseconds for each
+ *     4 KB, and on this class of part the cache is DISABLED while an erase or
+ *     a program runs.  Everything executing from flash stops for that time.
+ *
+ * So a store is filled at a moment the program is already standing still - a
+ * level load, a startup, an explicit save - and read during the parts that
+ * have to be smooth.  A write in an animation loop will be visible as a
+ * freeze, and no amount of buffering hides it.
+ */
+typedef const void *ag_store_t;     /* an open store, NULL when there is none */
+typedef uintptr_t   ag_store_map_t; /* a live mapping, 0 when there is none   */
+
+typedef struct ag_store_api {
+    uint32_t size;
+
+    /*
+     * Open the store with this label, or NULL when the partition table has no
+     * such raw store.  The handle is a description, not a lock: opening the
+     * same store twice is allowed and the two callers share the bytes.
+     */
+    ag_store_t (*open)(const char *label);
+
+    /* Bytes in the store, and the granularity erase() works in (4096 here). */
+    uint64_t (*bytes)(ag_store_t s);
+    uint32_t (*erase_size)(ag_store_t s);
+
+    ag_err_t (*read)(ag_store_t s, uint64_t off, void *buf, size_t len);
+
+    /*
+     * Write bytes that have already been erased.  Flash only clears bits, so
+     * writing over live data without erasing first gives the AND of the two,
+     * silently: erase the span, then write it.
+     */
+    ag_err_t (*write)(ag_store_t s, uint64_t off, const void *buf, size_t len);
+
+    /* Erase whole sectors.  off and len must be multiples of erase_size(). */
+    ag_err_t (*erase)(ag_store_t s, uint64_t off, size_t len);
+
+    /*
+     * Put a span in the address space, read only, and hand back a pointer to
+     * it.  Nothing is copied and no memory is spent: the pointer reaches
+     * flash through the cache.
+     *
+     * It can fail even when the store is fine - the address window for mapped
+     * flash is finite and shared with everything else mapped - so a caller
+     * that needs to work either way should fall back to read() rather than
+     * treat AG_ERR_NOMEM as fatal.  Unmap what is no longer needed.
+     */
+    ag_err_t (*map)(ag_store_t s, uint64_t off, size_t len, const void **addr,
+                    ag_store_map_t *out);
+    void (*unmap)(ag_store_map_t h);
+} ag_store_api_t;
+
 /* ------------------------------------------------------------------------ */
 
 typedef struct ag_api {
@@ -2141,8 +3841,24 @@ typedef struct ag_api {
     /* ABI 0.41+: the DVP camera transport - NULL without
      * CONFIG_ARGON_ENABLE_CAMERA. */
     const ag_cam_api_t *cam;
-} ag_api_t;
 
+    /* ABI 0.45+: raw flash stores.  Never NULL, but open() answers NULL on a
+     * machine whose partition table declares no store. */
+    const ag_store_api_t *store;
+
+    /*
+     * ABI 0.52+: threads of one program across the nodes.  Never NULL - a board
+     * with no link answers "one node, this one" and runs every thread locally,
+     * which is the same program working on one core count instead of two.  A
+     * program written against this therefore runs unchanged on a single board,
+     * and that is the point: the cluster is a size, not a different system.
+     */
+    const ag_clu_api_t *clu;
+
+    /* ABI 0.55+: the board as a USB mass-storage device, on demand.  NULL
+     * unless CONFIG_ARGON_USB_MSC (off by default) - probe with AG_HAS. */
+    const ag_usbd_api_t *usbd;
+} ag_api_t;
 /* ------------------------------------------------------------------------ */
 /* Executable image header                                                  */
 /* ------------------------------------------------------------------------ */
@@ -2183,6 +3899,28 @@ enum ag_axe_flags {
      * the flag then only makes that choice intentional rather than incidental.
      */
     AG_AXE_WANT_XIP = 1u << 7,
+    /*
+     * ABI 0.53: this program can be moved to another node while it runs.
+     *
+     * It is a PROMISE, not a permission, and the system will not move anything
+     * that has not made it.  Migration in this system is consent rather than
+     * transparency: there is no shared memory between boards, so a state that
+     * was taken without the program's knowledge could not be put back
+     * faithfully, and pretending otherwise would be the sort of lie that shows
+     * up as a program that works until it doesn't.
+     *
+     * What the promise means, exactly:
+     *   - the program checks proc->interrupted() often enough to notice;
+     *   - when it notices and proc->migrate_wanted() is true, it packs what it
+     *     needs into proc->migrate_save() and returns from ag_main;
+     *   - at start-up it calls proc->migrate_restore(), and if there is
+     *     something there it carries on from it instead of starting fresh;
+     *   - and it REOPENS WHAT IT NEEDS itself.  A file, a device, a socket are
+     *     different objects on the other board; nothing can move them, and the
+     *     program that said it could migrate is the only thing that knows what
+     *     it was holding and why.
+     */
+    AG_AXE_CAN_MIGRATE = 1u << 8,
 };
 
 /*

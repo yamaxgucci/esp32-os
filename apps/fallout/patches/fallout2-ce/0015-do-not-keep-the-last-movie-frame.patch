@@ -1,0 +1,24 @@
+diff --git a/src/movie.cc b/src/movie.cc
+--- a/src/movie.cc
++++ b/src/movie.cc
+@@ -420,9 +420,18 @@
+         _lastMovieBuffer = nullptr;
+     }
+ 
++    // ARGON: do not keep a copy of the last frame; nothing reads it.
++    //
++    // _lastMovieBuffer is written here and freed in movieExit(), and those are
++    // the only two places in the engine that mention it - there is no reader.
++    // Fallout 2 movies are 640x320, so the copy is 204800 bytes held from the
++    // moment the last movie ends until the program exits, on every map, for
++    // nothing.  It is a quarter of what an 8 MB part is short by.
++    //
++    // MVE_lastBuffer still has to be cleared: the decoder owns that buffer and
++    // MVE_ReleaseMem() below frees it, so leaving the pointer set would leave a
++    // dangling one behind.
+     if (MVE_lastBuffer != nullptr) {
+-        _lastMovieBuffer = (unsigned char*)internal_malloc_safe(_lastMovieBH * _lastMovieBW, __FILE__, __LINE__); // "..\\int\\MOVIE.C", 802
+-        memcpy(_lastMovieBuffer, MVE_lastBuffer, _lastMovieBW * _lastMovieBH);
+         MVE_lastBuffer = nullptr;
+     }
+ 

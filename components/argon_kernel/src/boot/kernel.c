@@ -15,13 +15,19 @@
 #include <string.h>
 
 #include <argon/board.h>
+#include <argon/cfg.h>
 #include <argon/console.h>
+#include <argon/display.h>
 #include <argon/log.h>
 #include <argon/module.h>
+#include <argon/place.h>
 #include <argon/power.h>
 #include <argon/recovery.h>
 #include <argon/shell.h>
+#include <argon/textpanel.h>
 
+#include <argon/nodeboot.h>
+#include <argon/port/mem.h>
 #include <argon/port/time.h>
 #include <argon/port/task.h>
 #include <argon/port/uart.h>
@@ -37,10 +43,17 @@
 /*
  * Eighty by twenty-five, unless the board says otherwise.
  *
- * It is a build option rather than a line in BOARD.CFG because of when it is
- * needed: the console exists three stages before anything has read a file off
- * the flash, and a console that has to be rebuilt later is a console whose
- * first three stages of output went somewhere else.
+ * It is a build option because of when it is needed: the console exists three
+ * stages before anything has read a file off the flash, and a console that has
+ * to be rebuilt later is a console whose first three stages of output went
+ * somewhere else.
+ *
+ * It is not the final word, though.  `[console] cols/rows` in SYSTEM.CFG is
+ * applied once the devices are up and again once the loadable drivers are
+ * (see apply_console_size), so the size is a line in a file for anyone who
+ * plugs a different display into a board that is already flashed - which is
+ * the whole point of not baking it in.  Twice because `auto` asks the panel,
+ * and a panel that arrives as a .SYS is not there for the first question.
  *
  * The board that wants it smaller is one whose only screen is the panel
  * soldered to it: 320 pixels hold forty of the 8-pixel cells this system
@@ -157,6 +170,99 @@ static ag_err_t stage_console(void)
 
 static ag_err_t stage_shell(void) { return AG_OK; }
 
+/*
+ * The console size, from the configuration.
+ *
+ *     [console]
+ *     cols=40        ; a number, or `auto` for whatever the panel can show
+ *     rows=25
+ *
+ * Run after the devices stage rather than after the config stage, because
+ * `auto` has to ask the panel and the panel is a device.  Nothing is lost by
+ * waiting: resizing keeps what is on the screen, so the boot report written at
+ * the built-in size is still there afterwards.
+ *
+ * A size that will not fit is reported and ignored - the console is how anyone
+ * would find out about it, so it is the last thing to break over a typo.
+ */
+static uint16_t size_from_cfg(const ag_cfg_t *cfg, const char *key,
+                              uint16_t built_in, uint16_t panel,
+                              uint16_t max)
+{
+    const char *v = ag_cfg_get(cfg, key, NULL);
+    if (v == NULL) {
+        return built_in;
+    }
+    if (v[0] == 'a' || v[0] == 'A') { /* auto */
+        return (panel > 0) ? panel : built_in;
+    }
+
+    const int32_t n = ag_cfg_get_int(cfg, key, (int32_t)built_in);
+    if (n < 1 || n > (int32_t)max) {
+        kout("console: %s=%s ignored (1..%u, or auto)\n", key, v,
+             (unsigned)max);
+        return built_in;
+    }
+    return (uint16_t)n;
+}
+
+static void apply_console_size(void)
+{
+    const ag_cfg_t *cfg = ag_sysconfig();
+    if (cfg == NULL) {
+        return;
+    }
+
+    /*
+     * What `auto` means, in the order it is asked.
+     *
+     * A panel driver with text ops knows its own answer (8x8 cells: forty by
+     * thirty on the 320x240 glass of a CYD).  Failing that, the framebuffer
+     * console draws 8x16 cells on whatever surface there is, so the surface
+     * divided by that cell is what fits.  Failing both, the board is headless
+     * and only the serial console is watching, where the built-in size is
+     * right and nothing should shrink it.
+     */
+    uint16_t pcols = 0, prows = 0;
+    if (ag_textpanel_geometry(&pcols, &prows) != AG_OK) {
+        pcols = 0;
+        prows = 0;
+        (void)ag_display_text_cells(&pcols, &prows);
+    }
+
+    const uint16_t cols = size_from_cfg(cfg, "console.cols", AG_CONSOLE_COLS,
+                                        pcols, AG_SCREEN_MAX_COLS);
+    const uint16_t rows = size_from_cfg(cfg, "console.rows", AG_CONSOLE_ROWS,
+                                        prows, AG_SCREEN_MAX_ROWS);
+
+    /*
+     * Nothing to do when the answer has not changed, which is the ordinary
+     * case for the second call: a resize reflows the screen, and doing that
+     * to an identical size would throw away the boot report for nothing.
+     */
+    static uint16_t s_cols, s_rows;
+    if (cols == s_cols && rows == s_rows) {
+        return;
+    }
+
+    const ag_err_t err = ag_console_resize(cols, rows);
+    if (err != AG_OK) {
+        kout("console: %ux%u refused with %d, staying at %ux%u\n",
+             (unsigned)cols, (unsigned)rows, (int)err,
+             (unsigned)AG_CONSOLE_COLS, (unsigned)AG_CONSOLE_ROWS);
+        return;
+    }
+    s_cols = cols;
+    s_rows = rows;
+}
+
+static ag_err_t stage_devices(void)
+{
+    const ag_err_t err = ag_devices_init();
+    apply_console_size();
+    return err;
+}
+
 static ag_err_t stage_modules(void)
 {
     /*
@@ -167,7 +273,32 @@ static ag_err_t stage_modules(void)
     if (ag_boot_in_recovery()) {
         return AG_OK;
     }
-    return ag_modules_boot();
+    const ag_err_t err = ag_modules_boot();
+
+    /*
+     * And again, now that the loadable drivers are up.
+     *
+     * `auto` asks the panel first, and on a board whose panel is a .SYS the
+     * panel does not exist yet at the devices stage: the question fell through
+     * to the framebuffer and a CYD answered 20x7 (a 160x120 surface in 8x16
+     * cells) for glass that holds 40x30.  That is worse than the built-in
+     * size, so the one documented way to fit the console to the screen made
+     * the console smaller.  Asked a second time here, the panel answers for
+     * itself; an explicit size in SYSTEM.CFG gets the same number twice and
+     * the call does nothing.
+     */
+    apply_console_size();
+
+    /*
+     * The wire, if SYSTEM.CFG asked for one.  Here because the link driver is
+     * a loadable .SYS and has only just registered its device, and before
+     * AUTOEXEC because a board that is half of a cluster should come up as
+     * half of a cluster - the binding is lost on every reset, so leaving it to
+     * a line in a batch file lost it on every test that resets a board and on
+     * every power cut in the field.
+     */
+    ag_node_autobind();
+    return err;
 }
 
 /*
@@ -185,7 +316,8 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_CONFIG]     = {"config",     ag_sysconfig_init, false},
     /* After the configuration, because [power] lives in it. */
     [AG_STAGE_POWER]      = {"power",      ag_powerctl_init, false},
-    [AG_STAGE_DEVICES]    = {"devices",    ag_devices_init, false},
+    /* Also the console size from [console]: `auto` asks the panel. */
+    [AG_STAGE_DEVICES]    = {"devices",    stage_devices,  false},
     [AG_STAGE_MEDIA]      = {"media",      ag_storage_mount_media, false},
     [AG_STAGE_MODULES]    = {"modules",    stage_modules,  false},
     [AG_STAGE_SUPERVISOR] = {"supervisor", ag_supervisor_init, false},
@@ -218,12 +350,31 @@ static void print_summary(void)
     }
 }
 
+/* The prompt's own task, when it has one: the main task's stack and priority
+ * (sdkconfig.defaults CONFIG_ESP_MAIN_TASK_STACK_SIZE; IDF runs main at 1). */
+#define AG_SHELL_STACK    12288u
+#define AG_SHELL_PRIORITY 1u
+
+static void shell_task(void *arg)
+{
+    (void)arg;
+    ag_shell_run();
+}
+
 void ag_kernel_main(void)
 {
     AG_TRACE("kernel entry\n");
     const int64_t t0 = ag_port_us();
 
     memset(&s_report, 0, sizeof(s_report));
+    /*
+     * Who holds the memory, by stage.  `mem` says only how much the system
+     * holds (137 KB on the C3, with no way to say whose), and "the system" is
+     * everything from the chip's own layer up; this is the same figure taken
+     * apart as it is built up.
+     */
+    s_report.entry_used = (uint32_t)(ag_port_mem_total(AG_MEM_FAST) -
+                                     ag_port_mem_free(AG_MEM_FAST));
 
     bool fatal_failure = false;
 
@@ -237,9 +388,34 @@ void ag_kernel_main(void)
         }
 
         const int64_t ts = ag_port_us();
+        const size_t  free0 = ag_port_mem_free(AG_MEM_FAST);
         const ag_err_t err = st->fn();
         s_report.stage_us[i] = (uint32_t)(ag_port_us() - ts);
+        s_report.stage_mem[i] =
+            (int32_t)free0 - (int32_t)ag_port_mem_free(AG_MEM_FAST);
         s_report.stage_result[i] = err;
+
+        /*
+         * ABSENT IS NOT BROKEN.  -AG_ENODEV from a stage means "there is
+         * nothing of this kind on this board" - no card slot, no panel - which
+         * is a fact about the hardware and not a fault in it.
+         *
+         * It used to be reported as a failure, in red, on every single boot of
+         * any board without an SD card, and printed again in the summary:
+         *
+         *   E (17) boot: stage 'media' failed with -19
+         *     stage 'media' FAILED with -19
+         *
+         * on a board whose own BOARD.CFG says `[sd] interface = none`.  A
+         * message that is wrong on every boot is worse than no message: it
+         * teaches whoever reads the board's first twenty lines to skip them,
+         * and the next line down is where a real fault will appear.
+         */
+        if (err == -AG_ENODEV) {
+            s_report.stage_result[i] = AG_OK;
+            ag_log(AG_LOG_INFO, "boot", "%s: none on this board", st->name);
+            continue;
+        }
 
         if (err != AG_OK) {
             s_report.degraded = true;
@@ -269,6 +445,22 @@ void ag_kernel_main(void)
         }
     }
 
+    /*
+     * [memory] shell.stack (argon/place.h).  The boot runs on the main task's
+     * internal stack and needs it - every stage runs there - but the prompt
+     * that follows is not in a hurry.  Asked for PSRAM, it moves to a task of
+     * its own with the same stack there, and returning from here ends the
+     * main task, so IDF frees its internal stack.  Flash from a PSRAM stack
+     * goes through the port's relay (flashop_hw.c): copy and dir slower by a
+     * sixth and a half, measured on the S3-Zero (9 Oct 2026), which a prompt
+     * can afford.  Otherwise it stays where it is.
+     */
+    if (ag_place_first("shell.stack") == AG_PLACE_PSRAM &&
+        ag_place_task("shell.stack", shell_task, "shell", AG_SHELL_STACK,
+                      NULL, AG_SHELL_PRIORITY, 0, NULL, NULL)) {
+        return;
+    }
+    ag_place_adopt("shell.stack", (void *)ag_port_task_self());
     ag_shell_run();
 }
 

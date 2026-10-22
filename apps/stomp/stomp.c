@@ -1966,6 +1966,15 @@ int ag_main(int argc, char **argv)
                 quit = 1;
                 break;
             case AG_EV_FOCUS_GAINED:
+                /*
+                 * The kernel took the screen away when the slot was left
+                 * (ag_session_focus force-releases it); a draw without
+                 * taking it back is dropped, flush by flush, and the slot
+                 * comes back to whatever the console left there.
+                 */
+                if (!s_headless) {
+                    (void)ag_gfx_acquire(&s_info);
+                }
                 draw(); /* somebody else had the panel: none of it is ours */
                 break;
             case AG_EV_KEY_DOWN:

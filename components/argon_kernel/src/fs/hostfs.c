@@ -20,6 +20,8 @@
 #include <argon/port/time.h>
 #include <argon/port/uart.h>
 
+#include "dev/io.h"
+
 #define HSFS_UART           1
 #define HSFS_UART_BAUD      115200
 #define HSFS_RX_BUF         (64 * 1024)
@@ -65,6 +67,8 @@ static bool       s_held_hdr_valid;
 static bool read_all(void *buf, size_t len, uint32_t timeout_ms);
 static bool read_hdr(hsfs_hdr_t *hdr, uint32_t timeout_ms);
 static bool drain_bytes(uint32_t len, uint32_t timeout_ms);
+static bool from_host(const hsfs_hdr_t *h);
+static uint16_t bare_op(const hsfs_hdr_t *h);
 
 static uint32_t now_ms(void)
 {
@@ -105,7 +109,7 @@ static void pad_store(const uint8_t *blob, uint32_t len)
 
 static bool ingest_padpush_locked(const hsfs_hdr_t *hdr, uint32_t timeout_ms)
 {
-    if (hdr == NULL || hdr->op != HSFS_OP_PADPUSH) {
+    if (hdr == NULL || !from_host(hdr) || bare_op(hdr) != HSFS_OP_PADPUSH) {
         return false;
     }
     if (hdr->path_len != 0 || hdr->data_len > HSFS_MAX_DATA) {
@@ -141,10 +145,51 @@ static void *hsfs_alloc(size_t n)
     return p;
 }
 
+/*
+ * True when this frame really came from the host helper.
+ *
+ * Everything below asks before believing a frame, because the alternative has
+ * a name and a story: two ArgonOS guests wired UART1 to UART1 both send
+ * PING seq 1, and without the direction bit each reads the other's REQUEST as
+ * its own ANSWER and mounts its neighbour as a live host folder.  See
+ * argon/hsfs_proto.h.
+ */
+static bool from_host(const hsfs_hdr_t *h)
+{
+    return h != NULL && h->magic == HSFS_MAGIC &&
+           (h->op & HSFS_F_FROM_HOST) != 0u;
+}
+
+/* The op with the direction bit taken off. */
+static uint16_t bare_op(const hsfs_hdr_t *h)
+{
+    return (uint16_t)(h->op & HSFS_OP_MASK);
+}
+
 static bool uart_open(void)
 {
     if (s_uart_up) {
         return true;
+    }
+    /*
+     * NOT A PORT WE MAY TAKE IF SOMEBODY ELSE HAS IT UP.
+     *
+     * On the boards on the desk UART1 is the cluster wire, and nodelink brings
+     * it up through io.  Probing it here would put HSFS PINGs on that wire every
+     * fifty milliseconds - and, worse, the "give the port back" below would
+     * close a driver nodelink's reader task is still reading: it then reads a
+     * port that is no longer installed, which IDF reports as "uart driver
+     * error", once per call.  Measured on the Zero: 74 909 lines during one
+     * 19 KB transfer, and the transfer lost.
+     *
+     * QEMU stages no BOARD.CFG and nothing claims UART1 there, so the probe
+     * still runs for the one case it was written for.
+     */
+    if (ag_io_uart_claimed(HSFS_UART)) {
+        ag_log(AG_LOG_INFO, "hostfs",
+               "UART%d is in use (a wire?); not looking for a host helper on it",
+               HSFS_UART);
+        return false;
     }
     const ag_port_uart_cfg_t cfg = {
         .baud = HSFS_UART_BAUD,
@@ -187,7 +232,7 @@ static void pump_rx_during_tx(void)
         if (!read_all(&hdr, sizeof(hdr), 200)) {
             return;
         }
-        if (hdr.magic == HSFS_MAGIC && hdr.op == HSFS_OP_PADPUSH) {
+        if (from_host(&hdr) && bare_op(&hdr) == HSFS_OP_PADPUSH) {
             /* Payload is small (3 or 6); give it time to finish arriving. */
             if (!ingest_padpush_locked(&hdr, 200)) {
                 return;
@@ -327,8 +372,18 @@ static ag_err_t rpc(uint16_t op, uint32_t a0, uint32_t a1, const char *path,
             err = -AG_EIO;
             goto done;
         }
+        if (!from_host(&resp)) {
+            /*
+             * Somebody else's REQUEST, not our answer - another node on the
+             * same wire, probing for a host of its own.  Drop what it carries
+             * and keep waiting for a real reply; answering it would be worse
+             * than ignoring it, because we are not a host.
+             */
+            (void)drain_bytes(resp.path_len + resp.data_len, timeout_ms);
+            continue;
+        }
         /* Host may push pad snapshots between our request and its reply. */
-        if (resp.op == HSFS_OP_PADPUSH) {
+        if (bare_op(&resp) == HSFS_OP_PADPUSH) {
             if (!ingest_padpush_locked(&resp, timeout_ms)) {
                 err = -AG_EIO;
                 goto done;
@@ -340,7 +395,7 @@ static ag_err_t rpc(uint16_t op, uint32_t a0, uint32_t a1, const char *path,
             err = -AG_EIO;
             goto done;
         }
-        if (resp.seq != seq || resp.op != op) {
+        if (resp.seq != seq || bare_op(&resp) != op) {
             /* Stale/late frame — discard payload and keep waiting. */
             if (!drain_bytes(resp.data_len, timeout_ms)) {
                 err = -AG_EIO;
@@ -405,7 +460,7 @@ static void pad_drain_once(void)
         if (!read_hdr(&hdr, 50)) {
             break;
         }
-        if (hdr.magic != HSFS_MAGIC || hdr.op != HSFS_OP_PADPUSH) {
+        if (!from_host(&hdr) || bare_op(&hdr) != HSFS_OP_PADPUSH) {
             /* Put it back for the next RPC — do not drop WRITE/READ replies. */
             s_held_hdr = hdr;
             s_held_hdr_valid = true;
@@ -769,7 +824,8 @@ static ag_err_t hostfs_probe_once(uint32_t timeout_ms)
         return -AG_ENODEV;
     }
 
-    err = ag_vfs_mount("/host", &k_ops, NULL, 0);
+    /* Volatile: the host owns this directory and edits it behind our back. */
+    err = ag_vfs_mount("/host", &k_ops, NULL, AG_MOUNT_VOLATILE);
     if (err != AG_OK) {
         ag_log(AG_LOG_ERROR, "hostfs", "mount /host failed (%d)", (int)err);
         return err;
@@ -802,7 +858,38 @@ static void hostfs_wait_task(void *arg)
         ag_port_task_delay(ag_port_ms_to_ticks(50));
     }
     if (!s_mounted) {
+        /*
+         * Give the port back.  Saying "skip H:" and keeping UART1 open is the
+         * kind of politeness that costs somebody else a day: the port stays
+         * installed with our buffers on it, and the next subsystem to open the
+         * same UART shares the STREAM with us rather than taking it over - two
+         * readers, each seeing the other's traffic as noise and its own as
+         * truncated.
+         *
+         * Found exactly that way.  The node link (apps/nodelink) opened UART1
+         * after boot and read HostFS handshakes - "HSFS" frames, every fifty
+         * milliseconds - while its own frames arrived in pieces.  From the
+         * outside it looked like a driver that could not talk.
+         *
+         * Only on the way out, and only when nothing was found: a mounted H: is
+         * still using the port, and the console can never be closed at all.
+         */
         ag_log(AG_LOG_INFO, "hostfs", "no host helper on UART1 (skip H:)");
+        if (s_uart_up && ag_io_uart_claimed(HSFS_UART)) {
+            /*
+             * Somebody took the port while we were asking - the node link does,
+             * a second or so before this task gives up.  Closing it now deletes
+             * the driver under their reader task, which is the failure this
+             * whole comment is about; leaving it open is the lesser harm and is
+             * said out loud, because a port left open by accident and one given
+             * away twice look identical from the outside.
+             */
+            ag_log(AG_LOG_INFO, "hostfs",
+                   "UART%d was taken while probing; leaving it open", HSFS_UART);
+        } else if (s_uart_up) {
+            (void)ag_port_uart_close(HSFS_UART);
+            s_uart_up = false;
+        }
     }
     s_wait_task = NULL;
     ag_port_task_delete(NULL);

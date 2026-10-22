@@ -55,6 +55,25 @@ typedef struct {
     int16_t cs;
     uint8_t spi_host;
 
+    /*
+     * A pin that is NOT the card's own chip select but has to be held high for
+     * the card to be readable at all: the panel's CS on a board where the
+     * display and the slot share one SPI bus.  GPIO 45 on the Waveshare
+     * ESP32-S3-Touch-LCD-2 is that pin - a strapping pin, so it floats low out
+     * of reset, and a selected ST7789 drives its SDO onto the card's MISO line.
+     * Measured there: driving it high before the card is touched mounts
+     * (SDHC, 7690 MB, FAT32); leaving it floating fails with 0x109 /
+     * ESP_ERR_INVALID_CRC.
+     *
+     * The card is mounted at the MEDIA stage and loadable .SYS drivers load
+     * AFTER it (MODULES), so at mount time no driver owns the panel's select
+     * and nothing has written it.  The port drives this pin high before the SPI
+     * bus comes up, which is why it lives here rather than with the display.
+     * AG_PIN_NONE (the default) means the feature is off and the port does
+     * nothing - every board without this arrangement is unaffected.
+     */
+    int16_t cs_hold;
+
     /* Card detect, when the board has one.  Without it, removal is noticed
      * only when a transfer fails. */
     int16_t card_detect;
@@ -75,7 +94,16 @@ typedef struct {
  */
 #define AG_I2C_BUSES 2  /* I2C0, I2C1                                       */
 #define AG_SPI_BUSES 2  /* SPI2, SPI3; SPI1 belongs to the flash            */
-#define AG_UART_PORTS 3 /* UART0 is the console                             */
+/*
+ * UART0, UART1, UART2 - every port the widest chip here has, INCLUDING UART0.
+ *
+ * It used to read "UART0 is the console" and the configuration loop skipped
+ * it.  That is true of a board with a USB-to-UART bridge and false of the C3
+ * SuperMini and the S3-Zero, which talk over the chip's own USB-Serial-JTAG
+ * and have UART0 sitting free on the header.  Which port is the console is
+ * AG_PORT_UART_CONSOLE, a property of the board; it is not this number.
+ */
+#define AG_UART_PORTS 3
 
 #define AG_SPI_FIRST 2 /* the chip's number of the first usable SPI         */
 
@@ -100,6 +128,15 @@ typedef struct {
     int16_t  mosi;
     int16_t  miso;
     uint32_t khz;
+    /*
+     * Pad drive strength, 0..3 = GPIO_DRIVE_CAP_n, -1 = leave the chip's
+     * default.  A board setting rather than a driver's, because the answer is a
+     * property of the wiring and not of what is being said over it: the same
+     * three pins that carry a link cleanly at the weakest setting look like a
+     * broken wire at the default one, and nothing in the failure says which.
+     * See docs/plans/cluster.md, pad drive.
+     */
+    int8_t   drive;
 } ag_board_spi_t;
 
 typedef struct {

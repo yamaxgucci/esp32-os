@@ -1,0 +1,37 @@
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -877,6 +877,33 @@
+ 
+     _obj_remove_all();
+ 
++    /*
++     * ARGON: and let the art go with the objects.
++     *
++     * The whole engine flushes the art cache in exactly one place -
++     * showDeath() in main.cc - so on a machine where the player does not die
++     * it never happens at all.  On a desktop that is merely wasteful; here it
++     * is the crash.  Measured leaving the Temple of Trials: the cache is still
++     * full of the temple's art, Arroyo loads on top of it, and the next thing
++     * that wants a large block in one piece does not get it.  The console
++     * fills with the engine's own complaint -
++     *
++     *     Heap Warning: Could not allocate block of 2984 bytes.
++     *
++     * - three thousand bytes, in a heap of 1800 KB, while the arena outside it
++     * still has megabytes free and malloc has not refused once.  Talking to an
++     * NPC then needs a 640x480 surface in one piece and there is nowhere to
++     * put it.
++     *
++     * Here is the moment when it costs nothing: the outgoing map's objects
++     * have just been removed, so their art is down to a reference count of
++     * zero, and the incoming map has not asked for anything yet.
++     * artCacheFlush evicts only entries nothing is holding, so what is still
++     * in use - the interface, the party - stays where it is.  What goes is on
++     * the card and comes back by being read again.
++     */
++    artCacheFlush();
++
+     if (gMapHeader.globalVariablesCount < 0) {
+         gMapHeader.globalVariablesCount = 0;
+     }

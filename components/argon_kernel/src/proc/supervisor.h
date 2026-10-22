@@ -35,6 +35,14 @@ void ag_supervisor_kill_request(ag_pid_t pid);
 bool ag_supervisor_interrupted(void);
 void ag_supervisor_clear_interrupt(void);
 
+/*
+ * Wake the supervisor from interrupt context.  The execution-budget accounting
+ * runs on the system tick and can only mark what it finds; changing a priority
+ * is task work, and this is how the tick asks for it.  Safe to call when there
+ * is no supervisor yet - it does nothing.
+ */
+void ag_supervisor_poke_isr(void);
+
 /* Session switch / break-in: wake long shell builtins (fm, copy, …). */
 void ag_supervisor_raise_shell_interrupt(void);
 

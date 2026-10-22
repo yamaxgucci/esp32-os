@@ -1,0 +1,82 @@
+diff --git a/src/dfile.h b/src/dfile.h
+index f0b26cf..11f6c59 100644
+--- a/src/dfile.h
++++ b/src/dfile.h
+@@ -39,6 +39,15 @@ typedef struct DBase {
+     // file in flash rather than into memory, in which case neither is ours to
+     // free.  See apps/fallout/port/dat_index.h.
+     void* indexMapping;
++
++    // ARGON: one open handle on the archive, parked between files.
++    //
++    // dfileOpenInternal used to fopen() the .DAT again for every entry it
++    // read, and dfileClose to close it again - so drawing a frame cost dozens
++    // of opens of a 326 MB file, each one a directory walk.  The engine reads
++    // one entry at a time and seeks before every read, so the same handle
++    // serves them all; this holds it while nobody is using it.
++    FILE* spare;
+ } DBase;
+ 
+ typedef struct DBaseEntry {
+diff --git a/src/dfile.cc b/src/dfile.cc
+index e360509..622674e 100644
+--- a/src/dfile.cc
++++ b/src/dfile.cc
+@@ -223,6 +223,12 @@ bool dbaseClose(DBase* dbase)
+         curr = next;
+     }
+ 
++    // ARGON: the handle parked for the next entry, if nothing took it.
++    if (dbase->spare != nullptr) {
++        fclose(dbase->spare);
++        dbase->spare = nullptr;
++    }
++
+     // ARGON: when the index came out of flash, neither the table nor the
+     // paths were allocated and freeing them would be freeing a mapping.
+     if (dbase->indexMapping != nullptr) {
+@@ -321,7 +327,13 @@ int dfileClose(DFile* stream)
+     }
+ 
+     if (stream->stream != nullptr) {
+-        fclose(stream->stream);
++        // ARGON: keep one open for the next entry; see DBase::spare.
++        if (stream->dbase->spare == nullptr) {
++            stream->dbase->spare = stream->stream;
++        } else {
++            fclose(stream->stream);
++        }
++        stream->stream = nullptr;
+     }
+ 
+     // Loop thru open file handles and find previous to remove current handle
+@@ -728,7 +740,12 @@ static DFile* dfileOpenInternal(DBase* dbase, const char* filePath, const char*
+         }
+ 
+         if (dfile->stream != nullptr) {
+-            fclose(dfile->stream);
++            // ARGON: park it rather than close it; it is about to be needed.
++            if (dbase->spare == nullptr) {
++                dbase->spare = dfile->stream;
++            } else {
++                fclose(dfile->stream);
++            }
+             dfile->stream = nullptr;
+         }
+ 
+@@ -740,7 +757,14 @@ static DFile* dfileOpenInternal(DBase* dbase, const char* filePath, const char*
+     dfile->entry = entry;
+ 
+     // Open stream to .DAT file.
+-    dfile->stream = compat_fopen(dbase->path, "rb");
++    //
++    // ARGON: or take the one this dbase already has open.  See DBase::spare.
++    if (dbase->spare != nullptr) {
++        dfile->stream = dbase->spare;
++        dbase->spare = nullptr;
++    } else {
++        dfile->stream = compat_fopen(dbase->path, "rb");
++    }
+     if (dfile->stream == nullptr) {
+         goto err;
+     }

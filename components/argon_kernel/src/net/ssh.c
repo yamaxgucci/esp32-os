@@ -43,6 +43,7 @@
 
 #include <argon/port/crypto.h>
 #include <argon/port/mem.h>
+#include <argon/netprov.h>
 #include <argon/port/net.h>
 #include <argon/port/random.h>
 #include <argon/port/sync.h>
@@ -1205,7 +1206,7 @@ out:
 
 static void handle_connection(ssh_conn_t *c)
 {
-    (void)ag_port_net_nonblock(c->fd, true);
+    (void)ag_netprov_nonblock(c->fd, true);
 
     static const char banner[] = SSH_VERSION "\r\n";
     if (ag_netio_send_all(c->fd, banner, sizeof(banner) - 1) != AG_OK) {
@@ -1327,7 +1328,7 @@ static void ssh_task(void *arg)
 {
     (void)arg;
     while (!s_stop) {
-        const int fd = ag_port_net_accept(s_listen_fd, SSH_ACCEPT_MS);
+        const int fd = ag_netprov_accept(s_listen_fd, SSH_ACCEPT_MS);
         if (fd < 0) {
             continue;
         }
@@ -1339,10 +1340,10 @@ static void ssh_task(void *arg)
         } else {
             ag_log(AG_LOG_ERROR, "ssh", "out of memory for a connection");
         }
-        (void)ag_port_net_close(fd);
+        (void)ag_netprov_close(fd);
     }
     if (s_listen_fd >= 0) {
-        (void)ag_port_net_close(s_listen_fd);
+        (void)ag_netprov_close(s_listen_fd);
         s_listen_fd = -1;
     }
     s_running = false;
@@ -1357,7 +1358,7 @@ ag_err_t ag_ssh_start(uint16_t port)
     if (port == 0) {
         port = SSH_DEFAULT_PORT;
     }
-    const int lfd = ag_port_net_listen(port);
+    const int lfd = ag_netprov_listen(port);
     if (lfd < 0) {
         return (ag_err_t)lfd;
     }
@@ -1369,7 +1370,7 @@ ag_err_t ag_ssh_start(uint16_t port)
      * point arithmetic is several kilobytes deep.  The per-connection buffers
      * live on the heap (ssh_conn_t) so this is headroom for the maths alone. */
     if (!ag_port_task_create(ssh_task, "ag_ssh", 16384, NULL, 6, 0, 0, &s_task)) {
-        (void)ag_port_net_close(s_listen_fd);
+        (void)ag_netprov_close(s_listen_fd);
         s_listen_fd = -1;
         s_running = false;
         return -AG_ENOMEM;

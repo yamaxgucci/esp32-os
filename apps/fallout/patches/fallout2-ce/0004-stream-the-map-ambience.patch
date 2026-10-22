@@ -1,0 +1,26 @@
+diff --git a/src/map.cc b/src/map.cc
+index e73109f..9b207e4 100644
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -816,7 +816,20 @@ int mapLoadById(int map)
+ static int mapLoad(File* stream)
+ {
+     _map_save_in_game(true);
+-    backgroundSoundLoad("wind2", 12, 13, 16);
++    // ARGON: 14 rather than 13 - streamed, not decoded whole into memory.
++    //
++    // 13 is SOUND_TYPE_MEMORY: _preloadBuffers then allocates the entire
++    // decoded file, and "wind2" is 510528 bytes of it.  That single block
++    // is what stopped Fallout 2 fitting in 8 MB of PSRAM - the arena had
++    // room for the game and not for its ambience as well, and the map
++    // failed to load with no explanation from the engine.
++    //
++    // 14 is SOUND_TYPE_STREAMING, which is what the main menu already
++    // asks for with a track of the same kind off the same card, so the
++    // question of whether a FAT card keeps up is one the port has been
++    // answering since it first reached the menu.  It costs the streaming
++    // ring instead: 256 KB, shared with every other background sound.
++    backgroundSoundLoad("wind2", 12, 14, 16);
+     isoDisable();
+     _partyMemberPrepLoad();
+     _gmouse_disable_scrolling();

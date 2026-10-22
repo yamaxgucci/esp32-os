@@ -12,6 +12,15 @@
 extern "C" {
 #endif
 
+/*
+ * The guard past an application's data - see `guard` below and guard_arm in
+ * loader.c.  Sixteen bytes keeps the data part's 16-byte alignment for
+ * whatever the heap hands out next, and is wide enough that a plausible
+ * overrun lands in it rather than stepping over it.
+ */
+#define AG_APP_GUARD_BYTES 16u
+#define AG_APP_GUARD_BYTE  0xA5u
+
 typedef struct {
     ag_axe_header_t  header;
     ag_axe_place_t   place;
@@ -23,6 +32,17 @@ typedef struct {
      * released with it.
      */
     void *data_owned;
+
+    /*
+     * Sixteen bytes of a known pattern immediately past the application's
+     * data, inside an allocation this loader owns.  This chip has no memory
+     * protection unit, so an application that walks off the end of one of its
+     * own buffers writes into whatever the heap put next - and the board then
+     * dies minutes later, in an allocator, with nothing to point at.  The
+     * guard cannot stop that write; it is how the system finds out whose it
+     * was.  NULL for an image with no data part.
+     */
+    void *guard;
 
     /*
      * R-1 flash XIP: code runs from a mapped appfs slot.  `code_scratch` held
@@ -46,6 +66,13 @@ typedef struct {
      * release, and the whole-arena mapping stays for the next image.
      */
     bool  code_from_psram;
+
+    /*
+     * Code in a block of the internal heap rather than the link-time arena
+     * (ag_port_execmem_alloc): what to hand back to the heap on release.
+     * place.code is inside it, rounded up to 16.  NULL otherwise.
+     */
+    void *code_heap;
 } ag_loaded_app_t;
 
 /*
@@ -64,6 +91,17 @@ ag_err_t ag_loader_peek(const char *path, const char *cwd,
                         ag_axe_header_t *out);
 
 void ag_loader_unload(ag_loaded_app_t *app);
+
+/*
+ * Has anything written past this application's data?
+ *
+ * Cheap enough to ask on a timer (sixteen bytes), and safe to ask from
+ * anywhere that may read the application's memory: it takes no lock and
+ * allocates nothing.  `bytes_past`, when given, receives how far into the
+ * guard the damage reaches - a floor, not a measurement: a write that cleared
+ * the whole guard went further than the guard can see.
+ */
+bool ag_loader_guard_broken(const ag_loaded_app_t *app, size_t *bytes_past);
 
 /*
  * The code arena.  Running an image is the process layer's business (argon/proc.h);
@@ -91,5 +129,19 @@ const ag_api_t *ag_loader_api(void);
 #ifdef __cplusplus
 }
 #endif
+
+/*
+ * Why an image would not load, in words.  Used by whoever reports a load
+ * failure to a person - the shell when it waits for one, and the process
+ * layer when the load happens on the new task and nobody is waiting.
+ */
+const char *ag_loader_why(ag_err_t err);
+
+/*
+ * This board's own image of the program called `want`, by the name in its
+ * header rather than by any filename.  -AG_ENOENT when this board has no
+ * build of it that it could execute.
+ */
+ag_err_t ag_loader_find_by_name(const char *want, char *out, size_t cap);
 
 #endif /* ARGON_LOADER_H */

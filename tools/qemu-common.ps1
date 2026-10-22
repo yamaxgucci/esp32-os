@@ -1,14 +1,149 @@
 # Shared helpers for the QEMU scripts.  Dot-source, do not run directly.
 
+# Which chip the build in build\ is for.
+#
+# Read from the generated sdkconfig rather than passed in, because everything
+# that launches the emulator has to agree with what was built and there is
+# exactly one place that knows: two RISC-V and three Xtensa targets share these
+# scripts, and a mismatch is a guest that produces no output at all.
+function Get-QemuTarget {
+    if (-not (Test-Path 'sdkconfig')) {
+        throw 'No sdkconfig. Run: argon target <chip>'
+    }
+    $line = Select-String -Path 'sdkconfig' -Pattern '^CONFIG_IDF_TARGET="(.+)"$' |
+            Select-Object -First 1
+    if (-not $line) { throw 'sdkconfig names no target.' }
+    return $line.Matches[0].Groups[1].Value
+}
+
+# The emulators THIS TREE started - and only those.
+#
+# WHY THIS IS A FUNCTION.  Six places in these scripts killed
+# `qemu-system-xtensa` by name, which was the whole list until 18 Sep 2026.  A
+# stray qemu-system-riscv32 then survived all of them, kept a core busy, and
+# the next run did not fail - it went SLOW, which came out as node B needing a
+# second attempt at a file transfer and arriving a hundred and fifty seconds
+# after the sender had finished.  So it became every emulator of both kinds.
+#
+# WHY IT IS NO LONGER EVERY EMULATOR (3 Oct 2026).  "Every emulator" meant every
+# emulator ON THE PC, and this PC runs several sessions in several worktrees at
+# once.  A cluster test starting in one worktree killed a Fallout measurement
+# running in another, twice in one morning, and both at the same second - with
+# nothing anywhere saying who had done it, because from the victim's side the
+# console port simply stops answering.  The same afternoon had already been lost
+# the other way round once (see the note in qemu-boot.ps1).
+#
+# So every launcher registers what it started, in this tree's own build folder:
+# one file per emulator, holding its pid, the moment it started (a pid alone is
+# reused by Windows, and stopping a stranger who inherited it would be the same
+# bug again) and the flash image it runs.  This stops the registered ones that
+# are still the same process, and forgets the rest.  `-Flash` narrows it to the
+# emulators of one image - a leftover of the board about to be booted again.
+# `-All` is the old sledgehammer, kept for a person who asks for it by name and
+# used by nothing in this folder.
+function Get-EmulatorRegistry {
+    return (Join-Path (Get-Location) 'build\qemu-pids')
+}
+
+function Get-FullFlashPath {
+    param([string]$Flash)
+    if (-not $Flash) { return '' }
+    return [IO.Path]::GetFullPath((Join-Path (Get-Location) $Flash))
+}
+
+function Register-Emulator {
+    param([System.Diagnostics.Process]$Process, [string]$Flash = '')
+    if (-not $Process) { return }
+    $dir = Get-EmulatorRegistry
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $started = 0
+    try { $started = $Process.StartTime.ToFileTimeUtc() } catch {}
+    Set-Content -Encoding ascii -Path (Join-Path $dir "$($Process.Id).pid") `
+        -Value @("$($Process.Id)", "$started", (Get-FullFlashPath $Flash))
+}
+
+function Unregister-Emulator {
+    param([System.Diagnostics.Process]$Process)
+    if (-not $Process) { return }
+    Remove-Item -LiteralPath (Join-Path (Get-EmulatorRegistry) "$($Process.Id).pid") `
+        -Force -ErrorAction SilentlyContinue
+}
+
+function Stop-Emulators {
+    param([string]$Flash = '', [switch]$All)
+    if ($All) {
+        foreach ($name in @('qemu-system-xtensa', 'qemu-system-riscv32')) {
+            Get-Process $name -ErrorAction SilentlyContinue |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+        }
+        return
+    }
+    $dir = Get-EmulatorRegistry
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    $want = Get-FullFlashPath $Flash
+    $stopped = 0
+    foreach ($f in Get-ChildItem -LiteralPath $dir -Filter '*.pid' -ErrorAction SilentlyContinue) {
+        $rec = @(Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue)
+        if ($rec.Count -lt 2) {
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+            continue
+        }
+        $image = if ($rec.Count -ge 3) { $rec[2] } else { '' }
+        if ($want -and ($image -ne $want)) {
+            continue    # another board of this tree: not the leftover asked about
+        }
+        $p = Get-Process -Id ([int]$rec[0]) -ErrorAction SilentlyContinue
+        $same = $false
+        if ($p) {
+            try {
+                $same = ([int64]$rec[1] -eq 0) -or
+                        ($p.StartTime.ToFileTimeUtc() -eq [int64]$rec[1])
+            } catch {}
+        }
+        if ($same) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $stopped++
+        }
+        Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+    }
+    if ($stopped -gt 0) {
+        Start-Sleep -Milliseconds 300    # let the ports it held go
+    }
+}
+
+# Who is listening on a port, if anyone - for the one message that says
+# "somebody else's emulator has your port" instead of a minute of silence.
+function Get-PortHolder {
+    param([int]$Port)
+    try {
+        $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+        if ($c) { return (Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue) }
+    } catch {}
+    return $null
+}
+
 function Resolve-Qemu {
+    # `Chip` overrides what is in sdkconfig, for the one case where they
+    # differ: a pair of guests that are two DIFFERENT machines, booted from
+    # images built earlier and kept aside.  See tools\xclutest.ps1.
+    param([string]$Chip = '')
     if (-not $env:IDF_TOOLS_PATH) {
         throw 'Run tools\idf-env.ps1 first.'
     }
-    $exe = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH 'tools\qemu-xtensa') `
-        -Filter 'qemu-system-xtensa.exe' -Recurse -ErrorAction SilentlyContinue |
+    $chip = if ($Chip) { $Chip } else { Get-QemuTarget }
+    if ($chip -like 'esp32c*' -or $chip -like 'esp32h*' -or $chip -like 'esp32p*') {
+        $pkg = 'qemu-riscv32'
+        $bin = 'qemu-system-riscv32.exe'
+    } else {
+        $pkg = 'qemu-xtensa'
+        $bin = 'qemu-system-xtensa.exe'
+    }
+    $exe = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH "tools\$pkg") `
+        -Filter $bin -Recurse -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if (-not $exe) {
-        throw 'QEMU not installed. Run: idf_tools.py install qemu-xtensa'
+        throw "QEMU for $chip not installed. Run: idf_tools.py install $pkg"
     }
     return $exe.FullName
 }
@@ -24,7 +159,44 @@ function Resolve-Qemu {
 # The image is kept rather than regenerated every time on purpose: C: is formatted
 # on first boot, and throwing it away would add half a second to every boot and
 # change the numbers the boot report is measured against.
+# Offset and size of one partition, out of the table the build actually uses.
+# Read rather than typed, so there is one place where 0x310000 is written down.
+function Get-PartitionEntry {
+    param([string]$Name, [string]$Csv = '')
+    if (-not $Csv) {
+        $Csv = 'partitions.csv'
+        if (Test-Path 'sdkconfig') {
+            $m = Select-String -Path 'sdkconfig' -Pattern `
+                '^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="(.+)"$' |
+                Select-Object -First 1
+            if ($m) { $Csv = $m.Matches[0].Groups[1].Value }
+        }
+    }
+    if (-not (Test-Path $Csv)) { throw "no partition table at $Csv" }
+    foreach ($line in Get-Content $Csv) {
+        $bare = ($line -split '#', 2)[0].Trim()
+        if (-not $bare) { continue }
+        $cols = $bare -split ',' | ForEach-Object { $_.Trim() }
+        if ($cols.Count -ge 5 -and $cols[0] -eq $Name) {
+            return @{ Offset = [Convert]::ToInt64($cols[3], 16)
+                      Size   = [Convert]::ToInt64($cols[4], 16) }
+        }
+    }
+    throw "no '$Name' partition in $Csv"
+}
+
 function Update-FlashImage {
+    # A pre-built C: partition, merged in with the firmware.
+    #
+    # Why it is worth having: the surface size, the modules to autoload and any
+    # file an application needs are all read off C: at boot, and the only other
+    # way to arrange them is to write C: on a running system and reboot.  In
+    # QEMU that is unreliable - three runs in eight had a file written to C:
+    # read back as -91 (AG_EFORMAT), and the boot after such a write took 128
+    # seconds against the usual two.  An image goes in before anything has
+    # booted, so none of that applies.  Build one with tools\mksysfs.py.
+    param([string]$SysFs = '')
+
     $app = 'build\argonos.bin'
     $flash = 'build\qemu_flash.bin'
     $stamp = 'build\qemu_flash.stamp'
@@ -32,9 +204,31 @@ function Update-FlashImage {
     if (-not (Test-Path $app)) {
         throw "$app not found. Run idf.py build first."
     }
+    if ($SysFs -and -not (Test-Path $SysFs)) {
+        throw "sysfs image not found: $SysFs"
+    }
 
     $want = "$((Get-Item $app).LastWriteTimeUtc.Ticks):$((Get-Item $app).Length)"
-    if ((Test-Path $flash) -and (Test-Path $stamp) -and
+    if ($SysFs) {
+        # In the stamp, or a run that changes only the C: image would reuse the
+        # flash built from the previous one - which is the same silent
+        # staleness the stamp exists to prevent for the firmware.
+        $s = Get-Item $SysFs
+        $want += "|$($s.FullName):$($s.LastWriteTimeUtc.Ticks):$($s.Length)"
+    }
+    # The stamp knows what went IN to the flash image and nothing about what
+    # the guest did to it afterwards - and the guest writes to C:, because a
+    # filesystem is for writing to.  So a run that copied a file left it in the
+    # image, the next run with the same inputs reused that image, and littlefs
+    # went on accumulating whatever the run before had done to it.  Measured
+    # over three runs of the desktop's own check: boot 0.65 s, then 1.78 s,
+    # then 2.20 s, and by the third the prompt never appeared at all.  Nothing
+    # in any of that said "stale image".
+    #
+    # Passing -SysFs means "boot this exact C:", so it is rebuilt every time.
+    # It costs one esptool merge, about a second, and it is the difference
+    # between a repeatable test and a test that depends on the one before it.
+    if (-not $SysFs -and (Test-Path $flash) -and (Test-Path $stamp) -and
         (Get-Content $stamp -Raw).Trim() -eq $want) {
         return
     }
@@ -44,13 +238,37 @@ function Update-FlashImage {
         Select-Object -First 1
     if (-not $python) { throw 'IDF python environment not found.' }
 
-    Write-Host 'Generating build\qemu_flash.bin'
-    & $python.FullName -m esptool --chip=esp32s3 merge_bin `
-        --output=$flash --fill-flash-size=8MB `
-        --flash_mode dio --flash_freq 80m --flash_size 8MB `
-        0x0 build\bootloader\bootloader.bin `
-        0x8000 build\partition_table\partition-table.bin `
-        0x10000 $app | Out-Null
+    $parts = @('0x0', 'build\bootloader\bootloader.bin',
+               '0x8000', 'build\partition_table\partition-table.bin',
+               '0x10000', $app)
+    if ($SysFs) {
+        # Not $sysfs: PowerShell variable names ignore case, so that name
+        # overwrites the $SysFs parameter and the next line looks for a file
+        # called System.Collections.Hashtable.
+        $part = Get-PartitionEntry -Name 'sysfs'
+        if ((Get-Item $SysFs).Length -gt $part.Size) {
+            throw ("$SysFs is {0} bytes and the sysfs partition holds {1}" -f
+                   (Get-Item $SysFs).Length, $part.Size)
+        }
+        $parts += @(('0x{0:x}' -f $part.Offset), $SysFs)
+        Write-Host ("Generating build\qemu_flash.bin (C: from $SysFs at 0x{0:x})" -f
+                    $part.Offset)
+    } else {
+        Write-Host 'Generating build\qemu_flash.bin'
+    }
+
+    # The chip and its flash size, from the build rather than typed: a 4 MB
+    # part filled to 8 MB boots to nothing, and esptool will not say why.
+    $chip = Get-QemuTarget
+    $mb = '8MB'
+    if (Select-String -Path 'sdkconfig' -Pattern '^CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y$' `
+            -Quiet -ErrorAction SilentlyContinue) {
+        $mb = '4MB'
+    }
+    & $python.FullName -m esptool --chip=$chip merge_bin `
+        --output=$flash --fill-flash-size=$mb `
+        --flash_mode dio --flash_freq 80m --flash_size $mb `
+        @parts | Out-Null
     if (-not $?) { throw 'esptool merge_bin failed.' }
 
     Set-Content -Path $stamp -Value $want -Encoding ascii
@@ -302,9 +520,56 @@ function Get-QemuSdArgs {
 
 # Machine arguments common to every way we start the emulator.
 function Get-QemuMachineArgs {
-    param([string]$EfusePath)
+    param(
+        [string]$EfusePath,
+        # The virtual RGB panel at 0x21000000, which is a machine option and
+        # not a device: `-device esp_rgb` does not exist and never did.
+        #
+        # This is opt-in on the QEMU side, and the failure when it is left out
+        # is quiet in a way that wasted an afternoon: `-display sdl` still
+        # opens a window, the window is QEMU's own default 800x600, and
+        # everything the guest draws goes into a framebuffer nobody shows.
+        # esp_lcd_new_rgb_qemu fails, ag_port_panel_open answers false, and the
+        # display driver falls back to a soft surface in PSRAM without a word.
+        # The way to tell from the outside: a window that is 800x600 rather
+        # than the size the guest asked for has no panel behind it.
+        [switch]$Graphics,
+        # Which flash image this guest runs from, and which efuse file.
+        #
+        # Parameters because a cluster test boots two guests at once and they
+        # cannot share either.  The flash drive is writable raw MTD: two
+        # emulators writing one file corrupt each other's C:, and the symptom
+        # is not a clean failure but a file read back as -91 (AG_EFORMAT) on
+        # some later, unrelated run - see the note in Update-FlashImage about
+        # exactly that.
+        [string]$FlashPath = 'build\qemu_flash.bin',
+        [string]$EfuseOverride = '',
+        # As in Resolve-Qemu: which machine, when it is not the one built last.
+        [string]$Chip = '',
+        # 8 or 16 and nothing else - see the note by -m below.
+        [int]$PsramMb = 8
+    )
+    if ($PsramMb -ne 8 -and $PsramMb -ne 16) {
+        throw "PSRAM must be 8 or 16 MB (asked for $PsramMb)."
+    }
+    if ($EfuseOverride) { $EfusePath = $EfuseOverride }
+    $chip = if ($Chip) { $Chip } else { Get-QemuTarget }
+    if ($chip -ne 'esp32s3') {
+        # The other machines, which have neither PSRAM nor a panel: the
+        # arguments below that name esp32s3 devices do not exist on them, and
+        # QEMU refuses to start rather than ignoring one - which is the good
+        # behaviour and the reason this is a separate list instead of a filter.
+        return @(
+            '-M', $chip
+            '-accel', 'tcg,tb-size=64'
+            '-drive', "file=$FlashPath,if=mtd,format=raw"
+            '-drive', "file=$EfusePath,if=none,format=raw,id=efuse"
+            '-global', "driver=nvram.$chip.efuse,property=drive,value=efuse"
+            '-global', "driver=timer.$chip.timg,property=wdt_disable,value=true"
+        )
+    }
     return @(
-        '-M', 'esp32s3'
+        '-M', $(if ($Graphics) { 'esp32s3,graphics=on' } else { 'esp32s3' })
         # QEMU reserves a 1 GB JIT buffer by default on a 64-bit host, and it
         # reserves it as committed memory.  On a 16 GB machine with the IDF
         # toolchain and an editor already resident that request fails outright -
@@ -313,13 +578,19 @@ function Get-QemuMachineArgs {
         # like a port problem and is not one.  A guest this size never fills
         # 64 MB of translated code.
         '-accel', 'tcg,tb-size=64'
-        # 8 MB, matching an N16R8 module.  Not a detail: the S3 reaches flash
-        # and PSRAM through one 32 MB window on the data bus, so 32 MB of PSRAM
-        # leaves no address space to map flash into, and esp_partition - which
-        # reads the partition table through a mapping rather than a read - then
-        # finds no partitions at all.
-        '-m', '8M'
-        '-drive', 'file=build\qemu_flash.bin,if=mtd,format=raw'
+        # 8 MB by default, matching an N16R8 module.  Not a detail: the S3
+        # reaches flash and PSRAM through one 32 MB window on the data bus, so
+        # 32 MB of PSRAM leaves no address space to map flash into, and
+        # esp_partition - which reads the partition table through a mapping
+        # rather than a read - then finds no partitions at all.
+        #
+        # 16 is the other size a real module comes in, and 16 + 8 of flash
+        # still fits the window.  Ask for it when the guest genuinely needs it:
+        # Fallout 2 does, and nothing else in the tree does, so the default
+        # stays at the smaller part where a shortage shows up rather than
+        # hiding until somebody flashes a board.
+        '-m', "${PsramMb}M"
+        '-drive', "file=$FlashPath,if=mtd,format=raw"
         '-drive', "file=$EfusePath,if=none,format=raw,id=efuse"
         '-global', 'driver=nvram.esp32s3.efuse,property=drive,value=efuse'
         '-global', 'driver=timer.esp32s3.timg,property=wdt_disable,value=true'
@@ -329,18 +600,33 @@ function Get-QemuMachineArgs {
 
 # OpenEth user-mode NIC + hostfwd so Windows can reach guest TCP listeners.
 # 5558 = PCMVIRT / pcmplay.py; 5559 = MIDIVIRT / midikbd.py;
-# 5560 = MOUSEVIRT; 5561 = KBDVIRT / kbdvirt.py; 5562 = USBHIDVIRT;
-# 5563 = USBCDCVIRT, where the far machine's agent sends its screen.
-# 8080 -> guest :80 so a browser on this machine can open KVM.AXE's page.
+# 5560 = MOUSEVIRT; 5561 = KBDVIRT / kbdvirt.py; 8765 = PHONE.SYS, which is
+# where a browser on this PC stands in for the phone.
 function Get-QemuNetArgs {
-    param([int]$HostPort = 5558, [int]$GuestPort = 5558)
-    $fwd = "hostfwd=tcp:127.0.0.1:{0}-:{1}" -f $HostPort, $GuestPort
+    param([int]$HostPort = 5558, [int]$GuestPort = 5558, [switch]$Lan)
+    # Which address the forwards listen on.
+    #
+    # 127.0.0.1 by default, and that is not timidity: every one of these ports
+    # is an unauthenticated way into the guest - its console (telnet), its
+    # keyboard (KBDVIRT), its screen and keyboard (PHONE.SYS) - and a default
+    # that listens on the network is a default that hands them to it.
+    #
+    # -Lan opens them to the local network, which is what a real phone needs:
+    # a phone cannot reach this PC's loopback.  It also needs a hole in the
+    # Windows firewall, which is asked for separately and on purpose.
+    $bind = if ($Lan) { '0.0.0.0' } else { '127.0.0.1' }
+    $fwd = "hostfwd=tcp:{0}:{1}-:{2}" -f $bind, $HostPort, $GuestPort
     if ($HostPort -eq 5558 -and $GuestPort -eq 5558) {
-        # 5558-5563: PCM / MIDI / mouse / kbd / usbhid / usbcdc virt helpers.
-        # 2323->23:
-        # reach the guest's telnet console from the host
-        # (CONFIG_ARGON_NET_TELNET).  8080->80: KVM.AXE's page in a browser.
-        $fwd = "hostfwd=tcp:127.0.0.1:5558-:5558,hostfwd=tcp:127.0.0.1:5559-:5559,hostfwd=tcp:127.0.0.1:5560-:5560,hostfwd=tcp:127.0.0.1:5561-:5561,hostfwd=tcp:127.0.0.1:5562-:5562,hostfwd=tcp:127.0.0.1:5563-:5563,hostfwd=tcp:127.0.0.1:2323-:23,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8080-:80"
+        # 5558-5561: PCM / MIDI / mouse / kbd virt helpers.  2323->23: reach the
+        # guest's telnet console from the host (CONFIG_ARGON_NET_TELNET).
+        $ports = @(
+            @(5558, 5558), @(5559, 5559), @(5560, 5560), @(5561, 5561),
+            @(5562, 5562), @(5563, 5563),
+            @(2323, 23), @(2222, 22), @(8765, 8765), @(8080, 80)
+        )
+        $fwd = ($ports | ForEach-Object {
+            "hostfwd=tcp:{0}:{1}-:{2}" -f $bind, $_[0], $_[1]
+        }) -join ','
     }
     return @(
         '-nic', ("user,model=open_eth,id=argon0,{0}" -f $fwd)

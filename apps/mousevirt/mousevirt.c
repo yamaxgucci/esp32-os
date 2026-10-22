@@ -53,6 +53,8 @@ typedef struct {
     uint8_t     rx_buf[PKT_SIZE];
     uint8_t     rx_n;
     uint8_t     pending_move;
+    ag_handle_t last_accept_err;
+    uint8_t     listen_moaned; /* the failed-to-listen warning is said once */
 } mousevirt_state_t;
 
 static mousevirt_state_t s_st;
@@ -117,12 +119,26 @@ static void handle_pkt(mousevirt_state_t *st, const mousevirt_pkt_t *pkt)
         inject_ptr(st, AG_EV_WHEEL, pkt->wheel);
     }
 
-    if ((cur & 1u) && !(prev & 1u)) {
+    /*
+     * An edge on any button, not just the first.
+     *
+     * It used to be the first alone, and that made this driver lie about the
+     * hardware it stands in for: a real mouse comes in through hidptr, which
+     * emits a down and an up per bit, so a right button that arrived here as
+     * a plain move with a mask set was a right button no application could
+     * see.  The context menu was written, built and driven by a script that
+     * pressed the right button eleven times without one of them arriving.
+     */
+    const uint8_t edges = (uint8_t)(cur ^ prev);
+    if (edges != 0u) {
         flush_move(st);
-        inject_ptr(st, AG_EV_POINTER_DOWN, 0);
-    } else if (!(cur & 1u) && (prev & 1u)) {
-        flush_move(st);
-        inject_ptr(st, AG_EV_POINTER_UP, 0);
+        for (uint8_t bit = 1u; bit != 0u; bit = (uint8_t)(bit << 1)) {
+            if ((edges & bit) == 0u) {
+                continue;
+            }
+            inject_ptr(st, (cur & bit) ? AG_EV_POINTER_DOWN
+                                       : AG_EV_POINTER_UP, 0);
+        }
     } else {
         /* Coalesce moves: a slow guest would overflow the 64-event queue. */
         st->pending_move = 1;
@@ -168,38 +184,87 @@ static void ensure_listen(mousevirt_state_t *st)
     if (!ag_net_is_ready()) {
         return;
     }
-    st->listen = ag_tcp_listen(MOUSEVIRT_PORT);
-    if (st->listen < 0) {
-        st->listen = -1;
+    /*
+     * Two tasks call this and neither may spoil the other's work.
+     *
+     * The kernel's input tick asks this driver for events every ten
+     * milliseconds, and the shell asks it when a device is opened, and both can
+     * read listen < 0 before either has stored its handle.  One of them then
+     * gets -AG_EBUSY from a port the other has just bound - and the version
+     * that wrote that straight into st->listen left the port shut for the rest
+     * of the boot, with a log saying it had opened it a millisecond earlier.
+     *
+     * From the outside: a host tool reporting "nothing listening", a guest
+     * reporting a healthy driver, and one run in three or four failing.  So a
+     * refusal never clears a handle somebody else installed, and a handle won
+     * twice has the loser's copy closed rather than leaked.
+     */
+    const int32_t rc = ag_tcp_listen(MOUSEVIRT_PORT);
+    if (rc < 0) {
+        if (st->listen < 0 && !st->listen_moaned) {
+            st->listen_moaned = 1;
+            ag_log(AG_LOG_WARN, "mousevirt", "cannot listen on :%u (%d)",
+                   (unsigned)MOUSEVIRT_PORT, (int)rc);
+        }
         return;
     }
+    if (st->listen >= 0) {
+        (void)ag_net_close(rc);
+        return;
+    }
+    st->listen = rc;
+    st->listen_moaned = 0;
     (void)ag_net_set_nonblock(st->listen, true);
     ag_log(AG_LOG_INFO, "mousevirt", "listen :%u", (unsigned)MOUSEVIRT_PORT);
 }
 
+/*
+ * Take every connection that is waiting, not one per call.
+ *
+ * One host tool, and always the newest peer (same as pcmvirt/midivirt):
+ * rejecting while a half-closed zombie still sat in st->conn made the host see
+ * connect → WinError 10053 on every --reconnect attempt.  Taking only one per
+ * call has the same shape of fault a step earlier - a tool that retried while
+ * the guest booted leaves a queued connection per attempt, QEMU's forwarding
+ * having accepted them all, and the live socket is the last in that queue.
+ * One accepted per read means a frame each to work through the dead ones while
+ * the real pointer sits still.
+ */
 static void try_accept(mousevirt_state_t *st)
 {
     ag_handle_t peer;
+    int         spins = 0;
     ensure_listen(st);
     if (st->listen < 0) {
         return;
     }
-    peer = ag_tcp_accept(st->listen, 0u);
-    if (peer < 0) {
+    for (;;) {
+        peer = ag_tcp_accept(st->listen, 0u);
+        if (peer < 0) {
+            break;
+        }
+        if (st->conn >= 0) {
+            (void)ag_net_close(st->conn);
+        }
+        st->conn = peer;
+        st->rx_n = 0;
+        if (++spins >= 64) {
+            break;
+        }
+    }
+    if (spins == 0) {
+        /* -EAGAIN is nobody knocking, sixty times a second.  Anything else is
+         * a connection the driver failed to take, which is invisible from the
+         * host - it sees a socket that opened and a pointer that never moves. */
+        if (peer != (ag_handle_t)(-AG_EAGAIN) && peer != st->last_accept_err) {
+            st->last_accept_err = peer;
+            ag_log(AG_LOG_WARN, "mousevirt", "accept refused: %d", (int)peer);
+        }
         return;
     }
-    /*
-     * One host tool.  Always take the newest peer (same as pcmvirt/midivirt).
-     * Rejecting while a half-closed zombie still sat in st->conn made the host
-     * see connect → WinError 10053 on every --reconnect attempt.
-     */
-    if (st->conn >= 0) {
-        close_conn(st, "replaced by new peer");
-    }
-    st->conn = peer;
+    st->last_accept_err = 0;
     (void)ag_net_set_nonblock(st->conn, true);
-    st->rx_n = 0;
-    ag_log(AG_LOG_INFO, "mousevirt", "host connected");
+    ag_log(AG_LOG_INFO, "mousevirt", "host connected (%d waiting)", spins);
 }
 
 /* Non-blocking drain; closes st->conn on peer error/EOF. */
@@ -313,6 +378,46 @@ static const ag_dev_ops_t k_ops = {
     .ioctl = mouse_ioctl,
 };
 
+/*
+ * The kernel's service tick (ABI 0.28), and what it is for here.
+ *
+ * This driver has no thread of its own - it could ask for one (sys->module_task,
+ * ABI 0.48) and does not, because looking at a socket ten times a second is
+ * exactly what this tick is for - so being called is the only chance it gets to
+ * look at its socket.  Until this existed the only call that ever came
+ * was read(), which meant an application had to open /dev/mouse0 and read it
+ * every frame *even though the events arrive through ag_poll_event* - and one
+ * that did not, having no reason to think a pointer needed opening, saw a
+ * driver that accepted the host's connection, never read it, and let it be
+ * reset.  From the outside that is a mouse that does not work, and it has been
+ * diagnosed twice from scratch: once for Doom, once for the desktop shell.
+ *
+ * ag_inputpoll_tick calls this every ten milliseconds whatever the foreground
+ * application is doing, which is exactly the tick that was missing.
+ *
+ * It returns no events, and that is deliberate rather than lazy.  The events
+ * are injected from here in the surface's own pixels, which is what a pointer
+ * is measured in (ABI 0.42); the kernel's poll path takes cells and rescales
+ * them, so handing them over would quantise a mouse to the 8x16 grid of the
+ * text console.  The tick is the service; the injection is the delivery.
+ */
+static int32_t mouse_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
+{
+    (void)h;
+    (void)out;
+    (void)max;
+    if (s_st.listen < 0 && s_st.conn < 0) {
+        ensure_listen(&s_st);
+    }
+    pump_rx(&s_st);
+    return 0;
+}
+
+static const ag_input_ops_t k_input_ops = {
+    .size = sizeof(ag_input_ops_t),
+    .poll = mouse_poll,
+};
+
 static void mouse_fini(void)
 {
     if (s_st.conn >= 0) {
@@ -348,6 +453,7 @@ ag_err_t ag_driver_init(void)
             .cls = AG_DEV_INPUT,
             .flags = 0,
             .ops = &k_ops,
+            .class_ops = &k_input_ops,
             .priv = &s_st,
         };
         const ag_err_t err = ag_dev_add(&desc);

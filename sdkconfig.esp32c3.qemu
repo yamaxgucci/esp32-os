@@ -1,0 +1,67 @@
+# ArgonOS - the C3 as QEMU emulates it, on top of sdkconfig.defaults.esp32c3.
+#
+# WHY THIS FILE EXISTS.  Everything RISC-V in this tree has been verified on the
+# board and nowhere else, because there was no emulator for it here.  There is
+# now - Espressif's QEMU has an esp32c3 machine, `idf_tools.py install
+# qemu-riscv32` - and that turns "plug the C3 in" from a precondition of every
+# RISC-V check into a last step.
+#
+# Two lines are all that differ, and both are about what the emulated part does
+# not have.
+#
+# THE CONSOLE.  The real SuperMini has no bridge chip: its USB-C socket goes to
+# the chip's own USB pins, so the console is the built-in USB-serial-JTAG
+# device.  QEMU's esp32c3 presents a UART on -serial and nothing on that
+# device, so a guest configured for the board says everything into a socket
+# nobody is holding - and the symptom is a boot that produces not one byte,
+# which reads exactly like a guest that did not start.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=n
+
+# THE RADIO.  There is no Wi-Fi in the emulated part, and an image that carries
+# the stack anyway spends about fifty kilobytes of a four-hundred-kilobyte
+# machine on a peripheral that will never answer.  Off here; the board build
+# above keeps it.
+CONFIG_ARGON_ENABLE_NET=n
+CONFIG_ARGON_NET_WIFI=n
+
+# THE CHIP REVISION.  QEMU's efuses start blank, so the emulated part reports
+# revision 0.0, and the bootloader this IDF builds refuses anything below v0.3:
+#
+#   E boot_comm: chip revision check failed. Required >= v0.3, found v0.0.
+#
+# then resets, and does it again, for ever - which on the screen looks exactly
+# like a guest that will not start.  Accepting v0 is safe here and only here:
+# the real SuperMini reports its own revision and keeps the board build's floor.
+CONFIG_ESP32C3_REV_MIN_0=y
+
+# THE HARDWARE STACK GUARD, off here and nowhere else.
+#
+# The C3 watches its stack pointer with the ASSIST_DEBUG peripheral, and QEMU
+# does not emulate it: the bounds registers read back as zero and the interrupt
+# fires on its own.  What that looks like is a panic one instruction after a
+# module is loaded -
+#
+#   Guru Meditation Error: Core 0 panic'ed (Stack protection fault).
+#   ASSIST_DEBUG is not triggered BUT interrupt occurred!
+#   Stack bounds: 0x00000000 - 0x00000000
+#
+# - and the second line is IDF's own panic handler saying the peripheral does
+# NOT corroborate the interrupt it was given.  The bounds being zero says the
+# same thing from the other side: nothing ever stored them.
+#
+# The S3 has the same peripheral and never sees this, because IDF arms the
+# guard on the RISC-V ports only.
+#
+# IF THIS EVER HIDES A REAL OVERFLOW the symptom will be corruption a little
+# later rather than a clean panic here, so it is worth remembering that this
+# line exists.  The board build keeps the guard.
+CONFIG_ESP_SYSTEM_HW_STACK_GUARD=n
+
+# A BACKTRACE IN THE PANIC.  Without it a RISC-V panic prints the registers of
+# the panic handler itself - MEPC in panic_abort, RA one frame up in the same
+# file - and the caller that actually failed is somewhere in a stack dump that
+# only `idf.py monitor` can decode.  With the unwind tables in the image the
+# chip walks its own stack and prints the chain.  It costs flash, not RAM, and
+# only here.
+CONFIG_ESP_SYSTEM_USE_EH_FRAME=y

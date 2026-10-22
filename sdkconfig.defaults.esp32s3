@@ -74,3 +74,11 @@ CONFIG_ARGON_ENABLE_AUDIO=y
 # devices.  USB-serial-JTAG becomes an additional console endpoint at runtime
 # once the console multiplexer exists.
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# mDNS stays in INTERNAL memory (IDF's default).  It was moved to PSRAM on
+# 25 Sep 2026, when its 4 KB stack was what stood between a nodetest guest and
+# the 6 KB task a remote run is served on.  That task, the device server and
+# the link's reader now take an internal stack when there is one and PSRAM
+# when there is not (ag_proc_task_create), so nothing needs the room.  (It was
+# also blamed, wrongly, for a pair of emulators that could not hear each
+# other: that was a console delivery sent twice - see tools\nodetest.ps1.)

@@ -1,0 +1,246 @@
+diff --git a/src/message.cc b/src/message.cc
+--- a/src/message.cc
++++ b/src/message.cc
+@@ -20,6 +20,161 @@
+ 
+ #define BADWORD_LENGTH_MAX 80
+ 
++/*
++ * ARGON: the strings of a message list in chunks, not one allocation each.
++ *
++ * Every entry of every .msg file costs two allocations here - internal_strdup
++ * for its audio name and one for its text - and the audio name is almost
++ * always the empty string.  The arena's allocator rounds a request up and puts
++ * a header in front of it, so a one-byte string costs sixteen bytes and a
++ * thirty-byte one costs forty.  Measured 31 August 2026 on the largest map in
++ * the game:
++ *
++ *     363 KB in 14046 blocks   protoInit - the six pro_*.msg and proto.msg
++ *     209 KB in  7054 blocks   aiMessageListReloadIfNeeded
++ *
++ * Twenty-one thousand blocks of about thirty bytes each.  Two hundred and
++ * twenty kilobytes of that is header and rounding rather than text.
++ *
++ * And the count matters as much as the size, which is what makes this worth
++ * doing rather than merely tidy.  What failed on 7 September 2026 was not the
++ * total but a *hole*: the save screen asks for one 307200-byte block for its
++ * 640x480 window, and it was refused with 212 KB free in a largest hole of
++ * 148 KB.  Twenty-one thousand small blocks scattered through six megabytes
++ * are what a hole that size is made of.
++ *
++ * A chain of chunks, not one block grown by realloc: a realloc may move, and
++ * every string handed out so far is a pointer somebody may still be holding -
++ * getmsg returns entry->text straight to the caller.  Chunks never move, so
++ * the pointers stay good for as long as they did before.
++ *
++ * The head lives in a side table keyed by the MessageList's address rather
++ * than in the structure.  The structure is declared on stacks and in arrays
++ * all over the engine and not every one of them is passed through
++ * messageListInit first, so a new pointer field would sometimes start as
++ * whatever was on the stack - and a garbage chunk chain is a crash a long way
++ * from its cause.  A list with no row in the table simply has no pool and
++ * falls back to internal_strdup, which is also what happens if the table
++ * fills: correct, just not cheap.
++ */
++#define MSG_POOL_CHUNK  4096u
++#define MSG_POOL_LISTS    96
++
++typedef struct MsgChunk {
++    struct MsgChunk* next;
++    uint32_t used;
++    uint32_t cap;
++} MsgChunk;
++
++typedef struct MsgPoolRow {
++    MessageList* owner;
++    MsgChunk* head;
++} MsgPoolRow;
++
++static MsgPoolRow gMsgPools[MSG_POOL_LISTS];
++/* The last row used, because the loader asks for two strings per entry and
++ * seven thousand entries is fourteen thousand walks of the table otherwise. */
++static int gMsgPoolLast;
++
++static MsgPoolRow* msg_pool_row(MessageList* msg, bool make)
++{
++    if (msg == nullptr) {
++        return nullptr;
++    }
++    if (gMsgPools[gMsgPoolLast].owner == msg) {
++        return &gMsgPools[gMsgPoolLast];
++    }
++    int free_slot = -1;
++    for (int i = 0; i < MSG_POOL_LISTS; i++) {
++        if (gMsgPools[i].owner == msg) {
++            gMsgPoolLast = i;
++            return &gMsgPools[i];
++        }
++        if (free_slot < 0 && gMsgPools[i].owner == nullptr) {
++            free_slot = i;
++        }
++    }
++    if (!make || free_slot < 0) {
++        return nullptr;
++    }
++    gMsgPools[free_slot].owner = msg;
++    gMsgPools[free_slot].head = nullptr;
++    gMsgPoolLast = free_slot;
++    return &gMsgPools[free_slot];
++}
++
++/* A copy of `s` that lives as long as the list does.  Falls back to
++ * internal_strdup when there is no room for a pool, so the caller never has to
++ * know which it got - both are freed by messageListFree. */
++static char* msg_pool_dup(MessageList* msg, const char* s)
++{
++    if (s == nullptr) {
++        s = "";
++    }
++    const size_t need = strlen(s) + 1;
++
++    MsgPoolRow* row = msg_pool_row(msg, true);
++    if (row == nullptr) {
++        return internal_strdup(s);
++    }
++
++    MsgChunk* c = row->head;
++    if (c == nullptr || (size_t)(c->cap - c->used) < need) {
++        /* A string longer than a chunk gets a chunk of its own rather than
++         * being refused: item descriptions run to several hundred bytes. */
++        size_t want = MSG_POOL_CHUNK;
++        if (need + sizeof(MsgChunk) > want) {
++            want = need + sizeof(MsgChunk);
++        }
++        MsgChunk* fresh = (MsgChunk*)internal_malloc(want);
++        if (fresh == nullptr) {
++            /*
++             * Not internal_strdup here, deliberately.  A list that has a pool
++             * and one string outside it is a list messageListFree cannot free
++             * correctly - it skips the per-entry frees when there is a pool -
++             * so one string would leak on every release.  The arena refusing
++             * four kilobytes is the caller's problem to report, and
++             * messageListLoad does report it.
++             */
++            return nullptr;
++        }
++        fresh->next = row->head;
++        fresh->used = 0;
++        fresh->cap = (uint32_t)(want - sizeof(MsgChunk));
++        row->head = fresh;
++        c = fresh;
++    }
++
++    char* out = (char*)(c + 1) + c->used;
++    memcpy(out, s, need);
++    c->used += (uint32_t)need;
++    return out;
++}
++
++static void msg_pool_free(MessageList* msg)
++{
++    MsgPoolRow* row = msg_pool_row(msg, false);
++    if (row == nullptr) {
++        return;
++    }
++    MsgChunk* c = row->head;
++    while (c != nullptr) {
++        MsgChunk* next = c->next;
++        internal_free(c);
++        c = next;
++    }
++    row->head = nullptr;
++    row->owner = nullptr;
++}
++
++/* True while this list's strings are in a pool, so the per-entry frees know to
++ * leave them alone. */
++static bool msg_pooled(MessageList* msg)
++{
++    const MsgPoolRow* row = msg_pool_row(msg, false);
++    return row != nullptr && row->head != nullptr;
++}
++
+ static constexpr int kFirstStandardMessageListId = 0;
+ static constexpr int kLastStandardMessageListId = kFirstStandardMessageListId + STANDARD_MESSAGE_LIST_COUNT - 1;
+ 
+@@ -178,17 +333,28 @@
+         return false;
+     }
+ 
+-    for (i = 0; i < messageList->entries_num; i++) {
+-        entry = &(messageList->entries[i]);
++    /*
++     * ARGON: the strings go with the pool, in a handful of frees rather than
++     * two per entry.  A list that never got a pool - the table was full, or
++     * the arena refused a chunk - still owns its strings one by one.
++     */
++    if (!msg_pooled(messageList)) {
++        for (i = 0; i < messageList->entries_num; i++) {
++            entry = &(messageList->entries[i]);
+ 
+-        if (entry->audio != nullptr) {
+-            internal_free(entry->audio);
+-        }
++            if (entry->audio != nullptr) {
++                internal_free(entry->audio);
++            }
+ 
+-        if (entry->text != nullptr) {
+-            internal_free(entry->text);
++            if (entry->text != nullptr) {
++                internal_free(entry->text);
++            }
+         }
+     }
++    /* Always, whether there were chunks or not: this is also what gives the
++     * row in the table back, and a table that fills up quietly stops being a
++     * pool for every list loaded after it. */
++    msg_pool_free(messageList);
+ 
+     messageList->entries_num = 0;
+ 
+@@ -381,13 +547,24 @@
+     if (_message_find(msg, new_entry->num, &index)) {
+         existing_entry = &(msg->entries[index]);
+ 
+-        if (existing_entry->audio != nullptr) {
+-            internal_free(existing_entry->audio);
+-        }
++        /*
++         * ARGON: a replaced entry's old strings are left where they are when
++         * they are in the pool - the bytes are wasted until the list is freed.
++         * A .msg file with the same number twice is a mistake the engine
++         * already warns about, and the two of them together are a few dozen
++         * bytes against the two hundred kilobytes the pool saves.
++         */
++        if (!msg_pooled(msg)) {
++            if (existing_entry->audio != nullptr) {
++                internal_free(existing_entry->audio);
++            }
+ 
+-        if (existing_entry->text != nullptr) {
+-            internal_free(existing_entry->text);
++            if (existing_entry->text != nullptr) {
++                internal_free(existing_entry->text);
++            }
+         }
++        existing_entry->audio = nullptr;
++        existing_entry->text = nullptr;
+     } else {
+         if (msg->entries != nullptr) {
+             entries = (MessageListItem*)internal_realloc(msg->entries, sizeof(MessageListItem) * (msg->entries_num + 1));
+@@ -417,12 +594,12 @@
+         msg->entries_num++;
+     }
+ 
+-    existing_entry->audio = internal_strdup(new_entry->audio);
++    existing_entry->audio = msg_pool_dup(msg, new_entry->audio);
+     if (existing_entry->audio == nullptr) {
+         return false;
+     }
+ 
+-    existing_entry->text = internal_strdup(new_entry->text);
++    existing_entry->text = msg_pool_dup(msg, new_entry->text);
+     if (existing_entry->text == nullptr) {
+         return false;
+     }

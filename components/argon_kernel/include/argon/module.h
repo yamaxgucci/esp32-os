@@ -34,6 +34,9 @@ typedef struct {
     char version[16];
     size_t code_bytes;
     size_t data_bytes;
+    /* internal memory it took to load and start - its image's data and all
+     * its init allocated, the kernel services it opened included */
+    int32_t held_bytes;
 } ag_modinfo_t;
 
 /*
@@ -80,6 +83,26 @@ const ag_probe_hint_t *ag_module_probe_hint(void);
  * leaked listen steals hostfwd accepts from the new image.
  */
 void ag_module_on_unload(void (*fn)(void));
+
+/*
+ * Start a task that belongs to this module.  Only valid during
+ * ag_driver_init, and for the same reason as the hook above: it is the module
+ * that owns it, and the module is only identifiable while it is loading.
+ *
+ * A driver has no process, so ag_thread_create - which is the application's
+ * way and refuses a caller with no process - cannot serve it.  Everything a
+ * driver does has therefore run on whoever called in, which is right for a
+ * register write and wrong for anything that takes milliseconds: a screen at
+ * the end of a serial wire charged three hundred milliseconds of frame to the
+ * game that drew it.
+ *
+ * Unload calls the on_unload hook first, so the driver can tell its task to
+ * stop, and then waits for the task to return before unmapping the image.  A
+ * task that does not return refuses the unload; it does not get its code taken
+ * away underneath it.
+ */
+bool ag_module_task(void (*fn)(void *), void *arg, const char *name,
+                    uint32_t stack, int priority, uint32_t flags);
 
 /*
  * Walks [modules] device=... from SYSTEM.CFG, then runs I2C probe against

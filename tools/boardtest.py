@@ -102,8 +102,27 @@ class Board:
         # because the I/O is still pending; the only cure is unplugging the
         # cable.  With one, a stuck write raises after 30 s and the process
         # exits, leaving the port openable so a reset can recover the board.
-        self.ser = serial.Serial(port, baud, timeout=0.05, xonxoff=True,
+        #
+        # Opened with DTR and RTS already low, because opening a port is a
+        # reset.
+        #
+        # Every USB-serial bridge on these boards wires DTR and RTS to EN and
+        # IO0 so that a flashing tool can restart the chip, and pyserial
+        # asserts both by default the moment the port opens.  So a command
+        # meant only to *watch* a board restarts it - which is fine when the
+        # next thing is a reset anyway and is not fine at all under --no-reset,
+        # where the whole point is to look at something that is running.
+        #
+        # It cost an evening in the shape of a receiver that kept "going
+        # quiet": every time its counters were read, the board it was running
+        # on was rebooted by the reading.
+        #
+        self.ser = serial.Serial(baudrate=baud, timeout=0.05, xonxoff=True,
                                  write_timeout=30)
+        self.ser.port = port
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.open()
         self.log = log
         self.echo = echo
         self.buf = bytearray()
@@ -212,6 +231,10 @@ def main():
                     help="how long to watch the boot before sending anything")
     ap.add_argument("--timeout", type=float, default=20.0,
                     help="how long one command may take")
+    ap.add_argument("--peek", action="store_true",
+                    help="only listen for --seconds: no reset, no prompt, not "
+                         "a single byte sent - for watching a program that "
+                         "stops on a keystroke")
     ap.add_argument("--no-reset", action="store_true",
                     help="attach to a board that is already running")
     ap.add_argument("--quiet", action="store_true", help="do not echo the wire")
@@ -230,9 +253,16 @@ def main():
     os.makedirs(os.path.dirname(args.log), exist_ok=True)
     with open(args.log, "wb") as log:
         board = Board(args.port, args.baud, log, not args.quiet)
-        if not args.no_reset:
+        if not args.no_reset and not args.peek:
             board.reset()
 
+        if args.peek:
+            # Nothing sent, deliberately.  --no-reset still wakes the prompt
+            # with a carriage return, and to a program that stops on any key
+            # a carriage return is a key: REMTERM ended every time its own
+            # counters were read this way, and the screen went with it.
+            board.pump(args.seconds)
+            return
         if args.no_reset:
             # Nothing is coming unprompted from a board that is sitting at a
             # prompt; ask for one.

@@ -1,0 +1,357 @@
+/*
+ * ArgonOS - the handful of hosted-system symbols libstdc++ and newlib insist on.
+ *
+ * Link this with cxx_rt.cpp and cxx_throw.cpp in an image that uses the STL.
+ * Two archives reach past the C library for things a bare-metal target does not
+ * normally have, and the linker will not finish without them:
+ *
+ *   - libstdc++'s eh_globals.o keeps the in-flight exception per thread and
+ *     asks POSIX for the storage.  It is pulled in by any object that has a
+ *     catch block, which several of the string and vector instantiations do,
+ *     even when nothing in the image ever throws;
+ *   - newlib's strtoul and its neighbours reach for the per-thread reentrancy
+ *     structure through __getreent.  They arrive with std::stoi and friends,
+ *     which live in the same archive member as the rest of std::string.
+ *
+ * All of it is small, and none of it is a stub in the bad sense: the mutexes
+ * are real ArgonOS mutexes, and the keys really are per-thread.  What is
+ * missing is named where it is missing.
+ *
+ * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
+ */
+#include <argon/argon.h>
+
+#include <errno.h>
+#include <pthread.h>
+#include <reent.h>
+#include <string.h>
+
+/* ---- newlib's reentrancy ------------------------------------------------- */
+
+/*
+ * One structure for the process rather than one per thread.  The members that
+ * can arrive here - the string-to-number conversions - use it for errno and
+ * nothing else, so the cost of sharing it is that two threads converting a
+ * malformed number at the same moment can read each other's ERANGE.
+ *
+ * It is deliberately not a full newlib environment: if something ever pulls in
+ * a member that wants the file table or the locale out of here, it will find
+ * them zeroed, and the right answer then is to add that function to
+ * apps/common/libc rather than to grow this.
+ */
+static struct _reent s_reent;
+
+struct _reent *__getreent(void) { return &s_reent; }
+
+/* ---- mutexes ------------------------------------------------------------- */
+
+/*
+ * Every mutex here is recursive, and that is the whole point.
+ *
+ * std::recursive_mutex is a pthread mutex with an attribute set, and the
+ * attribute is the part that does not survive: newlib's pthreads have no
+ * settype for us to honour, so a recursive mutex arrives looking exactly like
+ * an ordinary one.  Take it twice on one thread and the program stops.  Not
+ * fails - stops, with no message and nothing in the log.  Fallout 2's audio
+ * engine takes one twice, and the game reached its main menu, started the
+ * background music, and went quiet.
+ *
+ * Making every mutex recursive is the safe direction.  A std::mutex that is
+ * recursive when it should not be fails to catch a mistake; a recursive_mutex
+ * that is not deadlocks.  CXXSTL checks both.
+ *
+ * ag_mutex_t is a pointer and pthread_mutex_t is a 32-bit word, so the word
+ * holds a pointer to this instead - the count and the owner have to live
+ * somewhere.
+ *
+ * A statically initialised mutex arrives as _PTHREAD_MUTEX_INITIALIZER with no
+ * call to pthread_mutex_init, so it has to be made on first use.  Two threads
+ * reaching an untouched static mutex at the same instant would make two of
+ * them and one would be lost; that is the one race left here, and closing it
+ * needs a compare-and-swap the ABI does not offer yet.
+ */
+#define AG_PTHREAD_UNSET ((pthread_mutex_t)0xFFFFFFFFu)
+
+typedef struct {
+    ag_mutex_t  m;
+    ag_thread_t owner;
+    uint32_t    depth;
+} ag_pmutex_t;
+
+static ag_thread_t this_thread(void);
+
+static ag_pmutex_t *body_of(pthread_mutex_t *m)
+{
+    if (*m != AG_PTHREAD_UNSET && *m != 0) {
+        return (ag_pmutex_t *)(uintptr_t)*m;
+    }
+
+    ag_pmutex_t *p = (ag_pmutex_t *)ag_malloc(sizeof(*p));
+    if (p == NULL) {
+        return NULL;
+    }
+    p->m = ag_mutex_create();
+    p->owner = NULL;
+    p->depth = 0;
+    if (p->m == NULL) {
+        ag_free(p);
+        return NULL;
+    }
+    *m = (pthread_mutex_t)(uintptr_t)p;
+    return p;
+}
+
+int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *attr)
+{
+    /* The attribute is ignored because there is only one kind here, and it is
+     * the stronger one. */
+    (void)attr;
+    *m = AG_PTHREAD_UNSET;
+    return body_of(m) != NULL ? 0 : ENOMEM;
+}
+
+int pthread_mutex_destroy(pthread_mutex_t *m)
+{
+    if (*m != AG_PTHREAD_UNSET && *m != 0) {
+        ag_pmutex_t *p = (ag_pmutex_t *)(uintptr_t)*m;
+        ag_mutex_delete(p->m);
+        ag_free(p);
+    }
+    *m = AG_PTHREAD_UNSET;
+    return 0;
+}
+
+int pthread_mutex_lock(pthread_mutex_t *m)
+{
+    ag_pmutex_t *p = body_of(m);
+    if (p == NULL) {
+        return ENOMEM;
+    }
+    const ag_thread_t me = this_thread();
+    if (p->depth != 0 && p->owner == me) {
+        ++p->depth;
+        return 0;
+    }
+    /* Forever: a lock that gives up is not a lock, and the caller has no way
+     * to report the failure anyway. */
+    ag_mutex_lock(p->m, UINT32_MAX);
+    p->owner = me;
+    p->depth = 1;
+    return 0;
+}
+
+int pthread_mutex_trylock(pthread_mutex_t *m)
+{
+    ag_pmutex_t *p = body_of(m);
+    if (p == NULL) {
+        return ENOMEM;
+    }
+    const ag_thread_t me = this_thread();
+    if (p->depth != 0 && p->owner == me) {
+        ++p->depth;
+        return 0;
+    }
+    if (!ag_mutex_lock(p->m, 0)) {
+        return EBUSY;
+    }
+    p->owner = me;
+    p->depth = 1;
+    return 0;
+}
+
+int pthread_mutex_unlock(pthread_mutex_t *m)
+{
+    if (*m == AG_PTHREAD_UNSET || *m == 0) {
+        return EINVAL;
+    }
+    ag_pmutex_t *p = (ag_pmutex_t *)(uintptr_t)*m;
+    if (p->depth == 0) {
+        return EPERM;
+    }
+    if (--p->depth != 0) {
+        return 0;
+    }
+    p->owner = NULL;
+    ag_mutex_unlock(p->m);
+    return 0;
+}
+
+/*
+ * The attribute object.  std::recursive_mutex builds one to ask for
+ * PTHREAD_MUTEX_RECURSIVE, and that request is the only thing anybody sets.
+ *
+ * It is remembered and not honoured: ag_mutex_create makes one kind of mutex,
+ * and taking it twice on one thread would deadlock.  Nothing in the ports so
+ * far actually re-enters one - the engine that asks builds it, locks it once
+ * per call and unlocks - so this is a hole with a name rather than a bug with
+ * a symptom.  Closing it means a recursive flag in the task ABI.
+ */
+int pthread_mutexattr_init(pthread_mutexattr_t *attr)
+{
+    if (attr == NULL) {
+        return EINVAL;
+    }
+    memset(attr, 0, sizeof(*attr));
+    attr->is_initialized = 1;
+    return 0;
+}
+
+int pthread_mutexattr_destroy(pthread_mutexattr_t *attr)
+{
+    if (attr == NULL) {
+        return EINVAL;
+    }
+    attr->is_initialized = 0;
+    return 0;
+}
+
+int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int kind)
+{
+    if (attr == NULL) {
+        return EINVAL;
+    }
+    attr->recursive = (kind == PTHREAD_MUTEX_RECURSIVE) ? 1 : 0;
+    return 0;
+}
+
+/*
+ * Not a mutex operation at all.  libstdc++ decides whether the program is
+ * threaded by taking the address of pthread_cancel and seeing whether it is
+ * null - the old trick for a weakly linked pthreads.  Here it is a real
+ * reference to a real symbol, so the answer is yes, and the locking above is
+ * used rather than skipped.
+ *
+ * Cancelling a thread is another matter: FreeRTOS can delete a task, but
+ * unwinding one out of somebody else's critical section is not something to
+ * offer casually, and nothing asks.
+ */
+int pthread_cancel(pthread_t thread)
+{
+    (void)thread;
+    return ENOSYS;
+}
+
+/*
+ * std::call_once, underneath.  The flag is a word the caller owns, and the
+ * contract is that the function runs exactly once however many threads arrive.
+ *
+ * Not locked, for the same reason the static guards above are not: a lock here
+ * needs an atomic the ABI does not expose.  The single-threaded case - which
+ * is every once-flag any port has reached so far, because they are all
+ * initialisation - is correct.
+ */
+int pthread_once(pthread_once_t *once, void (*fn)(void))
+{
+    if (once == NULL || fn == NULL) {
+        return EINVAL;
+    }
+    if (!once->init_executed) {
+        once->init_executed = 1;
+        fn();
+    }
+    return 0;
+}
+
+/* ---- thread-specific data ------------------------------------------------ */
+
+/*
+ * A table rather than real thread-local storage, because a process gets four
+ * threads and libstdc++ asks for exactly one key.  Both bounds are checked, and
+ * running out of either is reported the way POSIX says rather than silently
+ * handing back somebody else's slot.
+ *
+ * The destructor a key carries is remembered and never run: it fires when a
+ * thread ends, and the ABI has no way to be told about that yet.  For the one
+ * user here it would free the exception globals of a thread that has finished,
+ * which on a process-owned arena the process teardown reclaims anyway.
+ */
+#define AG_TSD_KEYS 8
+#define AG_TSD_THREADS 8
+
+static struct {
+    bool used;
+    void (*dtor)(void *);
+} s_keys[AG_TSD_KEYS];
+
+static struct {
+    ag_thread_t owner;
+    void *value[AG_TSD_KEYS];
+} s_slots[AG_TSD_THREADS];
+
+static ag_thread_t this_thread(void)
+{
+    if (!AG_HAS(g_ag_api->task, self)) {
+        return NULL;
+    }
+    return g_ag_api->task->self();
+}
+
+static int slot_of(bool create)
+{
+    ag_thread_t me = this_thread();
+    int free_slot = -1;
+
+    for (int i = 0; i < AG_TSD_THREADS; ++i) {
+        if (s_slots[i].owner == me) {
+            return i;
+        }
+        if (s_slots[i].owner == NULL && free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    /* NULL is also what a missing task->self reports, and then every thread
+     * shares slot 0 - which is the single-threaded case, correctly. */
+    if (!create || free_slot < 0) {
+        return -1;
+    }
+    s_slots[free_slot].owner = me;
+    return free_slot;
+}
+
+int pthread_key_create(pthread_key_t *key, void (*dtor)(void *))
+{
+    for (int i = 0; i < AG_TSD_KEYS; ++i) {
+        if (!s_keys[i].used) {
+            s_keys[i].used = true;
+            s_keys[i].dtor = dtor;
+            *key = (pthread_key_t)i;
+            return 0;
+        }
+    }
+    return EAGAIN;
+}
+
+int pthread_key_delete(pthread_key_t key)
+{
+    if (key >= AG_TSD_KEYS || !s_keys[key].used) {
+        return EINVAL;
+    }
+    s_keys[key].used = false;
+    s_keys[key].dtor = NULL;
+    for (int i = 0; i < AG_TSD_THREADS; ++i) {
+        s_slots[i].value[key] = NULL;
+    }
+    return 0;
+}
+
+void *pthread_getspecific(pthread_key_t key)
+{
+    if (key >= AG_TSD_KEYS) {
+        return NULL;
+    }
+    int slot = slot_of(false);
+    return slot < 0 ? NULL : s_slots[slot].value[key];
+}
+
+int pthread_setspecific(pthread_key_t key, const void *value)
+{
+    if (key >= AG_TSD_KEYS || !s_keys[key].used) {
+        return EINVAL;
+    }
+    int slot = slot_of(true);
+    if (slot < 0) {
+        return ENOMEM;
+    }
+    s_slots[slot].value[key] = (void *)value;
+    return 0;
+}

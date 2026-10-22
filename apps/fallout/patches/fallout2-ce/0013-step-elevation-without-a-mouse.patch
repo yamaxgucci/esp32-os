@@ -1,0 +1,42 @@
+diff --git a/src/game.cc b/src/game.cc
+index 978a385..4300eef 100644
+--- a/src/game.cc
++++ b/src/game.cc
+@@ -735,6 +735,37 @@ int gameHandleKey(int eventCode, bool isInCombatMode)
+             }
+         }
+         break;
++    // ArgonOS: step to the next elevation this map actually has, no mouse.
++    //
++    // The memory an elevation change costs had to be weighed on both sides of
++    // itself, and reaching one the way a player does means aiming a pointer at
++    // a doorway from a script.  This is the same three calls the engine's own
++    // same-map transition makes (map.cc, _map_check_state), so what it costs is
++    // what walking in costs.
++    //
++    // elevationIsValid() is only a range check and says nothing about whether
++    // the map has that level: the header's flags do, and a *set* bit means the
++    // level is absent (map.cc, _map_data_elev_flags, and the reads at 1417 and
++    // 1727 which load tiles when the bit is clear).  Stepping without this
++    // check lands on an empty elevation, which costs nothing and proves
++    // nothing.
++    case KEY_F11: {
++        int target = gElevation;
++        for (int i = 1; i < ELEVATION_COUNT; i++) {
++            const int candidate = (gElevation + i) % ELEVATION_COUNT;
++            if ((gMapHeader.flags & (2 << candidate)) == 0) {
++                target = candidate;
++                break;
++            }
++        }
++        debugPrint("\n[argon] map flags 0x%x, elevation %d -> %d\n", gMapHeader.flags, gElevation, target);
++        if (target != gElevation) {
++            objectSetLocation(gDude, gDude->tile, target, nullptr);
++            mapSetElevation(target);
++            tileSetCenter(gDude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
++        }
++        break;
++    }
+     case KEY_HOME:
+         if (gDude->elevation != gElevation) {
+             mapSetElevation(gDude->elevation);

@@ -31,15 +31,44 @@ extern "C" {
 #endif
 
 /*
- * How many devices can exist at once.  A bound rather than a list that grows,
- * for the same reason the resource list has one: a bound that is reached is a
- * diagnosable event, and the registry has to work when memory is short.
+ * How many devices can exist at once - this board's own, and any it has
+ * borrowed from a neighbour.
+ *
+ * A bound rather than a list that grows, for the same reason the resource list
+ * has one: a bound that is reached is a diagnosable event, and the registry
+ * has to work when memory is short.  What was missing was the diagnosis - a
+ * borrowed device that did not fit was dropped in silence, and the CYD's
+ * screen simply was not in the C3's registry.  noderdev now names it.
+ *
+ * Settable per board (CONFIG_ARGON_DEV_MAX) because every board pays about
+ * seventy bytes an entry whether or not it will ever be in a cluster.
+ *
+ * THE INCLUDE BELOW IS THE WHOLE FIX, and it is here because without it the
+ * setting was a line that did nothing on every board.  This header read
+ * CONFIG_ARGON_DEV_MAX under #ifdef but never asked the port for the build-time
+ * options, so whether the symbol existed depended on whether the .c that
+ * included this header happened to have pulled sdkconfig.h in first - and in
+ * device.c it had not.  Every board ran on the twenty-four below while its
+ * sdkconfig said forty.
+ *
+ * Measured on the bench, the C3 in the middle of the trio: `link devs` brought
+ * in the CYD's registry and stopped at exactly twelve, refusing cyd.sd0,
+ * cyd.lcd0 and cyd.touch0 with -ENFILE (-23) - the card slot, the screen and
+ * the touchscreen, which are the three devices a cluster exists to lend.  Twelve
+ * of its own plus twelve borrowed is twenty-four, and the log said so next to a
+ * config that said forty.
  */
+#include <argon/port/config.h>
+
+#ifdef CONFIG_ARGON_DEV_MAX
+#define AG_DEV_MAX CONFIG_ARGON_DEV_MAX
+#else
 #define AG_DEV_MAX 24
+#endif
 
 /*
  * Public because a driver needs its own priv pointer back in every callback,
- * and because the shell and the tests read the bookkeeping.  The last three
+ * and because the shell and the tests read the bookkeeping.  The last five
  * fields belong to the registry; a driver must not write them.
  *
  * The ops table and AG_DEV_NAME_MAX live in the ABI: a .SYS sees the same
@@ -66,6 +95,22 @@ struct ag_device {
     const void *owner;
 
     uint32_t open_count;
+    /*
+     * Calls into this driver that are running right now.  The registry lock is
+     * let go for the length of one - see ag_dev_read/write/ioctl - so this is
+     * what keeps the slot from being reused underneath a call that is still
+     * inside somebody's driver.
+     */
+    uint32_t calls;
+    /* ...and calls straight into its class ops (ag_dev_call_begin), counted
+     * under a small lock of their own rather than the registry's */
+    uint32_t direct;
+    /*
+     * This device's own lock, from the lock interface below, held across a call
+     * into it in place of the registry lock.  NULL means there is none and the
+     * registry lock is held instead, which is what the host tests do.
+     */
+    void    *iolock;
     bool     used;
     bool     revoked; /* the hardware went away, handles are still open     */
 };
@@ -87,10 +132,37 @@ typedef struct {
  *
  * The lock must be recursive: a device operation is entitled to ask the
  * registry about itself.
+ *
+ * The second set is one lock per device, and it exists because the first one is
+ * one lock for the whole machine.  A driver call can block for a long time -
+ * writing sound is the plain case, because a converter plays it in real time
+ * and the write returns when there is room - and while the registry lock was
+ * held across that call, nothing else could so much as look at the registry.
+ * A frame flush walks it to find the display drivers; on the board it needed
+ * 18 microseconds of that walk and waited 161 milliseconds for the turn, and
+ * Fallout lost two thirds of every frame to it.
+ *
+ * So a call resolves what it is going to call under the registry lock, marks
+ * the device busy, lets the registry go, and takes the device's own lock for
+ * the call itself.  Two writes to the same device still serialise; a write to
+ * one device and a walk of the registry no longer do.  display.c has done this
+ * for blits since the wire made it obvious - see driver_present_blit.
+ *
+ * open returns a lock for a newly registered device, or NULL; close gives it
+ * back.  When open is absent or answers NULL the registry lock is held across
+ * the call as it always was, which is what the host tests get.
  */
 typedef struct {
     void (*lock)(void *ctx);
     void (*unlock)(void *ctx);
+    void *(*call_open)(void *ctx);
+    void (*call_close)(void *ctx, void *iolock);
+    void (*call_hold)(void *ctx, void *iolock);
+    void (*call_release)(void *ctx, void *iolock);
+    /* the direct-call count's lock: a plain one, held for a few
+     * instructions, taken inside `lock` and never around it */
+    void (*count_lock)(void *ctx);
+    void (*count_unlock)(void *ctx);
     void *ctx;
 } ag_dev_lock_t;
 
@@ -102,6 +174,8 @@ ag_err_t ag_dev_init(const ag_dev_lock_t *lock);
  * write should be checked against; see caller() in src/dev/io.c.
  */
 bool ag_dev_in_driver(void);
+/* The same for any task: inside a driver, holding what the driver holds. */
+bool ag_dev_task_in_driver(const void *task);
 
 /*
  * Hold the registry across a call into a driver.
@@ -118,7 +192,25 @@ bool ag_dev_in_driver(void);
  * hold it for microseconds.
  */
 void ag_dev_lock_hold(void);
+
+/*
+ * Which driver call is in flight under the registry, for the watch that
+ * reports a hold gone long (ag_dev_lockwatch).  Called around a call into a
+ * driver's vtable; `dev` and `op` must outlive the call (registry names and
+ * string literals do).
+ */
+void ag_dev_note_call(const char *dev, const char *op);
+void ag_dev_note_done(void);
+
+/* The report: runs on a port timer that holds nothing.  See devices.c. */
+void ag_dev_lockwatch(void);
 void ag_dev_lock_release(void);
+
+/* Held across a blocking display blit instead of the registry lock, so the
+ * wire does not stop audio and the console; carries the "system is writing"
+ * signal to the pin layer.  See devices.c. */
+void ag_dev_blit_hold(void);
+void ag_dev_blit_release(void);
 
 /*
  * Adds a device.  -AG_EEXIST for a name already taken, -AG_EINVAL for a name
@@ -143,10 +235,64 @@ ag_err_t ag_dev_unregister(ag_device_t *dev);
  * waiting for the holders to close would mean waiting for a process that may
  * never run again.
  */
+/*
+ * Told when a device goes away.
+ *
+ * A subsystem that has BOUND a device holds a pointer to it and to its class
+ * vtable, and a driver can be unloaded under that pointer - after which the
+ * binding is a pointer into an image that has been given back.  Found by
+ * unloading NODELINK while `link use node0` was in force: the next `link` still
+ * said "link on node0" and called into freed memory.  It returned zeros rather
+ * than crashing, which is the version of that bug that ships.
+ *
+ * Called WITH THE REGISTRY LOCK HELD, once per device, before the slot is
+ * cleared - so `dev` may be compared but nothing in the registry may be called
+ * from here.  Drop your pointer and return.
+ *
+ * There is no unregister: these are kernel subsystems that outlive every
+ * driver, not drivers themselves.
+ */
+typedef void (*ag_dev_revoke_fn)(ag_device_t *dev);
+ag_err_t ag_dev_on_revoke(ag_dev_revoke_fn fn);
+
 uint32_t ag_dev_revoke(ag_device_t *dev);
 
 /* Revokes everything one module registered.  Returns how many devices went. */
 uint32_t ag_dev_revoke_owner(const void *owner);
+
+/*
+ * Calls that are inside this module's drivers right now.
+ *
+ * Whoever is about to UNMAP a module has to wait for this to reach zero, and
+ * holding the registry lock is no longer the way to be sure of it: a call lets
+ * that lock go for its own length and takes the device's lock instead (see
+ * ag_dev_lock_t).  So the registry lock now says "nobody is looking things up",
+ * which is not the same as "nobody is executing the image".
+ *
+ * And the waiting must be done WITHOUT the registry lock: a call that is
+ * finishing needs it back to write down that it has finished, so a waiter
+ * holding it would be waiting for something it is itself preventing.
+ */
+uint32_t ag_dev_calls_of_owner(const void *owner);
+
+/*
+ * A call straight into a driver's class ops, counted like the calls above so
+ * an unload waits for it to come out - but WITHOUT the device's lock, which a
+ * link's recv would hold for its whole timeout and so shut out every send,
+ * and without the registry's, which the console holds across a remote
+ * screen's op while that op waits for an answer this very call brings in.
+ *
+ * The link provider's reader sits inside a driver's recv almost all the time.
+ * Uncounted, `drv unload NODELINK` gave the image back under it: the fini
+ * closed the link, recv came out at once and was called again, and the reader
+ * was standing in NODELINK's code when it was freed (a load fault on the C3,
+ * MEPC = image + 0x1c, 25 Sep 2026).
+ *
+ * begin is false when the device is gone or revoked: then do not call.  Every
+ * true is paired with one end.
+ */
+bool ag_dev_call_begin(ag_device_t *dev);
+void ag_dev_call_end(ag_device_t *dev);
 
 /* NULL when there is no such device, or when it has been revoked. */
 ag_device_t *ag_dev_find(const char *name);

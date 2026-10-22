@@ -23,6 +23,8 @@
 #include <argon/ioclaim.h>
 #include <argon/log.h>
 #include <argon/proc.h>
+#include <argon/spilink.h>
+#include <argon/uartlink.h>
 
 #include <argon/port/io.h>
 #include <argon/port/mem.h>
@@ -45,14 +47,77 @@
  * the same count for the same bytes; an overrun gives the same count for the
  * same *time*, which is what this was.
  *
- * Eight kilobytes is twenty milliseconds at four megabaud, which is longer than
- * anything a driver does between reads.  Transmit stays small on purpose: a
- * short transmit buffer makes a large write block until the wire has taken it,
- * and being paced by the wire is the correct behaviour for whoever is filling
- * it - the alternative is buffering a frame the far end cannot yet draw.
+ * Eight kilobytes is twenty milliseconds at four megabaud, and twenty
+ * milliseconds turned out not to be longer than everything a driver does
+ * between reads.  Running a game down the link, the receiver threw away about
+ * 200 KB of arriving pixels in forty seconds hunting for a frame header - it
+ * falls behind while putting a band on its panel, and a lost band is a
+ * rectangle of the last frame that stays on the glass until something redraws
+ * it.  Sixteen kilobytes is forty milliseconds, which covers a band, a write to
+ * a converter and a filesystem call together.
+ *
+ * Thirty-two was tried first and is too much for the board that needs it: the
+ * CYD has 179 KB and no PSRAM, and after a `wifi off` the free memory is there
+ * but not in one piece, so uart_driver_install failed and the receiver came up
+ * with `uart1 at 4000000 baud: input/output error` - a screen that stayed dark
+ * for want of a buffer twice the size of the one that works.
+ *
+ * Transmit used to stay at two kilobytes on purpose, so that a large write
+ * blocked until the wire had taken it - being paced by the wire is the correct
+ * behaviour for whoever is filling it.  That is still true and it is not the
+ * same as *waiting* for it.  With a buffer this size a write copies and
+ * returns, and the peripheral's interrupt empties it while the caller draws
+ * the next frame; the pacing comes back the moment the buffer is full, which
+ * on a picture that does not fit in it is one frame later.  On the link
+ * between the two boards that is the difference between a game that works
+ * while the picture goes out and a game that stops for it.
+ *
+ * Big on receive, small on transmit, and the asymmetry is the point.  A board
+ * carrying a picture is either the sender or the receiver: the sender pushes
+ * bands and reads back the odd byte, the receiver takes four megabaud and sends
+ * the odd byte.  So both want a large receive ring - thirty-two kilobytes,
+ * about a hundred and forty milliseconds, which is what stops the receiver
+ * dropping bands under load - and neither wants a large transmit one.
+ *
+ * The transmit buffer was thirty-two kilobytes for a while, for an experiment
+ * that let the sender's write return before the wire had taken it; that
+ * experiment is gone (the wire is synchronous now), and the two rings together
+ * were sixty-four kilobytes, which the CYD - 179 KB, no PSRAM - could not
+ * allocate on top of the receiver's own audio ring: `UART driver malloc
+ * error`, and a screen that stayed dark.  Two kilobytes is what a synchronous
+ * writer needs; it paces on the wire, which is correct.  The port halves each
+ * until they fit, transmit first, so a board that still cannot have the receive
+ * ring gets a smaller one rather than failing to open the port.
  */
-#define AG_IO_UART_RX_BUF 8192
+#define AG_IO_UART_RX_BUF 32768
 #define AG_IO_UART_TX_BUF 2048
+/* And what the console keeps: a shell's worth, the sizes that were the only
+ * sizes until the picture link needed more. */
+#define AG_IO_UART_CON_RX_BUF 4096
+#define AG_IO_UART_CON_TX_BUF 2048
+/*
+ * Thirty-two for receive as well, now.  The note above about the CYD not
+ * having 32 KB in one piece was true while that board also started a Wi-Fi
+ * stack at boot; it does not any more - it is a monitor, and the radio was
+ * costing it seventy kilobytes to do nothing - and with 108 KB in its largest
+ * block the ring fits.  The port halves each buffer until the pair fits,
+ * transmit first, so a board that still cannot have it gets a smaller one and
+ * works rather than failing to open the port.  What the sixteen was costing:
+ * eight per cent of the picture's bands corrupted at full load and none at a
+ * fifth of it, which is a receiver falling behind, not a line.
+ */
+/*
+ * A port whose link goes by DMA reads and writes neither ring: the DMA takes
+ * the FIFO itself.  The driver stays installed (the line's settings go
+ * through it) with the least it accepts - on the C3's 16 Mbaud wire the two
+ * rings were 10 KB of a 97 KB link that nothing ever touched.
+ */
+#define AG_IO_UART_DMA_RX_BUF 256
+#define AG_IO_UART_DMA_TX_BUF 0
+
+/* A port up, with the driver's rings this size if it comes up now. */
+static ag_err_t uart_bring_up_sized(int port, const ag_port_uart_cfg_t *want,
+                                    uint32_t rx_bytes, uint32_t tx_bytes);
 
 /*
  * A caller with more to send than AG_PORT_SPI_MAX_XFER splits it, and a chip
@@ -488,6 +553,14 @@ static ag_err_t io_i2c_probe(int bus, uint8_t addr)
 typedef struct {
     int  cs;  /* the chip select this bus is set up for, AG_PIN_NONE if none */
     bool up;
+    /*
+     * Which end of the clock the bus came up as.  It cannot change afterwards:
+     * the port has a device table and a set of pins on one end and a single
+     * transaction pair on the other, and the master and slave entry points are
+     * answered from different state.  A caller asking for the other role gets
+     * -AG_EBUSY rather than a bus that looks open and transfers nothing.
+     */
+    bool slave;
 } spi_state_t;
 
 static spi_state_t s_spi[AG_SPI_BUSES];
@@ -495,14 +568,35 @@ static spi_state_t s_spi[AG_SPI_BUSES];
 /* The chip's number (2 or 3) is what BOARD.CFG and the ABI both use. */
 static int spi_index(int bus) { return bus - AG_SPI_FIRST; }
 
-static ag_err_t spi_bring_up(int bus)
+/*
+ * `cs` is the slave's select input and is only read when slave is true: the
+ * master takes its selects one at a time, on the transfers that use them (see
+ * spi_take_cs), while a slave hands its one select to the driver at init and
+ * has no transfer call to carry another.
+ */
+static ag_err_t spi_bring_up(int bus, bool slave, int cs)
 {
     const int idx = spi_index(bus);
     if (idx < 0 || idx >= AG_SPI_BUSES) {
         return -AG_ERANGE;
     }
     if (s_spi[idx].up) {
+        if (s_spi[idx].slave != slave) {
+            return -AG_EBUSY;
+        }
+        /*
+         * A slave's select is handed to the driver once, at init, so a second
+         * open naming a different pin cannot take effect.  Saying so is better
+         * than answering "open" to a caller who now believes another pin
+         * selects this board.
+         */
+        if (slave && s_spi[idx].cs != cs) {
+            return -AG_EBUSY;
+        }
         return AG_OK;
+    }
+    if (slave && cs < 0) {
+        return -AG_EINVAL;
     }
 
     const ag_board_spi_t *cfg = &ag_board()->spi[idx];
@@ -525,22 +619,53 @@ static ag_err_t spi_bring_up(int bus)
     char why[AG_IO_REASON_MAX];
     snprintf(why, sizeof(why), "spi%d", bus);
 
-    const int16_t pins[] = {cfg->sck, cfg->mosi, cfg->miso};
-    ag_err_t      claimed = reserve_bus_pins(pins, 3, why);
+    /* The slave's select is claimed with the rest: nobody else may drive the
+     * pin that decides whether this board answers. */
+    const int16_t  pins[] = {cfg->sck, cfg->mosi, cfg->miso, (int16_t)cs};
+    const unsigned count = slave ? 4u : 3u;
+    ag_err_t       claimed = reserve_bus_pins(pins, count, why);
     if (claimed != AG_OK) {
         return claimed;
     }
 
     const ag_err_t rc =
-        ag_port_spi_open(bus, cfg->sck, cfg->mosi, cfg->miso, cfg->khz);
+        slave ? ag_port_spi_slave_open(bus, cfg->sck, cfg->mosi, cfg->miso, cs,
+                                       cfg->khz)
+              : ag_port_spi_open(bus, cfg->sck, cfg->mosi, cfg->miso, cfg->khz);
     if (rc != AG_OK) {
         return rc;
     }
 
+    /*
+     * The bus is up, so it is recorded as up before the drive strength is
+     * applied.  The strength is a tuning of a bus that exists, and failing the
+     * bring-up over it would leave a bus that is initialized and claimed but
+     * that this layer believes is not there - the next caller would try to
+     * claim the same pins and be refused for a reason that is not true.
+     */
     s_spi[idx].up = true;
-    s_spi[idx].cs = AG_PIN_NONE;
-    ag_log(AG_LOG_INFO, "io", "spi%d up on sck=%d mosi=%d miso=%d at %u kHz",
-           bus, cfg->sck, cfg->mosi, cfg->miso, (unsigned)cfg->khz);
+    s_spi[idx].slave = slave;
+    s_spi[idx].cs = slave ? cs : AG_PIN_NONE;
+
+    if (cfg->drive >= 0) {
+        const ag_err_t drv = ag_port_spi_set_drive(bus, cfg->drive);
+        if (drv != AG_OK) {
+            /*
+             * Worth saying out loud rather than swallowing: at this project's
+             * own wiring the default strength makes a link look broken in a way
+             * nothing else explains, so a board that asked for the weakest
+             * setting and did not get it has an unexplained link rather than a
+             * bus that failed to open.  See docs/plans/cluster.md.
+             */
+            ag_log(AG_LOG_WARN, "io", "spi%d drive %d not applied: %d", bus,
+                   (int)cfg->drive, (int)drv);
+        }
+    }
+
+    ag_log(AG_LOG_INFO, "io",
+           "spi%d up as %s on sck=%d mosi=%d miso=%d at %u kHz", bus,
+           slave ? "slave" : "master", cfg->sck, cfg->mosi, cfg->miso,
+           (unsigned)cfg->khz);
     return AG_OK;
 }
 
@@ -588,7 +713,7 @@ static ag_err_t io_spi_config(int bus, int cs, uint32_t khz)
     }
 
     lock();
-    ag_err_t err = spi_bring_up(bus);
+    ag_err_t err = spi_bring_up(bus, false, AG_PIN_NONE);
     if (err == AG_OK) {
         err = spi_take_cs(bus, cs);
     }
@@ -610,7 +735,7 @@ static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
     }
 
     lock();
-    ag_err_t err = spi_bring_up(bus);
+    ag_err_t err = spi_bring_up(bus, false, AG_PIN_NONE);
     if (err == AG_OK) {
         err = spi_take_cs(bus, cs);
     }
@@ -621,11 +746,412 @@ static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
     return err;
 }
 
+/*
+ * The bus as a slave.  Same pins out of BOARD.CFG as the master's, same lazy
+ * bring-up and the same ownership: the select is claimed here as well, because
+ * whoever drives it decides whether this board answers at all.
+ *
+ * `khz` is what the caller expects the peer to clock at and is not applied -
+ * the master on the other end owns the clock.  It is checked for being a real
+ * rate so that a caller who passed zero, which is nobody's clock, hears about
+ * it here rather than at the far end of a link that never moves.
+ */
+static ag_err_t io_spi_slave_open(int bus, int cs, uint32_t khz)
+{
+    if (cs < 0 || khz == 0) {
+        return -AG_EINVAL;
+    }
+
+    lock();
+    const ag_err_t err = spi_bring_up(bus, true, cs);
+    unlock();
+    return err;
+}
+
+/*
+ * One block, both directions at once, ending when the peer lets the select go.
+ *
+ * The bus has to have been opened as a slave already, and that is not a
+ * formality: the select pin came in with that call and there is nowhere on a
+ * transfer to put another one, so a transfer with no slave open has nothing to
+ * answer to.  -AG_ENODEV is that answer, and it is different from the timeout
+ * below - one is a call made in the wrong order, the other a peer that did not
+ * clock.
+ */
+static ag_err_t io_spi_slave_xfer(int bus, const void *tx, void *rx, size_t len,
+                                  uint32_t timeout_ms)
+{
+    if (len == 0 || len > AG_PORT_SPI_MAX_XFER) {
+        return -AG_EINVAL;
+    }
+    if (tx == NULL && rx == NULL) {
+        return -AG_EINVAL;
+    }
+
+    lock();
+    const int idx = spi_index(bus);
+    ag_err_t  err;
+    if (idx < 0 || idx >= AG_SPI_BUSES) {
+        err = -AG_ERANGE;
+    } else if (!s_spi[idx].up || !s_spi[idx].slave) {
+        err = -AG_ENODEV;
+    } else {
+        /*
+         * The lock is the kernel's io lock and the wait can be as long as the
+         * caller asked for.  That is deliberate and the same shape as the
+         * master path: the port serialises one transaction at a time on the
+         * bus, and this layer serialises the pin bookkeeping that a second
+         * caller would otherwise walk while this one is blocked.
+         */
+        err = ag_port_spi_slave_xfer(bus, tx, rx, len, timeout_ms);
+    }
+    unlock();
+    return err;
+}
+
+/* ---------------------------------------------------------------------- */
+/* The slave link service                                                 */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * The other half of the slave story (ABI 0.57).
+ *
+ * spi_slave_xfer above is one transaction and its caller waits for it, which is
+ * all a slave is and not enough to carry a link: between one transfer
+ * completing and the next being queued there is nobody listening, and on this
+ * wire the peer's select pulse that falls in that window is lost.  So the queue
+ * is kept armed by a task of the kernel's, at a priority the kernel chooses -
+ * src/net/spilink.c has the measurement and the numbers - and what is handed to
+ * the upper layer is bytes.
+ *
+ * The bus comes up through exactly the path the master takes: pins and clock
+ * from BOARD.CFG's spi<bus> section, the drive strength applied in
+ * spi_bring_up, the select claimed with the rest.  There is no second pin
+ * parser here or there, and that is deliberate - a link whose pins are read
+ * twice is a link that can be wired two ways.
+ */
+static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *cfg);
+
+static int32_t io_uart_dma_write(int port, const void *buf, size_t len)
+{
+    if (buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+
+    /*
+     * Same shape as the ordinary write, and the same reason for the lock being
+     * where it is: bring-up under it, the transfer outside.  A DMA transfer is
+     * even longer than a buffered write - it returns when the last byte has
+     * left the wire - so holding the io lock across it would be the same
+     * silent board, only for longer.
+     */
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return err;
+    }
+    return ag_port_uart_dma_write(port, buf, len);
+}
+
+static ag_err_t io_uart_tx_wait(int port, uint32_t timeout_ms)
+{
+    if (!ag_port_uart_is_open(port)) {
+        return AG_OK; /* nothing of ours is in a port that is not open */
+    }
+    return ag_port_uart_tx_wait(port, timeout_ms);
+}
+
+static int32_t io_uart_dma_submit(int port, const void *buf, size_t len)
+{
+    if (buf == NULL || len == 0) {
+        return -AG_EINVAL;
+    }
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return err;
+    }
+    return ag_port_uart_dma_submit(port, buf, len);
+}
+
+static ag_err_t io_uart_dma_drain(int port)
+{
+    if (!ag_port_uart_is_open(port)) {
+        return AG_OK;
+    }
+    return ag_port_uart_dma_drain(port);
+}
+
+static bool io_uart_dma_ready(int port)
+{
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return false;
+    }
+    return ag_port_uart_dma_ready(port);
+}
+
+/*
+ * The framed link over a UART (ABI 0.61): the port up at the baud asked for,
+ * with BOARD.CFG's pins, exactly as uart_config brings it up, and its DMA -
+ * then the link's own tasks own it until close.
+ */
+static ag_err_t io_uart_link_open(int port, uint32_t baud, uint32_t frame,
+                                  uint32_t flags)
+{
+    if (baud == 0u) {
+        return -AG_EINVAL;
+    }
+    const ag_port_uart_cfg_t cfg = {
+        .baud = baud, .data_bits = 8, .parity = 0, .stop_bits = 1};
+    /*
+     * Through the driver, its receive ring holds what the other end may have
+     * in flight - this end's room, three frames - and not the 8 KB a reader
+     * with no flow control needs: the link's own task empties it at once.
+     */
+    bool dma = (flags & AG_UARTLINK_DMA) != 0u;
+    /*
+     * AND ONLY WHERE THE DMA IS THIS PORT'S TO HAVE (6 Oct 2026).  The C3 in
+     * the middle of three boards has one UHCI and two wires: the wire to the
+     * CYD took it, the wire to the Zero asked for it as well and was refused
+     * outright - "uart0 would not open as a link at 8000000 baud by DMA: -45"
+     * - so the Zero was never in the cluster.  `dma = auto` means by DMA
+     * where the chip can, and through the driver where it cannot; a channel
+     * that is another wire's is a "cannot".
+     */
+    if (dma && !ag_port_uart_dma_available(port)) {
+        ag_log(AG_LOG_INFO, "io",
+               "uart%d: the chip's DMA is another wire's; this one goes "
+               "through the driver",
+               port);
+        dma = false;
+        flags &= ~(uint32_t)AG_UARTLINK_DMA;
+    }
+    /*
+     * EACH WAY AS THE CHIP DOES IT BEST, not as a board's file says (1 Oct
+     * 2026).  The ESP32 receives by DMA and sends through the driver; the S3
+     * sends by DMA and receives through the driver; the C3 does both by DMA.
+     * Whatever goes through the driver has its ring there.
+     */
+    const bool     dma_tx = dma && ag_port_uart_dma_can_send();
+    const bool     dma_rx = dma && ag_port_uart_dma_can_receive();
+    const uint32_t f = ag_uartlink_frame(frame);
+    lock();
+    ag_err_t err = uart_bring_up_sized(
+        port, &cfg, dma_rx ? AG_IO_UART_DMA_RX_BUF : 4u * f,
+        dma_tx ? AG_IO_UART_DMA_TX_BUF : AG_IO_UART_TX_BUF);
+    unlock();
+    if (err == AG_OK && dma_tx && !ag_port_uart_dma_ready(port)) {
+        err = -AG_ENOTSUP; /* asked for DMA on a port that has none */
+    }
+    if (err == AG_OK) {
+        err = ag_uartlink_open(port, baud, frame, flags);
+    }
+    if (err != AG_OK) {
+        ag_log(AG_LOG_WARN, "io", "uart%d link open failed: %d", port,
+               (int)err);
+    }
+    return err;
+}
+
+static ag_err_t io_uart_link_close(int port)
+{
+    return ag_uartlink_close(port, NULL);
+}
+
+static int32_t io_uart_dma_read(int port, void *buf, size_t len,
+                                uint32_t timeout_ms)
+{
+    lock();
+    const ag_err_t err = uart_bring_up(port, NULL);
+    unlock();
+    if (err != AG_OK) {
+        return err;
+    }
+    return ag_port_uart_dma_read(port, buf, len, timeout_ms);
+}
+
+static ag_err_t io_spi_link_open2(int bus, int cs, uint32_t khz,
+                                  uint32_t frame, uint32_t flags)
+{
+    if ((flags & AG_SPILINK_MASTER) == 0u) {
+        /* the slave end: the same bring-up as the raw link */
+        if (cs < 0 || khz == 0) {
+            return -AG_EINVAL;
+        }
+        lock();
+        ag_err_t err = spi_bring_up(bus, true, cs);
+        if (err == AG_OK) {
+            const int idx = spi_index(bus);
+            err = ag_spilink_open2(bus, cs, khz, frame, flags,
+                                   ag_board()->spi[idx].sck,
+                                   ag_board()->spi[idx].mosi,
+                                   ag_board()->spi[idx].miso);
+        }
+        unlock();
+        if (err != AG_OK) {
+            ag_log(AG_LOG_WARN, "io", "spi%d link open failed: %d", bus,
+                   (int)err);
+        }
+        return err;
+    }
+    if (cs < 0 || khz == 0) {
+        return -AG_EINVAL;
+    }
+    lock();
+    ag_err_t err = spi_bring_up(bus, false, AG_PIN_NONE);
+    if (err == AG_OK) {
+        err = spi_take_cs(bus, cs);
+    }
+    if (err == AG_OK) {
+        err = ag_port_spi_set_khz(bus, cs, khz);
+    }
+    if (err == AG_OK) {
+        const int idx = spi_index(bus);
+        err = ag_spilink_open2(bus, cs, khz, frame, flags,
+                               ag_board()->spi[idx].sck,
+                               ag_board()->spi[idx].mosi,
+                               ag_board()->spi[idx].miso);
+    }
+    unlock();
+    if (err != AG_OK) {
+        ag_log(AG_LOG_WARN, "io", "spi%d master link open failed: %d", bus,
+               (int)err);
+    }
+    return err;
+}
+
+static ag_err_t io_spi_link_open(int bus, int cs, uint32_t khz, uint32_t block)
+{
+    if (cs < 0 || khz == 0) {
+        return -AG_EINVAL;
+    }
+
+    lock();
+    ag_err_t err = spi_bring_up(bus, true, cs);
+    if (err == AG_OK) {
+        /*
+         * The pins go with it so the service can build the interface again if
+         * a recovery ever finds the port's bus closed - see slave_rebuild in
+         * src/net/spilink.c.  They come from the same BOARD.CFG section
+         * spi_bring_up just read, so this is not a second reading of the
+         * configuration.
+         */
+        const int idx = spi_index(bus);
+        err = ag_spilink_open(bus, cs, khz, block, ag_board()->spi[idx].sck,
+                              ag_board()->spi[idx].mosi,
+                              ag_board()->spi[idx].miso);
+    }
+    unlock();
+
+    if (err != AG_OK) {
+        /* Said out loud: the caller is a driver that is about to decide whether
+         * it can work at all, and -AG_ENOMEM here means it asked for a block
+         * whose eight copies do not fit. */
+        ag_log(AG_LOG_WARN, "io", "spi%d link open failed: %d", bus, (int)err);
+    }
+    return err;
+}
+
+/*
+ * Stops the service, waits for it, and gives this layer's hold on the bus back.
+ *
+ * The wait is the requirement and not politeness: a driver unloads on other
+ * people's stacks, and a service task left running behind a freed image would
+ * hold port transactions and its own memory for the life of the boot.  The
+ * counters the service kept are printed here, because the service itself may
+ * not log - one of the paths that stops it runs with the device registry lock
+ * held, and the console lock sits underneath that one.
+ *
+ * The port has no way to close a slave bus, so the peripheral and the pins it
+ * reserved stay exactly as a master bus's do once spi_xfer has used one.  What
+ * goes back is this layer's record of the bus being held, which is what a later
+ * open has to find false before it brings the bus up again.
+ */
+static ag_err_t io_spi_link_close(int bus)
+{
+    ag_spilink_stats_t st;
+    memset(&st, 0, sizeof(st));
+
+    lock();
+    const ag_err_t err = ag_spilink_close(bus, &st);
+    const int      idx = spi_index(bus);
+    if (err == AG_OK && idx >= 0 && idx < AG_SPI_BUSES && s_spi[idx].up &&
+        s_spi[idx].slave) {
+        s_spi[idx].up = false;
+        s_spi[idx].slave = false;
+        s_spi[idx].cs = AG_PIN_NONE;
+    }
+    unlock();
+
+    if (err == AG_OK) {
+        ag_log(AG_LOG_INFO, "io",
+               "spi%d link closed: %u blocks clocked, %u carried bytes, "
+               "%u unarmed, %u dropped, %u errors (last %d)",
+               bus, (unsigned)st.blocks_clocked, (unsigned)st.blocks_data,
+               (unsigned)st.blocks_unarmed, (unsigned)st.bytes_dropped,
+               (unsigned)st.errors, (int)st.last_error);
+        if (st.blocks_unarmed > 0u) {
+            /* The invariant broke: a block was completed with nothing of ours
+             * armed, so something arrived while this end was not listening. */
+            ag_log(AG_LOG_WARN, "io",
+                   "spi%d link: %u block(s) completed with nothing armed", bus,
+                   (unsigned)st.blocks_unarmed);
+        }
+    } else if (st.task_stuck) {
+        ag_log(AG_LOG_ERROR, "io",
+               "spi%d link: the service task did not stop; the bus stays open",
+               bus);
+    }
+    return err;
+}
+
+/* Bytes in and out of the rings the service keeps.  Neither takes the io lock:
+ * a read waits, and the rings have a lock of their own. */
+static int32_t io_spi_link_write(int bus, const void *buf, size_t len)
+{
+    return ag_spilink_write(bus, buf, len);
+}
+
+static int32_t io_spi_link_read(int bus, void *buf, size_t len,
+                                uint32_t timeout_ms)
+{
+    return ag_spilink_read(bus, buf, len, timeout_ms);
+}
+
+/*
+ * The counters, while the link is alive.
+ *
+ * Not a convenience.  The close line was the instrument this service was built
+ * with, and the first hardware round in which the slave wedged printed nothing
+ * at all, because the board never got far enough to close the link.  A driver
+ * can read these from its own loop and the shell can ask; the one rate-limited
+ * line about a fault is printed by spilink.c from here, and not from the
+ * service task, which must never log - a device revoke stops it while holding
+ * the device registry lock, and the console lock sits under that one.
+ */
+static ag_err_t io_spi_link_stats(int bus, ag_spilink_stats_t *out)
+{
+    return ag_spilink_stats(bus, out);
+}
+
 /* ---------------------------------------------------------------------- */
 /* UART                                                                   */
 /* ---------------------------------------------------------------------- */
 
 static bool s_uart_up[AG_UART_PORTS];
+
+bool ag_io_uart_claimed(int port)
+{
+    if (port < 0 || port >= AG_UART_PORTS) {
+        return false;
+    }
+    return s_uart_up[port];
+}
 
 /*
  * What was last applied to each port, and why it is worth remembering.
@@ -653,6 +1179,25 @@ static bool uart_cfg_same(const ag_port_uart_cfg_t *a,
 }
 
 static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
+{
+    /*
+     * The big rings are for a port that carries a picture.  The console
+     * is UART0 on every board here and carries a shell; giving it the same
+     * 64 KB of buffering cost the CYD the memory to load the very program
+     * that reads the picture - `load remterm.axe failed (-12)` - on a
+     * board with 179 KB to its name.  So port 0 keeps what a console
+     * needs, and the rest get the rings, halved until they fit.  A caller
+     * that knows what its port carries (a framed link) says so through
+     * uart_bring_up_sized instead.
+     */
+    const bool console = (port == 0);
+    return uart_bring_up_sized(
+        port, want, console ? AG_IO_UART_CON_RX_BUF : AG_IO_UART_RX_BUF,
+        console ? AG_IO_UART_CON_TX_BUF : AG_IO_UART_TX_BUF);
+}
+
+static ag_err_t uart_bring_up_sized(int port, const ag_port_uart_cfg_t *want,
+                                    uint32_t rx_bytes, uint32_t tx_bytes)
 {
     if (port < 0 || port >= AG_UART_PORTS) {
         return -AG_ERANGE;
@@ -695,11 +1240,14 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
 
         /* The port applies uart_cfg itself as the last thing open() does, so
          * there is nothing to apply again here. */
-        const ag_err_t rc = ag_port_uart_open(port, &uart_cfg,
-                                              AG_IO_UART_RX_BUF,
-                                              AG_IO_UART_TX_BUF);
+        const ag_err_t rc =
+            ag_port_uart_open(port, &uart_cfg, rx_bytes, tx_bytes);
         if (rc != AG_OK) {
             return rc;
+        }
+        ag_err_t pe = ag_port_uart_pins(port, cfg->tx, cfg->rx);
+        if (pe != AG_OK) {
+            return pe;
         }
         s_uart_up[port] = true;
         s_uart_cfg[port] = uart_cfg;
@@ -717,7 +1265,7 @@ static ag_err_t uart_bring_up(int port, const ag_port_uart_cfg_t *want)
     if (err == AG_OK) {
         s_uart_cfg[port] = uart_cfg;
     }
-    return err;
+    return AG_OK;
 }
 
 static ag_err_t io_uart_config(int port, uint32_t baud, int databits,
@@ -749,17 +1297,32 @@ static int32_t io_uart_write(int port, const void *buf, size_t len)
         return -AG_EINVAL;
     }
 
+    /*
+     * The lock covers the bring-up and nothing else.
+     *
+     * It used to be held across the write as well, and the write blocks: with
+     * a transmit buffer, uart_write_bytes waits for the peripheral to make
+     * room, and a port carrying a picture at four megabaud is full most of
+     * the time.  One io lock covers every UART, and the console is a UART.  So
+     * a thread blocked in a write to the picture link held the lock the
+     * console needed to print, and anything that then printed - the game's
+     * readout, the shell, the kernel's own log - waited behind the wire.  The
+     * evening it was found, the whole board went quiet at once: no readout, no
+     * prompt, not even Ctrl+\, with the game and the kernel both alive and
+     * both waiting on a mutex held by a task that was waiting on a UART.
+     *
+     * The port's write is safe to call without this lock - the driver
+     * serialises writes to one port itself - and two ports have nothing to
+     * serialise between them.
+     */
     lock();
-    ag_err_t err = uart_bring_up(port, NULL);
-    int32_t  n = err;
-    if (err == AG_OK) {
-        n = ag_port_uart_write(port, buf, len);
-        if (n < 0) {
-            n = -AG_EIO;
-        }
-    }
+    const ag_err_t err = uart_bring_up(port, NULL);
     unlock();
-    return n;
+    if (err != AG_OK) {
+        return err;
+    }
+    const int32_t n = ag_port_uart_write(port, buf, len);
+    return (n < 0) ? -AG_EIO : n;
 }
 
 static int32_t io_uart_read(int port, void *buf, size_t len,
@@ -973,6 +1536,11 @@ const ag_io_api_t ag_io_api_table = {
     .i2c_probe = io_i2c_probe,
     .spi_xfer = io_spi_xfer,
     .uart_write = io_uart_write,
+    .uart_tx_wait = io_uart_tx_wait,
+    .uart_dma_write = io_uart_dma_write,
+    .uart_dma_submit = io_uart_dma_submit,
+    .uart_dma_drain = io_uart_dma_drain,
+    .uart_dma_ready = io_uart_dma_ready,
     .uart_read = io_uart_read,
     .uart_config = io_uart_config,
 #if AG_PORT_HAS_ADC
@@ -983,6 +1551,30 @@ const ag_io_api_t ag_io_api_table = {
     .pwm_config = io_pwm_config,
     .pwm_set = io_pwm_set,
     .spi_config = io_spi_config,
+    .spi_slave_open = io_spi_slave_open,
+    .spi_slave_xfer = io_spi_slave_xfer,
+    .spi_link_open = io_spi_link_open,
+    .uart_dma_read = io_uart_dma_read,
+    .spi_link_close = io_spi_link_close,
+    .spi_link_write = io_spi_link_write,
+    .spi_link_read = io_spi_link_read,
+    .spi_link_stats = io_spi_link_stats,
+    .spi_link_open2 = io_spi_link_open2,
+    .spi_link_write_wait = ag_spilink_write_wait,
+    .spi_link_send = ag_spilink_send,
+    .spi_link_recv = ag_spilink_recv,
+    .uart_link_open = io_uart_link_open,
+    .uart_link_close = io_uart_link_close,
+    .uart_link_stats = ag_uartlink_stats,
+    .uart_link_write = ag_uartlink_write,
+    .uart_link_write_wait = ag_uartlink_write_wait,
+    .uart_link_read = ag_uartlink_read,
+    .uart_link_send = ag_uartlink_send,
+    .uart_link_recv = ag_uartlink_recv,
+    .spi_link_send2 = ag_spilink_send2,
+    .spi_link_recv2 = ag_spilink_recv2,
+    .uart_link_send2 = ag_uartlink_send2,
+    .uart_link_recv2 = ag_uartlink_recv2,
 };
 
 ag_err_t ag_io_init(void)
@@ -1050,7 +1642,14 @@ void ag_io_register_devices(void)
             register_bus(k_spi_names[i], "spi", AG_DEV_BUS);
         }
     }
-    for (int i = 1; i < AG_UART_PORTS; i++) {
+    /* Skipping the CONSOLE's port rather than port zero, for the reason
+     * written up at the configuration loop in boot/board.c: on a board whose
+     * console is the chip's own USB, UART0 is an ordinary free port and a
+     * board that configured it would not have seen it listed in `dev`. */
+    for (int i = 0; i < AG_UART_PORTS; i++) {
+        if (i == AG_PORT_UART_CONSOLE) {
+            continue;
+        }
         const ag_board_uart_t *cfg = &ag_board()->uart[i];
         if (cfg->tx >= 0 || cfg->rx >= 0) {
             register_bus(k_uart_names[i], "uart", AG_DEV_BUS);

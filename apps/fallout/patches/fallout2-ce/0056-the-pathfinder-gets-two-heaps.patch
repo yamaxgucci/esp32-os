@@ -1,0 +1,249 @@
+diff --git a/src/animation.cc b/src/animation.cc
+--- a/src/animation.cc
++++ b/src/animation.cc
+@@ -1718,6 +1718,155 @@ int _make_path(Object* object, int from, int to, unsigned char* rotations, int a
+ 
+ // TODO: move pathfinding into another unit
+ // 0x415EFC
++/*
++ * ARGON: two heaps, so the path search stops being quadratic.
++ *
++ * The search picks the cheapest open node by scanning the open array, and
++ * finds a slot for a new node by scanning it again.  Both are linear, and
++ * the search expands up to two thousand nodes - which is exactly what it
++ * does when there is no path at all, the case that costs most.
++ *
++ * The replacement has to choose the SAME node the scan would, or critters
++ * take different routes and the game changes: the scan takes the smallest
++ * estimate+cost, and among equals the one with the smallest index.  So the
++ * heap is ordered by (estimate + cost, index), and the free slots are a
++ * heap of their own so that "the first free slot" is still the smallest.
++ *
++ * A node is never re-costed once it is in the open list (every tile is
++ * added at most once - gPathfinderProcessedTiles sees to that), so no
++ * entry in the heap ever goes stale.
++ */
++static int ag_open_heap[2000];
++static int ag_open_heap_n;
++static int ag_free_heap[2000];
++static int ag_free_heap_n;
++
++static bool ag_open_before(int a, int b)
++{
++    const int fa = gOpenPathNodeList[a].estimate + gOpenPathNodeList[a].cost;
++    const int fb = gOpenPathNodeList[b].estimate + gOpenPathNodeList[b].cost;
++
++    if (fa != fb) {
++        return fa < fb;
++    }
++    return a < b;
++}
++
++static void ag_open_push(int index)
++{
++    int at = ag_open_heap_n++;
++
++    ag_open_heap[at] = index;
++    while (at > 0) {
++        const int up = (at - 1) / 2;
++
++        if (!ag_open_before(ag_open_heap[at], ag_open_heap[up])) {
++            break;
++        }
++
++        const int swap = ag_open_heap[at];
++
++        ag_open_heap[at] = ag_open_heap[up];
++        ag_open_heap[up] = swap;
++        at = up;
++    }
++}
++
++static int ag_open_pop(void)
++{
++    if (ag_open_heap_n == 0) {
++        return -1;
++    }
++
++    const int best = ag_open_heap[0];
++
++    ag_open_heap[0] = ag_open_heap[--ag_open_heap_n];
++
++    int at = 0;
++
++    for (;;) {
++        const int left = at * 2 + 1;
++        const int right = left + 1;
++        int       small = at;
++
++        if (left < ag_open_heap_n
++                && ag_open_before(ag_open_heap[left], ag_open_heap[small])) {
++            small = left;
++        }
++        if (right < ag_open_heap_n
++                && ag_open_before(ag_open_heap[right], ag_open_heap[small])) {
++            small = right;
++        }
++        if (small == at) {
++            break;
++        }
++
++        const int swap = ag_open_heap[at];
++
++        ag_open_heap[at] = ag_open_heap[small];
++        ag_open_heap[small] = swap;
++        at = small;
++    }
++    return best;
++}
++
++static void ag_free_push(int index)
++{
++    int at = ag_free_heap_n++;
++
++    ag_free_heap[at] = index;
++    while (at > 0) {
++        const int up = (at - 1) / 2;
++
++        if (ag_free_heap[at] >= ag_free_heap[up]) {
++            break;
++        }
++
++        const int swap = ag_free_heap[at];
++
++        ag_free_heap[at] = ag_free_heap[up];
++        ag_free_heap[up] = swap;
++        at = up;
++    }
++}
++
++static int ag_free_pop(void)
++{
++    if (ag_free_heap_n == 0) {
++        return -1;
++    }
++
++    const int best = ag_free_heap[0];
++
++    ag_free_heap[0] = ag_free_heap[--ag_free_heap_n];
++
++    int at = 0;
++
++    for (;;) {
++        const int left = at * 2 + 1;
++        const int right = left + 1;
++        int       small = at;
++
++        if (left < ag_free_heap_n && ag_free_heap[left] < ag_free_heap[small]) {
++            small = left;
++        }
++        if (right < ag_free_heap_n
++                && ag_free_heap[right] < ag_free_heap[small]) {
++            small = right;
++        }
++        if (small == at) {
++            break;
++        }
++
++        const int swap = ag_free_heap[at];
++
++        ag_free_heap[at] = ag_free_heap[small];
++        ag_free_heap[small] = swap;
++        at = small;
++    }
++    return best;
++}
++
+ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotations, int a5, PathBuilderCallback* callback)
+ {
+     const uint32_t ag_pf0 = ag_us();
+@@ -1753,6 +1902,15 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+         gOpenPathNodeList[index].tile = -1;
+     }
+ 
++    /* Slot 0 holds the start; every other slot is free, and the heap hands
++     * them out smallest first, exactly as the old scan found them. */
++    ag_open_heap_n = 0;
++    ag_free_heap_n = 0;
++    for (int index = 1999; index >= 1; index -= 1) {
++        ag_free_push(index);
++    }
++    ag_open_push(0);
++
+     int toScreenX;
+     int toScreenY;
+     tileToScreenXY(to, &toScreenX, &toScreenY, object->elevation);
+@@ -1762,26 +1920,16 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+     PathNode temp;
+ 
+     while (1) {
+-        int v63 = -1;
+-
+-        PathNode* prev = nullptr;
+-        int v12 = 0;
+         const uint32_t ag_scan0 = ag_us();
+-
+-        for (int index = 0; v12 < openPathNodeListLength; index += 1) {
+-            PathNode* curr = &(gOpenPathNodeList[index]);
+-            if (curr->tile != -1) {
+-                v12++;
+-                if (v63 == -1 || (curr->estimate + curr->cost) < (prev->estimate + prev->cost)) {
+-                    prev = curr;
+-                    v63 = index;
+-                }
+-            }
+-        }
++        const int      v63 = ag_open_pop();
+ 
+         ag_pf_scan_us += ag_us() - ag_scan0;
+         ag_pf_scan_n++;
+ 
++        if (v63 < 0) {
++            break;
++        }
++
+         PathNode* curr = &(gOpenPathNodeList[v63]);
+ 
+         memcpy(&temp, curr, sizeof(temp));
+@@ -1789,6 +1937,7 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+         openPathNodeListLength -= 1;
+ 
+         curr->tile = -1;
++        ag_free_push(v63);
+ 
+         if (temp.tile == to) {
+             if (openPathNodeListLength == 0) {
+@@ -1832,17 +1981,16 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+                 }
+             }
+ 
+-            int v25 = 0;
+             const uint32_t ag_slot0 = ag_us();
++            int            v25 = ag_free_pop();
+ 
+-            for (; v25 < 2000; v25++) {
+-                if (gOpenPathNodeList[v25].tile == -1) {
+-                    break;
+-                }
+-            }
+             ag_pf_slot_us += ag_us() - ag_slot0;
+             ag_pf_slot_n++;
+ 
++            if (v25 < 0) {
++                v25 = 2000;   /* as before: nothing free, the list is full */
++            }
++
+             openPathNodeListLength += 1;
+ 
+             if (openPathNodeListLength == 2000) {
+@@ -1886,6 +2034,10 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
+                     }
+                 }
+             }
++
++            /* Costed and settled: into the heap, ordered by
++             * (estimate + cost, index) exactly as the scan was. */
++            ag_open_push(v25);
+         }
+ 
+         if (openPathNodeListLength == 0) {

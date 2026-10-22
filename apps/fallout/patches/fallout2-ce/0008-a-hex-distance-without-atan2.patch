@@ -1,0 +1,131 @@
+diff --git a/src/tile.cc b/src/tile.cc
+index 0ac02c4..26cd48d 100644
+--- a/src/tile.cc
++++ b/src/tile.cc
+@@ -792,6 +792,89 @@ int tileFromScreenXY(int screenX, int screenY, int elevation, bool ignoreBounds)
+     return -1;
+ }
+ 
++/*
++ * ARGON: the angle of a step, in whole degrees, without floating point.
++ *
++ * tileDistanceBetween below walks the hex grid one tile at a time and asks at
++ * every step which of six directions points at the target.  It asked with
++ * atan2 on doubles.  This chip has no double precision in hardware, so every
++ * step was a call into __floatsidf, __ieee754_atan2, __muldf3, trunc and
++ * __fixdfsi - and a distance of thirty tiles is thirty of those.  Standing on
++ * a map with a debugger attached, forty samples of the program counter out of
++ * forty landed inside that chain.
++ *
++ * What the caller needs is trunc(degrees(atan2(y, x))), and only ever to put
++ * it in one of six sixty-degree buckets.  A table of tan(k degrees) and one
++ * 64-bit comparison per probe gives the same integer.
++ *
++ * "The same" is worth being careful about, because a bucket boundary that
++ * moves changes which way the walk steps.  The buckets fall on whole degrees,
++ * so the two disagree only when the true angle is within about 1e-8 of one -
++ * and with tile coordinates being small integers, the closest a ratio of them
++ * comes to an irrational tan(k) is around 6e-8.  The two angles that can land
++ * exactly on a degree, 0 and 45, are handled by name.
++ */
++static const int64_t kTanDeg[90] = {
++    0, 18742233, 37495890, 56272424, 75083342, 93940237,
++    112854813, 131838918, 150904572, 170063997, 189329653, 208714267,
++    228230870, 247892832, 267713904, 287708254, 307890513, 328275819,
++    348879867, 369718959, 390810063, 412170869, 433819856, 455776363,
++    478060660, 500694035, 523698879, 547098785, 570918654, 595184811,
++    619925131, 645169177, 670948357, 697296093, 724248005, 751842119,
++    780119099, 809122500, 838899053, 869498984, 900976368, 933389527,
++    966801480, 1001280449, 1036900426, 1073741823, 1111892207, 1151447134,
++    1192511107, 1235198671, 1279635676, 1325960725, 1374326862, 1424903527,
++    1477878833, 1533462245, 1591887718, 1653417414, 1718346116, 1787006487,
++    1859775393, 1937081527, 2019414665, 2107336983, 2201496986, 2302646772,
++    2411663622, 2529577216, 2657604272, 2797193084, 2950081415, 3118372685,
++    3304637534, 3512051256, 3744582745, 4007259041, 4306543235, 4650886805,
++    5051558114, 5523922812, 6089492485, 6779339067, 7640070064, 8744925388,
++    10215971043, 12272925207, 15355223470, 20488214511, 30747942832, 61514627898,
++};
++
++/* floor of atan(y/x) in degrees, for y >= 0 and x > 0; result in [0, 90). */
++static int argonAtanDegFloor(int y, int x)
++{
++    int lo = 0;
++    int hi = 89;
++    const int64_t scaled = (int64_t)y << 30;
++
++    while (lo < hi) {
++        const int mid = (lo + hi + 1) / 2;
++        if (kTanDeg[mid] * (int64_t)x <= scaled) {
++            lo = mid;
++        } else {
++            hi = mid - 1;
++        }
++    }
++    return lo;
++}
++
++/* trunc(degrees(atan2(y, x))) for x != 0, which is all the caller asks for. */
++static int argonAngleDeg(int y, int x)
++{
++    const int ax = x < 0 ? -x : x;
++    const int ay = y < 0 ? -y : y;
++    const int a = argonAtanDegFloor(ay, ax);
++    const bool exact = (ay == 0) || (ay == ax);
++
++    if (x > 0) {
++        return y < 0 ? -a : a;
++    }
++    if (y < 0) {
++        return exact ? a - 180 : a - 179;
++    }
++    return exact ? 180 - a : 179 - a;
++}
++
++/*
++ * ARGON: what the walking costs, for the frame-rate line.  Steps matter more
++ * than calls: every step used to be an atan2.
++ */
++extern "C" unsigned ag_tiledist_calls;
++extern "C" unsigned ag_tiledist_steps;
++extern "C" unsigned ag_tiledist_gaveup;
++
+ // tile_distance
+ // 0x4B185C
+ int tileDistanceBetween(int tile1, int tile2)
+@@ -813,8 +896,27 @@ int tileDistanceBetween(int tile1, int tile2)
+     int y1;
+     tileToScreenXY(tile2, &x1, &y1, 0);
+ 
++    /*
++     * ARGON: and a bound on the walk.
++     *
++     * The loop below steps towards the target and stops when it arrives.  It
++     * has nothing to say about a target it cannot reach - a tile off the grid,
++     * or a step that oscillates at a row boundary - and there it never stops:
++     * the game keeps both cores busy in this function and draws no more
++     * frames, which is what it did on entering a map, on some runs and not
++     * others.  No two tiles on a grid this size are further apart than its
++     * width plus its height, so more steps than that is not a distance.
++     */
++    const int limit = gHexGridWidth + gHexGridHeight;
++
++    ag_tiledist_calls++;
+     v2 = tile1;
+     for (i = 0; v2 != tile2; i++) {
++        if (i >= limit) {
++            ag_tiledist_gaveup++;
++            return limit;
++        }
++        ag_tiledist_steps++;
+         // TODO: Looks like inlined rotation_to_tile.
+         int x2;
+         int y2;
+@@ -830,7 +932,7 @@ int tileDistanceBetween(int tile1, int tile2)
+                 v9 = 2;
+             }
+         } else {
+-            v8 = (int)trunc(atan2((double)-dy, (double)dx) * 180.0 * 0.3183098862851122);
++            v8 = argonAngleDeg(-dy, dx);
+ 
+             v9 = 360 - (v8 + 180) - 90;
+             if (v9 < 0) {

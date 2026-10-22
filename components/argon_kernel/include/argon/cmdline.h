@@ -15,7 +15,13 @@
 extern "C" {
 #endif
 
-#define AG_ARGV_MAX 16
+/*
+ * Sixteen was enough for a shell command and far too few for an application
+ * driven by flags: a game started with twenty-seven words silently received
+ * fifteen, and every switch past the cut looked like a switch that did not
+ * work.  Raised, and the shell now says when a line still does not fit.
+ */
+#define AG_ARGV_MAX 48
 
 /*
  * Splits `line` in place into arguments.  Whitespace separates; double quotes

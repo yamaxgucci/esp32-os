@@ -8,7 +8,10 @@
 #include <setjmp.h>
 #include <string.h>
 
+#include <argon/budget.h>
+#include <argon/clu.h>
 #include <argon/console.h>
+#include <argon/device.h>
 #include <argon/hostfs.h>
 #include <argon/session.h>
 #include <argon/audio.h>
@@ -18,7 +21,9 @@
 #include <argon/loader.h>
 #include <argon/power.h>
 #include <argon/log.h>
+#include <argon/net.h>
 #include <argon/path.h>
+#include <argon/place.h>
 #include <argon/shell.h>
 #include <argon/vfs.h>
 
@@ -32,6 +37,39 @@
 #include "dev/io.h"
 #include "fs/storage.h"
 #include "proc/supervisor.h"
+
+/*
+ * Which of a program's declared needs THIS node cannot meet.
+ *
+ * Lives here, alone, because three different questions are the same question:
+ * the loader refusing to start something, another node being asked whether it
+ * could, and the shell deciding which node should get it.  Three copies of
+ * these tests would agree on the day they were written and disagree later, and
+ * the way that failure shows up is a program sent to a board that then refuses
+ * it - which reads as a broken cluster, not as a stale test.
+ *
+ * A device LISTING cannot replace this.  Every node has a sound device, because
+ * pcmnull is one; only `present()` distinguishes a board that can make a noise
+ * from a board that will swallow it.
+ */
+uint32_t ag_proc_unmet_needs(uint32_t axe_flags)
+{
+    uint32_t unmet = 0;
+
+    if ((axe_flags & AG_AXE_NEEDS_GFX) != 0 && !ag_display_ready()) {
+        unmet |= AG_AXE_NEEDS_GFX;
+    }
+    if ((axe_flags & AG_AXE_NEEDS_NET) != 0 && ag_loader_api()->net == NULL) {
+        unmet |= AG_AXE_NEEDS_NET;
+    }
+    if ((axe_flags & AG_AXE_NEEDS_AUDIO) != 0 &&
+        (ag_loader_api()->audio == NULL ||
+         ag_loader_api()->audio->present == NULL ||
+         !ag_loader_api()->audio->present())) {
+        unmet |= AG_AXE_NEEDS_AUDIO;
+    }
+    return unmet;
+}
 
 /* Stack, in bytes, and the arena an application allocates from. */
 #define AG_PROC_STACK_MIN (2u * 1024u)
@@ -53,12 +91,41 @@
 #define AG_PROC_HEAP_MIN (16u * 1024u)
 
 /* How long a process is given to leave the kernel before it is killed anyway. */
-#define AG_PROC_KILL_GRACE_MS 500
+#define AG_PROC_KILL_GRACE_MS 2000
 
-static proc_t            s_procs[AG_PROC_MAX];
+/*
+ * The table, on the heap from ag_proc_init, and walked only up to s_proc_n -
+ * zero until then, so a lookup before it exists (a fault early in the boot)
+ * finds nobody rather than a NULL.
+ *
+ * Not static storage, and the reason is the ESP32-S3's link and not the
+ * runtime: its internal SRAM is one pool seen through two windows, and the
+ * static window ends where the code arena and IRAM push it.  The merge of
+ * 25 Sep 2026 left the S3 7 400 bytes past that end with nothing wasted;
+ * these 8.9 KB are the same internal memory either way (AG_MEM_FAST), taken
+ * at boot from the heap instead of from the window.
+ */
+static proc_t           *s_procs;
+static uint32_t          s_proc_n;
 static ag_port_mutex_t        s_lock;
 static ag_pid_t          s_next_pid = 1;
 static ag_pid_t          s_foreground = AG_PID_KERNEL;
+
+/*
+ * How many processes currently have an output sink of their own.  Kept so the
+ * console can skip asking on every write, which is the common case by far: a
+ * board is not usually running anything for anybody else.
+ */
+static volatile uint32_t s_sinks;
+
+/* Giving a slot back.  Never a bare memset: a slot with a sink is counted. */
+static void release_slot(proc_t *p)
+{
+    if (p->out_sink != NULL && s_sinks > 0) {
+        s_sinks--;
+    }
+    memset(p, 0, sizeof(*p));
+}
 
 /* ---------------------------------------------------------------------- */
 
@@ -114,13 +181,13 @@ static proc_t *current(void)
 {
     const ag_port_task_t me = ag_port_task_self();
 
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         if (s_procs[i].used && s_procs[i].task == me) {
             return &s_procs[i];
         }
     }
 
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         proc_t *p = &s_procs[i];
         if (!p->used) {
             continue;
@@ -142,13 +209,15 @@ static proc_t *by_pid(ag_pid_t pid)
     if (pid == AG_PID_KERNEL) {
         return NULL;
     }
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         if (s_procs[i].used && s_procs[i].pid == pid) {
             return &s_procs[i];
         }
     }
     return NULL;
 }
+
+proc_t *ag_proc_by_pid(ag_pid_t pid) { return by_pid(pid); }
 
 const char *ag_proc_state_name(ag_proc_state_t state)
 {
@@ -172,6 +241,51 @@ const char *ag_proc_state_name(ag_proc_state_t state)
  * an application cannot fragment the kernel's heap, and the numbers an
  * application sees in ag_meminfo are about itself rather than about the machine.
  */
+
+/*
+ * And where it went, when the largest block is smaller than what is free.
+ *
+ * The gap between the two is something lying in the middle, and on 8 Oct 2026
+ * it was the whole question: Fallout's 6000 KB arena refused next to 6041 KB
+ * free.  Every block of 32 KB or more goes to the journal in address order,
+ * so the refusal names its own obstacle - `mem /x` afterwards is too late,
+ * the image's data is already given back.  Recorded first, logged after: the
+ * walk holds the heap, and nothing may allocate under it.
+ */
+#define ARENA_MAP_BIG   (32u * 1024u)
+#define ARENA_MAP_LINES 24
+
+typedef struct {
+    uintptr_t addr[ARENA_MAP_LINES];
+    uint32_t  kb[ARENA_MAP_LINES];
+    uint8_t   used[ARENA_MAP_LINES];
+    unsigned  n;
+} arena_map_t;
+
+static void arena_map_block(void *ctx, const void *addr, size_t bytes, int used)
+{
+    arena_map_t *m = (arena_map_t *)ctx;
+    if (bytes < ARENA_MAP_BIG || m->n == ARENA_MAP_LINES) {
+        return;
+    }
+    m->addr[m->n] = (uintptr_t)addr;
+    m->kb[m->n] = (uint32_t)(bytes / 1024u);
+    m->used[m->n] = (uint8_t)(used != 0);
+    m->n++;
+}
+
+static void arena_refused_map(void)
+{
+    static arena_map_t m;
+    memset(&m, 0, sizeof(m));
+    ag_port_mem_walk(AG_MEM_SLOW, arena_map_block, &m);
+    for (unsigned i = 0; i < m.n; i++) {
+        ag_log(AG_LOG_ERROR, "proc", "  extended %08x %5u KB %s",
+               (unsigned)m.addr[i], (unsigned)m.kb[i],
+               m.used[i] ? "used" : "free");
+    }
+}
+
 static ag_err_t heap_create(proc_t *p, uint32_t requested)
 {
     const bool required = requested != 0;
@@ -192,7 +306,11 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
      * that asked for a size is not touched: it gets what it asked for or it
      * does not start.
      */
-    if (!required) {
+    if (required) {
+        if (size < AG_PROC_HEAP_MIN) {
+            size = AG_PROC_HEAP_MIN;
+        }
+    } else {
         size_t pool = ag_port_mem_free(AG_MEM_SLOW);
         if (pool == 0) {
             pool = ag_port_mem_free(AG_MEM_FAST);
@@ -200,13 +318,36 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
         if (size > pool / 4u) {
             size = pool / 4u;
         }
+        /*
+         * THE FLOOR IS FOR A SIZE THE APPLICATION NAMED, NOT FOR A DEFAULT.
+         *
+         * This used to be a plain `if (size < AG_PROC_HEAP_MIN) size = ...`
+         * after the cap, and on a board with no PSRAM the floor silently
+         * overruled the cap - which is the one case the cap exists for.
+         * Measured on the C3: 34 KB of internal free at rest, so a quarter of
+         * the pool is 8.5 KB, which the 16 KB floor put back to 16.  The cap
+         * was written so that a default arena does not eat a small machine,
+         * and it handed that machine a quarter of itself anyway.
+         *
+         * Where the pool is under 64 KB there is no arena a DEFAULT can
+         * honestly have, and the honest answer is the one docs/13-memory.md
+         * already states: an application that names no heap gets none, and its
+         * ag_malloc returns NULL, rather than the machine paying 16 KB for a
+         * promise nobody made.  Measured, on the boards in this tree: the C3
+         * (34 KB free) now gives none; the CYD, the S3 and the QEMU build all
+         * have a pool whose quarter is above the floor and are unchanged.
+         *
+         * This is not a nicety on the C3, it is the difference between one
+         * guest and two: an 8 KB stack plus a 16 KB arena is 24 KB of the 34
+         * that board has, and the SECOND program - always the neighbour's
+         * build being substituted for a foreign one - is refused at 8 KB.
+         */
+        if (size < AG_PROC_HEAP_MIN) {
+            size = 0;
+        }
     }
 
-    if (size < AG_PROC_HEAP_MIN) {
-        size = AG_PROC_HEAP_MIN;
-    }
-
-    for (;;) {
+    while (size >= AG_PROC_HEAP_MIN) {
         /* PSRAM, then byte-accessible D/IRAM, then ordinary internal - so the
          * arena does not carve the DMA-capable DRAM the radio needs whole (see
          * data_alloc in src/loader/loader.c). */
@@ -231,20 +372,31 @@ static ag_err_t heap_create(proc_t *p, uint32_t requested)
         /*
          * An image that asked for a size needs that size: refusing to start is
          * better than starting something that will fail halfway through.  One
-         * that took the default gets whatever is available instead.
+         * that took the default gets whatever is available instead - and,
+         * below the floor, nothing at all.
          */
-        if (required || size <= AG_PROC_HEAP_MIN) {
+        if (required) {
             break;
         }
         size /= 2;
-        if (size < AG_PROC_HEAP_MIN) {
-            size = AG_PROC_HEAP_MIN;
-        }
     }
 
     if (required) {
-        ag_log(AG_LOG_ERROR, "proc", "%s asked for a %u KB arena; there is none",
-               p->name, (unsigned)(requested / 1024u));
+        /*
+         * Say what there was, not only that there was not enough.  "There is
+         * none" sends whoever reads it to work out the shortfall by
+         * subtraction - image data, driver buffers, whatever the kernel took
+         * at boot - and the answer to that arithmetic was wrong three times in
+         * one evening while the number itself was one call away.  A block is
+         * what is asked for and a block is what is reported.
+         */
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s asked for a %u KB arena; the largest block is %u KB "
+               "(%u KB free)",
+               p->name, (unsigned)(requested / 1024u),
+               (unsigned)(ag_port_mem_largest(AG_MEM_SLOW) / 1024u),
+               (unsigned)(ag_port_mem_free(AG_MEM_SLOW) / 1024u));
+        arena_refused_map();
         return -AG_ENOMEM;
     }
 
@@ -306,6 +458,20 @@ static void release_resource(ag_res_type_t type, void *ref, uint32_t extra,
 static void reap(proc_t *p)
 {
     const uint32_t held = ag_reslist_reclaim(&p->res, release_resource, p);
+
+    /*
+     * A cluster job belongs to this process, and the threads it has on OTHER
+     * boards are not in the list above and would be reclaimed by nothing at
+     * all.  Forgetting the job here is what stops a worker process on the
+     * neighbour waiting for ever for a master that no longer exists.
+     *
+     * AFTER the reclaim, not before, and the order is the whole point: this
+     * takes the job's mailboxes apart, and a thread of this process blocked
+     * waiting on one must already be gone when that happens.  The reclaim
+     * above is what makes sure it is.  It is cheap and touches no wire - the
+     * process table is locked here.
+     */
+    ag_clu_proc_ended(p->pid);
     const uint32_t files = ag_vfs_close_owned_by(p->pid);
     /*
      * Pins last, and never skipped.  An interrupt handler belonging to code
@@ -337,10 +503,80 @@ static void reap(proc_t *p)
         ag_audio_api_table.close();
     }
 
+    /*
+     * Its sockets, before anything else about it is let go.
+     *
+     * A process that exits closes its own; one that is killed, faults or runs
+     * out of stack does not, and until this was here nothing else did either.
+     * The far end of such a socket sees a peer that is alive and reading
+     * nothing for ever - which cost this board forty kilobytes a time, with
+     * `net sockets` showing two connections open and no application running.
+     */
+    (void)ag_net_close_owned_by(p->pid);
+
     const bool restore_tty = (ag_session_focused_pid() == p->pid);
     ag_session_unbind(p->pid);
     if (restore_tty) {
         ag_console_restore_tty();
+    }
+
+    /*
+     * AND NOW it can be said, because the console is back.
+     *
+     * This used to be written on the process's own task the instant its entry
+     * returned - see proc_task - where the process still owned the console and
+     * the line reached nobody.  The effect was that a program which finished
+     * quickly announced itself and one that ran for seconds did not, which is
+     * indistinguishable from working until something depends on it.  Something
+     * did: the QEMU harness decides a `run` has finished by this line, waited
+     * the full command timeout for programs that outlived their session
+     * adoption, and burned seven minutes a run while every check still passed.
+     *
+     * A foreground run reaps here synchronously (ag_proc_wait), so the line
+     * still lands before the shell's next prompt.
+     */
+    ag_log(AG_LOG_INFO, "proc", "%s (pid %u) returned %d, %u stack bytes unused",
+           p->name, (unsigned)p->pid, (int)p->exit_code,
+           (unsigned)p->stack_unused);
+
+    /*
+     * AND ON THE SCREEN, for the one case where the journal is not enough: a
+     * program somebody started and is watching end.
+     *
+     * The journal line above reaches the console only while log echo is on,
+     * and the shell turns echo on for the length of a COMMAND.  `run` is not
+     * that command: it starts the program in a session slot and returns to the
+     * prompt at once, so by the time the program ends the echo is off and this
+     * event - the direct consequence of what the user typed - is the one thing
+     * about it that nobody sees.  Every other kind of async noise is rightly
+     * kept off the prompt; this is not async noise.
+     *
+     * Only for a program that had the screen, and only when the echo did not
+     * already carry it, so nothing is said twice and a background job stays
+     * quiet.
+     */
+    if (restore_tty && !ag_log_echo()) {
+        ag_console_printf("%s (pid %u) returned %d\n", p->name,
+                          (unsigned)p->pid, (int)p->exit_code);
+    }
+
+    /*
+     * The last look at its memory, and often the only one anybody gets: an
+     * application that writes past its own data usually stands on its own
+     * feet first and faults, long before a supervisor tick could notice.
+     * Measured on the test program - eight bytes past its buffer reached the
+     * image's own remaining bss, overwrote a pointer, and the next line read
+     * it.  A memcmp on a path that is already freeing memory, and it turns
+     * "the application faulted" into "the application faulted after writing
+     * past the end of its own data".
+     */
+    size_t guard_past = 0;
+    if (!p->guard_said && ag_loader_guard_broken(&p->app, &guard_past)) {
+        p->guard_said = true;
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s (pid %u) wrote past the end of its own data by at least %u "
+               "bytes - a bug in %s, not in the board",
+               p->name, (unsigned)p->pid, (unsigned)guard_past, p->name);
     }
 
     ag_loader_unload(&p->app);
@@ -357,7 +593,7 @@ static void reap(proc_t *p)
                                                            : AG_PID_KERNEL;
     }
 
-    memset(p, 0, sizeof(*p));
+    release_slot(p);
 }
 
 /* Whatever the application did to the console, the next thing to print gets it
@@ -380,9 +616,24 @@ static bool holds_kernel_lock(ag_port_task_t task)
     if (task == NULL) {
         return false;
     }
+    /*
+     * AND INSIDE A DRIVER.  A task deleted in a device write leaves that
+     * device's lock held, and whatever the driver held below it: TONE killed
+     * on the C3 in the middle of pouring sound took the lock of the wire to
+     * the CYD with it, and the shell that had asked for the kill never came
+     * back (26 Sep 2026).
+     */
+    /*
+     * AND INSIDE THE JOURNAL.  Every word a background application prints goes
+     * through it (ag_log_app_write), and it was the one lock left off this
+     * list: SPIN, killed in the middle of its dots, took it with it and the
+     * board said nothing more but the lock watch (1 Oct 2026).
+     */
     return ag_console_lock_holder() == (void *)task ||
+           ag_log_lock_holder() == (const void *)task ||
            ag_storage_vfs_lock_holder() == (void *)task ||
-           ag_hostfs_rpc_holder() == (void *)task;
+           ag_hostfs_rpc_holder() == (void *)task ||
+           ag_dev_task_in_driver((const void *)task);
 }
 
 bool ag_proc_task_in_kernel(ag_port_task_t task)
@@ -391,10 +642,70 @@ bool ag_proc_task_in_kernel(ag_port_task_t task)
 }
 
 /*
+ * How long a task told to stop is given to actually leave its processor.  The
+ * stop is an interrupt to the other core and lands in microseconds; what can
+ * hold it off is a critical section or a scheduler suspended over there, and
+ * neither honestly lasts a millisecond.
+ */
+#define AG_PROC_STOP_SPIN_US 2000
+
+/*
+ * Stops `task` where it stands, and keeps it stopped only if it holds none of
+ * the kernel's locks there: true means it is suspended, off every processor,
+ * holding nothing, and may be deleted; false means it has been let go again,
+ * exactly as it was.  One attempt - the caller decides how long to keep trying.
+ *
+ * WHY STOP IT FIRST.  "Is it in the kernel?" and the delete used to be two
+ * steps, and the task they were about is an application on the OTHER core,
+ * running the whole time between them.  SPIN, killed while it wrote its dots
+ * through the journal (1 Oct 2026, proctest), was asked, answered "no", walked
+ * into the journal's lock in the next microseconds and was deleted holding it -
+ * and FreeRTOS lets only the owner give a mutex back, so from then on nothing
+ * on the board could log or print: "[lockwatch] the journal lock held 30 s by
+ * ''", the empty name being a task that no longer existed.  A suspended task
+ * runs no further, so the answer asked of one is still true at the delete.
+ *
+ * ASKED BEFORE IT IS STOPPED, AND AGAIN AFTER.  A task stopped inside a
+ * blocking call is taken off whatever it was waiting for, and when it is let
+ * go it returns as if the wait had run out.  A task already seen holding a lock
+ * is therefore never stopped at all - it is left to come out by itself - and
+ * only one that took a lock in the microseconds between the first look and the
+ * stop is let go again, early from whatever it was blocked on.  It is being
+ * killed; the cost of that rare early return is its own.
+ */
+static bool stop_outside_kernel(ag_port_task_t task)
+{
+    /* never itself: a task that suspends itself is not coming back */
+    if (task == NULL || task == ag_port_task_self() ||
+        holds_kernel_lock(task)) {
+        return false;
+    }
+    ag_port_task_suspend(task);
+    const int64_t until = ag_port_us() + AG_PROC_STOP_SPIN_US;
+    while (ag_port_task_on_cpu(task)) {
+        if (ag_port_us() > until) {
+            ag_port_task_resume(task);
+            return false;
+        }
+    }
+    if (holds_kernel_lock(task)) {
+        ag_port_task_resume(task);
+        return false;
+    }
+    return true;
+}
+
+bool ag_proc_task_stop_outside_kernel(ag_port_task_t task)
+{
+    return stop_outside_kernel(task);
+}
+
+/*
  * Written down in an exception context, so: no locks, no logging, no allocation.
  * Answers whether this fault belongs to an application that can be unwound.
  */
-bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp)
+bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp,
+                        uint32_t ra)
 {
     proc_t *p = current();
 
@@ -411,6 +722,7 @@ bool ag_proc_note_fault(uint32_t cause, uint32_t pc, uint32_t vaddr, uint32_t sp
     p->fault.pending = true;
     p->fault.cause = cause;
     p->fault.pc = pc;
+    p->fault.ra = ra;
     p->fault.vaddr = vaddr;
     p->fault.sp = sp;
     return true;
@@ -457,15 +769,95 @@ bool ag_proc_take_crash_record(char *out, size_t len)
     return waiting;
 }
 
-static void crash_record(proc_t *p, const char *reason)
+/*
+ * The panic the port could not recover, reported in the same form as a process
+ * that faulted - because it is the same question being asked, and the answer
+ * should not depend on which of the two happened.
+ *
+ * It is a boot-time report and not a live one: the machine that took the fault
+ * is gone.  The port kept the numbers across that reboot (RTC memory on ESP32),
+ * and this turns them into the record the supervisor already knows how to write
+ * to /sys/crash.log, journal tail and all.  Nothing here locks, so it goes
+ * through the same lock-free buffer as a crash in the fault-recovery path.
+ */
+void ag_proc_record_panic(const ag_port_panic_t *panic)
+{
+    if (panic == NULL) {
+        return;
+    }
+
+    s_crash_text[0] = '\0';
+    crash_printf("panic before this boot (the machine went down; no process "
+                 "survived to be blamed)\n");
+    crash_printf("  %s at pc %08x, ra %08x, address %08x, sp %08x\n",
+                 ag_port_fault_cause_name(panic->cause), (unsigned)panic->pc,
+                 (unsigned)panic->ra, (unsigned)panic->vaddr,
+                 (unsigned)panic->sp);
+    crash_printf("  image %08x (first 4 bytes of the ELF SHA256)",
+                 (unsigned)panic->image);
+    if (panic->words > 0) {
+        crash_printf(", stack top:");
+        for (uint32_t i = 0; i < panic->words; i++) {
+            crash_printf(" %08x", (unsigned)panic->stack[i]);
+        }
+    }
+    crash_printf("\n");
+    s_crash_waiting = true;
+}
+
+/*
+ * `may_lock` is false on the fault path.  See the note below: the heap query
+ * is the one thing in here that takes a lock, and on that path it is the
+ * difference between a recorded fault and a reset board.
+ */
+/*
+ * The hardware watch: asked for by `guard watch`, spent on the next
+ * application that starts.
+ *
+ * There is one watchpoint to give (the chip has two per core and FreeRTOS may
+ * hold the other for stack overflow), so it is not a mode the system runs in -
+ * it is a single shot, aimed deliberately.  Four bytes inside the guard are
+ * enough: an overrun that reaches the guard at all reaches its first word, and
+ * four bytes is a size and an alignment the hardware accepts everywhere.
+ */
+static bool s_guard_watch_armed;
+
+void ag_proc_guard_watch(bool on) { s_guard_watch_armed = on; }
+bool ag_proc_guard_watching(void) { return s_guard_watch_armed; }
+
+static void guard_watch_take(const proc_t *p, int core)
+{
+    if (!s_guard_watch_armed || p->app.guard == NULL) {
+        return;
+    }
+    /* The guard sits past the data, which need not leave it word-aligned. */
+    const uintptr_t at = ((uintptr_t)p->app.guard + 3u) & ~(uintptr_t)3u;
+
+    s_guard_watch_armed = false;
+    if (!ag_port_watch_write(core, (const void *)at, 4u)) {
+        ag_log(AG_LOG_WARN, "proc",
+               "%s: could not arm the hardware watch on its data guard; the "
+               "guard is still checked every tick",
+               p->name);
+        return;
+    }
+    ag_log(AG_LOG_WARN, "proc",
+           "%s: hardware watch armed at %p - a write past its data will stop "
+           "the board and print the instruction that did it",
+           p->name, (void *)at);
+}
+
+static void crash_record(proc_t *p, const char *reason, bool may_lock)
 {
     const uint32_t up_ms = now_ms() - (uint32_t)(p->started / 1000);
     size_t         used = 0;
+    bool           used_known = false;
 
-    if (p->heap != NULL) {
+    if (may_lock && p->heap != NULL) {
         ag_port_heap_info_t info;
         ag_port_heap_info(p->heap, &info);
         used = info.allocated;
+        used_known = true;
     }
 
     /*
@@ -476,17 +868,34 @@ static void crash_record(proc_t *p, const char *reason)
      * board (a double fault / interrupt-watchdog reset).  So the record is built
      * only into the lock-free crash buffer; the supervisor drains it to the
      * console and to /sys/crash.log from a safe context (write_crash_record).
+     *
+     * The heap query above is the same rule and was the same bug: it does not
+     * read like a lock, and inside IDF it enters a critical section on the
+     * heap's spinlock.  Measured on the board - an application faulted while
+     * the picture animated, and the machine reset with the watchdog standing
+     * on crash_record -> ag_port_heap_info -> spinlock_acquire.  Hence
+     * `may_lock`, and hence a record that says "arena unknown" rather than one
+     * that costs the board.
      */
     s_crash_text[0] = '\0';
     crash_printf("%s (pid %u) killed at %u ms uptime: %s\n", p->name,
                  (unsigned)p->pid, (unsigned)now_ms(),
                  (reason != NULL) ? reason : "no reason given");
-    crash_printf("  %s for %u ms, %u B of a %u KB arena, %u resource(s), "
-                 "%u B code at %p\n",
-                 ag_proc_state_name(p->state), (unsigned)up_ms, (unsigned)used,
-                 (unsigned)(p->heap_size / 1024u),
-                 (unsigned)ag_reslist_count(&p->res),
-                 (unsigned)p->app.header.code.size, p->app.place.code);
+    if (used_known) {
+        crash_printf("  %s for %u ms, %u B of a %u KB arena, %u resource(s), "
+                     "%u B code at %p\n",
+                     ag_proc_state_name(p->state), (unsigned)up_ms,
+                     (unsigned)used, (unsigned)(p->heap_size / 1024u),
+                     (unsigned)ag_reslist_count(&p->res),
+                     (unsigned)p->app.header.code.size, p->app.place.code);
+    } else {
+        crash_printf("  %s for %u ms, arena use unknown (fault path), %u KB "
+                     "arena, %u resource(s), %u B code at %p\n",
+                     ag_proc_state_name(p->state), (unsigned)up_ms,
+                     (unsigned)(p->heap_size / 1024u),
+                     (unsigned)ag_reslist_count(&p->res),
+                     (unsigned)p->app.header.code.size, p->app.place.code);
+    }
     s_crash_waiting = true;
 
     /*
@@ -507,9 +916,17 @@ static void crash_record(proc_t *p, const char *reason)
     const uintptr_t code = (uintptr_t)p->app.place.code;
     const uintptr_t code_end = code + p->app.header.code.size;
 
-    crash_printf("  %s at pc %08x, address %08x, sp %08x\n",
+    /*
+     * pc first, and ra next to it: the pc is where it died and the ra is where
+     * it came from, and for a bad cast or an unset function pointer the two
+     * together are usually the whole diagnosis.  The faulting sp is here because
+     * a stack is what an application that is not obviously wrong is usually
+     * short of.
+     */
+    crash_printf("  %s at pc %08x, ra %08x, address %08x, sp %08x\n",
                  ag_port_fault_cause_name(p->fault.cause), (unsigned)p->fault.pc,
-                 (unsigned)p->fault.vaddr, (unsigned)p->fault.sp);
+                 (unsigned)p->fault.ra, (unsigned)p->fault.vaddr,
+                 (unsigned)p->fault.sp);
 
     if (p->fault.pc >= code && p->fault.pc < code_end) {
         crash_printf("  pc is offset 0x%x in its own code\n",
@@ -551,10 +968,131 @@ bool ag_proc_task_create(ag_port_task_fn fn, const char *name,
 #endif
 }
 
+/* ---- internal memory kept for what may arrive (see proc.h) ---- */
+
+#define KEEP_SLOTS 4u
+static const void *s_keep_who[KEEP_SLOTS];
+static size_t      s_keep_bytes[KEEP_SLOTS];
+
+void ag_proc_keep_internal(const void *who, size_t bytes)
+{
+    int free_slot = -1;
+    for (uint32_t i = 0; i < KEEP_SLOTS; i++) {
+        if (s_keep_who[i] == who) {
+            s_keep_bytes[i] = bytes;
+            if (bytes == 0u) {
+                s_keep_who[i] = NULL;
+            }
+            return;
+        }
+        if (s_keep_who[i] == NULL && free_slot < 0) {
+            free_slot = (int)i;
+        }
+    }
+    if (bytes != 0u && free_slot >= 0) {
+        s_keep_bytes[free_slot] = bytes;
+        s_keep_who[free_slot] = who;
+    }
+}
+
+size_t ag_proc_kept_internal(void)
+{
+    size_t sum = 0;
+    for (uint32_t i = 0; i < KEEP_SLOTS; i++) {
+        if (s_keep_who[i] != NULL) {
+            sum += s_keep_bytes[i];
+        }
+    }
+    return sum;
+}
+
+/* Whether an application may take `bytes` of internal memory and still leave
+ * what is kept. */
+static bool app_internal_room(size_t bytes)
+{
+    return ag_port_mem_free(AG_MEM_FAST) >= bytes + ag_proc_kept_internal();
+}
+
+bool ag_proc_task_create_app(ag_port_task_fn fn, const char *name,
+                             uint32_t stack_bytes, void *arg, unsigned prio,
+                             int core, ag_port_task_t *out)
+{
+#if AG_PORT_TASK_STACK_CAPS
+    /*
+     * [memory] app.stack: iram, psram by default.  Internal SRAM only above
+     * what is kept for arriving devices (ag_proc_keep_internal).
+     */
+    ag_place_kind_t kinds[AG_PLACE_KINDS];
+    const unsigned  n = ag_place_order("app.stack", kinds);
+    ag_port_task_t  local = NULL;
+    ag_port_task_t *t = (out != NULL) ? out : &local;
+    for (unsigned k = 0; k < n; k++) {
+        if (kinds[k] == AG_PLACE_IRAM && app_internal_room(stack_bytes) &&
+            ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                                AG_MEM_FAST | AG_MEM_BYTE, t)) {
+            ag_place_adopt("app.stack", (void *)*t);
+            return true;
+        }
+        if (kinds[k] == AG_PLACE_PSRAM &&
+            ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                                AG_MEM_SLOW | AG_MEM_BYTE, t)) {
+            ag_place_adopt("app.stack", (void *)*t);
+            if (k > 0) {
+                ag_log(AG_LOG_INFO, "proc",
+                       "%s: task stack in PSRAM (%u bytes; internal SRAM is "
+                       "kept for devices, %u bytes)",
+                       name != NULL ? name : "?", (unsigned)stack_bytes,
+                       (unsigned)ag_proc_kept_internal());
+            }
+            return true;
+        }
+    }
+    return false;
+#else
+    return ag_proc_task_create(fn, name, stack_bytes, arg, prio, core, out);
+#endif
+}
+
+/*
+ * The other way round, for a task that lives as long as the board and is
+ * not in a hurry: PSRAM first, internal SRAM only where there is none
+ * (6 Oct 2026, the standing request worker - a 4 KB internal stack held for
+ * good cost the emulated S3 a program's thread stacks).
+ */
+bool ag_proc_task_create_slow(ag_port_task_fn fn, const char *name,
+                              uint32_t stack_bytes, void *arg, unsigned prio,
+                              int core, ag_port_task_t *out)
+{
+#if AG_PORT_TASK_STACK_CAPS
+    if (ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                            AG_MEM_SLOW | AG_MEM_BYTE, out)) {
+        return true;
+    }
+    return ag_port_task_create(fn, name, stack_bytes, arg, prio, core,
+                               AG_MEM_FAST | AG_MEM_BYTE, out);
+#else
+    return ag_port_task_create(fn, name, stack_bytes, arg, prio, core, 0, out);
+#endif
+}
+
 static uint32_t clamp_stack_bytes(uint32_t want)
 {
     if (want == 0) {
         want = (uint32_t)CONFIG_ARGON_APP_STACK_KB * 1024u;
+        /*
+         * A DEFAULT SIZED BY THE KIND OF MACHINE (6 Oct 2026).  On a board
+         * with no PSRAM every stack is the internal memory everything else
+         * lives in, and 16 KB of it for a program that named no size was the
+         * C3's undoing: a 440 Hz tone held 16 KB of stack with 12 KB never
+         * touched, and the next program on that board was refused an 8 KB
+         * one.  The CYD's sdkconfig already said 8 for the same reason; the
+         * kind of memory says it for every such board.  A program that needs
+         * more names it (AG_APP_SIZED) and gets it.
+         */
+        if (ag_port_mem_free(AG_MEM_SLOW) == 0u &&
+            want > AG_PROC_LOAD_STACK_MIN) {
+            want = AG_PROC_LOAD_STACK_MIN;
+        }
     }
     if (want < AG_PROC_STACK_MIN) {
         want = AG_PROC_STACK_MIN;
@@ -589,7 +1127,13 @@ static void apply_task_priority(proc_t *p)
     if (p == NULL || p->task == NULL) {
         return;
     }
+    /* watched for fairness at the ordinary priority only: low asked to be
+     * last, high asked by name to be first (ag_budget_fair) */
+    ag_budget_forget(p->task);
     ag_port_task_prio_set(p->task, prio_for(p->sched_class));
+    if (prio_for(p->sched_class) == AG_BUDGET_FAIR_PRIO) {
+        (void)ag_budget_fair(p->task, p->name);
+    }
 }
 
 static void name_from_path(char *dst, size_t dst_len, const char *path)
@@ -671,8 +1215,8 @@ static ag_err_t proc_finish_load(proc_t *p)
 
     ag_err_t err = ag_loader_load(p->path, p->cwd, &p->app);
     if (err != AG_OK) {
-        ag_log(AG_LOG_ERROR, "proc", "pid %u: load %s failed (%d)",
-               (unsigned)p->pid, p->path, (int)err);
+        ag_log(AG_LOG_ERROR, "proc", "pid %u: %s: %s (%d)",
+               (unsigned)p->pid, p->path, ag_loader_why(err), (int)err);
         return err;
     }
 
@@ -681,22 +1225,22 @@ static ag_err_t proc_finish_load(proc_t *p)
         ag_loader_unload(&p->app);
         return -AG_EINVAL;
     }
-    if ((p->app.header.flags & AG_AXE_NEEDS_GFX) != 0 && !ag_display_ready()) {
-        ag_log(AG_LOG_ERROR, "proc", "%s: needs a display", p->path);
-        ag_loader_unload(&p->app);
-        return -AG_ENODEV;
-    }
-    if ((p->app.header.flags & AG_AXE_NEEDS_NET) != 0 &&
-        ag_loader_api()->net == NULL) {
-        ag_log(AG_LOG_ERROR, "proc", "%s: needs networking", p->path);
-        ag_loader_unload(&p->app);
-        return -AG_ENODEV;
-    }
-    if ((p->app.header.flags & AG_AXE_NEEDS_AUDIO) != 0 &&
-        (ag_loader_api()->audio == NULL ||
-         ag_loader_api()->audio->present == NULL ||
-         !ag_loader_api()->audio->present())) {
-        ag_log(AG_LOG_ERROR, "proc", "%s: needs audio", p->path);
+    /*
+     * One test, asked once, so that the answer here and the answer another node
+     * gives about itself cannot drift apart.  The messages stay separate - the
+     * test is what must not be copied, not the wording.
+     */
+    const uint32_t unmet = ag_proc_unmet_needs(p->app.header.flags);
+    if (unmet != 0) {
+        const char *what = "something it needs";
+        if ((unmet & AG_AXE_NEEDS_GFX) != 0) {
+            what = "a display";
+        } else if ((unmet & AG_AXE_NEEDS_NET) != 0) {
+            what = "networking";
+        } else if ((unmet & AG_AXE_NEEDS_AUDIO) != 0) {
+            what = "audio";
+        }
+        ag_log(AG_LOG_ERROR, "proc", "%s: needs %s", p->path, what);
         ag_loader_unload(&p->app);
         return -AG_ENODEV;
     }
@@ -739,8 +1283,9 @@ static ag_err_t copy_args(proc_t *p, int argc, char **argv)
     size_t at = 0;
 
     p->argc = 0;
+    /* Refuse rather than truncate: a dropped argument is invisible. */
     if (argc > AG_PROC_ARGS_MAX) {
-        argc = AG_PROC_ARGS_MAX;
+        return -AG_ERANGE;
     }
 
     for (int i = 0; i < argc; i++) {
@@ -757,6 +1302,35 @@ static ag_err_t copy_args(proc_t *p, int argc, char **argv)
         p->argc++;
     }
     return AG_OK;
+}
+
+/*
+ * The last thing a process task does: say it is finished and wake whoever is
+ * waiting, AS ONE STEP, under the table lock.
+ *
+ * Two steps is how the C3 died in xclutest on 25 Sep 2026 (`assert failed:
+ * xQueueGenericSend queue.c:936 (pxQueue)`).  ZOMBIE was set first and
+ * p->done read after, and anything between the two - the two log lines of a
+ * failed load, which for a guest go down the wire to the asking node, or
+ * nothing more than a tick - let the supervisor see a zombie that nobody was
+ * waiting for yet and reap it.  reap() frees the semaphore and zeroes the
+ * slot, so this task then gave NULL; had a spawn taken the slot meanwhile, it
+ * would have woken somebody else's waiter instead.  Held open by a 300 ms
+ * pause after ZOMBIE, it failed on the first run of an image for the other
+ * processor, backtrace in proc_task.
+ *
+ * With the lock held nothing can reap in between, and once it is let go the
+ * semaphore has been given and nothing of the slot is touched again - the
+ * stack is the task's own and goes with it.
+ */
+static void proc_finished(proc_t *p)
+{
+    lock();
+    p->state = AG_PS_ZOMBIE;
+    ag_port_sem_give(p->done);
+    unlock();
+    ag_budget_forget(ag_port_task_self());
+    ag_port_task_delete(NULL);
 }
 
 static void proc_task(void *arg)
@@ -777,12 +1351,13 @@ static void proc_task(void *arg)
         p->load_pending = false;
         if (load_err != AG_OK) {
             p->exit_code = (int32_t)load_err;
-            p->state = AG_PS_ZOMBIE;
-            ag_log(AG_LOG_ERROR, "proc", "%s (pid %u) failed to load: %d",
+            /* Said while the slot is still ours: see proc_finished. */
+            ag_log(AG_LOG_ERROR, "proc", "%s (pid %u): %s (%d)",
+                   p->name, (unsigned)p->pid, ag_loader_why(load_err),
+                   (int)load_err);
+            ag_log(AG_LOG_DEBUG, "proc", "%s (pid %u) failed to load: %d",
                    p->name, (unsigned)p->pid, (int)load_err);
-            ag_port_sem_t done_fail = p->done;
-            ag_port_sem_give(done_fail);
-            ag_port_task_delete(NULL);
+            proc_finished(p);
             return;
         }
         apply_task_priority(p);
@@ -804,10 +1379,7 @@ static void proc_task(void *arg)
     const entry_fn entry = (entry_fn)p->app.binding.entry;
     if (entry == NULL) {
         p->exit_code = (int32_t)-AG_EINVAL;
-        p->state = AG_PS_ZOMBIE;
-        ag_port_sem_t done_bad = p->done;
-        ag_port_sem_give(done_bad);
-        ag_port_task_delete(NULL);
+        proc_finished(p);
         return;
     }
 
@@ -817,26 +1389,62 @@ static void proc_task(void *arg)
     /* else: came back through ag_proc_exit, which set exit_code already */
 
     p->stack_unused = (uint32_t)ag_port_task_stack_unused(NULL);
-    p->state = AG_PS_ZOMBIE;
 
-    ag_log(AG_LOG_INFO, "proc", "%s (pid %u) returned %d, %u stack bytes unused",
-           p->name, (unsigned)p->pid, (int)p->exit_code,
-           (unsigned)p->stack_unused);
+    /*
+     * The line saying it ended is NOT written here, and where it went instead
+     * is the whole of a defect that took three runs to see.
+     *
+     * Here, the process still owns the console - it is the process's own task,
+     * and the session has not unbound yet.  A kernel log line written while an
+     * application owns the console reaches nobody: not the screen, because the
+     * application has it, and not the eye of whoever is waiting to see the
+     * program finish.  A program that ended in under a few milliseconds got
+     * away with it, because the session had not adopted it yet and its output
+     * was still going to the journal; a program that ran for eight seconds did
+     * not.  So the same system printed "it returned" for short programs and
+     * said nothing at all for long ones - which is the worst possible rule,
+     * because it looks like it works.
+     *
+     * It is written in reap() instead, after the console has been given back.
+     * See there.
+     */
 
     /* Nothing may touch the process after this: whoever waits for it owns it. */
-    ag_port_sem_t done = p->done;
-    ag_port_sem_give(done);
-    ag_port_task_delete(NULL);
+    proc_finished(p);
 }
 
 static proc_t *free_slot(void)
 {
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         if (!s_procs[i].used) {
             return &s_procs[i];
         }
     }
     return NULL;
+}
+
+/*
+ * Which session slot a new process belongs in.
+ *
+ * A foreground child of a process goes into ITS PARENT'S slot, on top of it -
+ * not into a slot of its own.  That is what makes a program started from
+ * inside an application behave the way one started from the shell does: the
+ * console and the keyboard belong to the top of a slot, so a child sent
+ * somewhere else is a child that can draw and cannot be typed at, and whose
+ * printf goes to the journal instead of the screen.  All three of those were
+ * the same bug.
+ *
+ * Returns the parent's slot, or -1 for "the caller is not a process in a slot"
+ * - the shell, a driver, the kernel - where the old first-free-slot answer is
+ * the right one and the shell does its own binding anyway.
+ */
+static int parent_slot(void)
+{
+    const proc_t *me = current();
+    if (me == NULL) {
+        return -1;
+    }
+    return ag_session_slot_of(me->pid);
 }
 
 /*
@@ -852,6 +1460,10 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
 
     const bool background = (flags & (uint32_t)AG_SPAWN_BACKGROUND) != 0;
     p->state = AG_PS_LOADING;
+    /* Before the task exists: it can be over before this function returns. */
+    p->has_waiter = (flags & AG_SPAWN_KERNEL_WAITS) != 0;
+    const proc_t *spawner = current();
+    p->parent = (spawner != NULL) ? spawner->pid : AG_PID_KERNEL;
     p->prev_foreground = s_foreground;
     if (!background) {
         s_foreground = p->pid;
@@ -864,8 +1476,8 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
     const int      core = background ? 0 : (int)ag_sysinfo()->app_core;
     const unsigned prio = prio_for(p->sched_class);
 
-    if (!ag_proc_task_create(proc_task, p->name, p->stack_bytes, p, prio, core,
-                             NULL)) {
+    if (!ag_proc_task_create_app(proc_task, p->name, p->stack_bytes, p, prio,
+                                 core, NULL)) {
         /*
          * Tried internal SRAM, then PSRAM (when enabled).  Failure here means
          * both are exhausted or the TCB (always internal) could not be taken.
@@ -886,27 +1498,124 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
         *out_pid = p->pid;
     }
 
+    /* On the core this task was pinned to, before it has run an instruction. */
+    guard_watch_take(p, core);
+
     const ag_pid_t bound_pid = p->pid;
     char           bound_name[32];
     const bool     skip_bind = (flags & (uint32_t)AG_SPAWN_NO_SESSION) != 0;
+    /*
+     * Only a foreground child stacks on its parent.  A background one (`run
+     * /b`) must not take the keyboard away, so it gets a slot of its own, as
+     * before.
+     */
+    const int over = background ? -1 : parent_slot();
     set_string(bound_name, sizeof(bound_name), p->name);
     unlock();
     if (!skip_bind) {
-        const ag_err_t bind_err = ag_session_bind(bound_pid, bound_name);
+        const ag_err_t bind_err =
+            (over >= 0) ? ag_session_push_to(bound_pid, bound_name, over)
+                        : ag_session_bind(bound_pid, bound_name);
         if (bind_err != AG_OK) {
-            ag_log(AG_LOG_WARN, "proc", "pid %u: no free session slot (%d)",
+            ag_log(AG_LOG_WARN, "proc", "pid %u: no session slot (%d)",
                    (unsigned)bound_pid, (int)bind_err);
         }
     }
     return AG_OK;
 }
 
+bool ag_proc_out_sink(ag_con_sink_fn *sink, void **ctx)
+{
+    if (s_sinks == 0) {
+        return false;
+    }
+    const proc_t *p = current();
+    if (p == NULL || p->out_sink == NULL) {
+        return false;
+    }
+    if (sink != NULL) {
+        *sink = p->out_sink;
+    }
+    if (ctx != NULL) {
+        *ctx = p->out_ctx;
+    }
+    return true;
+}
+
 ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
                        ag_pid_t *out_pid)
+{
+    return ag_proc_spawn_sink(path, argc, argv, flags, NULL, NULL, out_pid);
+}
+
+/*
+ * A bytecode image has no processor to run it, so the interpreter does.
+ *
+ * HERE RATHER THAN IN THE SHELL, and that is the whole reason it is worth the
+ * few lines: `run`, placement, a run asked for over the wire and the cascade's
+ * own fallback all arrive at this function, and none of them should have to
+ * know that some images are not instructions.
+ *
+ * The interpreter is found the way the cascade finds anything - BY NAME, among
+ * the images this board can actually execute - so each board carries its own
+ * build of AGVM and nothing has a path written into it.
+ *
+ * Returns true and rewrites path/argv when the image turns out to be bytecode.
+ * `store` holds the rewritten argv; it must outlive the spawn, which is why it
+ * is the caller's.
+ */
+#define VM_ARGS_MAX (AG_PROC_ARGS_MAX)
+
+static bool via_interpreter(const char **path, int *argc, char ***argv,
+                            char *vmpath, size_t vmcap,
+                            const char **store)
+{
+    ag_axe_header_t h;
+    const ag_err_t  pk = ag_loader_peek(*path, ag_proc_cwd(), &h);
+    /*
+     * -AG_ENOTSUP means the header was read and understood and the image is
+     * simply not for this machine - which is exactly the answer for bytecode,
+     * because ag_axe_native_arch() is never AG_ARCH_BC.
+     */
+    if ((pk != AG_OK && pk != -AG_ENOTSUP) || h.arch != (uint16_t)AG_ARCH_BC) {
+        return false;
+    }
+    if (ag_loader_find_by_name("AGVM", vmpath, vmcap) != AG_OK) {
+        /*
+         * Both halves of the reason, in one sentence, because neither is any
+         * use alone: the load that follows will refuse this image with "built
+         * for a different processor", which is true of every foreign image and
+         * says nothing about what is actually missing here.
+         */
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s is bytecode and this board has no AGVM to run it", *path);
+        return false;
+    }
+
+    int n = 0;
+    store[n++] = vmpath;  /* argv[0] is the image being run, as everywhere */
+    store[n++] = *path;   /* and the bytecode is its first argument        */
+    for (int i = 1; i < *argc && n < (int)VM_ARGS_MAX; i++) {
+        store[n++] = (*argv)[i];
+    }
+    *path = vmpath;
+    *argc = n;
+    *argv = (char **)store;
+    return true;
+}
+
+ag_err_t ag_proc_spawn_sink(const char *path, int argc, char **argv,
+                            uint32_t flags, ag_con_sink_fn sink, void *ctx,
+                            ag_pid_t *out_pid)
 {
     if (path == NULL) {
         return -AG_EINVAL;
     }
+
+    char        vmpath[AG_PATH_MAX];
+    const char *vmargv[VM_ARGS_MAX];
+    (void)via_interpreter(&path, &argc, &argv, vmpath, sizeof(vmpath),
+                          vmargv);
 
     lock();
 
@@ -918,13 +1627,18 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
         return -AG_EBUSY;
     }
 
-    memset(p, 0, sizeof(*p));
+    release_slot(p);
     p->used = true;
     p->pid = s_next_pid++;
     p->flags = flags;
     p->started = (ag_time_t)ag_port_us();
     p->sched_class = (uint8_t)AG_PRIO_NORMAL;
     p->load_pending = true;
+    p->out_sink = sink;
+    p->out_ctx = ctx;
+    if (sink != NULL) {
+        s_sinks++;
+    }
     ag_reslist_init(&p->res, p->res_slots, AG_PROC_RES_MAX);
 
     const char *parent_cwd = ag_proc_cwd();
@@ -934,7 +1648,7 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
 
     ag_err_t err = copy_args(p, argc, argv);
     if (err != AG_OK) {
-        memset(p, 0, sizeof(*p));
+        release_slot(p);
         unlock();
         return err;
     }
@@ -947,11 +1661,32 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
      * image.  A failure to read it here is not fatal - the default is a working
      * answer and the real load will report the same problem properly - so the
      * header is a hint at this point and nothing more.
+     *
+     * -AG_ENOTSUP IS AN ANSWER, NOT A FAILURE, and this is the line the whole
+     * cross-ISA cluster turns on.
+     *
+     * ag_loader_peek fills the header and only THEN validates it, and the check
+     * that fails for an image built for the other instruction set is the arch
+     * check - which is not a statement about the stack, or the name, or the
+     * size.  Ignoring the header on that answer costs the board its DEFAULT
+     * stack (CONFIG_ARGON_APP_STACK_KB, 16 KB) for a program that named 8, and
+     * on the C3 that is the difference between the second guest starting and
+     * being refused.  Measured on COM8: `run c:\nodehi32.axe` - NODEHI for the
+     * other processor, declaring 8192 - logged "loading with 18776 free",
+     * which is 16384 gone; its own RISC-V build, which validates, logged
+     * "loading with 26968 free", which is 8192 gone.  One number, two answers,
+     * and the wrong one lands exactly on the path this board exists for: a run
+     * arriving over the wire is very often the neighbour's build of a program.
+     *
+     * The same reading is already relied on in nodeproc.c, where the identity
+     * in a header that failed validation is what makes the substitution
+     * possible at all.  This is the second half of that fact.
      */
     {
         ag_axe_header_t peek;
-        uint32_t        want = 0;
-        if (ag_loader_peek(p->path, p->cwd, &peek) == AG_OK) {
+        uint32_t        want   = 0;
+        const ag_err_t  peeked = ag_loader_peek(p->path, p->cwd, &peek);
+        if (peeked == AG_OK || peeked == -AG_ENOTSUP) {
             want = peek.stack_size;
         }
         /*
@@ -967,7 +1702,7 @@ ag_err_t ag_proc_spawn(const char *path, int argc, char **argv, uint32_t flags,
 
     err = spawn_common(p, flags, out_pid);
     if (err != AG_OK) {
-        memset(p, 0, sizeof(*p));
+        release_slot(p);
         unlock();
         return err;
     }
@@ -994,7 +1729,7 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
         return -AG_EBUSY;
     }
 
-    memset(p, 0, sizeof(*p));
+    release_slot(p);
     p->used = true;
     p->pid = s_next_pid++;
     p->flags = flags;
@@ -1023,7 +1758,7 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
 
     ag_err_t err = copy_args(p, argc, argv);
     if (err != AG_OK) {
-        memset(p, 0, sizeof(*p));
+        release_slot(p);
         unlock();
         return err;
     }
@@ -1031,7 +1766,7 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
     p->stack_bytes = clamp_stack_bytes(stack_bytes);
     err = heap_create(p, heap_bytes);
     if (err != AG_OK) {
-        memset(p, 0, sizeof(*p));
+        release_slot(p);
         unlock();
         return err;
     }
@@ -1041,7 +1776,7 @@ ag_err_t ag_proc_spawn_builtin(const char *name, ag_proc_entry_fn entry,
         if (p->heap_mem != NULL) {
             ag_port_free(p->heap_mem);
         }
-        memset(p, 0, sizeof(*p));
+        release_slot(p);
         unlock();
         return err;
     }
@@ -1053,7 +1788,9 @@ ag_err_t ag_proc_exec(const char *path, int argc, char **argv, uint32_t flags,
 {
     ag_pid_t pid = 0;
     ag_err_t err = ag_proc_spawn(path, argc, argv,
-                                 flags & ~(uint32_t)AG_SPAWN_BACKGROUND, &pid);
+                                 (flags & ~(uint32_t)AG_SPAWN_BACKGROUND) |
+                                     AG_SPAWN_KERNEL_WAITS,
+                                 &pid);
     if (err != AG_OK) {
         return err;
     }
@@ -1131,6 +1868,77 @@ ag_err_t ag_proc_signal(ag_pid_t pid)
     return AG_OK;
 }
 
+uint32_t ag_proc_check_guards(void)
+{
+    ag_pid_t caught[AG_PROC_MAX];
+    size_t   past[AG_PROC_MAX];
+    char     names[AG_PROC_MAX][32];
+    uint32_t n = 0;
+
+    /*
+     * Looked at under the lock, killed outside it: ag_proc_kill waits for the
+     * task to leave the kernel and takes the lock itself, and this runs on the
+     * supervisor, which must not be the task holding it while that happens.
+     */
+    lock();
+    for (uint32_t i = 0; i < s_proc_n && n < AG_PROC_MAX; i++) {
+        proc_t *p = &s_procs[i];
+        if (!p->used || p->state == AG_PS_ZOMBIE || p->guard_said) {
+            continue;
+        }
+        size_t bytes = 0;
+        if (!ag_loader_guard_broken(&p->app, &bytes)) {
+            continue;
+        }
+        p->guard_said = true; /* once per process, not once per tick */
+        caught[n] = p->pid;
+        past[n] = bytes;
+        snprintf(names[n], sizeof(names[n]), "%s", p->name);
+        n++;
+    }
+    unlock();
+
+    for (uint32_t i = 0; i < n; i++) {
+        ag_log(AG_LOG_ERROR, "proc",
+               "%s (pid %u) wrote past the end of its own data by at least "
+               "%u bytes - stopping it before the damage is used",
+               names[i], (unsigned)caught[i], (unsigned)past[i]);
+        ag_log(AG_LOG_ERROR, "proc",
+               "  this is a bug in %s, not in the board: a buffer of its own "
+               "was written off the end, into whatever the heap put next",
+               names[i]);
+        (void)ag_proc_kill(caught[i], "wrote past its own data");
+    }
+    return n;
+}
+
+/*
+ * True while somebody other than the supervisor will collect this process:
+ * a waiter inside ag_proc_wait, or the process that spawned it, for as long as
+ * that one lives.  Called with the table locked.
+ *
+ * The parent half is what Unix does with zombies, and for the same reason.  An
+ * application's spawn and its wait are two calls, and between them it is not
+ * waiting - a program that ends inside that gap (an image that will not load
+ * ends in a millisecond) was collected by the supervisor, and the wait that
+ * followed answered -AG_ENOENT instead of the child's code.  A wait taken in
+ * slices has the gap again between every slice, and the desktop waits in
+ * slices of 200 ms so that Ctrl+C can reach the child: a kill there found
+ * nobody waiting and collected the child on the spot, and the desktop then
+ * waited for ever for a pid that no longer existed.  The kernel's own waiters
+ * mark themselves at spawn (AG_SPAWN_KERNEL_WAITS); an application cannot, so
+ * its children are kept for it instead.
+ *
+ * The price is Unix's too: a program that spawns and never waits keeps its
+ * finished children's slots until it ends itself.  When it does, the next
+ * supervisor tick finds them with no parent and collects them.  Pids are never
+ * reused, so a parent that is gone cannot be mistaken for a new process.
+ */
+static bool held_for_collecting(const proc_t *p)
+{
+    return p->has_waiter || by_pid(p->parent) != NULL;
+}
+
 ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
 {
     lock();
@@ -1152,29 +1960,34 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
     unlock();
 
     /*
-     * Wait for it to be outside the kernel.  A task deleted while it holds a
-     * kernel lock leaves that lock held forever, and the two locks that matter -
-     * the console and the filesystem - are how anything else gets done.
+     * Stopped outside the kernel, or not at all.  A task deleted while it holds
+     * a kernel lock leaves that lock held forever, and the locks that matter -
+     * the console, the journal, the filesystem - are how anything else gets
+     * done.  See stop_outside_kernel for why it is stopped before it is asked.
+     *
+     * Tried under the table lock, so that it cannot be finishing by itself in
+     * the meantime; let go between tries, because the way out of whatever it
+     * holds may lead through the table.  A millisecond at a time: a program
+     * that writes sound is outside the driver for moments, not for tens of
+     * milliseconds.
      */
-    for (uint32_t waited = 0; waited < AG_PROC_KILL_GRACE_MS; waited += 10) {
-        if (!holds_kernel_lock(task)) {
-            break;
+    bool stopped = false;
+    for (uint32_t waited = 0;; waited++) {
+        lock();
+        p = by_pid(pid);
+        if (p == NULL || p->state == AG_PS_ZOMBIE) {
+            unlock();
+            return AG_OK; /* it finished by itself while we waited */
         }
-        ag_port_task_delay(ag_port_ms_to_ticks(10));
+        stopped = stop_outside_kernel(task);
+        if (stopped || waited >= AG_PROC_KILL_GRACE_MS) {
+            break; /* with the table locked */
+        }
+        unlock();
+        ag_port_task_delay(1);
     }
 
-    lock();
-    p = by_pid(pid);
-    if (p == NULL) {
-        unlock();
-        return AG_OK; /* it finished by itself while we waited */
-    }
-    if (p->state == AG_PS_ZOMBIE) {
-        unlock();
-        return AG_OK;
-    }
-
-    if (holds_kernel_lock(task)) {
+    if (!stopped) {
         /*
          * Refusing rather than pretending.  Killing it here would trade a hung
          * application for a hung system, and saying so gives the operator
@@ -1188,30 +2001,31 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
         return -AG_EBUSY;
     }
 
-    crash_record(p, reason);
+    crash_record(p, reason, true);
 
+    ag_budget_forget(task);
     ag_port_task_delete(task);
     p->task = NULL;
     p->exit_code = -AG_EKILLED;
     p->state = AG_PS_ZOMBIE;
 
     /*
-     * Whoever is waiting for it owns the collecting, so it is woken; with nobody
-     * waiting, the killer does it here and now, so that ps right after a kill
+     * Whoever will collect it owns the collecting - a waiter, or a parent that
+     * may wait later - so the token is given and the slot left alone.  With
+     * nobody, the killer does it here and now, so that ps right after a kill
      * shows the truth rather than a corpse the supervisor has not swept up yet.
+     *
+     * Given under the lock, as proc_finished does: once the lock is let go a
+     * held zombie is its collector's, and may already be gone.
      */
-    ag_port_sem_t done = p->done;
-    const bool        waited_for = p->has_waiter;
-    if (!waited_for) {
+    if (held_for_collecting(p)) {
+        ag_port_sem_give(p->done);
+    } else {
         reap(p);
     }
     unlock();
 
     console_restore();
-
-    if (waited_for && done != NULL) {
-        ag_port_sem_give(done);
-    }
     return AG_OK;
 }
 
@@ -1220,9 +2034,9 @@ uint32_t ag_proc_reap_finished(void)
     uint32_t reaped = 0;
 
     lock();
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         proc_t *p = &s_procs[i];
-        if (!p->used || p->state != AG_PS_ZOMBIE || p->has_waiter) {
+        if (!p->used || p->state != AG_PS_ZOMBIE || held_for_collecting(p)) {
             continue;
         }
         reap(p);
@@ -1266,7 +2080,7 @@ ag_err_t ag_proc_set_foreground(ag_pid_t pid)
 uint32_t ag_proc_count(void)
 {
     uint32_t n = 0;
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         if (s_procs[i].used) {
             n++;
         }
@@ -1298,7 +2112,7 @@ ag_err_t ag_proc_info(uint32_t index, ag_procinfo_t *out)
 
     lock();
     uint32_t seen = 0;
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         const proc_t *p = &s_procs[i];
         if (!p->used) {
             continue;
@@ -1397,6 +2211,17 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
             want |= AG_MEM_SLOW;
         }
 
+        /* an application's internal memory stops above what is kept for
+         * arriving devices (see ag_proc_keep_internal) */
+        if (p != NULL && (want & AG_MEM_SLOW) == 0u &&
+            (want & AG_MEM_EXEC) == 0u && !app_internal_room(bytes)) {
+            ag_log(AG_LOG_INFO, "proc",
+                   "%s: %u bytes of internal memory refused - %u are kept for "
+                   "devices",
+                   p->name, (unsigned)bytes,
+                   (unsigned)ag_proc_kept_internal());
+            return NULL;
+        }
         void *ptr = ag_port_alloc(bytes, want);
         if (ptr == NULL && (want & AG_MEM_SLOW)) {
             ptr = ag_port_alloc(bytes, AG_MEM_FAST | AG_MEM_BYTE);
@@ -1582,7 +2407,7 @@ void ag_proc_fault_exit(void)
         return;
     }
 
-    crash_record(p, "faulted");
+    crash_record(p, "faulted", false);   /* mid-fault: nothing here may lock */
     p->killed = true;
     p->exit_code = -AG_EKILLED;
 
@@ -1602,6 +2427,7 @@ void ag_proc_fault_exit(void)
      */
     ag_thread_mark_self_finished();
     ag_supervisor_kill_request(p->pid);
+    ag_budget_forget(ag_port_task_self());
     ag_port_task_delete(NULL);
 }
 
@@ -1693,7 +2519,7 @@ ag_pid_t ag_proc_overdue(uint32_t *late_by_ms)
     uint32_t       late = 0;
 
     lock();
-    for (uint32_t i = 0; i < AG_PROC_MAX; i++) {
+    for (uint32_t i = 0; i < s_proc_n; i++) {
         const proc_t *p = &s_procs[i];
 
         if (!p->used || p->watchdog_ms == 0) {
@@ -1730,7 +2556,18 @@ ag_err_t ag_proc_init(void)
         return -AG_ENOMEM;
     }
 
-    memset(s_procs, 0, sizeof(s_procs));
+    /*
+     * Internal memory, and NOT PSRAM, measured: the table is walked on almost
+     * every call into the kernel (current(), the owner of every file), and with
+     * it in PSRAM an emulated S3 took 190 s to receive a 4 KB file over its
+     * console and a nodetest pair lost its link (25 Sep 2026).
+     */
+    s_procs = ag_port_alloc(sizeof(proc_t) * AG_PROC_MAX, AG_MEM_FAST | AG_MEM_BYTE);
+    if (s_procs == NULL) {
+        return -AG_ENOMEM;
+    }
+    memset(s_procs, 0, sizeof(proc_t) * AG_PROC_MAX);
+    s_proc_n = AG_PROC_MAX;
     s_foreground = AG_PID_KERNEL;
 
     /* From now on the VFS knows whose files it is holding. */

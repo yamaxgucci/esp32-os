@@ -78,7 +78,33 @@ ag_err_t ag_axe_validate(const ag_axe_header_t *header, size_t file_bytes,
  */
 ag_err_t ag_axe_apply(const ag_axe_header_t *header,
                       const ag_axe_place_t *place, const uint32_t *relocs,
-                      uint32_t reloc_count, ag_axe_binding_t *out);
+                      uint32_t reloc_count, const ag_axe_ireloc_t *irelocs,
+                      uint32_t ireloc_count, ag_axe_binding_t *out);
+
+/*
+ * The instruction relocation table, as this image really has it.
+ *
+ * Two words were added to the header after `reserved`, so an image built
+ * before them has neither, and asking these two rather than reading the fields
+ * is what keeps such an image loading unchanged: a short header read into a
+ * full struct leaves those fields holding whatever was in the struct.
+ */
+uint32_t ag_axe_ireloc_count(const ag_axe_header_t *header);
+uint32_t ag_axe_ireloc_offset(const ag_axe_header_t *header);
+
+/*
+ * One instruction relocation, applied to a window of the code part.
+ *
+ * `code_bytes` points at the code part's byte `code_off`, and `code_addr` /
+ * `data_addr` are where the parts will finally sit.  Entries outside the
+ * window are ignored, which is what lets the streamed XIP path hand over one
+ * page at a time; entries that point outside the image return false and the
+ * image is refused.
+ */
+bool ag_axe_ireloc_apply(const ag_axe_header_t *header, uint8_t *code_bytes,
+                         uint32_t code_stored, uint32_t code_addr,
+                         uint32_t data_addr, uint32_t code_off,
+                         ag_axe_ireloc_t entry);
 
 /*
  * Turns an address as linked into the address it ended up at, by finding which

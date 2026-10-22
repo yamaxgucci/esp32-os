@@ -1,0 +1,81 @@
+diff --git a/src/interpreter.cc b/src/interpreter.cc
+--- a/src/interpreter.cc
++++ b/src/interpreter.cc
+@@ -3136,22 +3136,77 @@ void _updatePrograms()
+     // non-critical calls scheduled from managed windows). One more thing to
+     // note is that global scripts in CE cannot handle conditional/timed procs
+     // (which are not used anyway).
++    /*
++     * ARGON: where the script machine's worst call goes.
++     *
++     * _doBkProcesses is 2276 microseconds of every frame and its worst
++     * call is 164 milliseconds - the largest single thing left, and the
++     * only one never looked into.  Inside it this function is the biggest
++     * part, and it is four different things: sfall's own scripts, a burst
++     * of every live program, the deferred event queue, and the library's
++     * own tick.  Which of the four, and whether it is one slow program or
++     * many ordinary ones, decides what can be done - and guessing about
++     * this game has been wrong every time it was tried.
++     */
++    const uint32_t ag_p0 = ag_us();
++
+     sfall_gl_scr_update(_cpuBurstSize);
+ 
++    const uint32_t ag_p1 = ag_us();
++    unsigned ag_n = 0;
++    uint32_t ag_one_worst = 0;
++
+     ProgramListNode* curr = gInterpreterProgramListHead;
+     while (curr != nullptr) {
+         ProgramListNode* next = curr->next;
+         if (curr->program != nullptr) {
++            const uint32_t ag_q0 = ag_us();
++
+             _interpret(curr->program, _cpuBurstSize);
+ 
++            {
++                const uint32_t took = ag_us() - ag_q0;
++
++                ag_n++;
++                if (took > ag_one_worst) {
++                    ag_one_worst = took;
++                }
++            }
+             if (curr->program->exited) {
+                 programListNodeFree(curr);
+             }
+         }
+         curr = next;
+     }
++
++    const uint32_t ag_p2 = ag_us();
++
+     _doEvents();
++
++    const uint32_t ag_p3 = ag_us();
++
+     intLibUpdate();
++
++    {
++        const uint32_t ag_p4 = ag_us();
++        const uint32_t whole = ag_p4 - ag_p0;
++
++        ag_prog_calls++;
++        ag_prog_n += ag_n;
++        ag_prog_sfall_us += ag_p1 - ag_p0;
++        ag_prog_run_us += ag_p2 - ag_p1;
++        ag_prog_events_us += ag_p3 - ag_p2;
++        ag_prog_intlib_us += ag_p4 - ag_p3;
++        if (whole > ag_prog_worst_us) {
++            ag_prog_worst_us = whole;
++            ag_prog_worst_n = ag_n;
++            ag_prog_worst_one = ag_one_worst;
++            ag_prog_worst_sfall = ag_p1 - ag_p0;
++            ag_prog_worst_run = ag_p2 - ag_p1;
++            ag_prog_worst_events = ag_p3 - ag_p2;
++            ag_prog_worst_intlib = ag_p4 - ag_p3;
++        }
++    }
+ }
+ 
+ // ARGON: free a program and take it out of the interpreter's list.

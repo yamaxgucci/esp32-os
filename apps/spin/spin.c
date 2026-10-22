@@ -11,6 +11,11 @@
  *   run t:\spin.axe wd     promises a heartbeat every 500 ms and then stops
  *                          sending one: the watchdog should end it by itself,
  *                          with nobody pressing anything.
+ *   run t:\spin.axe log    deaf, and writes without a pause between: it is
+ *                          inside the kernel's output path - the journal's lock,
+ *                          the console's - nearly all the time, so a kill lands
+ *                          there as often as it can.  apps\reapwait's storm
+ *                          kills it again and again (proctest).
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -20,7 +25,8 @@ AG_APP("SPIN", "1.0", "argon", 0);
 
 int ag_main(int argc, char **argv)
 {
-    const bool deaf = (argc > 1) && argv[1][0] == 'd';
+    const bool noisy = (argc > 1) && argv[1][0] == 'l';
+    const bool deaf = noisy || ((argc > 1) && argv[1][0] == 'd');
     const bool watched = (argc > 1) && argv[1][0] == 'w';
 
     ag_printf("spinning%s; pid %d\n", deaf ? " and not listening" : "",
@@ -29,6 +35,10 @@ int ag_main(int argc, char **argv)
     if (watched) {
         ag_watchdog(500);
         ag_print("promised a heartbeat every 500 ms; will stop sending them\n");
+    }
+
+    while (noisy) {
+        ag_print(".");
     }
 
     for (unsigned round = 0;; round++) {

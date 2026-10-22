@@ -43,6 +43,7 @@ _Static_assert(API_SLOT(io) == API_OFF_IO, "ag_api_t.io moved");
 _Static_assert(API_SLOT(time) == API_OFF_TIME, "ag_api_t.time moved");
 _Static_assert(API_SLOT(proc) == API_OFF_PROC, "ag_api_t.proc moved");
 _Static_assert(API_SLOT(audio) == API_OFF_AUDIO, "ag_api_t.audio moved");
+_Static_assert(API_SLOT(clu) == API_OFF_CLU, "ag_api_t.clu moved");
 
 _Static_assert(SUB_SLOT(ag_mem_api_t, alloc) == MEM_OFF_ALLOC,
                "mem.alloc moved");
@@ -88,10 +89,31 @@ _Static_assert(SUB_SLOT(ag_inp_api_t, key_pressed) == INP_OFF_KEY_PRESSED,
 _Static_assert(SUB_SLOT(ag_inp_api_t, pad) == INP_OFF_PAD, "inp.pad moved");
 _Static_assert(SUB_SLOT(ag_inp_api_t, btn) == INP_OFF_BTN, "inp.btn moved");
 
+/*
+ * The cluster table.  These eight are the only way a program compiled on the
+ * board can use more than the board it was compiled on, and a slot that moved
+ * would send a thread's work through the wrong function rather than fail.
+ */
+_Static_assert(SUB_SLOT(ag_clu_api_t, nodes) == CLU_OFF_NODES, "clu.nodes moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, start) == CLU_OFF_START, "clu.start moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, spawn) == CLU_OFF_SPAWN, "clu.spawn moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, send) == CLU_OFF_SEND, "clu.send moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, recv) == CLU_OFF_RECV, "clu.recv moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, join) == CLU_OFF_JOIN, "clu.join moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, self) == CLU_OFF_SELF, "clu.self moved");
+_Static_assert(SUB_SLOT(ag_clu_api_t, done) == CLU_OFF_DONE, "clu.done moved");
+
 _Static_assert(SUB_SLOT(ag_sys_api_t, heartbeat) == SYS_OFF_HEARTBEAT,
                "sys.heartbeat moved");
 _Static_assert(SUB_SLOT(ag_proc_api_t, focused) == PROC_OFF_FOCUSED,
                "proc.focused moved");
+_Static_assert(SUB_SLOT(ag_proc_api_t, migrate_wanted) == PROC_OFF_MIG_WANTED,
+               "proc.migrate_wanted moved");
+_Static_assert(SUB_SLOT(ag_proc_api_t, migrate_save) == PROC_OFF_MIG_SAVE,
+               "proc.migrate_save moved");
+_Static_assert(SUB_SLOT(ag_proc_api_t, migrate_restore) ==
+                   PROC_OFF_MIG_RESTORE,
+               "proc.migrate_restore moved");
 
 _Static_assert(SUB_SLOT(ag_time_api_t, us) == TIME_OFF_US, "time.us moved");
 _Static_assert(SUB_SLOT(ag_time_api_t, ms) == TIME_OFF_MS, "time.ms moved");
@@ -477,6 +499,236 @@ static void check_dx7nofx_example(void)
     /* pcmvirt/midivirt via ag_dev_* (no AG_AXE_NEEDS_AUDIO; not ag_audio_*). */
     check_example_file("dx7nofx", "../apps/cc/examples/dx7nofx.c",
                        "apps/cc/examples/dx7nofx.c", 128 * 1024, 0u);
+}
+
+/*
+ * The program that travels, and the two things that make it possible.
+ *
+ * AG_AXE_CAN_MIGRATE (1<<8) so the kernel asks it to move at all, and its own
+ * NAME in the header so that the board it lands on can look for its own build
+ * of the same program.  Every image this compiler wrote used to be called
+ * "TCC", which is indistinguishable from every other, and a cascade that
+ * matches on identity would have matched the wrong thing.
+ */
+static void check_migrant_example(void)
+{
+    const char *paths[] = {"../apps/cc/examples/migrant.c",
+                           "apps/cc/examples/migrant.c", NULL};
+    FILE       *f = NULL;
+    for (int i = 0; paths[i] != NULL; i++) {
+        f = fopen(paths[i], "rb");
+        if (f != NULL) {
+            break;
+        }
+    }
+    AG_CHECK(f != NULL);
+    if (f == NULL) {
+        return;
+    }
+    char *buf = (char *)malloc(16 * 1024);
+    AG_CHECK(buf != NULL);
+    if (buf == NULL) {
+        fclose(f);
+        return;
+    }
+    const size_t n = fread(buf, 1, 16u * 1024u - 1u, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    cc_result_t res;
+    const int   rc = cc_compile_to_axe(buf, n, &res);
+    AG_CHECK(rc == 0);
+    if (rc != 0) {
+        printf("     migrant.c: %s\n", res.err);
+        free(buf);
+        return;
+    }
+    const uint32_t flags = (uint32_t)res.axe[12] | ((uint32_t)res.axe[13] << 8) |
+                           ((uint32_t)res.axe[14] << 16) |
+                           ((uint32_t)res.axe[15] << 24);
+    AG_CHECK((flags & (1u << 8)) != 0u);       /* AG_AXE_CAN_MIGRATE */
+    AG_CHECK((flags & (1u << 3)) == 0u);       /* not a driver */
+    /* name at 72, version at 104 - what the far node matches on. */
+    AG_CHECK(strcmp((const char *)res.axe + 72, "MIGRANT") == 0);
+    AG_CHECK(strcmp((const char *)res.axe + 104, "1.0") == 0);
+    cc_result_free(&res);
+    free(buf);
+}
+
+/*
+ * Counting upwards only, at the two ends the host can see: it compiles, and
+ * the constants that fill a word are accepted.
+ *
+ * What a host test CANNOT see is the instruction chosen - QUOU against QUOS,
+ * SRL against SRA, BLTU against BLT - because that only shows up in an answer.
+ * apps/cc/examples/unsigned.c prints seven of those answers with the signed
+ * reading beside each, and was run on the emulator:
+ *
+ *     shr 08000000   shr_s f8000000   div 55555555   rem 5
+ *     gt yes         gt_s no          shr20 00000800
+ */
+static void check_unsigned_example(void)
+{
+    const char *paths[] = {"../apps/cc/examples/unsigned.c",
+                           "apps/cc/examples/unsigned.c", NULL};
+    FILE       *f = NULL;
+    for (int i = 0; paths[i] != NULL; i++) {
+        f = fopen(paths[i], "rb");
+        if (f != NULL) {
+            break;
+        }
+    }
+    AG_CHECK(f != NULL);
+    if (f == NULL) {
+        return;
+    }
+    char *buf = (char *)malloc(16 * 1024);
+    AG_CHECK(buf != NULL);
+    if (buf == NULL) {
+        fclose(f);
+        return;
+    }
+    const size_t n = fread(buf, 1, 16u * 1024u - 1u, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    cc_result_t res;
+    const int   rc = cc_compile_to_axe(buf, n, &res);
+    AG_CHECK(rc == 0);
+    if (rc != 0) {
+        printf("     unsigned.c: %s\n", res.err);
+        free(buf);
+        return;
+    }
+    AG_CHECK(strcmp((const char *)res.axe + 72, "UNSIGNED") == 0);
+    cc_result_free(&res);
+    free(buf);
+
+    /* A hex constant may fill the word; a decimal one may not, and saying so
+     * is the point of the second half. */
+    check_prog("int ag_main(void) { int x = 0xffffffff; return x; }\n", 1);
+    check_prog("int ag_main(void) { unsigned x = 0x80000000; return 0; }\n", 1);
+    check_prog("int ag_main(void) { unsigned char c = 1; return c; }\n", 1);
+    check_prog("typedef unsigned int u32;\n"
+               "int ag_main(void) { u32 a = 7; return a / 2; }\n", 1);
+    /* `signed char` is a byte this compiler cannot represent, and says so
+     * rather than quietly treating it as unsigned. */
+    check_prog("int ag_main(void) { signed char c = 1; return c; }\n", 0);
+
+    /* sizeof a variable, and a struct given its fields at a declaration. */
+    check_prog("struct v { int a; int b; };\n"
+               "int ag_main(void) { struct v s = {1, 2}; return sizeof(s); }\n",
+               1);
+    check_prog("struct v { int a; char c; };\n"
+               "int ag_main(void) { struct v s = {0}; return s.a + s.c; }\n",
+               1);
+    check_prog("int ag_main(void) { char b[5]; return sizeof(b); }\n", 1);
+    /* More values than fields is a mistake, not a truncation. */
+    check_prog("struct v { int a; };\n"
+               "int ag_main(void) { struct v s = {1, 2}; return s.a; }\n", 0);
+    /* And a whole-struct assignment is still refused - the brace list is a
+     * declaration's initialiser, not a copy. */
+    check_prog("struct v { int a; };\n"
+               "int ag_main(void) { struct v s = {1}; struct v t; t = s;\n"
+               "  return t.a; }\n", 0);
+    /* sizeof of an expression has no honest answer here. */
+    check_prog("int ag_main(void) { int a = 1; return sizeof(a + 1); }\n", 0);
+
+    /* `static` where it already describes what happens, and refused where it
+     * would promise something this compiler does not do. */
+    check_prog("static int g;\n"
+               "static int f(void) { return 1; }\n"
+               "int ag_main(void) { g = f(); return g; }\n", 1);
+    check_prog("int ag_main(void) { static int n = 0; return n; }\n", 0);
+
+    /* bool, one byte like the host's _Bool, with true and false. */
+    check_prog("int ag_main(void) { bool b = true; if (b) { return 1; }\n"
+               "  return 0; }\n", 1);
+    check_prog("struct v { bool a; bool b; };\n"
+               "int ag_main(void) { struct v s = {true, false};\n"
+               "  return sizeof(s); }\n", 1);
+    /* A program that has its own idea of bool keeps it. */
+    check_prog("typedef int bool;\n"
+               "int ag_main(void) { bool b = 1; return b; }\n", 1);
+}
+
+/*
+ * A job for the whole cluster, written in the dialect the board itself
+ * compiles.  Two things are being checked here that nothing else checks:
+ *
+ *  - the eight ag_clu_* names resolve, with `&worker` as the code address in
+ *    an entry table this compiler has no function-pointer type for;
+ *  - the image DEMANDS ABI 0.52.  A kernel older than the cluster would
+ *    otherwise hand the program a NULL table and it would fault on the first
+ *    call instead of being refused at load.
+ *
+ * What a host test cannot see is whether the work actually left the board.
+ * That is `argon nodetest -Scenario ccjob`: node A compiles this file, runs
+ * it, and the blocks are ground on node B.
+ */
+static void check_clujob_example(void)
+{
+    const char *paths[] = {"../apps/cc/examples/clujob.c",
+                           "apps/cc/examples/clujob.c", NULL};
+    FILE       *f = NULL;
+    for (int i = 0; paths[i] != NULL; i++) {
+        f = fopen(paths[i], "rb");
+        if (f != NULL) {
+            break;
+        }
+    }
+    AG_CHECK(f != NULL);
+    if (f == NULL) {
+        return;
+    }
+    char *buf = (char *)malloc(16 * 1024);
+    AG_CHECK(buf != NULL);
+    if (buf == NULL) {
+        fclose(f);
+        return;
+    }
+    const size_t n = fread(buf, 1, 16u * 1024u - 1u, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    cc_result_t res;
+    const int   rc = cc_compile_to_axe(buf, n, &res);
+    AG_CHECK(rc == 0);
+    if (rc != 0) {
+        printf("     clujob.c: %s\n", res.err);
+        free(buf);
+        return;
+    }
+    const uint32_t minor = (uint32_t)res.axe[6] | ((uint32_t)res.axe[7] << 8);
+    AG_CHECK(minor >= 52u);
+    AG_CHECK(strcmp((const char *)res.axe + 72, "CLUJOB") == 0);
+    cc_result_free(&res);
+    free(buf);
+
+    /* Each of the eight on its own, so that a broken one is named rather than
+     * hidden behind whichever comes first in the example. */
+    check_prog("int ag_main(void) { return ag_clu_nodes(0, 0); }\n", 1);
+    check_prog("struct e { int name; int fn; };\n"
+               "struct e t[1];\n"
+               "void w(int s, char *a, int n) { return; }\n"
+               "int ag_main(void) { t[0].name = \"w\"; t[0].fn = &w;\n"
+               "  if (ag_clu_start(&t[0], 1)) { return 0; } return 0; }\n", 1);
+    check_prog("int ag_main(void) { return ag_clu_spawn(-1, \"w\", 0, 0); }\n",
+               1);
+    check_prog("int ag_main(void) { char b[4];\n"
+               "  return ag_clu_send(0, &b[0], 4, 100); }\n", 1);
+    check_prog("int ag_main(void) { char b[4]; int f;\n"
+               "  return ag_clu_recv(&f, &b[0], 4, 100); }\n", 1);
+    check_prog("int ag_main(void) { return ag_clu_join(1, 100); }\n", 1);
+    check_prog("int ag_main(void) { return ag_clu_self(); }\n", 1);
+    check_prog("int ag_main(void) { ag_clu_done(); return 0; }\n", 1);
+    /* The arity is the ABI: a call with the wrong number of arguments would
+     * put rubbish in a register the kernel reads. */
+    check_prog("int ag_main(void) { return ag_clu_join(1); }\n", 0);
+    check_prog("int ag_main(void) { return ag_clu_self(1); }\n", 0);
+    /* And the names are the kernel's, so a program may not take them. */
+    check_prog("int ag_clu_self(void) { return 0; }\n"
+               "int ag_main(void) { return ag_clu_self(); }\n", 0);
 }
 
 static void check_echo_sys_example(void)
@@ -1223,6 +1475,9 @@ void run_cc_tests(void)
         cc_result_free(&res);
     }
 
+    check_migrant_example();
+    check_unsigned_example();
+    check_clujob_example();
     check_asteroids_example();
     check_dx7nofx_example();
     check_echo_sys_example();

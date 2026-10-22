@@ -1,0 +1,141 @@
+diff --git a/src/animation.cc b/src/animation.cc
+--- a/src/animation.cc
++++ b/src/animation.cc
+@@ -2845,6 +2845,9 @@ void _object_animate()
+     const uint32_t ag_anim_t0 = ag_us();
+     const unsigned ag_lock0 = ag_art_lock_us;
+     const unsigned ag_rfsh0 = ag_move_refresh_us;
++    const unsigned ag_tref0 = ag_tilerefresh_us;
++    const unsigned ag_trefn0 = ag_tilerefresh_n;
++    const unsigned ag_trefpx0 = ag_tilerefresh_px;
+     const unsigned ag_refresh_n0 = ag_anim_refresh_n;
+     const unsigned ag_refresh_px0 = ag_anim_refresh_px;
+     const unsigned ag_seq0 = ag_anim_seq_us;
+@@ -3070,7 +3073,11 @@ void _object_animate()
+     {
+         const uint32_t took = ag_us() - ag_anim_t0;
+ 
+-        if (took > ag_anim_worst_us) {
++        /* A tick during a map load is not a tick of the game: it is the
++         * interface being read off the card for the first time, and it
++         * took the "worst tick" slot in almost every window - 1.16 s of
++         * loading against 35 ms of playing. */
++        if (took > ag_anim_worst_us && ag_map_loading == 0u) {
+             ag_anim_worst_us = took;
+             ag_anim_worst_refreshes = ag_anim_refresh_n - ag_refresh_n0;
+             ag_anim_worst_px = ag_anim_refresh_px - ag_refresh_px0;
+@@ -3079,6 +3086,9 @@ void _object_animate()
+             ag_anim_worst_move_us = ag_anim_move_us - ag_move0;
+             ag_anim_worst_lock_us = ag_art_lock_us - ag_lock0;
+             ag_anim_worst_rfsh_us = ag_move_refresh_us - ag_rfsh0;
++            ag_anim_worst_tref_us = ag_tilerefresh_us - ag_tref0;
++            ag_anim_worst_tref_n = ag_tilerefresh_n - ag_trefn0;
++            ag_anim_worst_tref_px = ag_tilerefresh_px - ag_trefpx0;
+             ag_anim_worst_script_us = ag_anim_script_us - ag_script0;
+         }
+     }
+diff --git a/src/cache.cc b/src/cache.cc
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -400,7 +400,18 @@ bool cacheLock(Cache* cache, int key, void** data, CacheEntry** cacheEntryPtr)
+      * is nothing to lock - and locking is what defeats compaction. */
+     if (cacheEntry->referenceCount == 0
+             && (cacheEntry->flags & CACHE_ENTRY_FLASH) == 0) {
+-        if (!heapLock(&(cache->heap), cacheEntry->heapHandleIndex, &(cacheEntry->data))) {
++        /* ARGON: what locking a block costs.  A tick spent 1.11 seconds of
++         * its 1.16 inside artLock while cache misses accounted for five
++         * milliseconds, so the time is in here - and the heap compacts
++         * around blocks it is not allowed to move. */
++        const unsigned ag_hl0 = ag_cache_now_us();
++        const bool     ag_hl_ok = heapLock(&(cache->heap),
++                                           cacheEntry->heapHandleIndex,
++                                           &(cacheEntry->data));
++
++        ag_heaplock_us += ag_cache_now_us() - ag_hl0;
++        ag_heaplock_n++;
++        if (!ag_hl_ok) {
+             return false;
+         }
+     }
+@@ -948,33 +959,42 @@ static int cacheFindIndexForKey(Cache* cache, int key, int* indexPtr)
+         return 3;
+     }
+ 
+-    int r = length - 1;
++    /*
++     * ARGON: a binary search that was not one.
++     *
++     * The original moves its bounds by a single element - l = l + 1 and
++     * r = r - 1 instead of mid + 1 and mid - 1 - so it walks the whole
++     * table one entry at a time while computing a midpoint it then throws
++     * away.  With a thousand entries in the art cache that is hundreds of
++     * steps per lookup, and lookups are the hot path: 8279 artLock calls
++     * in a thirty-second window cost 344 ms, 41 us each, while the heap
++     * inside them accounted for under four.
++     *
++     * On a Pentium this was merely wasteful.  Here it is a fifth of every
++     * map redraw.  The entries are sorted by key - the insert path keeps
++     * them so - which is what makes the proper search correct.
++     */
+     int l = 0;
+-    int mid;
+-    int cmp;
++    int r = length - 1;
+ 
+-    do {
+-        mid = (l + r) / 2;
++    while (l <= r) {
++        const int mid = l + (r - l) / 2;
++        const int cmp = key - cache->entries[mid]->key;
+ 
+-        cmp = key - cache->entries[mid]->key;
+         if (cmp == 0) {
+             *indexPtr = mid;
+             return 2;
+         }
+-
+         if (cmp > 0) {
+-            l = l + 1;
++            l = mid + 1;
+         } else {
+-            r = r - 1;
++            r = mid - 1;
+         }
+-    } while (r >= l);
+-
+-    if (cmp < 0) {
+-        *indexPtr = mid;
+-    } else {
+-        *indexPtr = mid + 1;
+     }
+ 
++    /* Where it would go: the first entry with a larger key. */
++    *indexPtr = l;
++
+     return 3;
+ }
+ 
+diff --git a/src/tile.cc b/src/tile.cc
+--- a/src/tile.cc
++++ b/src/tile.cc
+@@ -523,11 +523,20 @@ void tileEnable()
+ // 0x4B12C0
+ void tileWindowRefreshRect(Rect* rect, int elevation)
+ {
++    /* ARGON: every redraw of a piece of the map, wherever it is asked for.
++     * The animation tick calls this from a dozen places and only two of
++     * them were timed, which left 186 ms of a 293 ms tick unnamed. */
++    const uint32_t ag_tr0 = ag_us();
++
+     if (gTileEnabled) {
+         if (elevation == gElevation) {
+             gTileWindowRefreshElevationProc(rect, elevation);
+         }
+     }
++    ag_tilerefresh_us += ag_us() - ag_tr0;
++    ag_tilerefresh_n++;
++    ag_tilerefresh_px += (unsigned)((rect->right - rect->left + 1)
++                                    * (rect->bottom - rect->top + 1));
+ }
+ 
+ // 0x4B12D8

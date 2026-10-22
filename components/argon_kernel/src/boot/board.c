@@ -8,9 +8,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/log.h>
 #include <argon/path.h>
 
 #include <argon/port/config.h>
+/* For AG_PORT_UART_CONSOLE: which port is the one the system talks over is a
+ * property of the board, not a constant - see the UART loop below. */
+#include <argon/port/uart.h>
 
 #include "sdkconfig.h"
 
@@ -80,6 +84,8 @@ static void apply_generic_defaults(void)
     s_board.sd.miso = 13;
     s_board.sd.cs = 10;
     s_board.sd.spi_host = 2; /* SPI2, as the datasheet numbers it */
+    /* Off unless a board asks for it: see ag_board_sd_t.cs_hold. */
+    s_board.sd.cs_hold = AG_PIN_NONE;
 
     /*
      * Buses start unwired, and they stay that way until BOARD.CFG says
@@ -97,12 +103,29 @@ static void apply_generic_defaults(void)
         s_board.spi[i].mosi = AG_PIN_NONE;
         s_board.spi[i].miso = AG_PIN_NONE;
         s_board.spi[i].khz = 1000;
+        /* Leave the pad drive as the chip came up with it: this is an
+         * electrical choice for one board's wiring, not a default. */
+        s_board.spi[i].drive = -1;
     }
     for (int i = 0; i < AG_UART_PORTS; i++) {
         s_board.uart[i].tx = AG_PIN_NONE;
         s_board.uart[i].rx = AG_PIN_NONE;
         s_board.uart[i].baud = 115200;
     }
+    /*
+     * UART1/UART2 get placeholder pins in the generic (QEMU) profile.  The
+     * emulator wires these UARTs to its own serial ports and ignores the pin
+     * numbers, but the io layer still refuses to open a UART with none - so a
+     * loadable driver (an external radio on UART2, say) could not reach an
+     * emulated coprocessor without them.  A real board overrides these in
+     * BOARD.CFG with the GPIOs the peripheral is actually wired to; these
+     * numbers avoid the SD/SPI defaults above so nothing collides if it does
+     * not.  UART0 stays the console and is never set here.
+     */
+    s_board.uart[1].tx = 17;
+    s_board.uart[1].rx = 18;
+    s_board.uart[2].tx = 19;
+    s_board.uart[2].rx = 20;
 
     strcpy(s_board.audio.driver, "auto");
     s_board.audio.bclk = AG_PIN_NONE;
@@ -184,11 +207,45 @@ static void apply_bus_config(const ag_cfg_t *cfg)
         bus->miso = cfg_pin(cfg, key, bus->miso);
         snprintf(key, sizeof(key), "spi%d.khz", chip);
         bus->khz = cfg_rate(cfg, key, bus->khz, 80000);
+        /*
+         * 0..3 is the whole range a chip's pad driver has; -1 and "absent" both
+         * mean leave it as it is.  A number outside that is not a strength and
+         * is refused rather than clamped: a board that wrote 7 meant something
+         * this file does not say, and quietly driving the pins at some other
+         * strength is how that goes unnoticed.
+         */
+        snprintf(key, sizeof(key), "spi%d.drive", chip);
+        const int32_t drive = ag_cfg_get_int(cfg, key, bus->drive);
+        if (drive >= -1 && drive <= 3) {
+            bus->drive = (int8_t)drive;
+        }
     }
 
-    /* UART0 is the console and is not configurable here: the pins it uses are
-     * the ones the system is talking to you over. */
-    for (int i = 1; i < AG_UART_PORTS; i++) {
+    /*
+     * EVERY PORT BUT THE CONSOLE'S, and which one that is depends on the board.
+     *
+     * This loop started at 1, with a comment saying UART0 is the console and
+     * the pins it uses are the ones the system is talking to you over.  True
+     * on a board with a USB-to-UART bridge, and FALSE on the two that have
+     * none: the C3 SuperMini and the S3-Zero talk over the chip's own
+     * USB-Serial-JTAG, the port layer models that as a pseudo-port past the
+     * real UARTs (AG_PORT_UART_CONSOLE), and UART0 on those boards drives two
+     * header pins that nothing else wants.
+     *
+     * What the old rule cost: a `[uart0]` section was read by nobody and said
+     * so to nobody.  The C3 has exactly two UARTs, so refusing UART0 refused
+     * it a SECOND WIRE - which is the whole of a three-board cluster with the
+     * C3 in the middle.  The pins were free the entire time.
+     *
+     * The ROM still prints its reset banner on UART0's DEFAULT pins (20/21 on
+     * the C3), whatever the matrix is told afterwards.  That is an argument
+     * for putting the wire on other pins, not for leaving the port unusable -
+     * and the pin table refuses the console's own pins by number either way.
+     */
+    for (int i = 0; i < AG_UART_PORTS; i++) {
+        if (i == AG_PORT_UART_CONSOLE) {
+            continue;
+        }
         ag_board_uart_t *port = &s_board.uart[i];
 
         snprintf(key, sizeof(key), "uart%d.tx", i);
@@ -261,6 +318,14 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
     s_board.sd.mosi = cfg_pin(cfg, "sd.mosi", s_board.sd.mosi);
     s_board.sd.miso = cfg_pin(cfg, "sd.miso", s_board.sd.miso);
     s_board.sd.cs = cfg_pin(cfg, "sd.cs", s_board.sd.cs);
+    /*
+     * The pin that has to be held high for the card to be readable on a board
+     * where the panel's chip select and the card's share a bus.  It is read
+     * like every other pin, so a board without this arrangement leaves it at
+     * AG_PIN_NONE and the port drives nothing; see ag_board_sd_t.cs_hold for
+     * the measurement behind it.
+     */
+    s_board.sd.cs_hold = cfg_pin(cfg, "sd.cs_hold", s_board.sd.cs_hold);
     s_board.sd.card_detect = cfg_pin(cfg, "sd.card_detect",
                                      s_board.sd.card_detect);
 
@@ -312,10 +377,27 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
             snprintf(s_board.audio.driver, sizeof(s_board.audio.driver), "%s",
                      adrv);
         }
-        s_board.audio.bclk = cfg_pin(cfg, "audio.bclk", s_board.audio.bclk);
-        s_board.audio.ws = cfg_pin(cfg, "audio.ws", s_board.audio.ws);
-        s_board.audio.dout = cfg_pin(cfg, "audio.dout", s_board.audio.dout);
-        s_board.audio.mclk = cfg_pin(cfg, "audio.mclk", s_board.audio.mclk);
+        /*
+         * `fitted = no`: the wiring is written down and nothing is on the end
+         * of it (2 Oct 2026).  The S3-CAM's amplifier was taken off its I2S
+         * pins, its /dev/pcm0 kept coming up and playing into the air, and
+         * as a real converter it beat the CYD's speaker next door: no sound
+         * on the pair, ever, Fallout's included.  Unfitted, there is no
+         * converter here, and the neighbour's is the one (devdefault.c).
+         */
+        const char *fitted = ag_cfg_get(cfg, "audio.fitted", "yes");
+        if (fitted != NULL && strcmp(fitted, "no") == 0) {
+            ag_log(AG_LOG_INFO, "board",
+                   "audio: nothing fitted on its pins - no converter here");
+        } else {
+            s_board.audio.bclk =
+                cfg_pin(cfg, "audio.bclk", s_board.audio.bclk);
+            s_board.audio.ws = cfg_pin(cfg, "audio.ws", s_board.audio.ws);
+            s_board.audio.dout =
+                cfg_pin(cfg, "audio.dout", s_board.audio.dout);
+            s_board.audio.mclk =
+                cfg_pin(cfg, "audio.mclk", s_board.audio.mclk);
+        }
         const int32_t ar = ag_cfg_get_int(cfg, "audio.rate",
                                           (int32_t)s_board.audio.rate);
         if (ar >= 8000 && ar <= 48000) {

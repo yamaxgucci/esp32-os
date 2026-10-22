@@ -49,6 +49,8 @@ typedef struct {
     uint8_t      rx_buf[PKT_SIZE];
     uint8_t      rx_n;
     uint8_t      drop_stale;
+    ag_handle_t  last_accept_err;
+    uint8_t      listen_moaned; /* the failed-to-listen warning is said once */
 } kbdvirt_state_t;
 
 static kbdvirt_state_t s_st;
@@ -161,33 +163,101 @@ static void ensure_listen(kbdvirt_state_t *st)
     if (!ag_net_is_ready()) {
         return;
     }
-    st->listen = ag_tcp_listen(KBDVIRT_PORT);
-    if (st->listen < 0) {
-        st->listen = -1;
+    /*
+     * A refusal never clears a handle somebody else installed.  See the long
+     * note in apps/mousevirt/mousevirt.c: the kernel's input tick and the
+     * shell both call this, and the loser of that race used to overwrite the
+     * winner's socket with -1 and leave the port shut for the whole boot.
+     */
+    const int32_t rc = ag_tcp_listen(KBDVIRT_PORT);
+    if (rc < 0) {
+        if (st->listen < 0 && !st->listen_moaned) {
+            st->listen_moaned = 1;
+            ag_log(AG_LOG_WARN, "kbdvirt", "cannot listen on :%u (%d)",
+                   (unsigned)KBDVIRT_PORT, (int)rc);
+        }
         return;
     }
+    if (st->listen >= 0) {
+        (void)ag_net_close(rc);
+        return;
+    }
+    st->listen = rc;
+    st->listen_moaned = 0;
     (void)ag_net_set_nonblock(st->listen, true);
     ag_log(AG_LOG_INFO, "kbdvirt", "listen :%u", (unsigned)KBDVIRT_PORT);
 }
 
+/*
+ * Take every connection that is waiting, not one per call.
+ *
+ * A host tool that retries while the guest boots leaves one queued connection
+ * per attempt, and QEMU's forwarding accepts them all whether or not anybody
+ * here ever will.  Taking one per read then works through a queue of corpses
+ * at a frame each while the live socket - always the last of them - waits its
+ * turn and its keys go nowhere.
+ *
+ * The newest peer is the real one, so the rest are closed as they come.
+ *
+ * This was not the bug that made the keyboard look dead - that was the drain
+ * below - but it is a real one and it is the same shape, so it is fixed here
+ * rather than left to be found the same way.
+ */
 static void try_accept(kbdvirt_state_t *st)
 {
     ag_handle_t peer;
+    int         spins = 0;
     ensure_listen(st);
     if (st->listen < 0) {
         return;
     }
-    peer = ag_tcp_accept(st->listen, 0u);
-    if (peer < 0) {
+    for (;;) {
+        peer = ag_tcp_accept(st->listen, 0u);
+        if (peer < 0) {
+            break;
+        }
+        /* Quietly: a line for each of forty corpses is not a diagnosis, and
+         * the count goes in the one line printed below. */
+        if (st->conn >= 0) {
+            (void)ag_net_close(st->conn);
+        }
+        st->conn = peer;
+        st->rx_n = 0;
+        if (++spins >= 64) {
+            break;
+        }
+    }
+    if (spins == 0) {
+        /*
+         * -EAGAIN is the ordinary answer - nobody is knocking - and it arrives
+         * sixty times a second, so it is not worth a line.  Anything else is
+         * the driver failing to take a connection that is there, which from
+         * the outside looks exactly like a keyboard that does not work, and
+         * left no trace at all until this line existed.  Once per code, so a
+         * standing fault does not fill the screen.
+         */
+        if (peer != (ag_handle_t)(-AG_EAGAIN) && peer != st->last_accept_err) {
+            st->last_accept_err = peer;
+            ag_log(AG_LOG_WARN, "kbdvirt", "accept refused: %d", (int)peer);
+        }
         return;
     }
-    if (st->conn >= 0) {
-        close_conn(st, "replaced by new peer");
-    }
-    st->conn = peer;
+    st->last_accept_err = 0;
     (void)ag_net_set_nonblock(st->conn, true);
-    drain_rx(st);
-    st->drop_stale = 1;
+    /*
+     * Events queued from an older peer go; bytes on this brand new socket
+     * stay.
+     *
+     * This used to drain the socket here as well, and that was a keyboard that
+     * dropped keys.  The socket has just been accepted, so the only thing it
+     * can hold is what *this* peer has already sent - and a host tool that
+     * connects and immediately types has sent it before the guest, which only
+     * accepts on its ten-millisecond tick, gets here.  Measured: a scripted F5
+     * arriving one run in three, with the driver reporting a healthy
+     * connection every time.
+     */
+    ring_clear(st);
+    st->rx_n = 0;
     ag_log(AG_LOG_INFO, "kbdvirt", "host connected");
 }
 
@@ -225,8 +295,15 @@ static ag_err_t kbd_open(ag_device_t *dev, uint32_t flags)
         return -AG_ENODEV;
     }
     ensure_listen(st);
+    /*
+     * Throw away what is waiting only when a peer was already connected before
+     * this open: that is a previous application's leftovers and belongs to
+     * nobody.  A connection this open has just accepted has sent nothing but
+     * what the caller is about to want.
+     */
+    const bool had_peer = (st->conn >= 0);
     try_accept(st);
-    st->drop_stale = 1;
+    st->drop_stale = had_peer ? 1u : 0u;
     return AG_OK;
 }
 
@@ -304,6 +381,35 @@ static const ag_dev_ops_t k_ops = {
     .ioctl = kbd_ioctl,
 };
 
+/*
+ * The kernel's service tick (ABI 0.28).  See the long note over mouse_poll in
+ * apps/mousevirt/mousevirt.c: this driver keeps no thread of its own (it could,
+ * since ABI 0.48), and without this tick the only service it ever got was an
+ * application reading the device - which
+ * an application taking its keys from ag_poll_event has no reason to do.
+ *
+ * No events are returned: they are injected from the pump, already decoded.
+ * The stale-drop is deliberately not run here.  It exists to throw away what a
+ * previous peer left behind when an application opens the device, and running
+ * it on a ten-millisecond tick would throw away every key instead.
+ */
+static int32_t kbd_poll(ag_handle_t h, ag_event_t *out, uint32_t max)
+{
+    (void)h;
+    (void)out;
+    (void)max;
+    if (s_st.listen < 0 && s_st.conn < 0) {
+        ensure_listen(&s_st);
+    }
+    pump_rx(&s_st);
+    return 0;
+}
+
+static const ag_input_ops_t k_input_ops = {
+    .size = sizeof(ag_input_ops_t),
+    .poll = kbd_poll,
+};
+
 static void kbd_fini(void)
 {
     if (s_st.conn >= 0) {
@@ -339,6 +445,7 @@ ag_err_t ag_driver_init(void)
             .cls = AG_DEV_INPUT,
             .flags = 0,
             .ops = &k_ops,
+            .class_ops = &k_input_ops,
             .priv = &s_st,
         };
         const ag_err_t err = ag_dev_add(&desc);

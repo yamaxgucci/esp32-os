@@ -17,6 +17,7 @@
 #ifndef ARGON_PORT_IMPL_TASK_H
 #define ARGON_PORT_IMPL_TASK_H
 
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
@@ -69,11 +70,33 @@ static inline bool ag_port_task_create(ag_port_task_fn fn, const char *name,
 
 static inline void ag_port_task_delete(ag_port_task_t t) { vTaskDelete(t); }
 
+/*
+ * Stopping another task where it stands, for the kernel's kill.  On two cores
+ * vTaskSuspend of a task running on the other one only asks that core to
+ * switch away, and returns before it has: eTaskGetState answers eRunning until
+ * it really is off, which is what ag_port_task_on_cpu is for.
+ */
+static inline void ag_port_task_suspend(ag_port_task_t t) { vTaskSuspend(t); }
+
+static inline void ag_port_task_resume(ag_port_task_t t) { vTaskResume(t); }
+
+static inline bool ag_port_task_on_cpu(ag_port_task_t t)
+{
+    return eTaskGetState(t) == eRunning;
+}
+
 static inline void ag_port_task_delay(ag_port_ticks_t ticks) { vTaskDelay(ticks); }
 
 static inline ag_port_task_t ag_port_task_self(void)
 {
     return xTaskGetCurrentTaskHandle();
+}
+
+/* The task's name, for a report; never NULL. */
+static inline const char *ag_port_task_name(ag_port_task_t t)
+{
+    const char *n = (t != NULL) ? pcTaskGetName(t) : NULL;
+    return (n != NULL) ? n : "?";
 }
 
 static inline void ag_port_task_prio_set(ag_port_task_t t, unsigned prio)
@@ -94,6 +117,38 @@ static inline void ag_port_notify_take(bool clear, ag_port_ticks_t ticks)
 }
 
 static inline void ag_port_task_yield(void) { taskYIELD(); }
+
+/*
+ * The tick, per core, in interrupt context.  Not inline: registering it needs
+ * esp_freertos_hooks.h and two trampolines, which is a source file's work -
+ * see src/tick_hw.c.
+ */
+/*
+ * A tick callback must live where the instruction cache being off cannot reach
+ * it, and must call nothing that does not.  The tick fires on both cores all
+ * the time, including while a flash write has the cache disabled, and a
+ * handler in flash then takes the core down with "Cache disabled but cached
+ * memory region accessed".  That is not a theory: it panicked this board on
+ * the first boot after the hook was added.
+ */
+#define AG_PORT_IRAM IRAM_ATTR
+
+typedef void (*ag_port_tick_fn)(int core, ag_port_task_t running);
+bool ag_port_tick_hook(ag_port_tick_fn fn);
+
+/* The scheduler's idle task on `core`, or NULL where there is no such core:
+ * a tick that finds it running is a tick nobody wanted. */
+ag_port_task_t ag_port_task_idle_of(int core);
+
+/* A notification from interrupt context, with the yield the ISR owes. */
+static inline void ag_port_notify_give_isr(ag_port_task_t t)
+{
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(t, &woken);
+    if (woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
 
 static inline void ag_port_sched_lock(void) { vTaskSuspendAll(); }
 

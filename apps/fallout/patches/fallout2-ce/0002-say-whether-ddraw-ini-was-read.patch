@@ -1,0 +1,28 @@
+diff --git a/src/sfall_config.cc b/src/sfall_config.cc
+index cfa239d..6f9aed2 100644
+--- a/src/sfall_config.cc
++++ b/src/sfall_config.cc
+@@ -3,6 +3,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#include "debug.h"
+ #include "platform_compat.h"
+ 
+ namespace fallout {
+@@ -78,7 +79,14 @@ bool sfallConfigInit(int argc, char** argv)
+         strcpy(path, SFALL_CONFIG_FILE_NAME);
+     }
+ 
+-    configRead(&gSfallConfig, path, false);
++    // ARGON: say where it looked and whether it found anything.  The path is
++    // built from argv[0], which on this system is whatever the shell was
++    // typed, so a setting that "has no effect" is usually a file that was
++    // never read - and that was invisible.
++    {
++        const bool ok = configRead(&gSfallConfig, path, false);
++        debugPrint("sfall: %s %s\n", path, ok ? "read" : "NOT FOUND");
++    }
+ 
+     configParseCommandLineArguments(&gSfallConfig, argc, argv);
+ 

@@ -21,8 +21,10 @@ set(ARGON_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/core/path.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cfg.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/core/place_parse.c"
     "${ARGON_ROOT}/components/argon_kernel/src/core/cmdline.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/codepage.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/dev/hidrep.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/screen.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtout.c"
     "${ARGON_ROOT}/components/argon_kernel/src/console/vtin.c"
@@ -97,6 +99,8 @@ set(ARGON_INCLUDES
     "${ARGON_ROOT}/apps/common/ckt"
     "${ARGON_ROOT}/apps/common/tube"
     "${ARGON_ROOT}/apps/common/kvm"
+    "${ARGON_ROOT}/apps/common/pixband"
+    "${ARGON_ROOT}/apps/common/ws"
     "${ARGON_ROOT}/apps/cktbench")
 
 # The NAM player has to agree with the reference implementation to the last bit -
@@ -116,6 +120,7 @@ add_executable(argon_tests
     main.c
     test_path.c
     test_cfg.c
+    test_place.c
     test_screen.c
     test_vtout.c
     test_vtin.c
@@ -132,6 +137,7 @@ add_executable(argon_tests
     test_axeload.c
     test_axesig.c
     test_codepage.c
+    test_hidrep.c
     test_probe.c
     test_cc.c
     test_draw.c
@@ -140,12 +146,41 @@ add_executable(argon_tests
     test_tube.c
     test_nam.c
     test_netmsg.c
+    test_cluframe.c
+    "${ARGON_ROOT}/components/argon_kernel/src/net/cluframe.c"
     test_rempix.c
     test_kvm.c
     test_ws.c
     test_vid.c
+    test_desktop.c
+    test_fsops.c
+    "${ARGON_ROOT}/apps/desktop/dsk_rect.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_layout.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_paint.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_wm.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_kbd.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_menu.c"
+    "${ARGON_ROOT}/apps/desktop/dsk_dlg.c"
+    "${ARGON_ROOT}/apps/common/fsops/fsops.c"
+    test_rlink.c
+    "${ARGON_ROOT}/apps/common/rlink/ag_rlink.c"
+    test_atproto.c
+    "${ARGON_ROOT}/apps/common/atproto/ag_atproto.c"
+    test_rdcodec.c
+    "${ARGON_ROOT}/components/argon_kernel/src/net/rdcodec.c"
+    # The link to a phone.  Unlike test_rempix.c, which mirrors REMDISP's codec
+    # in a copy because a .SYS for Xtensa will not link here, these two are the
+    # shipped files: what the test exercises is what PHONE.SYS runs.
+    test_phonelink.c
+    "${ARGON_ROOT}/apps/common/pixband/ag_pixband.c"
+    "${ARGON_ROOT}/apps/common/ws/ag_ws.c"
+    test_espldr.c
+    "${ARGON_ROOT}/apps/common/esp8266/ag_espldr.c"
+    test_stm32ldr.c
+    "${ARGON_ROOT}/apps/common/stm32/ag_stm32ldr.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
+    test_rv32.c
     "${ARGON_ROOT}/components/argon_kernel/src/dev/draw.c"
     ${ARGON_DSP_SRCS}
     ${ARGON_KVM_SRCS}
@@ -156,9 +191,12 @@ add_executable(argon_tests
 target_include_directories(argon_tests BEFORE PRIVATE
     "${ARGON_ROOT}/tools/host_stub")
 target_include_directories(argon_tests PRIVATE
+    "${ARGON_ROOT}/components/argon_kernel/src"
     "${ARGON_ROOT}/tools"
+    "${ARGON_ROOT}/apps/common/agvm"
     ${ARGON_INCLUDES}
-    "${ARGON_ROOT}/apps/common/ir")
+    "${ARGON_ROOT}/apps/common/ir"
+    "${ARGON_ROOT}/apps/common")
 if(NOT MSVC)
     target_link_libraries(argon_tests PRIVATE m)
 endif()
@@ -178,6 +216,31 @@ add_executable(vtdump
     "${ARGON_ROOT}/components/argon_kernel/src/console/screen.c")
 
 target_include_directories(vtdump PRIVATE ${ARGON_INCLUDES})
+
+# The board's own compiler, run here.  Not a test by itself: it is what makes a
+# change to the code generator answerable - compile every example before and
+# after and compare the hashes.
+add_executable(cchost
+    "${ARGON_ROOT}/tools/cchost/cchost.c"
+    "${ARGON_ROOT}/apps/cc/cc_compile.c")
+
+target_include_directories(cchost PRIVATE
+    "${ARGON_ROOT}/apps/cc"
+    "${ARGON_ROOT}/apps/common/agvm"
+    ${ARGON_INCLUDES})
+
+target_compile_definitions(cchost PRIVATE AG_HOST=1)
+
+# A picture encoded by the real encoder, for tools/phonepage.py to replay at a
+# browser.  The page's three decoders are the half of the phone link that the
+# two-board rig cannot judge, and writing the encoder a second time in Python
+# to test them would be a second thing to be wrong - see ag_pixband.h.
+add_executable(pixband_sample
+    "${ARGON_ROOT}/tools/pixband_sample.c"
+    "${ARGON_ROOT}/apps/common/pixband/ag_pixband.c")
+
+target_include_directories(pixband_sample PRIVATE
+    "${ARGON_ROOT}/apps/common/pixband")
 
 # Listening files.  Not tests - ears catch things numbers do not - but they
 # are built here so the engines they render cannot quietly stop compiling.
@@ -343,8 +406,9 @@ foreach(smoke engine_smoke synth_smoke ckt_smoke ckt_play ir_check)
         "${ARGON_ROOT}/apps/common/ir")
 endforeach()
 
-foreach(target argon_tests vtdump engine_smoke synth_smoke ckt_smoke ckt_play
-        ir_check wavdiff wavrate ckt_exact tube_render)
+foreach(target argon_tests vtdump cchost pixband_sample engine_smoke
+        synth_smoke ckt_smoke ckt_play ir_check wavdiff wavrate ckt_exact
+        tube_render)
     if(MSVC)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${target} PRIVATE /W4)
@@ -355,3 +419,43 @@ foreach(target argon_tests vtdump engine_smoke synth_smoke ckt_smoke ckt_play
 endforeach()
 
 add_test(NAME argon_tests COMMAND argon_tests)
+
+# The framed link's protocol, both ends and a lossy wire in one process.  Its
+# own executable because it stands the port's locks, clock and randomness in
+# with stubs (wlink_stub/, first on the path), and every other test reaches
+# those headers through the `bare` port.
+add_executable(wlink_tests
+    test_wlink.c
+    "${ARGON_ROOT}/components/argon_kernel/src/net/wlink.c")
+target_include_directories(wlink_tests BEFORE PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/wlink_stub")
+target_include_directories(wlink_tests PRIVATE
+    "${ARGON_ROOT}/components/argon_kernel/src"
+    ${ARGON_INCLUDES})
+if(MSVC)
+    target_compile_definitions(wlink_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(wlink_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+target_compile_definitions(wlink_tests PRIVATE ARGON_NO_WTRACE)
+add_test(NAME wlink_tests COMMAND wlink_tests)
+
+# A neighbour's screen end to end: the painter's passes drawn into a
+# framebuffer that must equal the frame after each (test_rdpaint.c).  Its
+# own executable for the same reason as the one above: the painter's port
+# is stubbed (rdpaint_stub/).
+add_executable(rdpaint_tests
+    test_rdpaint.c
+    "${ARGON_ROOT}/components/argon_kernel/src/net/rdcodec.c")
+target_include_directories(rdpaint_tests BEFORE PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/rdpaint_stub")
+target_include_directories(rdpaint_tests PRIVATE
+    "${ARGON_ROOT}/components/argon_kernel/src"
+    ${ARGON_INCLUDES})
+if(MSVC)
+    target_compile_definitions(rdpaint_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(rdpaint_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+target_compile_definitions(rdpaint_tests PRIVATE ARGON_NO_WTRACE)
+add_test(NAME rdpaint_tests COMMAND rdpaint_tests)

@@ -60,62 +60,198 @@ void ag_port_audio_pins(const ag_port_audio_pins_t *pins)
 #if SOC_DAC_SUPPORTED
 
 #include "driver/dac_continuous.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 const char *ag_port_audio_name(void) { return "dac"; }
 
-/* Four descriptors of half a kilobyte: about ninety milliseconds at 22 kHz,
- * which is the whole latency budget and about four kilobytes of DMA buffers. */
-#define DAC_DESCS    4
-#define DAC_BUF      512
+/*
+ * Eight descriptors of a quarter kilobyte: still about ninety milliseconds at
+ * 22 kHz, which is the whole latency budget, but each one is 11.6 ms instead of
+ * 23.
+ *
+ * The length of one descriptor is not a detail - it is the shortest a write can
+ * possibly wait.  A descriptor becomes free to load only once it has been
+ * played, so at the moment the converter starts, *every* descriptor is busy and
+ * the first write has to wait a whole one.  With half-kilobyte descriptors that
+ * is 23 ms, and a poke shorter than that fails every time with
+ * `dac_continuous: Get available descriptor timeout` - which is exactly how the
+ * first version of the short-timeout flush below silenced `beep`.
+ */
+#define DAC_DESCS    8
+#define DAC_BUF      256
 #define DAC_FRAMES   (DAC_DESCS * DAC_BUF)
 
-/* How long write() may wait for the converter to drain: one buffer's worth. */
+/*
+ * How long a write may wait for the converter to drain.
+ *
+ * DAC_WAIT_MS is for closing, where waiting is the point: the walk down to
+ * silence has to actually reach the pin before the peripheral stops.
+ *
+ * DAC_POKE_MS is for the ordinary path, and it is short because a write to a
+ * device is made with the kernel's device registry held.  Waiting here does
+ * not only slow the caller down, it stops every other device the caller's
+ * machine has - which on the CYD is the display, being fed pixels down a UART
+ * with no flow control.  See ag_port_audio_write.
+ *
+ * It cannot be *very* short, and two milliseconds was a mistake: a descriptor
+ * is 11.6 ms of sound and does not come free before it has been played, so a
+ * poke shorter than one descriptor fails every time and the sound never
+ * starts.  Twenty is one descriptor and a margin.
+ */
 #define DAC_WAIT_MS  120
+#define DAC_POKE_MS  20
 
 /*
- * One whole DMA chain's worth of converted bytes, filled before any of it is
- * handed over.
- *
- * Not an optimisation: the driver underneath takes a descriptor per call
- * regardless of how little is in it, and feeding it a hundred and twenty eight
- * bytes at a time starves the chain within four calls.  Filling two kilobytes
- * first means one call per ninety milliseconds of sound and a chain that is
- * always loaded to the top.
+ * OUT BY THE CONVERTER'S OWN CLOCK, FROM A RING (2 Oct 2026).  Written in
+ * calls, the driver gave each call's last bytes two descriptors half full and
+ * stopped its DMA whenever the chain ran to its end: one big write every 46
+ * ms stopped it every 46 ms, small writes stopped it after each - Maxim heard
+ * the S3's tone through the CYD "with frequent clicks", then its own beep
+ * choppy.  Now the DMA goes round its descriptors for as long as the device
+ * is open, and each one it has played is filled again in its interrupt from
+ * this ring - with what is there, and when nothing is, with the last sample
+ * held: no stop, no restart.  And after running out it plays again only with
+ * DAC_PRIME waiting, so sound that comes at a neighbour's clock, a little
+ * slower than this one, has a cushion instead of a click a period.
  */
-#define ACC_BYTES (DAC_DESCS * DAC_BUF)
+#define DAC_RING  3072u            /* samples as played: 70 ms at 44.1 kHz */
+#define DAC_PRIME 1536u            /* 35 ms */
 
 static dac_continuous_handle_t s_dac;
+/* playing: enabled and going round (s_dac alone is only "made") */
+static bool                    s_dac_on;
+/* the rate s_dac was made at, as played (after s_up) */
+static uint32_t                s_dac_hz;
 static uint8_t                 s_channels = 2;
-static uint8_t                 s_acc[ACC_BYTES];
-static size_t                  s_acc_used;
+/* each input sample is given this many times (see ag_port_audio_open) */
+static uint8_t                 s_up = 1;
+static uint8_t                 s_ring[DAC_RING];
+static volatile uint32_t       s_w, s_r; /* samples in, samples played */
+static volatile bool           s_priming = true;
+static volatile uint8_t        s_last = 128;
+/* the ring ran out while playing: a gap, counted (2 Oct 2026) */
+static volatile uint32_t       s_dac_stops;
 
-/* Hands the buffer over, in as few calls as the driver will take. */
-static bool acc_flush(void)
+uint32_t ag_port_audio_stops(void)
 {
-    size_t off = 0;
+    return s_dac_stops;
+}
 
-    while (off < s_acc_used) {
-        size_t          loaded = 0;
-        const esp_err_t err = dac_continuous_write(
-            s_dac, s_acc + off, s_acc_used - off, &loaded, DAC_WAIT_MS);
-        off += loaded;
-        if (err != ESP_OK) {
-            break; /* the converter is still full: the rest is dropped */
+/* What the DMA has played, held samples and all, and when it started: the
+ * converter's own clock, against which the neighbour's sound arrives
+ * (2 Oct 2026, for the gaps the S3's tone had now and then). */
+static volatile uint32_t s_dma_samples;
+static volatile int64_t  s_dma_t0_us;
+static uint32_t          s_rate_seen_samples;
+static int64_t           s_rate_seen_us;
+
+uint32_t ag_port_audio_rate_mhz(void)
+{
+    const uint32_t n = s_dma_samples;
+    const int64_t  now = esp_timer_get_time();
+    if (s_rate_seen_us == 0 || s_dma_t0_us == 0) {
+        s_rate_seen_us = (s_dma_t0_us != 0) ? s_dma_t0_us : now;
+        s_rate_seen_samples = 0u;
+    }
+    const uint32_t dn = n - s_rate_seen_samples;
+    const int64_t  dt = now - s_rate_seen_us;
+    s_rate_seen_samples = n;
+    s_rate_seen_us = now;
+    if (dn == 0u || dt <= 0 || s_up == 0u) {
+        return 0u;
+    }
+    return (uint32_t)((uint64_t)dn * 1000000000ull / (uint64_t)dt / s_up);
+}
+
+static bool IRAM_ATTR on_dac_done(dac_continuous_handle_t h,
+                                  const dac_event_data_t *e, void *arg)
+{
+    (void)arg;
+    uint8_t        piece[DAC_BUF];
+    const uint32_t want =
+        (e->buf_size / 2u < DAC_BUF) ? e->buf_size / 2u : DAC_BUF;
+    const uint32_t have = s_w - s_r;
+    uint32_t       n = 0;
+    if (s_dma_t0_us == 0) {
+        s_dma_t0_us = esp_timer_get_time();
+    }
+    s_dma_samples += want;
+    if (s_priming && have >= DAC_PRIME) {
+        s_priming = false;
+    }
+    if (!s_priming) {
+        n = (have < want) ? have : want;
+        for (uint32_t i = 0; i < n; i++) {
+            piece[i] = s_ring[(s_r + i) % DAC_RING];
+        }
+        s_r += n;
+        if (n > 0u) {
+            s_last = piece[n - 1u];
+        }
+        if (n < want) {
+            s_dac_stops++;
+            s_priming = true;
         }
     }
-    const bool all = (off == s_acc_used);
-    s_acc_used = 0;
-    return all;
+    for (uint32_t i = n; i < want; i++) {
+        piece[i] = s_last; /* held, not dropped to the rail */
+    }
+    (void)dac_continuous_write_asynchronously(h, e->buf, e->buf_size, piece,
+                                              want, NULL);
+    return false;
+}
+
+/*
+ * THE CONVERTER'S MEMORY, KEPT FOR IT FROM THE START (2 Oct 2026).  It opens
+ * on the first sound, and by then the CYD had 1 KB of byte memory left - the
+ * neighbour's picture and the link had the rest - so its DMA buffers could
+ * not be had: "failed to allocate dma buffer", sound arriving and nothing
+ * played.  So a block the size of what the driver takes is held from the
+ * first question about the converter until the driver asks for its buffers.
+ *
+ * AND NOT GIVEN BACK AFTER THAT (2 Oct 2026).  Held again at every close, the
+ * block came back somewhere else: the heap's best fit for 3 KB was the CYD's
+ * last 5 KB piece, not the hole the driver had left, and one `beep` took the
+ * largest block of byte memory from 5 KB to 2 KB.  The neighbour's next
+ * request then had no 4 KB for the task it is served in - its open of
+ * cyd.pcm0 answered -12, the S3's mixer had "nowhere to send sound", and the
+ * CYD played nothing more of it.  So the driver keeps its channels from the
+ * first open on, stopped while the device is closed, and the memory never
+ * moves; only a different rate makes them anew - and 22 050 and 44 100, the
+ * two that reach here, are both played at 44 100 (see the open).
+ */
+#define DAC_RESERVE (DAC_DESCS * DAC_BUF + 1024u)
+static void *s_reserve;
+
+static void dac_reserve(void)
+{
+    if (s_reserve == NULL && s_dac == NULL) {
+        s_reserve = heap_caps_malloc(DAC_RESERVE,
+                                     MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    }
 }
 
 bool ag_port_audio_present(void)
 {
+    dac_reserve(); /* asked once at boot, before anything else holds it */
     return true;
+}
+
+static void dac_drop(void)
+{
+    if (s_dac != NULL) {
+        (void)dac_continuous_del_channels(s_dac);
+        s_dac = NULL;
+    }
+    dac_reserve();
 }
 
 bool ag_port_audio_open(uint32_t rate, uint8_t channels)
 {
-    if (s_dac != NULL) {
+    if (s_dac_on) {
         return true;
     }
     if (channels != 1u && channels != 2u) {
@@ -130,7 +266,23 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
     if (rate < 20000u) {
         rate = 20000u;
     }
+    /*
+     * And below 32 kHz the converter is run at twice the rate, each sample
+     * given twice.  Near the bottom of what the divider reaches the rate it
+     * gives is not the rate asked for: at 22 050 this DAC played about 16%
+     * slow, measured as a stream from the C3 that the CYD could only keep up
+     * with by throwing a sixth of it away (25 Sep 2026), where at 44 100 a
+     * sixty-second tone takes sixty seconds.  A sample held twice is the same
+     * sound to an 8-bit converter behind a small speaker.
+     */
+    s_up = (rate < 32000u) ? 2u : 1u;
+    rate *= s_up;
 
+    if (s_dac != NULL && s_dac_hz != rate) {
+        /* another clock: the one thing that needs the channels made anew */
+        (void)dac_continuous_del_channels(s_dac);
+        s_dac = NULL;
+    }
     const dac_continuous_config_t cfg = {
         /* Channel 1 is GPIO 26: the pin the amplifier is on. */
         .chan_mask = DAC_CHANNEL_MASK_CH1,
@@ -142,99 +294,136 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
         .chan_mode = DAC_CHANNEL_MODE_SIMUL,
     };
 
-    esp_err_t err = dac_continuous_new_channels(&cfg, &s_dac);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "dac channels: %s", esp_err_to_name(err));
-        s_dac = NULL;
-        return false;
-    }
-    err = dac_continuous_enable(s_dac);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "dac enable: %s", esp_err_to_name(err));
-        (void)dac_continuous_del_channels(s_dac);
-        s_dac = NULL;
-        return false;
+    esp_err_t err = ESP_OK;
+    if (s_dac == NULL) {
+        if (s_reserve != NULL) {
+            heap_caps_free(s_reserve); /* for the driver's own buffers, now */
+            s_reserve = NULL;
+        }
+        err = dac_continuous_new_channels(&cfg, &s_dac);
+        if (err == ESP_OK) {
+            const dac_event_callbacks_t cbs = {.on_convert_done = on_dac_done,
+                                               .on_stop = NULL};
+            err = dac_continuous_register_event_callback(s_dac, &cbs, NULL);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "dac: %s", esp_err_to_name(err));
+            dac_drop();
+            return false;
+        }
+        s_dac_hz = rate;
     }
 
+    s_w = s_r = 0;
+    s_priming = true;
+    s_last = 128;
+    err = dac_continuous_enable(s_dac);
+    if (err == ESP_OK) {
+        err = dac_continuous_start_async_writing(s_dac);
+        if (err != ESP_OK) {
+            (void)dac_continuous_disable(s_dac);
+        }
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "dac: %s", esp_err_to_name(err));
+        dac_drop();
+        return false;
+    }
+    s_dac_on = true;
     s_channels = channels;
-    s_acc_used = 0;
     ESP_LOGI(TAG, "dac out on gpio26, %u Hz, %u ch in", (unsigned)rate,
              (unsigned)channels);
     return true;
 }
 
+/* What is waiting is played out, for at most `ms`. */
+static void ring_drain(uint32_t ms)
+{
+    for (uint32_t t = 0; t < ms && s_w != s_r && !s_priming; t += 2u) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+static void ring_put(uint8_t v)
+{
+    s_ring[s_w % DAC_RING] = v;
+    s_w++;
+}
+
 void ag_port_audio_close(void)
 {
-    if (s_dac == NULL) {
+    if (!s_dac_on) {
         return;
     }
-    (void)acc_flush();
-
+    ring_drain(DAC_WAIT_MS);
     /*
      * Silence is 128, not 0: the converter swings from ground to the supply
      * and the middle of that is what the amplifier's input is coupled around.
-     * Stopping at 128 and then cutting the peripheral drops the pin to ground
-     * in one step, which is a thump in the speaker - so walk it down first,
-     * over about twenty milliseconds, which is below what a speaker this size
-     * will reproduce.
+     * Cutting the peripheral drops the pin to ground in one step, which is a
+     * thump in the speaker - so walk it down first, over about twenty
+     * milliseconds, which is below what a speaker this size will reproduce.
      */
-    for (int level = 128; level > 0; level -= 4) {
-        memset(s_acc + s_acc_used, (uint8_t)level, 16u);
-        s_acc_used += 16u;
+    s_priming = false;
+    for (int level = s_last; level > 0; level -= 1) {
+        for (int k = 0; k < 3 && s_w - s_r < DAC_RING; k++) {
+            ring_put((uint8_t)level);
+        }
     }
-    (void)acc_flush();
-
+    ring_drain(DAC_WAIT_MS);
+    (void)dac_continuous_stop_async_writing(s_dac);
     (void)dac_continuous_disable(s_dac);
-    (void)dac_continuous_del_channels(s_dac);
-    s_dac = NULL;
+    s_dac_on = false; /* the channels and their memory stay, for the next */
 }
 
 int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
 {
-    if (s_dac == NULL || pcm == NULL || frames <= 0) {
+    if (!s_dac_on || pcm == NULL || frames <= 0) {
         return 0;
     }
-
-    int32_t done = 0;
+    int32_t  done = 0;
+    uint32_t waited = 0;
     while (done < frames) {
-        int32_t n = frames - done;
-        const int32_t room = (int32_t)(ACC_BYTES - s_acc_used);
-        if (n > room) {
-            n = room;
+        const uint32_t room = DAC_RING - (s_w - s_r);
+        if (room < s_up) {
+            /* a full ring paces the writer, as a full chain did - briefly,
+             * because a device write holds the registry (DAC_POKE_MS) */
+            if (waited >= DAC_POKE_MS) {
+                break;
+            }
+            vTaskDelay(1);
+            waited += portTICK_PERIOD_MS;
+            continue;
         }
-
+        int32_t n = frames - done;
+        if ((uint32_t)n > room / s_up) {
+            n = (int32_t)(room / s_up);
+        }
         /*
          * Signed 16-bit to unsigned 8-bit is the top byte with the sign
          * flipped.  Two channels become one by averaging rather than by
          * dropping the right: an effect that lives in one channel would
          * otherwise vanish, and this speaker has no stereo to lose.
          */
-        uint8_t *out = s_acc + s_acc_used;
-        if (s_channels == 2u) {
-            const int16_t *src = pcm + (size_t)done * 2u;
-            for (int32_t i = 0; i < n; i++) {
-                const int32_t mono = ((int32_t)src[i * 2] + src[i * 2 + 1]) / 2;
-                out[i] = (uint8_t)((mono + 32768) >> 8);
-            }
-        } else {
-            const int16_t *src = pcm + done;
-            for (int32_t i = 0; i < n; i++) {
-                out[i] = (uint8_t)(((int32_t)src[i] + 32768) >> 8);
+        for (int32_t i = 0; i < n; i++) {
+            const int32_t v16 =
+                (s_channels == 2u)
+                    ? ((int32_t)pcm[(size_t)(done + i) * 2u] +
+                       pcm[(size_t)(done + i) * 2u + 1u]) / 2
+                    : (int32_t)pcm[done + i];
+            const uint8_t v = (uint8_t)((v16 + 32768) >> 8);
+            for (uint8_t k = 0; k < s_up; k++) {
+                ring_put(v);
             }
         }
-        s_acc_used += (size_t)n;
         done += n;
-
-        if (s_acc_used >= ACC_BYTES && !acc_flush()) {
-            break; /* the converter would not take it: say what was played */
-        }
+        waited = 0;
     }
     return done;
 }
 
 int32_t ag_port_audio_space(void)
 {
-    return s_dac != NULL ? (int32_t)(ACC_BYTES - s_acc_used) : 0;
+    return s_dac_on ? (int32_t)((DAC_RING - (s_w - s_r)) / s_up) : 0;
 }
 
 #elif SOC_I2S_SUPPORTED
@@ -253,7 +442,14 @@ int32_t ag_port_audio_space(void)
  * buzz at that buffer's own frequency, which is the first thing anyone hears
  * when an application falls behind.  The price is a memset per descriptor.
  */
-#define I2S_DESCS   4
+/*
+ * Eight, not four (27 Sep 2026): sound poured from a neighbour arrives with
+ * the wire's jitter, and four descriptors are 22 ms at 44.1 kHz - the S3-Zero
+ * ran dry 70-115 times in five minutes with every period arriving, while the
+ * CYD beside it, whose converter holds some 90 ms, never did.  Eight are
+ * 44 ms, and 3.8 KB more while something plays.
+ */
+#define I2S_DESCS   8
 #define I2S_FRAMES  240
 #define I2S_WAIT_MS 120
 
@@ -389,6 +585,9 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
  * count of it in this layer would be keeping it wrong.  The caller uses it to
  * size a ring, and a ring the size of the chain is the right size.
  */
+uint32_t ag_port_audio_stops(void) { return 0; }
+uint32_t ag_port_audio_rate_mhz(void) { return 0; }
+
 int32_t ag_port_audio_space(void)
 {
     return (s_tx != NULL) ? (int32_t)(I2S_DESCS * I2S_FRAMES) : 0;
@@ -415,6 +614,9 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
     (void)frames;
     return 0;
 }
+
+uint32_t ag_port_audio_stops(void) { return 0; }
+uint32_t ag_port_audio_rate_mhz(void) { return 0; }
 
 int32_t ag_port_audio_space(void) { return 0; }
 
@@ -446,6 +648,9 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
     (void)frames;
     return 0;
 }
+
+uint32_t ag_port_audio_stops(void) { return 0; }
+uint32_t ag_port_audio_rate_mhz(void) { return 0; }
 
 int32_t ag_port_audio_space(void)
 {

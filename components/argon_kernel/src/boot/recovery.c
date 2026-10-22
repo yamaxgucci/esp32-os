@@ -33,8 +33,24 @@ static bool         s_begun;
 
 static bool reset_is_unclean(ag_reset_t rr)
 {
-    /* A cold start and a deliberate `reboot` are both clean; nothing else is. */
-    return rr == AG_RESET_OTHER;
+    /*
+     * A cold start, a deliberate `reboot`, and a console or debugger attach are
+     * all clean; nothing else is.
+     *
+     * The attach is in that list because it is not the board failing: a chip
+     * whose console is its own USB-Serial-JTAG is reset by the mere act of
+     * opening the port, so EVERY tool that looks at the board - ours, an
+     * operator's terminal, a log viewer - used to add one to this streak.  With
+     * the threshold at three that is a board that skips its modules and its
+     * AUTOEXEC after three looks, which then reads as "the middle board has no
+     * wire" rather than "somebody attached a console".
+     *
+     * It is exactly as wide as "somebody asked for this": a watchdog, a panic,
+     * a brownout, a power glitch or a lockup is the board itself and stays
+     * counted, which is the whole reason this counter exists.
+     */
+    return rr != AG_RESET_POWERON && rr != AG_RESET_SOFTWARE &&
+           rr != AG_RESET_ATTACH;
 }
 
 static bool marker_present(void)

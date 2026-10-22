@@ -23,6 +23,7 @@
 #include <argon/console.h>
 #include <argon/log.h>
 
+#include <argon/netprov.h>
 #include <argon/port/net.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
@@ -62,7 +63,7 @@ static int32_t telnet_write(void *ctx, const char *data, size_t len)
     if (!c->used || c->fd < 0) {
         return 0;
     }
-    const int32_t n = ag_port_net_send(c->fd, data, len);
+    const int32_t n = ag_netprov_send(c->fd, data, len);
     /* A send error does not detach here - the read side sees the same broken
      * socket and returns negative, which is the one place that detaches. */
     return (n < 0) ? 0 : n;
@@ -85,7 +86,7 @@ static int32_t telnet_read(void *ctx, uint8_t *buf, size_t len)
         return 0;
     }
 
-    const int32_t n = ag_port_net_recv_now(c->fd, raw, want);
+    const int32_t n = ag_netprov_recv_now(c->fd, raw, want);
     if (n == 0) {
         return -1; /* orderly close: peer hung up */
     }
@@ -130,7 +131,7 @@ static void telnet_close(void *ctx)
 {
     telnet_conn_t *c = (telnet_conn_t *)ctx;
     if (c->fd >= 0) {
-        (void)ag_port_net_close(c->fd);
+        (void)ag_netprov_close(c->fd);
         c->fd = -1;
     }
     c->used = false;
@@ -160,28 +161,28 @@ static telnet_conn_t *conn_alloc(void)
 
 static void accept_one(void)
 {
-    const int fd = ag_port_net_accept(s_listen_fd, TELNET_ACCEPT_MS);
+    const int fd = ag_netprov_accept(s_listen_fd, TELNET_ACCEPT_MS);
     if (fd < 0) {
         return; /* timeout (nothing waiting) or a transient error */
     }
 
     telnet_conn_t *c = conn_alloc();
     if (c == NULL) {
-        (void)ag_port_net_close(fd); /* too many sessions already */
+        (void)ag_netprov_close(fd); /* too many sessions already */
         return;
     }
     c->fd = fd;
-    (void)ag_port_net_nonblock(fd, true);
+    (void)ag_netprov_nonblock(fd, true);
 
     /* Offer to echo and to run without go-ahead, so a line-mode client switches
      * to character-at-a-time - which is what the console's input decoder wants. */
     static const uint8_t hello[] = {
         TN_IAC, TN_WILL, TN_ECHO, TN_IAC, TN_WILL, TN_SGA,
     };
-    (void)ag_port_net_send(fd, hello, sizeof(hello));
+    (void)ag_netprov_send(fd, hello, sizeof(hello));
 
     if (ag_console_attach(&k_telnet_transport, c) != AG_OK) {
-        (void)ag_port_net_close(fd);
+        (void)ag_netprov_close(fd);
         c->fd = -1;
         c->used = false;
     }
@@ -201,7 +202,7 @@ static void telnet_task(void *arg)
         }
     }
     if (s_listen_fd >= 0) {
-        (void)ag_port_net_close(s_listen_fd);
+        (void)ag_netprov_close(s_listen_fd);
         s_listen_fd = -1;
     }
     s_running = false;
@@ -217,7 +218,7 @@ ag_err_t ag_telnet_start(uint16_t port)
         port = TELNET_DEFAULT_PORT;
     }
 
-    const int lfd = ag_port_net_listen(port);
+    const int lfd = ag_netprov_listen(port);
     if (lfd < 0) {
         return (lfd < 0) ? (ag_err_t)lfd : -AG_EIO;
     }
@@ -228,7 +229,7 @@ ag_err_t ag_telnet_start(uint16_t port)
 
     if (!ag_port_task_create(telnet_task, "ag_telnet", 4096, NULL, 6, 0, 0,
                              &s_task)) {
-        (void)ag_port_net_close(s_listen_fd);
+        (void)ag_netprov_close(s_listen_fd);
         s_listen_fd = -1;
         s_running = false;
         return -AG_ENOMEM;

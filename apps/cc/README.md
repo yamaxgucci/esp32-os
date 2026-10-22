@@ -1,17 +1,53 @@
 # Argon CC — tiny C → `.AXE` on the device
 
-**Argon CC** compiles a small subset of C to a runnable Xtensa `.AXE` without a
-host toolchain (image name `CC.AXE`).
+**Argon CC** compiles a small subset of C to a runnable `.AXE` without a host
+toolchain (image name `CC.AXE`). Three machines: **Xtensa**, **RV32IM**, and
+one with no processor at all.
+
+```text
+run t:\cc.axe t:\hi.c t:\hi.axe             this board
+run t:\cc.axe -riscv t:\hi.c t:\hi.axe      the other one
+run t:\cc.axe -bc t:\hi.c t:\hi.bc          both, through AGVM.AXE
+```
+
+The default is the board it is running on; `-riscv` / `-xtensa` says otherwise.
+Cross-compiling is what the cluster needs and it goes one way in practice: this
+compiler wants three megabytes of heap, which every board with PSRAM has and no
+C3 ever will, so the board that can compile does it for the board that cannot.
+The image header carries the architecture and the far board's loader names it —
+an image for the wrong machine does not refuse to load, it loads and throws an
+illegal instruction somewhere inside.
 
 ## Language
 
-- Types: `int` (32-bit), `char` (one **unsigned** byte), `struct`, a pointer to
-  any of those, `void` (return / empty params)
+- Types: `int` (32-bit), `char` (one **unsigned** byte), `unsigned` /
+  `unsigned int` (32-bit, counting upwards only), `unsigned char`, `struct`, a
+  pointer to any of those, `void` (return / empty params).  `signed int` is
+  accepted and means `int`; `signed char` is refused, because a byte is loaded
+  zero-extended here and always has been
+- `bool` with `true` / `false`: one byte, like the host compiler's `_Bool`, so a
+  struct carrying one has the same shape on both sides of the ABI. Not a
+  keyword — a program that says `typedef int bool;` keeps its own meaning
+- `static` on a function or a global is accepted and ignored: an image is one
+  translation unit, so it already describes what happens. On a **local** it is
+  refused rather than quietly turned into an ordinary one — a variable that
+  promises to survive the call and does not would be wrong on the second call
+- Unsigned is not decoration: `/`, `%`, `>>` and the four comparisons emit
+  different instructions for it (QUOU/REMU/SRL/BLTU).  A `typedef unsigned int
+  uint32_t;` therefore behaves as the name says.  A hex constant may fill the
+  word (`0x80000000`, `0xffffffff`); a decimal one may not, because written out
+  it is more likely a typo than an intention
 - Entry: `ag_main` (app) or `ag_driver_init` (`.SYS` driver). Exactly one.
   Other functions allowed; **define before use**
 - Drivers: `#pragma drv "NAME" "VER" "AUTHOR"` (required) sets the image
   header; the compiler stamps `AG_AXE_DRIVER`. `&func` yields a code address
   for filling an ops table
+- Apps: `#pragma app "NAME" "VER" "AUTHOR"` gives the image its own identity in
+  the header. Without it every image this compiler wrote called itself
+  `TCC 0.2 cc`, which makes a cluster that looks for *its own build of that
+  program* unable to tell one from any other
+- `#pragma migrate` stamps `AG_AXE_CAN_MIGRATE`, without which the kernel never
+  asks the program to move and the three `ag_migrate_*` calls are dead code
 - App sizes: `#pragma appstack N` / `#pragma appheap N` write non-zero
   `stack_size` / `heap_size` into the AXE header (kernel defaults if omitted;
   `N` is decimal or `0x` hex bytes)
@@ -24,7 +60,10 @@ host toolchain (image name `CC.AXE`).
   or empty; step the same (no decl)
 - `switch` is an if-chain with fall-through; `break` leaves it (no `continue`)
 - `typedef` and `enum { A, B = 3 }` (enumerators are int constants); `const` /
-  `volatile` are accepted and ignored; `sizeof(type)` for known types
+  `volatile` are accepted and ignored; `sizeof(type)` for known types, and
+  `sizeof(name)` for a declared variable or array - exact, so `char b[5]` is 5.
+  Not `sizeof(expression)`: there is no typed tree to ask, and an answer it
+  could not give honestly would be worse than a refusal
 - Arrays and pointers: `a[i]`, `a[i] = expr`, `*p`, `*p = expr`, `&x`, `&a[i]`,
   `&func` (code address of a function already defined)
 - Structs: `struct v { int x; char tag; int a[4]; struct v *next; };` then
@@ -51,6 +90,12 @@ host toolchain (image name `CC.AXE`).
 No floats, unions, arrays of pointers, or pointers to pointers. Functions return
 `int` or `void` — an address is an `int` like any other, so a function that hands
 one back is declared `int`.
+
+A struct local may be given its fields where it is declared —
+`struct v s = {1, 2};`, in declaration order, a trailing comma allowed, and
+whatever is left out is zero (so `= {0}` means all of it). Nested structs and
+arrays inside the braces are refused rather than guessed at. That is an
+initialiser and not a copy: everywhere else,
 
 A struct is only ever handled by address: no struct assignment (`a = b`), no
 struct parameter or return value — pass `&s` and take a `struct v *`. Fields go
@@ -87,7 +132,9 @@ of a guest.
 The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 `ag_gfx_*` (which also sets `AG_AXE_NEEDS_GFX`), 10 for `ag_btn`, 14 for
 `ag_audio_*` (`AG_AXE_NEEDS_AUDIO`), 16 for clip/round-rect, 17 for
-`ag_gfx_blit_bind` / `blit_copy` / `blit_keyed`, 20 for `ag_focused`.
+`ag_gfx_blit_bind` / `blit_copy` / `blit_keyed`, 20 for `ag_focused`, 52 for
+`ag_clu_*`, 53 for `ag_migrate_*`. That is what makes an older kernel refuse
+the image at load instead of handing it a NULL table to fault on.
 
 | Builtin | Notes |
 |---------|--------|
@@ -140,6 +187,25 @@ The image demands the highest ABI minor of the features it uses: 8 plain, 9 for
 | `ag_dev_read` / `ag_dev_write` / `ag_dev_ioctl` | same shapes as the FS calls |
 | `ag_dev_add(desc)` / `ag_dev_remove(name)` | publish / withdraw (only in `ag_driver_init`) |
 | `ag_dev_priv(dev)` | driver's `priv` from inside ops callbacks |
+| `ag_migrate_wanted()` | true when a board has asked this program to move (ABI 0.53) |
+| `ag_migrate_save(p, n)` / `ag_migrate_restore(p, n)` | hand over / take back the state; restore returns 0 on a fresh start |
+| `ag_clu_nodes(out, max)` | boards this job may use; `out` 0 asks only for the count (ABI 0.52) |
+| `ag_clu_start(tab, n)` | declare the entry points; **true means this copy is a worker and its share is already done** |
+| `ag_clu_spawn(node, name, arg, len)` | one thread there; node `-1` any, `-2` here |
+| `ag_clu_send(tid, buf, len, ms)` / `ag_clu_recv(&from, buf, cap, ms)` | messages between threads, wherever they are |
+| `ag_clu_join(tid, ms)` / `ag_clu_self()` / `ag_clu_done()` | wait for one, ask who I am, end the job |
+
+The cluster entry table is `ag_clu_entry_t` written out word by word —
+`struct entry { int name; int fn; };` — and filled at run time with a string and
+`&worker`, the same way a `.SYS` fills its ops. `ag_clu_nodes` is asked for the
+count rather than the table because `ag_clu_node_t` has a `char[16]` in it,
+which this compiler cannot yet lay out.
+
+A whole job in the dialect: [`examples/clujob.c`](examples/clujob.c) — it
+computes the same sum twice, once on this core and once out of the messages
+that came back, and the two must be the same number. `argon nodetest -Scenario
+ccjob` compiles that file **on node A** and checks that node B, which has never
+held a copy of the image, ran it.
 
 No `ag_seek`: the kernel API is `int64_t`, and every value in this language is a
 32-bit word. Open flags are ordinary `#define`s (see above), not keywords.
@@ -179,6 +245,78 @@ sticky keys remain a fallback. `[` `]` algorithm, `,` `.` preset, `-` `=`
 feedback, Space panic, Esc quit. The live UI shows `Perf` / `Stream`
 (render load %, late, drop, resync) like host DX7. Smoke prints
 `dx7nofx: smoke ok`.
+
+## The three back ends
+
+`cc_compile.c` is one translation unit with a **seam** in the middle: one
+function per operation the parser can ask for, and the machines under it
+(`xt_*`, `rv_*`, `bc_*`). Above the seam the registers are NUMBERS, not registers — 8
+is the value in hand, 9 the other operand, 7 the frame, 10..15 the arguments
+going out, and a call's answer comes back in 10, which is true of a windowed
+machine (a2 seen as a10) and of an ordinary one (a0) alike.
+
+What actually differs is not the encodings:
+
+| | Xtensa | RV32IM | bytecode |
+|---|---|---|---|
+| an address | `l32r` from a literal pool beside the code; relocating it is arithmetic on a word | `lui`+`addi` carrying it in their immediates; relocating it rewrites two instructions (`ag_axe_ireloc_t`) | an offset the interpreter adds to where it put the data — no relocations at all |
+| a call | `ENTRY` rotates a window and allocates the frame; arguments arrive eight registers along | the prologue saves `ra` and `s0` itself; arguments arrive where the caller put them | one `CALL`; a tagged operand is a call inside the image, anything else is an address in the ABI table |
+| the frame size | one rewritten `ENTRY` | every `return` jumps to one epilogue, written when the size is known | a rewritten `ENTER`, and the frame is a block of the interpreter's store |
+| `a < b` | a branch and two moves | `slt` / `sltu` | `SLT` / `SLTU` |
+| `x >> 20` unsigned | through the shift-amount register: `SRLI` cannot count past 15 | `srli` | `SHRUI` |
+
+How it is known to work, and the first is not enough:
+
+- `tools/ccbaseline.ps1` compiles every example with the host build of this
+  compiler (`build-host/cchost.exe`) and prints a hash each. Run it before a
+  change to the code generator and after: an Xtensa image that was not meant to
+  move must not move.
+- `riscv32-esp-elf-objdump` decodes every instruction of every example. That
+  says they are legal, not that they are the right ones.
+- `host-tests/test_rv32.c` **runs** them: an RV32IM interpreter, the two parts
+  placed somewhere other than where they were linked, and the kernel's own
+  `ag_axe_ireloc_apply` used to relocate — so it also checks that the compiler
+  and the loader agree about which bits of a `lui` an address goes into.
+- `argon rvtest` is the whole thing with no board: an emulated ESP32-C3 runs
+  the images and gives the same seven unsigned answers the Xtensa build gives,
+  an emulated S3 writes one with `cc -riscv` that matches the host build byte
+  for byte, and the SAME `.bc` file is run on both machines through the
+  interpreter and has to answer identically.
+
+## `-bc`: the machine with no processor
+
+The third rung of the cascade in [`docs/plans/cluster.md`](../../docs/plans/cluster.md).
+`cc -bc x.c x.bc` writes an image with `arch = 3`, and
+[`AGVM.AXE`](../agvm/agvm.c) runs it:
+
+```text
+run t:\agvm.axe t:\x.bc
+```
+
+One file every board can execute, at five to fifty times the cost of native
+code. That is the right trade for coordination — policy, supervision, glue —
+because such a program sleeps between events, and the wrong one for audio.
+
+The instruction set is the seam written down
+([`apps/common/agvm/ag_bc.h`](../common/agvm/ag_bc.h)): sixteen registers with
+the seam's own numbers, so the back end is about one line an operation. It is
+also the only one of the three with **no relocations at all** — Xtensa fetches
+an address from a literal beside the code and RISC-V builds it in a `lui`/`addi`
+pair, and both need fixing up once the parts are placed; the interpreter knows
+where it put the data and adds the offset as it runs.
+
+The interpreter is ~2 KB of code on either machine and **knows no builtins**: a
+bytecode program reaches the ABI the way a native one does (load the api
+pointer out of its own data, walk to the sub-table, walk to the function, call
+it), so all it needs is a CALL that can call an ordinary address with six
+arguments. Adding an ABI call to the system adds nothing to it.
+
+**What it cannot do**, and the reason the plan gives this rung to coordination
+rather than to everything: a code address here is an offset into bytecode with
+the top bit set, which is not something the kernel can jump to. So a bytecode
+program cannot be a `.SYS` driver and cannot register cluster entry points —
+both are callbacks *from* native code. Registers hold real addresses and there
+is no MMU underneath, so this is portability, not a sandbox.
 
 ## Build
 

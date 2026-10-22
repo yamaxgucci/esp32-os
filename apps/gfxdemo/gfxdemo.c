@@ -13,7 +13,18 @@
 #include <argon/argon.h>
 #include <argon/keys.h>
 
-AG_APP("GFXDEMO", "1.0", "argon", AG_AXE_NEEDS_GFX);
+/*
+ * Eight kilobytes of stack and four of arena, named rather than defaulted.
+ *
+ * Measured on the CYD: this demo touches 4.3 KB of stack (the kernel prints
+ * what a process left unused when it exits) and allocates nothing, while the
+ * default hands it sixteen and an arena besides.  On a board with 49 KB free
+ * that difference is most of the machine, and what it costs is not the demo -
+ * it is the radio: with the demo up, the largest free block fell to 5 KB, and
+ * a WPA2 handshake cannot complete in that.  The network stayed visible and
+ * stopped admitting anyone, which a phone reports as a wrong password.
+ */
+AG_APP_SIZED("GFXDEMO", "1.0", "argon", AG_AXE_NEEDS_GFX, 8 * 1024, 4 * 1024);
 
 static void draw_scene(const ag_gfxinfo_t *info)
 {

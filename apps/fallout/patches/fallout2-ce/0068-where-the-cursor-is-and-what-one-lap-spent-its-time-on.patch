@@ -1,0 +1,89 @@
+diff --git a/src/animation.cc b/src/animation.cc
+--- a/src/animation.cc
++++ b/src/animation.cc
+@@ -3252,6 +3252,10 @@ void _object_animate()
+     {
+         const uint32_t took = ag_us() - ag_anim_t0;
+ 
++        /* ARGON: and into the lap, for the cause of one freeze rather than
++         * the worst of a window.  See ag_lap_* in port/ag_diag.h. */
++        ag_lap_anim_us += took;
++
+         /* A tick during a map load is not a tick of the game: it is the
+          * interface being read off the card for the first time, and it
+          * took the "worst tick" slot in almost every window - 1.16 s of
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -198,6 +198,7 @@ int inputGetInput()
+ 
+     ag_in_events_us += ag_i1 - ag_i0;
+     ag_in_bk_us += ag_i2 - ag_i1;
++    ag_lap_events_us += ag_i1 - ag_i0;
+     ag_in_calls++;
+ 
+     v3 = dequeueInputEvent();
+@@ -233,8 +234,12 @@ void _process_bk()
+     _mouse_info();
+     AG_STEP("input: buttons");
+ 
++    const uint32_t t2 = ag_us();
++
+     ag_bk_tickers_us += t1 - t0;
+-    ag_bk_mouse_us += ag_us() - t1;
++    ag_lap_tickers_us += t1 - t0;
++    ag_bk_mouse_us += t2 - t1;
++    ag_lap_mouse_us += t2 - t1;
+ 
+     v1 = _win_check_all_buttons();
+     if (v1 != -1) {
+diff --git a/src/mouse.cc b/src/mouse.cc
+--- a/src/mouse.cc
++++ b/src/mouse.cc
+@@ -728,3 +728,25 @@ int mouse_get_last_buttons()
+ }
+ 
+ } // namespace fallout
++
++/*
++ * ARGON: where the cursor the player can see actually is.
++ *
++ * The port needed this for the one-to-one view, and asking the wrong side of
++ * the port for it is what made that view misbehave: the window began to slide
++ * before the pointer reached the edge, or only once it had been pushed past
++ * it.  The port knows the position the mouse DRIVER reports, in panel pixels,
++ * and that is not where this cursor is.  The engine does not read a position
++ * from the port at all - dinput.cc takes relative motion through
++ * SDL_GetRelativeMouseState and accumulates it here, in the picture's own
++ * 640x480, clipped by _mouse_clip to the screen rather than to the panel.  So
++ * the two drift apart as soon as either one runs into a limit the other does
++ * not have, and they were never the same thing to begin with.
++ *
++ * The hot spot is included, because the question this answers is "where is the
++ * cursor pointing", not "where does its bitmap start".
++ */
++extern "C" void ag_mouse_where(int* x, int* y)
++{
++    fallout::mouseGetPosition(x, y);
++}
+diff --git a/src/scripts.cc b/src/scripts.cc
+--- a/src/scripts.cc
++++ b/src/scripts.cc
+@@ -824,6 +824,8 @@ static void _doBkProcesses()
+ 
+             ag_bk_timed_us += ag_b5 - ag_b4;
+             ag_bk_critters_us += ag_b3 - ag_b2;
++            ag_lap_timed_us += ag_b5 - ag_b4;
++            ag_lap_critters_us += ag_b3 - ag_b2;
+             if (ag_b3 - ag_b2 > ag_bk_critters_worst) {
+                 ag_bk_critters_worst = ag_b3 - ag_b2;
+             }
+@@ -835,6 +837,8 @@ static void _doBkProcesses()
+ 
+     ag_bk_programs_us += ag_b1 - ag_b0;
+     ag_bk_windows_us += ag_b2 - ag_b1;
++    ag_lap_programs_us += ag_b1 - ag_b0;
++    ag_lap_windows_us += ag_b2 - ag_b1;
+     ag_bk_calls++;
+ 
+     /* The averages are small and the outlier is a second, so keep the

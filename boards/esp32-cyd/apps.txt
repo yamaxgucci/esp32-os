@@ -1,0 +1,29 @@
+# What goes on this board's C:, staged by tools\mksysfs.py.
+#
+# The rule that decides this list: a board carries the images its NEIGHBOUR
+# can execute as well as its own.  A cluster spanning two instruction sets
+# passes messages and shares devices without noticing the line, and code stops
+# at it dead - so MIGRANT travelling from here to the C3 arrives as an image
+# that board cannot run, and the C3 answers by finding its own build of the
+# same program (cluster.md 3b).  For that to work, each side needs both.
+#
+# Xtensa, for this board itself:
+# GFXNOISE: the screen test.  A neighbour without a screen (the C3) that is
+# asked to run it sends it HERE, to the panel - and this board runs its own
+# build of it, which it has to have (26 Sep 2026: -45, "no build of GFXNOISE").
+GFXNOISE.AXE
+GRIND32.AXE
+LINK32.AXE
+MIGRAN32.AXE
+NODEHI32.AXE
+# RISC-V, for the C3 next door to be handed:
+NODEHIRV.AXE
+# Xtensa LX7, for the S3-Zero beyond it.  Same rule as on the Zero's own list,
+# which has carried the CYD's LX6 builds since before there was a route: a
+# program that travels two hops is SENT by the board that asks, and the far
+# board can only run an image built for itself.  Without these, `link run` from
+# here to the Zero fails at the far end for a reason that has nothing to do
+# with the wire.
+NODEHI.AXE
+MIGRANT.AXE
+GRIND.AXE

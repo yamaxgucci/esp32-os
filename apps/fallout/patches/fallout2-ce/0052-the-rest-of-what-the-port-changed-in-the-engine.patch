@@ -1,0 +1,3865 @@
+diff --git a/src/animation.cc b/src/animation.cc
+--- a/src/animation.cc
++++ b/src/animation.cc
+@@ -36,6 +36,8 @@
+ 
+ /* ARGON: the breadcrumbs.  See port/ag_diag.h. */
+ #include "ag_diag.h"
++
++extern "C" uint32_t ag_us(void);
+ #include "worldmap.h"
+ 
+ namespace fallout {
+@@ -2529,6 +2531,87 @@ static int _check_for_falling(Object* obj, int anim, int a3)
+ }
+ 
+ // 0x417360
++/*
++ * ARGON: the map refreshes of one animation tick, merged before they are done.
++ *
++ * Every moving object ends its step with tileWindowRefreshRect over the
++ * rectangle it left and the one it entered, and that call re-renders the map
++ * inside it - tiles, objects, light.  Measured on the board: about a thousand
++ * of them every thirty seconds, covering thirteen million pixels and costing
++ * nine seconds.  A third of the machine, spent on brahmin walking.
++ *
++ * A herd walks together, so those rectangles overlap, and every overlapped
++ * pixel is drawn again for each animal.  Collecting the tick's rectangles and
++ * merging the ones that overlap costs a few comparisons and saves the whole
++ * overlap.
++ *
++ * Merging is only done when it pays: two rectangles are joined if their union
++ * is no larger than the two of them added together.  Two animals at opposite
++ * ends of the screen therefore stay separate - joining those would redraw
++ * everything between them, which is how a well-meant optimisation becomes a
++ * slower game.
++ */
++#define AG_DEFER_MAX 12
++
++static Rect ag_defer[AG_DEFER_MAX];
++static int ag_defer_n;
++static bool ag_defer_on;
++
++static long ag_rect_area(const Rect* r)
++{
++    const long w = (long)r->right - r->left + 1;
++    const long h = (long)r->bottom - r->top + 1;
++
++    return (w > 0 && h > 0) ? (w * h) : 0;
++}
++
++/* Add one rectangle, or do it now if the tick is not collecting. */
++static void ag_refresh_rect(Rect* r, int elevation)
++{
++    if (!ag_defer_on || ag_defer_n >= AG_DEFER_MAX) {
++        ag_move_refresh_n++;
++        ag_move_refresh_px += (unsigned)ag_rect_area(r);
++        const uint32_t t0 = ag_us();
++        tileWindowRefreshRect(r, elevation);
++        ag_move_refresh_us += ag_us() - t0;
++        return;
++    }
++    ag_defer[ag_defer_n++] = *r;
++}
++
++/* Merge what overlaps, then draw what is left. */
++static void ag_refresh_flush(int elevation)
++{
++    bool merged = true;
++
++    while (merged) {
++        merged = false;
++        for (int i = 0; i < ag_defer_n && !merged; i++) {
++            for (int j = i + 1; j < ag_defer_n && !merged; j++) {
++                Rect u;
++
++                rectUnion(&ag_defer[i], &ag_defer[j], &u);
++                if (ag_rect_area(&u) <= ag_rect_area(&ag_defer[i])
++                        + ag_rect_area(&ag_defer[j])) {
++                    ag_defer[i] = u;
++                    ag_defer[j] = ag_defer[ag_defer_n - 1];
++                    ag_defer_n--;
++                    merged = true;
++                }
++            }
++        }
++    }
++
++    for (int i = 0; i < ag_defer_n; i++) {
++        ag_move_refresh_n++;
++        ag_move_refresh_px += (unsigned)ag_rect_area(&ag_defer[i]);
++        const uint32_t t0 = ag_us();
++        tileWindowRefreshRect(&ag_defer[i], elevation);
++        ag_move_refresh_us += ag_us() - t0;
++    }
++    ag_defer_n = 0;
++}
++
+ static void _object_move(int index)
+ {
+     AnimationSad* sad = &(gAnimationSads[index]);
+@@ -2582,7 +2665,14 @@ static void _object_move(int index)
+         Object* obstacle = _obj_blocking_at(object, nextTile, object->elevation);
+         if (obstacle != nullptr) {
+             if (!canUseDoor(object, obstacle)) {
++                /* ARGON: the way is blocked, so the whole path is computed
++                 * again and the object is put back where it started.  That
++                 * "put back" is what Maxim saw as brahmin stepping backwards,
++                 * and a search over a 200x200 grid is not a frame's work. */
++                const uint32_t ag_p0 = ag_us();
+                 sad->field_1C = _make_path(object, object->tile, sad->field_24, sad->rotations, 1);
++                ag_path_us += ag_us() - ag_p0;
++                ag_path_n++;
+                 if (sad->field_1C != 0) {
+                     objectSetLocation(object, object->tile, object->elevation, &tempRect);
+                     rectUnion(&dirtyRect, &tempRect, &dirtyRect);
+@@ -2643,7 +2733,7 @@ static void _object_move(int index)
+         }
+     }
+ 
+-    tileWindowRefreshRect(&dirtyRect, object->elevation);
++    ag_refresh_rect(&dirtyRect, object->elevation);
+     if (sad->field_20 == -1000) {
+         _anim_set_continue(sad->animationSequenceIndex, 1);
+     }
+@@ -2746,7 +2836,24 @@ void _object_animate()
+         return;
+     }
+ 
++    /* ARGON: what one tick of this costs and what it was doing.  Its worst
++     * call is 336 ms - the largest single thing left in the game - and it
++     * calls tileWindowRefreshRect once per animated object per frame, which
++     * re-renders the map inside that object's rectangle.  Whether that is
++     * many objects or one huge rectangle is the whole question; these count
++     * both.  See ag_anim_* in port/ag_diag.h. */
++    const uint32_t ag_anim_t0 = ag_us();
++    const unsigned ag_lock0 = ag_art_lock_us;
++    const unsigned ag_rfsh0 = ag_move_refresh_us;
++    const unsigned ag_refresh_n0 = ag_anim_refresh_n;
++    const unsigned ag_refresh_px0 = ag_anim_refresh_px;
++    const unsigned ag_seq0 = ag_anim_seq_us;
++    const unsigned ag_move0 = ag_anim_move_us;
++    const unsigned ag_script0 = ag_anim_script_us;
++
+     _anim_in_bk = true;
++    ag_defer_on = true;
++    ag_defer_n = 0;
+ 
+     for (int index = 0; index < gAnimationCurrentSad; index++) {
+         AnimationSad* sad = &(gAnimationSads[index]);
+@@ -2773,22 +2880,48 @@ void _object_animate()
+          * script - and refreshes the screen.  Four candidates.
+          */
+         AG_STEP("anim: run the sequence");
+-        if (animationRunSequence(sad->animationSequenceIndex) == -1) {
+-            AG_STEP("input: background handlers");
+-            continue;
++        {
++            const uint32_t q0 = ag_us();
++            const int rc = animationRunSequence(sad->animationSequenceIndex);
++
++            ag_anim_seq_us += ag_us() - q0;
++            if (rc == -1) {
++                AG_STEP("input: background handlers");
++                continue;
++            }
+         }
+ 
+         if (sad->field_1C > 0) {
+             if ((sad->flags & ANIM_SAD_STRAIGHT) != 0) {
+                 AG_STEP("anim: straight move");
++                const uint32_t q0 = ag_us();
+                 _object_straight_move(index);
++                ag_anim_move_us += ag_us() - q0;
+             } else {
+                 int savedTile = object->tile;
+                 AG_STEP("anim: move");
++                const uint32_t q0 = ag_us();
+                 _object_move(index);
++                ag_anim_move_us += ag_us() - q0;
+                 if (savedTile != object->tile) {
+                     AG_STEP("anim: the tile's spatial script");
++                    const uint32_t q1 = ag_us();
+                     scriptsExecSpatialProc(object, object->tile, object->elevation);
++                    const uint32_t q2 = ag_us() - q1;
++
++                    ag_anim_script_us += q2;
++                    /*
++                     * ARGON: a trap, not a report.  Here in Arroyo the tile's
++                     * script costs twenty-four microseconds and there is
++                     * nothing to say; somewhere later in the game one of them
++                     * will not, and the only way to know which is to have
++                     * been watching all along.  It says nothing until a
++                     * single script passes the threshold, and then it names
++                     * the tile it was standing on.  Maxim asked for it to be
++                     * left in for the whole game, and he is right: the cost
++                     * of carrying it is one comparison per step taken.
++                     */
++                    ag_script_slow_note(q2, object->tile, object->elevation);
+                 }
+             }
+             AG_STEP("input: background handlers");
+@@ -2843,7 +2976,11 @@ void _object_animate()
+                     }
+                 }
+ 
+-                tileWindowRefreshRect(&dirtyRect, gElevation);
++                ag_anim_refresh_n++;
++                ag_anim_refresh_px += (unsigned)
++                    ((dirtyRect.right - dirtyRect.left + 1)
++                     * (dirtyRect.bottom - dirtyRect.top + 1));
++                ag_refresh_rect(&dirtyRect, gElevation);
+ 
+                 continue;
+             }
+@@ -2914,13 +3051,37 @@ void _object_animate()
+                 rectUnion(&dirtyRect, &tempRect, &dirtyRect);
+             }
+ 
+-            tileWindowRefreshRect(&dirtyRect, gElevation);
++            ag_anim_refresh_n++;
++            ag_anim_refresh_px += (unsigned)
++                ((dirtyRect.right - dirtyRect.left + 1)
++                 * (dirtyRect.bottom - dirtyRect.top + 1));
++            ag_refresh_rect(&dirtyRect, gElevation);
+         }
+     }
+ 
++    ag_defer_on = false;
++    ag_refresh_flush(gElevation);
++
+     _anim_in_bk = 0;
+ 
+     _object_anim_compact();
++
++    /* ARGON: and what this tick came to.  See the note at the top. */
++    {
++        const uint32_t took = ag_us() - ag_anim_t0;
++
++        if (took > ag_anim_worst_us) {
++            ag_anim_worst_us = took;
++            ag_anim_worst_refreshes = ag_anim_refresh_n - ag_refresh_n0;
++            ag_anim_worst_px = ag_anim_refresh_px - ag_refresh_px0;
++            ag_anim_worst_sads = (unsigned)gAnimationCurrentSad;
++            ag_anim_worst_seq_us = ag_anim_seq_us - ag_seq0;
++            ag_anim_worst_move_us = ag_anim_move_us - ag_move0;
++            ag_anim_worst_lock_us = ag_art_lock_us - ag_lock0;
++            ag_anim_worst_rfsh_us = ag_move_refresh_us - ag_rfsh0;
++            ag_anim_worst_script_us = ag_anim_script_us - ag_script0;
++        }
++    }
+ }
+ 
+ // 0x417F18
+diff --git a/src/art.cc b/src/art.cc
+--- a/src/art.cc
++++ b/src/art.cc
+@@ -1,5 +1,7 @@
+ #include "art.h"
+ 
++#include "../../../apps/fallout/port/art_store.h"
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -16,6 +18,7 @@
+ 
+ /* ARGON: AG_CACHE_ART, for the miss counters. */
+ #include "ag_diag.h"
++extern "C" uint32_t ag_us(void);
+ 
+ namespace fallout {
+ 
+@@ -440,7 +443,7 @@ void artRender(int fid, unsigned char* dest, int width, int height, int pitch)
+         return;
+     }
+ 
+-    unsigned char* frameData = artGetFrameData(frm, 0, 0);
++    const unsigned char* frameData = artGetFrameData(frm, 0, 0);
+     int frameWidth = artGetWidth(frm, 0, 0);
+     int frameHeight = artGetHeight(frm, 0, 0);
+ 
+@@ -487,8 +490,130 @@ int art_list_str(int fid, char* name)
+ }
+ 
+ // 0x419160
++/*
++ * ARGON: the character's own animations, pinned so the map cannot evict them.
++ *
++ * Measured on the board, 9 September 2026, one minute of walking:
++ *
++ *   tile     2118 misses,  5701 ms   (2.7 ms each)
++ *   scenery  1197 misses,  3427 ms   (2.9 ms each)
++ *   wall      572 misses,  1571 ms   (2.7 ms each)
++ *   critter   216 misses, 10527 ms   (49 ms each)
++ *
++ * Critter art is five per cent of the misses and half of the lost time.  The
++ * reason is size: a walk animation is one FRM of 116 KB, while a tile is a
++ * couple of kilobytes.  Scrolling the view pulls in tiles by the dozen, they
++ * push everything else out of a cache that is already too small - and what
++ * gets pushed out includes the walk animation of the character doing the
++ * walking, which is then read again from the card a step later.  Two thousand
++ * cheap misses were evicting two hundred expensive ones.
++ *
++ * So the last few animations this character actually used are held with a
++ * reference count, which is the one thing the eviction sweep respects.  Four
++ * of them: walking, standing, and room for whatever else a step involves.
++ *
++ * Two things this must not do, and does not:
++ *
++ *   - it must not survive a map change, or the pins hold art for a critter
++ *     that is no longer there.  artCacheFlush is called on every map change,
++ *     so the pins are dropped from there.
++ *   - it must not stand in the way when the arena runs out.  A pinned entry
++ *     cannot be swept, so it would make a flush free less than it should.  The
++ *     out-of-arena hook drops every pin before it does anything else.
++ */
++/*
++ * Four became eight, measured rather than guessed.  At four, one minute of
++ * walking cost 224.6 critter misses per hundred hexes against 358.9 with no
++ * pins at all - so pinning worked, and the question was where the trade stops
++ * paying: every pin is about 116 KB that tiles cannot have, and tiles went up
++ * 19% for that first half megabyte.  Eight is the next step of the same
++ * experiment; if the total time lost per hundred hexes rises rather than
++ * falls, four was the answer and this comment says so.
++ */
++#define ARGON_PINS 8
++
++/* How many of those slots are actually used: -pins N, so the trade between
++ * animations and tiles can be measured by restarting rather than rebuilding.
++ * Four is where the first measurement put it. */
++extern "C" int ag_art_pins;
++
++static CacheEntry* argonPinEntry[ARGON_PINS];
++static int argonPinFid[ARGON_PINS];
++static int argonPinNext;
++static unsigned argonPinned, argonPinReplaced;
++
++void artDropPins()
++{
++    int i;
++
++    for (i = 0; i < ARGON_PINS; i++) {
++        if (argonPinEntry[i] != nullptr) {
++            artUnlock(argonPinEntry[i]);
++            argonPinEntry[i] = nullptr;
++        }
++        argonPinFid[i] = 0;
++    }
++    argonPinNext = 0;
++}
++
++void artPin(int fid)
++{
++    int i;
++
++    if (fid == 0) {
++        return;
++    }
++
++    if (ag_art_pins <= 0) {
++        return;
++    }
++
++    for (i = 0; i < ARGON_PINS; i++) {
++        if (argonPinFid[i] == fid && argonPinEntry[i] != nullptr) {
++            return;   /* already held */
++        }
++    }
++
++    /* Take the new one BEFORE letting the old one go: locking may evict, and
++     * the slot being reused is as good a victim as any other. */
++    {
++        CacheEntry* entry = nullptr;
++        Art* art = artLock(fid, &entry);
++
++        if (art == nullptr) {
++            return;
++        }
++
++        {
++            const int slots = (ag_art_pins < ARGON_PINS) ? ag_art_pins
++                                                         : ARGON_PINS;
++            i = argonPinNext % slots;
++            argonPinNext = (i + 1) % slots;
++        }
++
++        if (argonPinEntry[i] != nullptr) {
++            artUnlock(argonPinEntry[i]);
++            argonPinReplaced++;
++        }
++
++        argonPinEntry[i] = entry;
++        argonPinFid[i] = fid;
++        argonPinned++;
++    }
++}
++
+ Art* artLock(int fid, CacheEntry** handlePtr)
+ {
++    /* ARGON: what locking art costs, everywhere.  A tick that spends 371 ms
++     * with 3 ms in the parts I had timed has to be spending it somewhere, and
++     * every frame of every animation passes through here. */
++    const uint32_t ag_lock_t0 = ag_us();
++    struct ag_lock_timer {
++        uint32_t t0;
++        ag_lock_timer(uint32_t t) : t0(t) {}
++        ~ag_lock_timer() { ag_art_lock_us += ag_us() - t0; ag_art_lock_n++; }
++    } ag_lock_timer_instance(ag_lock_t0);
++
+     if (handlePtr == nullptr) {
+         return nullptr;
+     }
+@@ -499,7 +624,7 @@ Art* artLock(int fid, CacheEntry** handlePtr)
+ }
+ 
+ // 0x419188
+-unsigned char* artLockFrameData(int fid, int frame, int direction, CacheEntry** handlePtr)
++const unsigned char* artLockFrameData(int fid, int frame, int direction, CacheEntry** handlePtr)
+ {
+     Art* art;
+     ArtFrame* frm;
+@@ -521,7 +646,7 @@ unsigned char* artLockFrameData(int fid, int frame, int direction, CacheEntry**
+ }
+ 
+ // 0x4191CC
+-unsigned char* artLockFrameDataReturningSize(int fid, CacheEntry** handlePtr, int* widthPtr, int* heightPtr)
++const unsigned char* artLockFrameDataReturningSize(int fid, CacheEntry** handlePtr, int* widthPtr, int* heightPtr)
+ {
+     *handlePtr = nullptr;
+ 
+@@ -557,9 +682,54 @@ int artUnlock(CacheEntry* handle)
+ // 0x41927C
+ int artCacheFlush()
+ {
++    /* The pins belong to the map that is going away.  See artPin. */
++    artDropPins();
++
+     return cacheFlush(&gArtCache);
+ }
+ 
++/*
++ * ARGON: the art cache's block, lent out and taken back.
++ *
++ * Called only from the out-of-arena hook, which is the point: on a board with
++ * room the allocation never fails, the hook never runs, and the cache is never
++ * touched - the game behaves exactly as its author built it.  It is only where
++ * the arena is too small for the screen the game wants that this fires.
++ */
++bool artCacheLend()
++{
++    return argonCacheLend(&gArtCache);
++}
++
++bool artCacheTakeBack()
++{
++    return argonCacheTakeBack(&gArtCache);
++}
++
++/* What the block is worth asking for, so nobody has to hard-code 1800. */
++int artCacheMaxSize()
++{
++    return gArtCache.maxSize;
++}
++
++/* Grow or shrink the block, emptying it.  See argonCacheResize. */
++bool artCacheResize(int maxSize)
++{
++    return argonCacheResize(&gArtCache, maxSize);
++}
++
++/* ARGON: borrow a large short-lived buffer out of the art cache's own memory.
++ * See argonCacheBorrow. */
++bool artBorrow(int size, int* handleIndexPtr, unsigned char** bufferPtr)
++{
++    return argonCacheBorrow(&gArtCache, size, handleIndexPtr, bufferPtr);
++}
++
++void artReturn(int* handleIndexPtr)
++{
++    argonCacheReturn(&gArtCache, handleIndexPtr);
++}
++
+ // 0x4192B0
+ int artCopyFileName(int objectType, int id, char* dest)
+ {
+@@ -861,7 +1031,7 @@ int artGetRotationOffsets(Art* art, int rotation, int* xPtr, int* yPtr)
+ }
+ 
+ // 0x419870
+-unsigned char* artGetFrameData(Art* art, int frame, int direction)
++const unsigned char* artGetFrameData(Art* art, int frame, int direction)
+ {
+     ArtFrame* frm;
+ 
+@@ -970,16 +1140,72 @@ int artAliasFid(int fid)
+ }
+ 
+ // 0x419A78
++/*
++ * ARGON: five file opens per cache miss, and four of them wasted.
++ *
++ * Measured on the board, 9 September 2026: 20149 opens costing 11036 ms
++ * against 3817 art misses.  Where they came from is all in this file.
++ *
++ * The cache asks twice for every miss - once for the size, once for the data -
++ * and each of those opened the file from scratch.  Worse, each first tried a
++ * localized path, art\\<language>\\..., which in this
++ * installation does not exist: two lookups through a thirty-thousand entry
++ * index, guaranteed to fail, per miss.
++ *
++ * Two memos fix it without changing what the game sees:
++ *
++ *   - the localized directory is given a fair trial and then dropped.  If the
++ *     first sixty-four lookups all miss, it is not there and asking again is
++ *     superstition.  One hit at any point and it is trusted for the rest of
++ *     the session - a translated installation keeps working exactly as before.
++ *
++ *   - the size call records which path answered for that fid, and the read
++ *     call that always follows it goes straight there.
++ *
++ * Five opens become two.  Merging those last two would mean holding the file
++ * open across the cache's two calls, and the cache may give up between them,
++ * so it is not worth the leak it invites.
++ */
++#define ARGON_LOCALIZED_TRIES 64
++
++static int argonLocalizedTried;
++static int argonLocalizedFound;
++static int argonSizeFid = -1;
++static bool argonSizeWasLocalized;
++
++/* Whether the localized art directory is still worth a lookup. */
++static bool argonTryLocalized()
++{
++    if (!gArtLanguageInitialized) {
++        return false;
++    }
++    if (argonLocalizedFound != 0) {
++        return true;
++    }
++    return argonLocalizedTried < ARGON_LOCALIZED_TRIES;
++}
++
+ static int artCacheGetFileSizeImpl(int fid, int* sizePtr)
+ {
+     int result = -1;
+ 
++    /* ARGON: if the flash store has it, that is the size, and asking the card
++     * is pointless work on the path that decides whether to evict. */
++    {
++        const int stored = ag_art_store_size(fid);
++
++        if (stored > 0) {
++            *sizePtr = stored;
++            return 0;
++        }
++    }
++
+     char* artFilePath = artBuildFilePath(fid);
+     if (artFilePath != nullptr) {
+         bool loaded = false;
+         File* stream = nullptr;
+ 
+-        if (gArtLanguageInitialized) {
++        if (argonTryLocalized()) {
+             char* pch = strchr(artFilePath, '\\');
+             if (pch == nullptr) {
+                 pch = artFilePath;
+@@ -989,8 +1215,16 @@ static int artCacheGetFileSizeImpl(int fid, int* sizePtr)
+             snprintf(localizedPath, sizeof(localizedPath), "art\\%s\\%s", gArtLanguage, pch);
+ 
+             stream = fileOpen(localizedPath, "rb");
++            argonLocalizedTried++;
++            if (stream != nullptr) {
++                argonLocalizedFound++;
++            }
+         }
+ 
++        /* Which path answered, for the read call that follows. */
++        argonSizeFid = fid;
++        argonSizeWasLocalized = (stream != nullptr);
++
+         if (stream == nullptr) {
+             stream = fileOpen(artFilePath, "rb");
+         }
+@@ -1013,6 +1247,42 @@ static int artCacheReadDataImpl(int fid, int* sizePtr, unsigned char* data)
+ {
+     int result = -1;
+ 
++    /* ARGON: which kind of art this miss was for, and what it cost.  This
++     * function IS the miss - the cache calls it only when the art is not in
++     * hand.  See ag_art_miss in port/ag_diag.h. */
++    const uint32_t argonT0 = ag_us();
++    const int argonKind = (int)(FID_TYPE(fid));
++
++    if (argonKind >= 0 && argonKind < AG_ART_KINDS) {
++        ag_art_miss[argonKind]++;
++    }
++
++    /* ARGON: the flash store answers first.  It holds art already unpacked,
++     * so a hit here costs a read from flash instead of a read from the SD
++     * card plus an inflate - the two things that make a miss expensive.  It
++     * is not a second cache: it never writes during play, only while a map
++     * is loading.  See apps/fallout/port/art_store.h. */
++    /* ARGON: this function IS the miss in RAM - the cache calls it only when
++     * it has nothing.  What happens next is the question that matters: the
++     * store answers, or the card does.  Counted apart, because "a miss" was
++     * being used for both and they cost a hundred times different. */
++    ag_miss_ram++;
++
++    {
++        const int stored = ag_art_store_size(fid);
++
++        if (stored > 0 && ag_art_store_read(fid, stored, data)) {
++            *sizePtr = stored;
++            ag_miss_flash++;
++
++            if (argonKind >= 0 && argonKind < AG_ART_KINDS) {
++                ag_art_miss_ms[argonKind] += (ag_us() - argonT0) / 1000u;
++                ag_art_from_flash[argonKind]++;
++            }
++            return 0;
++        }
++    }
++
+     char* artFileName = artBuildFilePath(fid);
+     if (artFileName != nullptr) {
+         /* ARGON: so a dip can name the file it was waiting for.  The last
+@@ -1034,7 +1304,10 @@ static int artCacheReadDataImpl(int fid, int* sizePtr, unsigned char* data)
+         }
+ 
+         bool loaded = false;
+-        if (gArtLanguageInitialized) {
++        /* The size call for this same fid has just been through both
++         * paths; do not repeat its failed lookup. */
++        if (fid == argonSizeFid ? argonSizeWasLocalized
++                                : argonTryLocalized()) {
+             char* pch = strchr(artFileName, '\\');
+             if (pch == nullptr) {
+                 pch = artFileName;
+@@ -1057,12 +1330,63 @@ static int artCacheReadDataImpl(int fid, int* sizePtr, unsigned char* data)
+         if (loaded) {
+             *sizePtr = artGetDataSize((Art*)data);
+             result = 0;
++            /* Neither RAM nor flash had it: this one came off the card, and
++             * this is the number Maxim means by "a miss". */
++            ag_miss_card++;
++            ag_miss_card_kb += (unsigned)(*sizePtr >> 10);
++
++            /* ARGON: this one came off the card.  If a map is loading, the
++             * game is already standing still, so this is the moment - and the
++             * only moment - it is safe to put it in flash for next time.
++             * Outside that window the key goes on the waiting list instead and
++             * the bytes are written at the next load.  See
++             * apps/fallout/port/art_store.h. */
++            ag_art_store_offer(fid, data, *sizePtr);
++            ag_art_store_want(fid);
+         }
+     }
+ 
++    if (argonKind >= 0 && argonKind < AG_ART_KINDS) {
++        ag_art_miss_ms[argonKind] += (ag_us() - argonT0) / 1000u;
++    }
++
+     return result;
+ }
+ 
++/*
++ * ARGON: put the art that was asked for outside a map load into the store.
++ *
++ * Called once at the start of a fill window, when the game is already waiting.
++ * Each item is read off the card into a temporary block and offered; the block
++ * goes straight back, so the peak cost is one picture rather than all of them.
++ * A failure at any step is simply skipped - the item stays on no list and is
++ * read from the card as before, which is exactly the behaviour without a
++ * store at all.
++ */
++void artStoreTopUp(void)
++{
++    int wanted[64];
++    const unsigned n = ag_art_store_wanted(wanted, 64);
++
++    for (unsigned i = 0; i < n; i++) {
++        int size = 0;
++
++        if (artCacheGetFileSizeImpl(wanted[i], &size) != 0 || size <= 0) {
++            continue;
++        }
++
++        unsigned char* buf = (unsigned char*)internal_malloc((size_t)size);
++
++        if (buf == nullptr) {
++            continue;
++        }
++        if (artCacheReadDataImpl(wanted[i], &size, buf) == 0) {
++            ag_art_store_offer(wanted[i], buf, size);
++        }
++        internal_free(buf);
++    }
++}
++
+ // 0x419C80
+ static void artCacheFreeImpl(void* ptr)
+ {
+diff --git a/src/art.h b/src/art.h
+--- a/src/art.h
++++ b/src/art.h
+@@ -125,10 +125,22 @@ int artGetFidgetCount(int headFid);
+ void artRender(int fid, unsigned char* dest, int width, int height, int pitch);
+ int art_list_str(int fid, char* name);
+ Art* artLock(int fid, CacheEntry** cache_entry);
+-unsigned char* artLockFrameData(int fid, int frame, int direction, CacheEntry** out_cache_entry);
+-unsigned char* artLockFrameDataReturningSize(int fid, CacheEntry** out_cache_entry, int* widthPtr, int* heightPtr);
++const unsigned char* artLockFrameData(int fid, int frame, int direction, CacheEntry** out_cache_entry);
++const unsigned char* artLockFrameDataReturningSize(int fid, CacheEntry** out_cache_entry, int* widthPtr, int* heightPtr);
+ int artUnlock(CacheEntry* cache_entry);
+ int artCacheFlush();
++bool artCacheLend();
++bool artCacheTakeBack();
++int artCacheMaxSize();
++bool artCacheResize(int maxSize);
++/* ARGON: a large short-lived buffer out of the art cache's memory rather than
++ * the arena; see argonCacheBorrow in cache.cc. */
++bool artBorrow(int size, int* handleIndexPtr, unsigned char** bufferPtr);
++void artReturn(int* handleIndexPtr);
++/* ARGON: hold this animation against eviction, and let them all go.  See the
++ * measurements above artPin in art.cc. */
++void artPin(int fid);
++void artDropPins();
+ int artCopyFileName(int objectType, int a2, char* a3);
+ int _art_get_code(int a1, int a2, char* a3, char* a4);
+ char* artBuildFilePath(int a1);
+@@ -140,7 +152,11 @@ int artGetHeight(Art* art, int frame, int direction);
+ int artGetSize(Art* art, int frame, int direction, int* out_width, int* out_height);
+ int artGetFrameOffsets(Art* art, int frame, int direction, int* a4, int* a5);
+ int artGetRotationOffsets(Art* art, int rotation, int* out_offset_x, int* out_offset_y);
+-unsigned char* artGetFrameData(Art* art, int frame, int direction);
++const unsigned char* artGetFrameData(Art* art, int frame, int direction);
++
++/* ARGON: write the art asked for outside a map load into the flash store.
++ * Call it at the start of a fill window; see apps/fallout/port/art_store.h. */
++void artStoreTopUp(void);
+ ArtFrame* artGetFrame(Art* art, int frame, int direction);
+ bool artExists(int fid);
+ bool _art_fid_valid(int fid);
+@@ -163,6 +179,15 @@ public:
+ 
+     int getWidth() const { return _width; }
+     int getHeight() const { return _height; }
++    /* ARGON: NOT const, and that is the point.
++     *
++     * FrmImage hands its pixels to fontDrawText and to buttonSetMask, which
++     * draw INTO them - the inventory's move dialogue writes a number onto the
++     * button art, the interface writes its lights, the world map writes the
++     * tab labels.  So this really is a mutable buffer, and art reached this
++     * way must never live in flash.  The kinds it covers - interface,
++     * inventory, skilldex, heads - are exactly the ones in_place_allowed in
++     * object.cc refuses to hand out where they lie.  See the note there. */
+     unsigned char* getData() const { return _data; }
+ 
+ private:
+diff --git a/src/cache.cc b/src/cache.cc
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -1,5 +1,7 @@
+ #include "cache.h"
+ 
++#include "../../../apps/fallout/port/art_store.h"
++
+ #include <limits.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -31,6 +33,18 @@ static bool cacheEntryFree(Cache* cache, CacheEntry* cacheEntry);
+ static bool cacheClean(Cache* cache);
+ static bool cacheResetStatistics(Cache* cache);
+ static bool cacheEnsureSize(Cache* cache, int size);
++
++/* ARGON: how much beyond the requested size a sweep evicts, in KB; -evict N.
++ * Negative means the original "a fifth of the cache" rule. */
++extern "C" int ag_cache_slack_kb;
++
++/* ARGON: the hit credit given to an entry the cache is fetching back after
++ * evicting it; -boost N, 0 for the engine's own behaviour. */
++extern "C" int ag_refetch_boost;
++
++/* ARGON: -lru N; 1 = evict least recently asked for, 0 = the engine's own
++ * least-often-used order.  See cacheEntriesCompareByUsage. */
++extern "C" int ag_cache_lru;
+ static bool cacheSweep(Cache* cache);
+ static bool cacheSetCapacity(Cache* cache, int newCapacity);
+ static int cacheEntriesCompareByUsage(const void* a1, const void* a2);
+@@ -382,7 +396,10 @@ bool cacheLock(Cache* cache, int key, void** data, CacheEntry** cacheEntryPtr)
+     }
+ 
+     CacheEntry* cacheEntry = cache->entries[index];
+-    if (cacheEntry->referenceCount == 0) {
++    /* ARGON: flash is already at a fixed address and cannot move, so there
++     * is nothing to lock - and locking is what defeats compaction. */
++    if (cacheEntry->referenceCount == 0
++            && (cacheEntry->flags & CACHE_ENTRY_FLASH) == 0) {
+         if (!heapLock(&(cache->heap), cacheEntry->heapHandleIndex, &(cacheEntry->data))) {
+             return false;
+         }
+@@ -397,6 +414,18 @@ bool cacheLock(Cache* cache, int key, void** data, CacheEntry** cacheEntryPtr)
+         cacheResetStatistics(cache);
+     }
+ 
++    /* ARGON: every key the cache is asked for, with its size, so the window's
++     * working set can be weighed.  Distinct keys only - see ag_ws_note. */
++    ag_ws_note(cache->ag_kind, key, cacheEntry->size);
++
++    /* And how many times the art cache was asked for anything at all - the
++     * denominator every other number here needs.  Counting one phase of the
++     * game instead was how a report came to say "433 misses" beside "1471
++     * answered by flash" and leave them unreconcilable. */
++    if (cache->ag_kind == AG_CACHE_ART) {
++        ag_art_requests++;
++    }
++
+     *data = cacheEntry->data;
+     *cacheEntryPtr = cacheEntry;
+ 
+@@ -416,7 +445,8 @@ bool cacheUnlock(Cache* cache, CacheEntry* cacheEntry)
+ 
+     cacheEntry->referenceCount--;
+ 
+-    if (cacheEntry->referenceCount == 0) {
++    if (cacheEntry->referenceCount == 0
++            && (cacheEntry->flags & CACHE_ENTRY_FLASH) == 0) {
+         heapUnlock(&(cache->heap), cacheEntry->heapHandleIndex);
+     }
+ 
+@@ -425,6 +455,189 @@ bool cacheUnlock(Cache* cache, CacheEntry* cacheEntry)
+ 
+ // cache_flush
+ // 0x42012C
++/*
++ * ARGON: lend the whole block out, and take it back.
++ *
++ * Maxim's idea, 9 September 2026, and it replaces a reserve I had no business
++ * holding: "У нас же уже есть кэш арта - непрерывный кусок.  На экранах
++ * загрузки, сохранения, диалогов и др. этот кэш можно использовать."
++ *
++ * He is right on both counts.  A reserve is memory held idle for a moment that
++ * may never come, and twice already the arena ran out somewhere else while it
++ * sat there.  The art cache, by contrast, is 1800 KB taken in ONE piece at
++ * startup (heapInit -> internal_malloc) and never given back - and on a
++ * full-screen panel there is no map on the screen, so not one byte of it is
++ * doing anything.  Handing it over costs nothing permanent and yields five
++ * times what the panel asks for: opening the save screen needs 307324 and
++ * 307200 bytes, contiguous, and a played-in arena has no such hole.
++ *
++ * Safety is the whole of the work here.  cacheFlush evicts only entries that
++ * nothing holds, so after it the entry count is exactly the number of live
++ * pointers into this heap.  If that is not zero, someone is mid-draw and the
++ * block must stay: refuse, and let the caller carry on as before.  Freeing it
++ * under a held pointer would be a use-after-free at the worst possible moment.
++ */
++bool argonCacheLend(Cache* cache)
++{
++    if (cache == nullptr || cache->heap.data == nullptr) {
++        return false;
++    }
++
++    cacheFlush(cache);
++
++    if (cache->entriesLength != 0) {
++        return false;
++    }
++
++    return heapFree(&(cache->heap));
++}
++
++/*
++ * ARGON: and the same block, taken back at a different size.
++ *
++ * Measured on the board, 9 September 2026: the art the game asks for in any
++ * twenty seconds weighs 2118 KB at the median, 2745 at the ninetieth
++ * percentile and 2940 at the worst - against a cache of 1800.  A cache a
++ * little smaller than the working set does not run a little slower; it evicts
++ * precisely what is about to be wanted again, which is why 91% of the misses
++ * while walking were for art the cache had just thrown away.
++ *
++ * A fixed larger number is not available: the arena peaks at 5806 KB of 6000
++ * on a big map and at 5977 in the Temple, so the missing megabyte does not
++ * exist to give.  What exists is the ability to change the size at runtime,
++ * which is the same free-and-take that lending uses.
++ *
++ * The cost is honest and unavoidable: resizing empties the cache, so every
++ * resize is paid for by reloading the working set.  That is why the caller
++ * shrinks only on a real refusal and grows only rarely and only into real
++ * slack.
++ */
++/*
++ * ARGON: lend a caller some of the cache's own memory, for as long as it needs
++ * it.
++ *
++ * Maxim's idea, and the part of it that can actually be built.  His question
++ * was why the game does not take the whole arena and hand it out itself, so it
++ * could defragment; the answer is that the cache's heap can move blocks only
++ * because they are reached through a handle - lock, use, unlock - while
++ * malloc hands out a bare pointer the caller keeps in its own fields.  Making
++ * the whole arena compacting would mean rewriting every allocation in the game
++ * onto handles.
++ *
++ * But the allocations that hurt are few and they are all the same shape: a
++ * 640x480 window - 307200 bytes, contiguous - that lives for as long as a
++ * panel is on the screen and then goes.  The save panel needs two of them.  A
++ * played-in arena has no such hole and the game says "Error loading save game
++ * screen data"; raising the art cache to 2600 KB to make more room instead
++ * killed it outright, out of arena on a 2452-byte script allocation with 3 KB
++ * free.
++ *
++ * The cache's heap is the right place for them.  It is 2200 KB, it can evict
++ * art to make room (cacheEnsureSize), it can compact, and while a full-screen
++ * panel is up there is no map being drawn, so the art it evicts is art nobody
++ * wants for the moment.  The borrow is locked, so it does not move under the
++ * window manager's pointer - which does mean it pins that much of the heap for
++ * the life of the panel, and that is exactly the trade: seconds of a fragmented
++ * art cache against a panel that opens at all.
++ *
++ * Refuses rather than pretends: if the heap cannot find the room the caller
++ * falls back to the arena, which is where it used to go anyway.
++ */
++bool argonCacheBorrow(Cache* cache, int size, int* handleIndexPtr,
++    unsigned char** bufferPtr)
++{
++    if (cache == nullptr || cache->heap.data == nullptr || size <= 0
++        || handleIndexPtr == nullptr || bufferPtr == nullptr) {
++        return false;
++    }
++
++    /* Bigger than the cache could ever hold: not worth emptying it to fail. */
++    if (size > cache->maxSize / 2) {
++        return false;
++    }
++
++    if (!cacheEnsureSize(cache, size)) {
++        return false;
++    }
++
++    if (!heapBlockAllocate(&(cache->heap), handleIndexPtr, size, 0)) {
++        return false;
++    }
++
++    if (!heapLock(&(cache->heap), *handleIndexPtr, bufferPtr)) {
++        (void)heapBlockDeallocate(&(cache->heap), handleIndexPtr);
++        return false;
++    }
++
++    return true;
++}
++
++void argonCacheReturn(Cache* cache, int* handleIndexPtr)
++{
++    if (cache == nullptr || cache->heap.data == nullptr
++        || handleIndexPtr == nullptr) {
++        return;
++    }
++
++    (void)heapUnlock(&(cache->heap), *handleIndexPtr);
++    (void)heapBlockDeallocate(&(cache->heap), handleIndexPtr);
++}
++
++bool argonCacheResize(Cache* cache, int maxSize)
++{
++    if (cache == nullptr || maxSize <= 0) {
++        return false;
++    }
++
++    /*
++     * A cache that has not been created yet is not a cache with room to spare.
++     * Without this the board did exactly that on 9 September 2026 - the grow
++     * ran before art_init, read a maxSize of zero and "grew" the art cache to
++     * 512 KB, which is a third of what it should have been.  A resize is for
++     * changing a size, never for inventing one.
++     */
++    if (cache->heap.data == nullptr || cache->maxSize <= 0) {
++        return false;
++    }
++
++    if (maxSize == cache->maxSize) {
++        return true;
++    }
++
++    cacheFlush(cache);
++
++    /* Something is holding art right now: its pointer is into this block, and
++     * the block is about to move.  Refuse, and let the caller carry on. */
++    if (cache->entriesLength != 0) {
++        return false;
++    }
++
++    if (cache->heap.data != nullptr && !heapFree(&(cache->heap))) {
++        return false;
++    }
++
++    if (!heapInit(&(cache->heap), maxSize)) {
++        /* Put back what was there, or the cache is dead for the rest of the
++         * session.  If even that fails there is nothing left to try. */
++        (void)heapInit(&(cache->heap), cache->maxSize);
++        return false;
++    }
++
++    cache->maxSize = maxSize;
++    cache->size = 0;
++
++    return true;
++}
++
++bool argonCacheTakeBack(Cache* cache)
++{
++    if (cache == nullptr || cache->heap.data != nullptr) {
++        return false;
++    }
++
++    return heapInit(&(cache->heap), cache->maxSize);
++}
++
+ bool cacheFlush(Cache* cache)
+ {
+     if (cache == nullptr) {
+@@ -477,12 +690,72 @@ static bool cacheFetchEntryForKey(Cache* cache, int key, int* indexPtr)
+         return false;
+     }
+ 
++    /*
++     * ARGON: something the cache threw out and now wants back starts with a
++     * credit, so it is not immediately first in the queue to be thrown out
++     * again.
++     *
++     * The victim is chosen by hit count - fewest hits goes first, see
++     * cacheEntriesCompareByUsage - and an evicted entry is destroyed with its
++     * counter.  Coming back it starts at zero, which makes it the prime victim
++     * again, which is how it left in the first place.  Once thrown out, always
++     * thrown out: on the board, 9 September 2026, 93% of every miss while
++     * walking was for art the cache had held and evicted, and a critter
++     * animation - 116 KB, 49 ms off the card - went round that loop about
++     * twice per hex stepped.
++     *
++     * The ring of recently evicted keys already exists; it was built to tell a
++     * first read from a re-read.  If the key is in it, this is the cache
++     * correcting its own mistake, and the entry is handed a few hits so that
++     * the next sweep has to consider it against art that has genuinely been
++     * idle.  The credit is not a lock: it is a place in the same queue, so
++     * the block stays movable and the heap can still compact it - which is
++     * exactly what pinning could not do.
++     *
++     * -boost N sets the credit; 0 restores the engine's own behaviour.
++     */
++    if (ag_refetch_boost > 0 && ag_gone_has(cache->ag_kind, key)) {
++        cacheEntry->hits = (unsigned int)ag_refetch_boost;
++    }
++
+     do {
+         int size;
+         if (cache->sizeProc(key, &size) != 0) {
+             break;
+         }
+ 
++        /*
++         * ARGON: if the art store can point at this picture, take the pointer
++         * and stop.  No heap block, no read, no copy - and because the entry
++         * owns no memory, nothing has to be thrown out to make room for it.
++         * This is what makes the art cache stop thrashing: the art that is in
++         * flash simply never competes for the cache at all.
++         *
++         * Only the art cache: the other caches have nothing in the store.
++         */
++        if (cache->ag_kind == AG_CACHE_ART) {
++            int mapped_size = 0;
++            const unsigned char* mapped = ag_art_store_ptr(key, &mapped_size);
++
++            if (mapped != nullptr && mapped_size > 0) {
++                cacheEntry->flags |= CACHE_ENTRY_FLASH;
++                cacheEntry->heapHandleIndex = -1;
++                cacheEntry->data = (unsigned char*)mapped;
++                cacheEntry->size = mapped_size;
++                cacheEntry->key = key;
++
++                if (cacheFindIndexForKey(cache, key, indexPtr) != 3) {
++                    cacheEntryFree(cache, cacheEntry);
++                    return false;
++                }
++                if (!cacheInsertEntryAtIndex(cache, cacheEntry, *indexPtr)) {
++                    cacheEntryFree(cache, cacheEntry);
++                    return false;
++                }
++                return true;
++            }
++        }
++
+         if (!cacheEnsureSize(cache, size)) {
+             break;
+         }
+@@ -651,7 +924,12 @@ static bool cacheInsertEntryAtIndex(Cache* cache, CacheEntry* cacheEntry, int in
+ 
+     cache->entries[index] = cacheEntry;
+     cache->entriesLength++;
+-    cache->size += cacheEntry->size;
++    /* ARGON: a flash-backed entry holds no cache memory, so counting its
++     * size would make the cache evict real blocks to make room for something
++     * that takes no room. */
++    if ((cacheEntry->flags & CACHE_ENTRY_FLASH) == 0) {
++        cache->size += cacheEntry->size;
++    }
+ 
+     return true;
+ }
+@@ -718,7 +996,10 @@ static bool cacheEntryInit(CacheEntry* cacheEntry)
+ // 0x420740
+ static bool cacheEntryFree(Cache* cache, CacheEntry* cacheEntry)
+ {
+-    if (cacheEntry->data != nullptr) {
++    /* ARGON: a flash-backed entry never had a heap block; handing its
++     * sentinel handle to the heap would corrupt the handle table. */
++    if (cacheEntry->data != nullptr
++            && (cacheEntry->flags & CACHE_ENTRY_FLASH) == 0) {
+         heapBlockDeallocate(&(cache->heap), &(cacheEntry->heapHandleIndex));
+     }
+ 
+@@ -738,7 +1019,9 @@ static bool cacheClean(Cache* cache)
+         // inner loop to decrement `referenceCount` one by one. Probably using
+         // some inlined function.
+         if (cacheEntry->referenceCount != 0) {
+-            heapUnlock(heap, cacheEntry->heapHandleIndex);
++            if ((cacheEntry->flags & CACHE_ENTRY_FLASH) == 0) {
++                heapUnlock(heap, cacheEntry->heapHandleIndex);
++            }
+             cacheEntry->referenceCount = 0;
+         }
+     }
+@@ -790,19 +1073,79 @@ static bool cacheEnsureSize(Cache* cache, int size)
+         return true;
+     }
+ 
+-    CacheEntry** entries = (CacheEntry**)internal_malloc(sizeof(*entries) * cache->entriesLength);
++    /*
++     * ARGON: the sort's scratch, kept rather than asked for.
++     *
++     * With the sweep sized against the request instead of against the cache it
++     * runs far more often, and every run used to ask the arena for an array of
++     * pointers and give it back - churn on the one allocator that must not
++     * fragment, in the middle of the path that is already the game's slowest.
++     * Six hundred entries is 2.4 KB of BSS and covers every cache this program
++     * builds; anything larger still falls back to the arena rather than
++     * silently sorting part of the list.
++     */
++    /* static, not automatic: 2.4 KB is too much to put on a stack that has
++     * faulted before, and cacheEnsureSize is only ever reached from the game
++     * thread - the audio thread reads buffers that are already loaded and
++     * never locks the cache. */
++    static CacheEntry* scratch[600];
++    CacheEntry** entries;
++    bool borrowed = false;
++
++    if ((size_t)cache->entriesLength <= sizeof(scratch) / sizeof(scratch[0])) {
++        entries = scratch;
++    } else {
++        entries = (CacheEntry**)internal_malloc(sizeof(*entries) * cache->entriesLength);
++        borrowed = true;
++    }
++
+     if (entries != nullptr) {
+         memcpy(entries, cache->entries, sizeof(*entries) * cache->entriesLength);
+         qsort(entries, cache->entriesLength, sizeof(*entries), cacheEntriesCompareByUsage);
+ 
+         // The sweeping threshold is 20% of cache size plus size for the new
+         // entry. Once the threshold is reached the marking process stops.
+-        int threshold = size + (int)((double)cache->size * 0.2);
++        /*
++         * ARGON: and twenty per cent is a third of a megabyte here.
++         *
++         * Measured on the board, 9 September 2026: walking costs 2118 tile
++         * misses per hundred hexes, 2.7 ms each, and 93% of all misses are for
++         * art the cache had and threw away.  This line is why.  A floor tile
++         * is three kilobytes; the threshold to make room for it is 3 KB plus a
++         * fifth of the cache, which at 1800 KB is 363 KB.  So every tile that
++         * misses evicts a third of a megabyte of the least recently used art -
++         * and most of it is wanted again within a frame or two, because what
++         * is least recently used on a map you are walking across is the part
++         * of the map just behind you.
++         *
++         * Sweeping in bulk is not senseless: the sort above costs a malloc and
++         * a qsort of the whole entry array, and doing it for every three
++         * kilobytes would be its own kind of waste.  But the batch should be
++         * sized against the work it saves, not against the cache - a fixed
++         * slack, so a 3 KB tile evicts 3 KB plus the slack rather than a fifth
++         * of everything.
++         *
++         * -evict N sets it, in kilobytes, so the right number can be measured
++         * rather than argued; a negative N restores the original behaviour for
++         * comparison.
++         */
++        int threshold;
++
++        if (ag_cache_slack_kb < 0) {
++            threshold = size + (int)((double)cache->size * 0.2);
++        } else {
++            threshold = size + (ag_cache_slack_kb << 10);
++        }
+ 
+         int accum = 0;
+         int index;
+         for (index = 0; index < cache->entriesLength; index++) {
+             CacheEntry* entry = entries[index];
++            /* ARGON: throwing out a flash-backed entry frees no cache memory
++             * at all, so it can only cost a reload and never help. */
++            if ((entry->flags & CACHE_ENTRY_FLASH) != 0) {
++                continue;
++            }
+             if (entry->referenceCount == 0) {
+                 if (entry->size >= threshold) {
+                     entry->flags |= CACHE_ENTRY_MARKED_FOR_EVICTION;
+@@ -834,13 +1177,16 @@ static bool cacheEnsureSize(Cache* cache, int size)
+             // unreferenced entries for sweeping.
+             for (; index >= 0; index--) {
+                 CacheEntry* entry = entries[index];
+-                if (entry->referenceCount == 0) {
++                if (entry->referenceCount == 0
++                        && (entry->flags & CACHE_ENTRY_FLASH) == 0) {
+                     entry->flags |= CACHE_ENTRY_MARKED_FOR_EVICTION;
+                 }
+             }
+         }
+ 
+-        internal_free(entries);
++        if (borrowed) {
++            internal_free(entries);
++        }
+     }
+ 
+     cacheSweep(cache);
+@@ -855,6 +1201,59 @@ static bool cacheEnsureSize(Cache* cache, int size)
+ // 0x42099C
+ static bool cacheSweep(Cache* cache)
+ {
++    /*
++     * ARGON: the whole eviction reaches flash as one visit.
++     *
++     * This is how the store fills - not from the map's files, but from what
++     * the game actually used and the cache could no longer keep.  The cache
++     * does not give up one picture when it runs short; it gives up a batch,
++     * and writing that batch one picture at a time was fifty separate stops
++     * of the processor instead of one.  So everything going out this sweep is
++     * collected first, handed over together, and only then freed.
++     *
++     * Each block is locked while it is read: an unreferenced block may have
++     * been moved by a compaction since its pointer was last taken, and the
++     * stale pointer would hand the store somebody else's bytes.  The locks
++     * are held until the batch is written, which is why they are undone in a
++     * second pass rather than at once.
++     */
++    if (cache->ag_kind == AG_CACHE_ART) {
++        enum { kBatchMax = 256 };
++        static ag_art_put_t going[kBatchMax];
++        static int          locked[kBatchMax];
++        int                 n = 0;
++
++        for (int index = 0; index < cache->entriesLength && n < kBatchMax;
++                index++) {
++            CacheEntry* e = cache->entries[index];
++
++            if ((e->flags & CACHE_ENTRY_MARKED_FOR_EVICTION) == 0
++                    || e->referenceCount != 0
++                    || (e->flags & CACHE_ENTRY_FLASH) != 0) {
++                continue;
++            }
++
++            void* bytes = nullptr;
++
++            if (heapLock(&(cache->heap), e->heapHandleIndex, &bytes)
++                    && bytes != nullptr) {
++                going[n].fid = e->key;
++                going[n].data = (const unsigned char*)bytes;
++                going[n].size = e->size;
++                locked[n] = e->heapHandleIndex;
++                n++;
++            }
++        }
++
++        if (n > 0) {
++            ag_art_store_put_many(going, n);
++
++            for (int i = 0; i < n; i++) {
++                heapUnlock(&(cache->heap), locked[i]);
++            }
++        }
++    }
++
+     for (int index = 0; index < cache->entriesLength; index++) {
+         CacheEntry* cacheEntry = cache->entries[index];
+         if ((cacheEntry->flags & CACHE_ENTRY_MARKED_FOR_EVICTION) != 0) {
+@@ -864,6 +1263,8 @@ static bool cacheSweep(Cache* cache)
+                 cacheEntry->flags &= ~CACHE_ENTRY_MARKED_FOR_EVICTION;
+             } else {
+                 int cacheEntrySize = cacheEntry->size;
++                const unsigned entry_was_flash =
++                    (cacheEntry->flags & CACHE_ENTRY_FLASH) ? 1u : 0u;
+ 
+                 // ARGON: one entry thrown out to make room for another.
+                 ag_cache_evicted++;
+@@ -879,7 +1280,17 @@ static bool cacheSweep(Cache* cache)
+                 memmove(&(cache->entries[index]), &(cache->entries[index + 1]), sizeof(*cache->entries) * ((cache->entriesLength - index) - 1));
+ 
+                 cache->entriesLength--;
+-                cache->size -= cacheEntrySize;
++                /* ARGON: only if it was ever counted.  A flash-backed
++                 * entry holds no cache memory and is not added to
++                 * cache->size when it is inserted, so subtracting here walks
++                 * the total towards a negative number - after which
++                 * maxSize - size is enormous, the cache believes it has room
++                 * for anything and stops evicting at all.  Written down
++                 * because the symptom was nothing like the cause: brahmin
++                 * animating unevenly, 11 September 2026. */
++                if ((entry_was_flash & 1u) == 0u) {
++                    cache->size -= cacheEntrySize;
++                }
+ 
+                 // The entry was removed, compensate index.
+                 index--;
+@@ -922,6 +1333,40 @@ static int cacheEntriesCompareByUsage(const void* a1, const void* a2)
+         return -1;
+     }
+ 
++    /*
++     * ARGON: least recently ASKED FOR, not least often.
++     *
++     * Maxim, 10 September 2026: "А если выкидывать из кэша самое старое что
++     * спрашивали, а не что поместили - это не будет лучше?"  It is, and the
++     * engine already has the stamp for it: cacheLock writes entry->mru on
++     * every access, so mru is exactly "when was this last wanted".
++     *
++     * The original sorted by hit COUNT first and only used mru to break ties.
++     * That is a frequency policy, and on a map it works against the game: art
++     * that has just been read has one hit, so it is first out - even though
++     * having just been needed is the best evidence that it will be needed
++     * again.  And an evicted entry is destroyed along with its counter, so
++     * what comes back starts at one hit and is first out again.  Once thrown
++     * away, always thrown away: 85 to 96 per cent of every miss while walking
++     * was art the cache had held and evicted.
++     *
++     * Ordering by mru alone is plain LRU, which is what a map wants - what you
++     * needed a step ago is what the next step needs - and it dissolves the
++     * circle for nothing: a re-read entry gets a fresh stamp and goes to the
++     * back of the queue instead of the front.  The hit credit that used to
++     * paper over this (-boost) is not needed with it.
++     *
++     * -lru 0 restores the engine's own order, for comparison.
++     */
++    if (ag_cache_lru != 0) {
++        if (v1->mru < v2->mru) {
++            return -1;
++        } else if (v1->mru > v2->mru) {
++            return 1;
++        }
++        return 0;
++    }
++
+     if (v1->hits < v2->hits) {
+         return -1;
+     } else if (v1->hits > v2->hits) {
+diff --git a/src/cache.h b/src/cache.h
+--- a/src/cache.h
++++ b/src/cache.h
+@@ -13,6 +13,13 @@ typedef enum CacheEntryFlags {
+     // Specifies that cache entry has no references as should be evicted during
+     // the next sweep operation.
+     CACHE_ENTRY_MARKED_FOR_EVICTION = 0x01,
++
++    /* ARGON: the bytes are not in the heap - they are mapped flash, read
++     * only, and belong to the art store.  Such an entry costs the forty bytes
++     * of this struct and nothing else: it is never locked, never moved, never
++     * counted against the cache size and never worth evicting.  See
++     * apps/fallout/port/art_store.h. */
++    CACHE_ENTRY_FLASH = 0x02,
+ } CacheEntryFlags;
+ 
+ typedef int CacheSizeProc(int key, int* sizePtr);
+@@ -77,6 +84,20 @@ bool cacheFree(Cache* cache);
+ bool cacheLock(Cache* cache, int key, void** data, CacheEntry** cacheEntryPtr);
+ bool cacheUnlock(Cache* cache, CacheEntry* cacheEntry);
+ bool cacheFlush(Cache* cache);
++
++/* ARGON: lend the cache's whole contiguous block to a full-screen panel and
++ * take it back afterwards.  argonCacheLend refuses while anything holds an
++ * entry.  See the comment in cache.cc. */
++bool argonCacheLend(Cache* cache);
++bool argonCacheTakeBack(Cache* cache);
++/* Take the block back at a different size, emptying it.  Refuses while
++ * anything holds an entry.  See cache.cc. */
++bool argonCacheResize(Cache* cache, int maxSize);
++/* ARGON: borrow a block of the cache's own memory for as long as a caller needs
++ * it, evicting art to make room.  See cache.cc. */
++bool argonCacheBorrow(Cache* cache, int size, int* handleIndexPtr,
++    unsigned char** bufferPtr);
++void argonCacheReturn(Cache* cache, int* handleIndexPtr);
+ bool cachePrintStats(Cache* cache, char* dest, size_t size);
+ 
+ } // namespace fallout
+diff --git a/src/combat.cc b/src/combat.cc
+--- a/src/combat.cc
++++ b/src/combat.cc
+@@ -46,6 +46,9 @@
+ #include "trait.h"
+ #include "window_manager.h"
+ 
++/* ARGON: AG_STEP and the clock, for the bounded wait below. */
++#include "ag_diag.h"
++
+ namespace fallout {
+ 
+ #define CALLED_SHOT_WINDOW_Y (20)
+@@ -2559,6 +2562,53 @@ static int _combatAIInfoSetLastMove(Object* object, int move)
+     return 0;
+ }
+ 
++
++/*
++ * ARGON: wait for a critter's animation, but not for ever.
++ *
++ * Two places here register a "get up" animation and then spin on
++ * animationIsBusy, pumping the background handlers and drawing nothing.  If
++ * the animation never finishes the game is simply gone: no frames, no input,
++ * until the watchdog kills the process forty-five seconds later.  Maxim, 8
++ * September 2026, fighting two scorpions - the watcher named it exactly:
++ *
++ *     STUCK: no frame and no lap for 5001 ms.  Step 3 (scripts),
++ *            at input: buttons, last sound icombat1.ACM
++ *     script -1 proc -1: 805429 steps -> 805429 (stopped inside one
++ *            instruction)
++ *
++ * - step 3 is scriptsHandleRequests, no script was executing, the interpreter
++ * was not moving, and the breadcrumb was the stale one _process_bk leaves
++ * behind.  That is this loop.
++ *
++ * Three seconds: a critter getting up takes well under one, and an animation
++ * still busy after three is not going to finish.  Giving up leaves the critter
++ * where it is - which the engine copes with, it is the same state as an
++ * animation that was interrupted - instead of taking the game with it.
++ */
++#define ARGON_ANIM_WAIT_MS 3000u
++
++static void argonWaitForAnimation(Object* critter, const char* where)
++{
++    const char* const step_was = ag_step;
++    AG_STEP("combat: waiting for a critter's animation");
++
++    const unsigned began = ag_cache_now_us();
++    while (animationIsBusy(critter)) {
++        _process_bk();
++        if ((ag_cache_now_us() - began) / 1000u >= ARGON_ANIM_WAIT_MS) {
++            debugPrint("\nCOMBAT: %s waited %u ms for an animation that will "
++                       "not finish (fid %x, tile %d); going on without it\n",
++                where, ARGON_ANIM_WAIT_MS,
++                (unsigned)(critter != NULL ? critter->fid : 0),
++                critter != NULL ? critter->tile : -1);
++            break;
++        }
++    }
++
++    ag_step = step_was;
++}
++
+ // 0x421A34
+ static void _combat_begin(Object* attacker)
+ {
+@@ -2628,9 +2678,7 @@ static void _combat_begin(Object* attacker)
+             animationRegisterSetFid(v1, fid, -1);
+             reg_anim_end();
+ 
+-            while (animationIsBusy(v1)) {
+-                _process_bk();
+-            }
++            argonWaitForAnimation(v1, "a knocked-down critter getting up");
+         }
+     }
+ }
+@@ -2795,9 +2843,7 @@ static void _combat_over()
+             animationRegisterSetFid(critter, fid, -1);
+             reg_anim_end();
+ 
+-            while (animationIsBusy(critter)) {
+-                _process_bk();
+-            }
++            argonWaitForAnimation(critter, "a critter getting up");
+         }
+     }
+ 
+diff --git a/src/dfile.cc b/src/dfile.cc
+--- a/src/dfile.cc
++++ b/src/dfile.cc
+@@ -1,5 +1,9 @@
+ #include "dfile.h"
+ 
++/* ARGON: the miss-cost counters and the clock they are read with. */
++#include "ag_diag.h"
++extern "C" uint32_t ag_us(void);
++
+ #include <assert.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -15,7 +19,36 @@
+ namespace fallout {
+ 
+ // The size of decompression buffer for reading compressed [DFile]s.
+-#define DFILE_DECOMPRESSION_BUFFER_SIZE (0x400)
++/*
++ * ARGON: sixteen kilobytes, not one, and the reason is measured.
++ *
++ * On the board, 9 September 2026, one session of walking around a big map:
++ *
++ *     [dat] open 13484 in 6831 ms | card 16344 reads of 11324 KB in 15025 ms
++ *           (753 KB/s) | inflate 3429504 in 20005 ms
++ *
++ * Three and a half MILLION calls into inflate for eleven megabytes - one call
++ * per three bytes, 5.8 us each - and reads averaging 710 bytes, which is why
++ * the card appeared to manage only 753 KB/s.  Neither number is about zlib or
++ * about the card; both are this constant.  The compressed stream was handed
++ * over a kilobyte at a time, so zlib was re-entered on every kilobyte and the
++ * card was asked for a kilobyte at a time with it.
++ *
++ * Sixteen kilobytes cuts both counts by sixteen.  It also changes where the
++ * read lands: the shim's FILE buffer is 4096 bytes and a request larger than
++ * it goes straight to the kernel, so a refill is now one card read of 16 KB
++ * rather than sixteen trips through a buffer that could not hold it.
++ *
++ * The cost is 16 KB of arena per open compressed file, and the engine keeps
++ * one or two of those at a time (see DBase::spare).  It is not a memory
++ * compromise to undo on a bigger board - it is the size a read should have
++ * been, and a 16 MB board wants it just as much.
++ */
++#define DFILE_DECOMPRESSION_BUFFER_SIZE (0x4000)
++
++/* ARGON: how much is inflated in one go and handed out piecemeal afterwards.
++ * See DFile::outBuffer in dfile.h and dfileInflateSome below. */
++#define DFILE_OUT_BUFFER_SIZE (0x2000)
+ 
+ // Specifies that [DFile] has unget character.
+ //
+@@ -410,6 +443,10 @@ int dfileClose(DFile* stream)
+         free(stream->decompressionBuffer);
+     }
+ 
++    if (stream->outBuffer != nullptr) {
++        free(stream->outBuffer);
++    }
++
+     if (stream->stream != nullptr) {
+         // ARGON: keep one open for the next entry; see DBase::spare.
+         if (stream->dbase->spare == nullptr) {
+@@ -459,7 +496,15 @@ DFile* dfileOpen(DBase* dbase, const char* filePath, const char* mode)
+     assert(filePath); // dfile.c, 296
+     assert(mode); // dfile.c, 297
+ 
+-    return dfileOpenInternal(dbase, filePath, mode, nullptr);
++    /* ARGON: the third share of a cache miss - finding the entry, opening the
++     * archive and starting a zlib stream.  See ag_diag.h. */
++    {
++        const uint32_t t0 = ag_us();
++        DFile* const opened = dfileOpenInternal(dbase, filePath, mode, nullptr);
++        ag_dat_open_us += ag_us() - t0;
++        ag_dat_open_n++;
++        return opened;
++    }
+ }
+ 
+ // [vfprintf].
+@@ -730,6 +775,9 @@ int dfileSeek(DFile* stream, long offset, int origin)
+ 
+     stream->position = 0;
+     stream->compressedBytesRead = 0;
++    /* ARGON: the inflated bytes in hand belong to the old position. */
++    stream->outPos = 0;
++    stream->outLen = 0;
+     stream->flags &= ~(DFILE_HAS_UNGETC | DFILE_EOF);
+ 
+     return 0;
+@@ -835,6 +883,8 @@ static DFile* dfileOpenInternal(DBase* dbase, const char* filePath, const char*
+ 
+         dfile->compressedBytesRead = 0;
+         dfile->position = 0;
++        dfile->outPos = 0;
++        dfile->outLen = 0;
+         dfile->flags = 0;
+     }
+ 
+@@ -873,6 +923,12 @@ static DFile* dfileOpenInternal(DBase* dbase, const char* filePath, const char*
+             if (dfile->decompressionBuffer == nullptr) {
+                 goto err;
+             }
++
++            /* ARGON: and the inflated side.  See DFile::outBuffer. */
++            dfile->outBuffer = (unsigned char*)malloc(DFILE_OUT_BUFFER_SIZE);
++            if (dfile->outBuffer == nullptr) {
++                goto err;
++            }
+         } else {
+             // ARGON: end the stream that is already in there before starting a
+             // new one on top of it.
+@@ -993,12 +1049,92 @@ static int dfileReadCharInternal(DFile* stream)
+ }
+ 
+ // 0x4E6078
++/*
++ * ARGON: inflate a bufferful at a time, and serve the reads out of it.
++ *
++ * Measured on the board, 9 September 2026: 3417003 calls into inflate for
++ * eighteen megabytes - one per three bytes - costing 20.7 seconds of a
++ * session.  Almost none of that was decompression; it was the cost of
++ * entering and leaving zlib, because the engine reads a compressed entry two
++ * bytes at a time (artReadFrameData pulls a frame apart field by field, and
++ * every fileReadInt16 came all the way down here).
++ *
++ * So the small reads are answered from memory and zlib is entered once per
++ * eight kilobytes.  Nothing above this function changes; nothing below it
++ * knows.  The first attempt at this fixed the wrong end - a bigger *input*
++ * chunk, which cut the card's reads from 710 bytes to 2.9 KB and took the card
++ * from 753 to 1211 KB/s, but left the inflate count exactly where it was.
++ * Both ends needed doing, and they are different bugs.
++ */
++static int dfileInflateSome(DFile* stream)
++{
++    z_streamp const zs = stream->decompressionStream;
++
++    zs->next_out = (Bytef*)stream->outBuffer;
++    zs->avail_out = DFILE_OUT_BUFFER_SIZE;
++
++    for (;;) {
++        int rc;
++
++        if (zs->avail_out == 0) {
++            break;
++        }
++
++        if (zs->avail_in == 0) {
++            const int bytesToRead = std::min(DFILE_DECOMPRESSION_BUFFER_SIZE,
++                stream->entry->dataSize - stream->compressedBytesRead);
++
++            if (bytesToRead <= 0) {
++                /* The entry has no compressed bytes left; whatever is in the
++                 * buffer now is the end of it. */
++                break;
++            }
++
++            /* The card's share of a cache miss.  See ag_diag.h. */
++            {
++                const uint32_t t0 = ag_us();
++                const size_t got = fread(stream->decompressionBuffer,
++                                         (size_t)bytesToRead, 1,
++                                         stream->stream);
++                ag_dat_read_us += ag_us() - t0;
++                ag_dat_read_n++;
++                ag_dat_read_kb += (unsigned)(bytesToRead / 1024);
++                if (got != 1) {
++                    break;
++                }
++            }
++
++            zs->avail_in = (uInt)bytesToRead;
++            zs->next_in = stream->decompressionBuffer;
++            stream->compressedBytesRead += bytesToRead;
++        }
++
++        /* And zlib's share of it. */
++        {
++            const uint32_t t0 = ag_us();
++            rc = inflate(zs, Z_NO_FLUSH);
++            ag_dat_inflate_us += ag_us() - t0;
++            ag_dat_inflate_n++;
++        }
++
++        if (rc != Z_OK) {
++            /* Z_STREAM_END, or an error - either way there is no more. */
++            break;
++        }
++    }
++
++    stream->outPos = 0;
++    stream->outLen = DFILE_OUT_BUFFER_SIZE - (int)zs->avail_out;
++
++    return stream->outLen;
++}
++
+ static bool dfileReadCompressed(DFile* stream, void* ptr, size_t size)
+ {
++    unsigned char* out = (unsigned char*)ptr;
++
+     if ((stream->flags & DFILE_HAS_COMPRESSED_UNGETC) != 0) {
+-        unsigned char* byteBuffer = (unsigned char*)ptr;
+-        *byteBuffer++ = stream->compressedUngotten & 0xFF;
+-        ptr = byteBuffer;
++        *out++ = stream->compressedUngotten & 0xFF;
+ 
+         size--;
+ 
+@@ -1010,37 +1146,29 @@ static bool dfileReadCompressed(DFile* stream, void* ptr, size_t size)
+         }
+     }
+ 
+-    stream->decompressionStream->next_out = (Bytef*)ptr;
+-    stream->decompressionStream->avail_out = size;
+-
+-    do {
+-        if (stream->decompressionStream->avail_out == 0) {
+-            // Everything was decompressed.
+-            break;
+-        }
+-
+-        if (stream->decompressionStream->avail_in == 0) {
+-            // No more unprocessed data, request next chunk.
+-            size_t bytesToRead = std::min(DFILE_DECOMPRESSION_BUFFER_SIZE, stream->entry->dataSize - stream->compressedBytesRead);
++    while (size != 0) {
++        size_t take;
+ 
+-            if (fread(stream->decompressionBuffer, bytesToRead, 1, stream->stream) != 1) {
+-                break;
++        if (stream->outPos == stream->outLen) {
++            if (dfileInflateSome(stream) == 0) {
++                /* Asked for more than the entry holds, or the stream broke -
++                 * the same answer the field-by-field version gave. */
++                return false;
+             }
++        }
+ 
+-            stream->decompressionStream->avail_in = bytesToRead;
+-            stream->decompressionStream->next_in = stream->decompressionBuffer;
+-
+-            stream->compressedBytesRead += bytesToRead;
++        take = (size_t)(stream->outLen - stream->outPos);
++        if (take > size) {
++            take = size;
+         }
+-    } while (inflate(stream->decompressionStream, Z_NO_FLUSH) == Z_OK);
+ 
+-    if (stream->decompressionStream->avail_out != 0) {
+-        // There are some data still waiting, which means there was in error
+-        // during decompression loop above.
+-        return false;
+-    }
++        memcpy(out, stream->outBuffer + stream->outPos, take);
+ 
+-    stream->position += size;
++        stream->outPos += (int)take;
++        stream->position += (int)take;
++        out += take;
++        size -= take;
++    }
+ 
+     return true;
+ }
+diff --git a/src/dfile.h b/src/dfile.h
+--- a/src/dfile.h
++++ b/src/dfile.h
+@@ -95,6 +95,21 @@ typedef struct DFile {
+     // This value is NULL if entry is not compressed.
+     unsigned char* decompressionBuffer;
+ 
++    /*
++     * ARGON: the OTHER side of the decompressor - bytes already inflated and
++     * waiting to be handed out.
++     *
++     * The engine reads a compressed entry two bytes at a time (artReadFrameData
++     * takes a frame apart field by field), and without this every one of those
++     * was a separate call into inflate: measured on the board, 3417003 calls
++     * for eighteen megabytes, 20.7 seconds of a session spent almost entirely
++     * on entering and leaving zlib rather than on decompressing.  With a buffer
++     * the small reads are a memcpy and inflate is entered once per bufferful.
++     */
++    unsigned char* outBuffer;
++    int outLen;
++    int outPos;
++
+     // The last ungot character.
+     //
+     // See [DFILE_HAS_UNGETC] notes.
+diff --git a/src/draw.cc b/src/draw.cc
+--- a/src/draw.cc
++++ b/src/draw.cc
+@@ -149,7 +149,7 @@ void bufferDrawRectShadowed(unsigned char* buf, int pitch, int left, int top, in
+ }
+ 
+ // 0x4D33F0
+-void blitBufferToBufferStretch(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destWidth, int destHeight, int destPitch)
++void blitBufferToBufferStretch(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destWidth, int destHeight, int destPitch)
+ {
+     int stepX = (destWidth << 16) / srcWidth;
+     int stepY = (destHeight << 16) / srcHeight;
+@@ -176,7 +176,7 @@ void blitBufferToBufferStretch(unsigned char* src, int srcWidth, int srcHeight,
+ }
+ 
+ // 0x4D3560
+-void blitBufferToBufferStretchTrans(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destWidth, int destHeight, int destPitch)
++void blitBufferToBufferStretchTrans(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destWidth, int destHeight, int destPitch)
+ {
+     int stepX = (destWidth << 16) / srcWidth;
+     int stepY = (destHeight << 16) / srcHeight;
+@@ -205,13 +205,13 @@ void blitBufferToBufferStretchTrans(unsigned char* src, int srcWidth, int srcHei
+ }
+ 
+ // 0x4D36D4
+-void blitBufferToBuffer(unsigned char* src, int width, int height, int srcPitch, unsigned char* dest, int destPitch)
++void blitBufferToBuffer(const unsigned char* src, int width, int height, int srcPitch, unsigned char* dest, int destPitch)
+ {
+     srcCopy(dest, destPitch, src, srcPitch, width, height);
+ }
+ 
+ // 0x4D3704
+-void blitBufferToBufferTrans(unsigned char* src, int width, int height, int srcPitch, unsigned char* dest, int destPitch)
++void blitBufferToBufferTrans(const unsigned char* src, int width, int height, int srcPitch, unsigned char* dest, int destPitch)
+ {
+     transSrcCopy(dest, destPitch, src, srcPitch, width, height);
+ }
+@@ -311,7 +311,7 @@ void bufferOutline(unsigned char* buf, int width, int height, int pitch, int col
+ }
+ 
+ // 0x4E0DB0
+-void srcCopy(unsigned char* dest, int destPitch, unsigned char* src, int srcPitch, int width, int height)
++void srcCopy(unsigned char* dest, int destPitch, const unsigned char* src, int srcPitch, int width, int height)
+ {
+     for (int y = 0; y < height; y++) {
+         memcpy(dest, src, width);
+@@ -321,7 +321,7 @@ void srcCopy(unsigned char* dest, int destPitch, unsigned char* src, int srcPitc
+ }
+ 
+ // 0x4E0ED5
+-void transSrcCopy(unsigned char* dest, int destPitch, unsigned char* src, int srcPitch, int width, int height)
++void transSrcCopy(unsigned char* dest, int destPitch, const unsigned char* src, int srcPitch, int width, int height)
+ {
+     int destSkip = destPitch - width;
+     int srcSkip = srcPitch - width;
+diff --git a/src/draw.h b/src/draw.h
+--- a/src/draw.h
++++ b/src/draw.h
+@@ -6,17 +6,17 @@ namespace fallout {
+ void bufferDrawLine(unsigned char* buf, int pitch, int left, int top, int right, int bottom, int color);
+ void bufferDrawRect(unsigned char* buf, int a2, int a3, int a4, int a5, int a6, int a7);
+ void bufferDrawRectShadowed(unsigned char* buf, int a2, int a3, int a4, int a5, int a6, int a7, int a8);
+-void blitBufferToBufferStretch(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destWidth, int destHeight, int destPitch);
+-void blitBufferToBufferStretchTrans(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destWidth, int destHeight, int destPitch);
+-void blitBufferToBuffer(unsigned char* src, int width, int height, int srcPitch, unsigned char* dest, int destPitch);
+-void blitBufferToBufferTrans(unsigned char* src, int width, int height, int srcPitch, unsigned char* dest, int destPitch);
++void blitBufferToBufferStretch(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destWidth, int destHeight, int destPitch);
++void blitBufferToBufferStretchTrans(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destWidth, int destHeight, int destPitch);
++void blitBufferToBuffer(const unsigned char* src, int width, int height, int srcPitch, unsigned char* dest, int destPitch);
++void blitBufferToBufferTrans(const unsigned char* src, int width, int height, int srcPitch, unsigned char* dest, int destPitch);
+ void bufferFill(unsigned char* buf, int width, int height, int pitch, int a5);
+ void _buf_texture(unsigned char* buf, int width, int height, int pitch, void* a5, int a6, int a7);
+ void _lighten_buf(unsigned char* buf, int width, int height, int pitch);
+ void _swap_color_buf(unsigned char* buf, int width, int height, int pitch, int color1, int color2);
+ void bufferOutline(unsigned char* buf, int width, int height, int pitch, int a5);
+-void srcCopy(unsigned char* dest, int destPitch, unsigned char* src, int srcPitch, int width, int height);
+-void transSrcCopy(unsigned char* dest, int destPitch, unsigned char* src, int srcPitch, int width, int height);
++void srcCopy(unsigned char* dest, int destPitch, const unsigned char* src, int srcPitch, int width, int height);
++void transSrcCopy(unsigned char* dest, int destPitch, const unsigned char* src, int srcPitch, int width, int height);
+ 
+ } // namespace fallout
+ 
+diff --git a/src/endgame.cc b/src/endgame.cc
+--- a/src/endgame.cc
++++ b/src/endgame.cc
+@@ -320,7 +320,7 @@ static void endgameEndingRenderPanningScene(int direction, const char* narratorF
+     if (background != nullptr) {
+         int width = artGetWidth(background, 0, 0);
+         int height = artGetHeight(background, 0, 0);
+-        unsigned char* backgroundData = artGetFrameData(background, 0, 0);
++        const unsigned char* backgroundData = artGetFrameData(background, 0, 0);
+         bufferFill(gEndgameEndingSlideshowWindowBuffer, ENDGAME_ENDING_WINDOW_WIDTH, ENDGAME_ENDING_WINDOW_HEIGHT, ENDGAME_ENDING_WINDOW_WIDTH, _colorTable[0]);
+         endgameEndingLoadPalette(6, 327);
+ 
+@@ -453,7 +453,7 @@ static void endgameEndingRenderStaticScene(int fid, const char* narratorFileName
+         return;
+     }
+ 
+-    unsigned char* backgroundData = artGetFrameData(background, 0, 0);
++    const unsigned char* backgroundData = artGetFrameData(background, 0, 0);
+     if (backgroundData != nullptr) {
+         blitBufferToBuffer(backgroundData, ENDGAME_ENDING_WINDOW_WIDTH, ENDGAME_ENDING_WINDOW_HEIGHT, ENDGAME_ENDING_WINDOW_WIDTH, gEndgameEndingSlideshowWindowBuffer, ENDGAME_ENDING_WINDOW_WIDTH);
+         windowRefresh(gEndgameEndingSlideshowWindow);
+diff --git a/src/fps_limiter.cc b/src/fps_limiter.cc
+--- a/src/fps_limiter.cc
++++ b/src/fps_limiter.cc
+@@ -15,10 +15,42 @@ void FpsLimiter::mark()
+     _ticks = SDL_GetTicks();
+ }
+ 
++/*
++ * ARGON: read the clock ONCE.
++ *
++ * The original read it twice - once for the test, once for the subtraction -
++ * and between those two reads time moves:
++ *
++ *     if (1000 / _fps > SDL_GetTicks() - _ticks) {
++ *         SDL_Delay(1000 / _fps - (SDL_GetTicks() - _ticks));
++ *     }
++ *
++ * Let the budget be 16 ms.  A frame that has taken 15 ms passes the test; if
++ * the millisecond turns over before the second read, the subtraction is
++ * 16 - 16... or 16 - 17, in unsigned arithmetic, which is 4294967295.  The
++ * game then sleeps for forty-nine days.
++ *
++ * That is a race a frame runs against itself, so it is rare and it is fatal.
++ * The board, 9 September 2026, seven minutes into a session:
++ *
++ *     [watch] STUCK: no frame and no lap for 5000 ms.  Step 6 (throttle)
++ *     [watch] script ... 349918 steps -> 349918 (not moving)
++ *     [watch] the sound thread is at writing to the device (still running)
++ *
++ * Everything else alive, the game thread asleep in the frame limiter.  It
++ * looked for all the world like the audio wedge and it was nothing of the
++ * kind.
++ *
++ * One read, one comparison, and a guard on _fps because a zero there would
++ * divide by zero before any of this mattered.
++ */
+ void FpsLimiter::throttle() const
+ {
+-    if (1000 / _fps > SDL_GetTicks() - _ticks) {
+-        SDL_Delay(1000 / _fps - (SDL_GetTicks() - _ticks));
++    const unsigned int budget = (_fps != 0) ? (1000u / _fps) : 16u;
++    const unsigned int elapsed = SDL_GetTicks() - _ticks;
++
++    if (elapsed < budget) {
++        SDL_Delay(budget - elapsed);
+     }
+ }
+ 
+diff --git a/src/game_dialog.cc b/src/game_dialog.cc
+--- a/src/game_dialog.cc
++++ b/src/game_dialog.cc
+@@ -3205,7 +3205,7 @@ int _gdialog_barter_create_win()
+         return -1;
+     }
+ 
+-    unsigned char* backgroundData = backgroundFrmImage.getData();
++    const unsigned char* backgroundData = backgroundFrmImage.getData();
+     if (backgroundData == nullptr) {
+         return -1;
+     }
+@@ -3359,7 +3359,7 @@ int partyMemberControlWindowInit()
+         return -1;
+     }
+ 
+-    unsigned char* backgroundData = backgroundFrmImage.getData();
++    const unsigned char* backgroundData = backgroundFrmImage.getData();
+     if (backgroundData == nullptr) {
+         partyMemberControlWindowFree();
+         return -1;
+@@ -3434,7 +3434,7 @@ int partyMemberControlWindowInit()
+ 
+         int width = artGetWidth(upButtonFrm, 0, 0);
+         int height = artGetHeight(upButtonFrm, 0, 0);
+-        unsigned char* upButtonFrmData = artGetFrameData(upButtonFrm, 0, 0);
++        const unsigned char* upButtonFrmData = artGetFrameData(upButtonFrm, 0, 0);
+ 
+         fid = buildFid(OBJ_TYPE_INTERFACE, buttonData->downFrmId, 0, 0, 0);
+         Art* downButtonFrm = artLock(fid, &(buttonData->downFrmHandle));
+@@ -3443,7 +3443,7 @@ int partyMemberControlWindowInit()
+             return -1;
+         }
+ 
+-        unsigned char* downButtonFrmData = artGetFrameData(downButtonFrm, 0, 0);
++        const unsigned char* downButtonFrmData = artGetFrameData(downButtonFrm, 0, 0);
+ 
+         fid = buildFid(OBJ_TYPE_INTERFACE, buttonData->disabledFrmId, 0, 0, 0);
+         Art* disabledButtonFrm = artLock(fid, &(buttonData->disabledFrmHandle));
+@@ -3452,7 +3452,7 @@ int partyMemberControlWindowInit()
+             return -1;
+         }
+ 
+-        unsigned char* disabledButtonFrmData = artGetFrameData(disabledButtonFrm, 0, 0);
++        const unsigned char* disabledButtonFrmData = artGetFrameData(disabledButtonFrm, 0, 0);
+ 
+         v21++;
+ 
+@@ -3551,7 +3551,7 @@ void partyMemberControlWindowUpdate()
+     int backgroundFid = buildFid(OBJ_TYPE_INTERFACE, 390, 0, 0, 0);
+     if (backgroundFrmImage.lock(backgroundFid)) {
+         int width = backgroundFrmImage.getWidth();
+-        unsigned char* buffer = backgroundFrmImage.getData();
++        const unsigned char* buffer = backgroundFrmImage.getData();
+ 
+         // Clear "Weapon Used:".
+         blitBufferToBuffer(buffer + width * 20 + 112, 110, fontGetLineHeight(), width, windowBuffer + windowWidth * 20 + 112, windowWidth);
+@@ -3591,7 +3591,7 @@ void partyMemberControlWindowUpdate()
+     if (preview != nullptr) {
+         int width = artGetWidth(preview, 0, ROTATION_SW);
+         int height = artGetHeight(preview, 0, ROTATION_SW);
+-        unsigned char* buffer = artGetFrameData(preview, 0, ROTATION_SW);
++        const unsigned char* buffer = artGetFrameData(preview, 0, ROTATION_SW);
+         blitBufferToBufferTrans(buffer, width, height, width, windowBuffer + windowWidth * (132 - height / 2) + 39 - width / 2, windowWidth);
+         artUnlock(previewHandle);
+     }
+@@ -3797,7 +3797,7 @@ int partyMemberCustomizationWindowInit()
+         return -1;
+     }
+ 
+-    unsigned char* backgroundFrmData = backgroundFrmImage.getData();
++    const unsigned char* backgroundFrmData = backgroundFrmImage.getData();
+     if (backgroundFrmData == nullptr) {
+         // FIXME: Leaking background.
+         partyMemberCustomizationWindowFree();
+@@ -3854,7 +3854,7 @@ int partyMemberCustomizationWindowInit()
+ 
+         int width = artGetWidth(upButtonFrm, 0, 0);
+         int height = artGetHeight(upButtonFrm, 0, 0);
+-        unsigned char* upButtonFrmData = artGetFrameData(upButtonFrm, 0, 0);
++        const unsigned char* upButtonFrmData = artGetFrameData(upButtonFrm, 0, 0);
+ 
+         int downButtonFid = buildFid(OBJ_TYPE_INTERFACE, buttonData->downFrmId, 0, 0, 0);
+         Art* downButtonFrm = artLock(downButtonFid, &(buttonData->downFrmHandle));
+@@ -3863,7 +3863,7 @@ int partyMemberCustomizationWindowInit()
+             return -1;
+         }
+ 
+-        unsigned char* downButtonFrmData = artGetFrameData(downButtonFrm, 0, 0);
++        const unsigned char* downButtonFrmData = artGetFrameData(downButtonFrm, 0, 0);
+ 
+         optionButton++;
+         _gdialog_buttons[optionButton] = buttonCreate(gGameDialogWindow,
+@@ -3994,7 +3994,7 @@ void partyMemberCustomizationWindowUpdate()
+ 
+     int backgroundWidth = backgroundFrmImage.getWidth();
+     int backgroundHeight = backgroundFrmImage.getHeight();
+-    unsigned char* backgroundData = backgroundFrmImage.getData();
++    const unsigned char* backgroundData = backgroundFrmImage.getData();
+     blitBufferToBuffer(backgroundData, backgroundWidth, backgroundHeight, backgroundWidth, windowBuffer, GAME_DIALOG_WINDOW_WIDTH);
+ 
+     backgroundFrmImage.unlock();
+@@ -4332,7 +4332,7 @@ int _gdialog_window_create()
+         return -1;
+     }
+ 
+-    unsigned char* backgroundFrmData = backgroundFrmImage.getData();
++    const unsigned char* backgroundFrmData = backgroundFrmImage.getData();
+     if (backgroundFrmData != nullptr) {
+         _dialogue_subwin_len = backgroundFrmImage.getHeight();
+ 
+@@ -4563,7 +4563,7 @@ void gameDialogRenderTalkingHead(Art* headFrm, int frame)
+             debugPrint("\tError locking background in display...\n");
+         }
+ 
+-        unsigned char* backgroundFrmData = backgroundFrmImage.getData();
++        const unsigned char* backgroundFrmData = backgroundFrmImage.getData();
+         if (backgroundFrmData != nullptr) {
+             blitBufferToBuffer(backgroundFrmData, 388, 200, 388, gGameDialogDisplayBuffer, GAME_DIALOG_WINDOW_WIDTH);
+         } else {
+@@ -4572,7 +4572,7 @@ void gameDialogRenderTalkingHead(Art* headFrm, int frame)
+ 
+         int width = artGetWidth(headFrm, frame, 0);
+         int height = artGetHeight(headFrm, frame, 0);
+-        unsigned char* data = artGetFrameData(headFrm, frame, 0);
++        const unsigned char* data = artGetFrameData(headFrm, frame, 0);
+ 
+         int a3;
+         int v8;
+diff --git a/src/game_mouse.cc b/src/game_mouse.cc
+--- a/src/game_mouse.cc
++++ b/src/game_mouse.cc
+@@ -9,6 +9,7 @@
+ #include "actions.h"
+ #include "animation.h"
+ #include "art.h"
++#include "memory.h"
+ #include "color.h"
+ #include "combat.h"
+ #include "critter.h"
+@@ -1358,7 +1359,7 @@ int gameMouseSetCursor(int cursor)
+     offsetX = width / 2 - offsetX;
+     offsetY = height - 1 - offsetY;
+ 
+-    unsigned char* mouseCursorFrmData = artGetFrameData(mouseCursorFrm, frame, 0);
++    const unsigned char* mouseCursorFrmData = artGetFrameData(mouseCursorFrm, frame, 0);
+     if (mouseSetFrame(mouseCursorFrmData, width, height, width, offsetX, offsetY, 0) != 0) {
+         return -1;
+     }
+@@ -1715,11 +1716,11 @@ int gameMouseRenderPrimaryAction(int x, int y, int menuItem, int width, int heig
+         return 0;
+     }
+ 
+-    unsigned char* arrowFrmData = artGetFrameData(arrowFrm, 0, 0);
++    const unsigned char* arrowFrmData = artGetFrameData(arrowFrm, 0, 0);
+     int arrowFrmWidth = artGetWidth(arrowFrm, 0, 0);
+     int arrowFrmHeight = artGetHeight(arrowFrm, 0, 0);
+ 
+-    unsigned char* menuItemFrmData = artGetFrameData(menuItemFrm, 0, 0);
++    const unsigned char* menuItemFrmData = artGetFrameData(menuItemFrm, 0, 0);
+     int menuItemFrmWidth = artGetWidth(menuItemFrm, 0, 0);
+     int menuItemFrmHeight = artGetHeight(menuItemFrm, 0, 0);
+ 
+@@ -1841,7 +1842,7 @@ int gameMouseRenderActionMenuItems(int x, int y, const int* menuItems, int menuI
+     unsigned char* v22 = gGameMouseActionMenuFrmData;
+     unsigned char* v58 = v22;
+ 
+-    unsigned char* arrowData;
++    const unsigned char* arrowData;
+     if (x + arrowWidth + menuItemWidth - 1 < width) {
+         arrowData = artGetFrameData(arrowFrm, 0, 0);
+         v58 = v22 + arrowWidth;
+@@ -1869,7 +1870,7 @@ int gameMouseRenderActionMenuItems(int x, int y, const int* menuItems, int menuI
+ 
+     unsigned char* v38 = v58;
+     for (int index = 0; index < menuItemsLength; index++) {
+-        unsigned char* data = artGetFrameData(menuItemFrms[index], 0, 0);
++        const unsigned char* data = artGetFrameData(menuItemFrms[index], 0, 0);
+         blitBufferToBuffer(data, menuItemWidth, menuItemHeight, menuItemWidth, v38, gGameMouseActionPickFrmWidth);
+         v38 += gGameMouseActionMenuFrmWidth * menuItemHeight;
+     }
+@@ -1908,7 +1909,7 @@ int gameMouseHighlightActionMenuItemAtIndex(int menuItemIndex)
+ 
+     int width = artGetWidth(art, 0, 0);
+     int height = artGetHeight(art, 0, 0);
+-    unsigned char* data = artGetFrameData(art, 0, 0);
++    const unsigned char* data = artGetFrameData(art, 0, 0);
+     blitBufferToBuffer(data, width, height, width, _gmouse_3d_menu_actions_start + gGameMouseActionMenuFrmWidth * height * gGameMouseActionMenuHighlightedItemIndex, gGameMouseActionMenuFrmWidth);
+     artUnlock(handle);
+ 
+@@ -1941,7 +1942,7 @@ int gameMouseRenderAccuracy(const char* string, int color)
+ 
+     int crosshairFrmWidth = artGetWidth(crosshairFrm, 0, 0);
+     int crosshairFrmHeight = artGetHeight(crosshairFrm, 0, 0);
+-    unsigned char* crosshairFrmData = artGetFrameData(crosshairFrm, 0, 0);
++    const unsigned char* crosshairFrmData = artGetFrameData(crosshairFrm, 0, 0);
+     blitBufferToBuffer(crosshairFrmData,
+         crosshairFrmWidth,
+         crosshairFrmHeight,
+@@ -2002,6 +2003,8 @@ void gameMouseLoadItemHighlight()
+     gGameMouseItemHighlightEnabled = settings.preferences.item_highlight;
+ }
+ 
++// 0x44D984
++
+ // 0x44D984
+ int gameMouseObjectsInit()
+ {
+@@ -2103,6 +2106,25 @@ void gameMouseObjectsFree()
+ }
+ 
+ // 0x44DB78
++
++/*
++ * ARGON: these five pictures ARE written into, and that is by design.
++ *
++ * The action menu is composed into the art buffer - memset to zero, then the
++ * icons drawn on top - and the cursor object is then rendered FROM that same
++ * art.  The buffer is a shared surface: one part of the engine writes it, another
++ * reads it back.
++ *
++ * Giving them private copies in RAM therefore breaks the game rather than
++ * saving it: the menu is assembled into the copy while the screen is still
++ * drawn from the original, so it appears half-built and never goes away.
++ * Measured by Maxim on 11 September 2026, and reverted.
++ *
++ * What they need is not a copy but a home: this art must live in RAM inside
++ * the cache and never be handed out as a pointer into flash, which is what
++ * in_place_allowed in object.cc already guarantees for OBJ_TYPE_INTERFACE.
++ */
++
+ int gameMouseActionMenuInit()
+ {
+     int fid;
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -24,6 +24,7 @@ extern "C" {
+ uint32_t ag_us(void);
+ extern void    *ag_ticker_who[12];
+ extern uint32_t ag_ticker_us[12];
++extern uint32_t ag_ticker_worst[12];
+ extern uint32_t ag_ticker_calls[12];
+ extern uint32_t ag_bk_tickers_us;
+ extern uint32_t ag_bk_mouse_us;
+@@ -347,6 +348,13 @@ void tickersExecute()
+                 if (ag_ticker_who[i] == (void*)curr->proc) {
+                     ag_ticker_us[i] += dt;
+                     ag_ticker_calls[i]++;
++                    /* ARGON: and the worst single call.  An average cannot
++                     * find a stall that happens once a second: 112 ms spread
++                     * over fifty frames reads as two, which is what every
++                     * ticker here looks like.  The worst call names it. */
++                    if (dt > ag_ticker_worst[i]) {
++                        ag_ticker_worst[i] = dt;
++                    }
+                     break;
+                 }
+             }
+diff --git a/src/interface.cc b/src/interface.cc
+--- a/src/interface.cc
++++ b/src/interface.cc
+@@ -1404,7 +1404,7 @@ void interfaceBarEndButtonsShow(bool animated)
+             sharedFpsLimiter.mark();
+ 
+             if (getTicksSince(time) >= delay) {
+-                unsigned char* src = artGetFrameData(art, frame, 0);
++                const unsigned char* src = artGetFrameData(art, frame, 0);
+                 if (src != nullptr) {
+                     blitBufferToBuffer(src, 57, 58, 57, gInterfaceWindowBuffer + gInterfaceBarWidth * 38 + 580 + gInterfaceBarContentOffset, gInterfaceBarWidth);
+                     windowRefreshRect(gInterfaceBarWindow, &gInterfaceBarEndButtonsRect);
+@@ -1419,7 +1419,7 @@ void interfaceBarEndButtonsShow(bool animated)
+             sharedFpsLimiter.throttle();
+         }
+     } else {
+-        unsigned char* src = artGetFrameData(art, frameCount - 1, 0);
++        const unsigned char* src = artGetFrameData(art, frameCount - 1, 0);
+         blitBufferToBuffer(src, 57, 58, 57, gInterfaceWindowBuffer + gInterfaceBarWidth * 38 + 580 + gInterfaceBarContentOffset, gInterfaceBarWidth);
+         windowRefreshRect(gInterfaceBarWindow, &gInterfaceBarEndButtonsRect);
+     }
+@@ -1463,7 +1463,7 @@ void interfaceBarEndButtonsHide(bool animated)
+             sharedFpsLimiter.mark();
+ 
+             if (getTicksSince(time) >= delay) {
+-                unsigned char* src = artGetFrameData(art, frame - 1, 0);
++                const unsigned char* src = artGetFrameData(art, frame - 1, 0);
+                 unsigned char* dest = gInterfaceWindowBuffer + gInterfaceBarWidth * 38 + 580 + gInterfaceBarContentOffset;
+                 if (src != nullptr) {
+                     blitBufferToBuffer(src, 57, 58, 57, dest, gInterfaceBarWidth);
+@@ -1480,7 +1480,7 @@ void interfaceBarEndButtonsHide(bool animated)
+         }
+     } else {
+         unsigned char* dest = gInterfaceWindowBuffer + gInterfaceBarWidth * 38 + 580 + gInterfaceBarContentOffset;
+-        unsigned char* src = artGetFrameData(art, 0, 0);
++        const unsigned char* src = artGetFrameData(art, 0, 0);
+         blitBufferToBuffer(src, 57, 58, 57, dest, gInterfaceBarWidth);
+         windowRefreshRect(gInterfaceBarWindow, &gInterfaceBarEndButtonsRect);
+     }
+@@ -1575,7 +1575,7 @@ static int interfaceBarRefreshMainAction()
+                 if (useTextFrmImage.lock(fid)) {
+                     int width = useTextFrmImage.getWidth();
+                     int height = useTextFrmImage.getHeight();
+-                    unsigned char* data = useTextFrmImage.getData();
++                    const unsigned char* data = useTextFrmImage.getData();
+                     blitBufferToBufferTrans(data, width, height, width, _itemButtonUp + 188 * 7 + 181 - width, 188);
+                     _dark_trans_buf_to_buf(data, width, height, width, _itemButtonDown, 181 - width + 1, 5, 188, 59641);
+                 }
+@@ -1613,7 +1613,7 @@ static int interfaceBarRefreshMainAction()
+                 if (bullseyeFrmImage.lock(bullseyeFid)) {
+                     int width = bullseyeFrmImage.getWidth();
+                     int height = bullseyeFrmImage.getHeight();
+-                    unsigned char* data = bullseyeFrmImage.getData();
++                    const unsigned char* data = bullseyeFrmImage.getData();
+                     blitBufferToBufferTrans(data, width, height, width, _itemButtonUp + 188 * (60 - height) + (181 - width), 188);
+ 
+                     int v9 = 60 - height - 2;
+@@ -1708,7 +1708,7 @@ static int interfaceBarRefreshMainAction()
+                 if (primaryFrmImage.lock(primaryFid)) {
+                     int width = primaryFrmImage.getWidth();
+                     int height = primaryFrmImage.getHeight();
+-                    unsigned char* data = primaryFrmImage.getData();
++                    const unsigned char* data = primaryFrmImage.getData();
+                     blitBufferToBufferTrans(data, width, height, width, _itemButtonUp + 188 * 7 + 181 - width, 188);
+                     _dark_trans_buf_to_buf(data, width, height, width, _itemButtonDown, 181 - width + 1, 5, 188, 59641);
+                 }
+@@ -1724,7 +1724,7 @@ static int interfaceBarRefreshMainAction()
+         if (apFrmImage.lock(apFid)) {
+             int width = apFrmImage.getWidth();
+             int height = apFrmImage.getHeight();
+-            unsigned char* data = apFrmImage.getData();
++            const unsigned char* data = apFrmImage.getData();
+ 
+             blitBufferToBufferTrans(data, width, height, width, _itemButtonUp + 188 * (60 - height) + 7, 188);
+ 
+@@ -1744,7 +1744,7 @@ static int interfaceBarRefreshMainAction()
+             if (apNumbersFrmImage.lock(apNumbersFid)) {
+                 int width = apNumbersFrmImage.getWidth();
+                 int height = apNumbersFrmImage.getHeight();
+-                unsigned char* data = apNumbersFrmImage.getData();
++                const unsigned char* data = apNumbersFrmImage.getData();
+ 
+                 blitBufferToBufferTrans(data + actionPoints * 10, 10, height, width, _itemButtonUp + 188 * (60 - height) + 7 + offset, 188);
+ 
+@@ -1766,7 +1766,7 @@ static int interfaceBarRefreshMainAction()
+         if (itemFrmImage.lock(itemState->itemFid)) {
+             int width = itemFrmImage.getWidth();
+             int height = itemFrmImage.getHeight();
+-            unsigned char* data = itemFrmImage.getData();
++            const unsigned char* data = itemFrmImage.getData();
+ 
+             int v46 = (188 - width) / 2;
+             int v47 = (67 - height) / 2 - 2;
+@@ -2055,13 +2055,13 @@ static void interfaceRenderCounter(int x, int y, int previousValue, int value, i
+         value = -999;
+     }
+ 
+-    unsigned char* numbers = _numbersFrmImage.getData() + offset;
++    const unsigned char* numbers = _numbersFrmImage.getData() + offset;
+     unsigned char* dest = gInterfaceWindowBuffer + gInterfaceBarWidth * y;
+ 
+-    unsigned char* downSrc = numbers + 90;
+-    unsigned char* upSrc = numbers + 99;
+-    unsigned char* minusSrc = numbers + 108;
+-    unsigned char* plusSrc = numbers + 114;
++    const unsigned char* downSrc = numbers + 90;
++    const unsigned char* upSrc = numbers + 99;
++    const unsigned char* minusSrc = numbers + 108;
++    const unsigned char* plusSrc = numbers + 114;
+ 
+     unsigned char* signDest = dest + x;
+     unsigned char* hundredsDest = dest + x + 6;
+@@ -2507,7 +2507,7 @@ static void customInterfaceBarExit()
+     }
+ }
+ 
+-unsigned char* customInterfaceBarGetBackgroundImageData()
++const unsigned char* customInterfaceBarGetBackgroundImageData()
+ {
+     if (!gInterfaceBarIsCustom) {
+         return nullptr;
+@@ -2586,7 +2586,7 @@ static void sidePanelsDraw(const char* path, int win, bool isLeading)
+         return;
+     }
+ 
+-    unsigned char* imageData = artGetFrameData(image, 0, 0);
++    const unsigned char* imageData = artGetFrameData(image, 0, 0);
+ 
+     int imageWidth = artGetWidth(image, 0, 0);
+     int imageHeight = artGetHeight(image, 0, 0);
+diff --git a/src/interface.h b/src/interface.h
+--- a/src/interface.h
++++ b/src/interface.h
+@@ -63,7 +63,7 @@ bool indicatorBarShow();
+ bool indicatorBarHide();
+ bool interface_get_current_attack_mode(int* hit_mode);
+ 
+-unsigned char* customInterfaceBarGetBackgroundImageData();
++const unsigned char* customInterfaceBarGetBackgroundImageData();
+ 
+ } // namespace fallout
+ 
+diff --git a/src/inventory.cc b/src/inventory.cc
+--- a/src/inventory.cc
++++ b/src/inventory.cc
+@@ -230,7 +230,7 @@ typedef struct InventoryWindowConfiguration {
+ 
+ typedef struct InventoryCursorData {
+     Art* frm;
+-    unsigned char* frmData;
++    const unsigned char* frmData;
+     int width;
+     int height;
+     int offsetX;
+@@ -1634,7 +1634,7 @@ static void _display_inventory(int stackOffset, int dragSlotIndex, int inventory
+                 FrmImage itemBackgroundFrmImage;
+                 int itemBackgroundFid = buildFid(OBJ_TYPE_INTERFACE, 32, 0, 0, 0);
+                 if (itemBackgroundFrmImage.lock(itemBackgroundFid)) {
+-                    unsigned char* data = itemBackgroundFrmImage.getData();
++                    const unsigned char* data = itemBackgroundFrmImage.getData();
+                     int width = itemBackgroundFrmImage.getWidth();
+                     int height = itemBackgroundFrmImage.getHeight();
+                     blitBufferToBuffer(data, width, height, width, windowBuffer + pitch * 284 + 152, pitch);
+@@ -2024,7 +2024,7 @@ static void _display_body(int fid, int inventoryWindowType)
+ 
+         int rotation = rotations[index];
+ 
+-        unsigned char* frameData = artGetFrameData(art, frame, rotation);
++        const unsigned char* frameData = artGetFrameData(art, frame, rotation);
+ 
+         int framePitch = artGetWidth(art, frame, rotation);
+         int frameWidth = std::min(framePitch, INVENTORY_BODY_VIEW_WIDTH);
+@@ -2359,7 +2359,7 @@ static void _inven_pickup(int buttonCode, int indexOffset)
+     if (itemInventoryFrmImage.lock(itemInventoryFid)) {
+         int width = itemInventoryFrmImage.getWidth();
+         int height = itemInventoryFrmImage.getHeight();
+-        unsigned char* data = itemInventoryFrmImage.getData();
++        const unsigned char* data = itemInventoryFrmImage.getData();
+         mouseSetFrame(data, width, height, width, width / 2, height / 2, 0);
+         soundPlayFile("ipickup1");
+     }
+@@ -4576,7 +4576,7 @@ static InventoryMoveResult _move_inventory(Object* item, int slotIndex, Object*
+     if (itemInventoryFrmImage.lock(itemInventoryFid)) {
+         int width = itemInventoryFrmImage.getWidth();
+         int height = itemInventoryFrmImage.getHeight();
+-        unsigned char* data = itemInventoryFrmImage.getData();
++        const unsigned char* data = itemInventoryFrmImage.getData();
+         mouseSetFrame(data, width, height, width, width / 2, height / 2, 0);
+         soundPlayFile("ipickup1");
+     }
+@@ -4796,7 +4796,7 @@ static void _barter_move_inventory(Object* item, int quantity, int slotIndex, in
+     if (itemInventoryFrmImage.lock(itemInventoryFid)) {
+         int width = itemInventoryFrmImage.getWidth();
+         int height = itemInventoryFrmImage.getHeight();
+-        unsigned char* data = itemInventoryFrmImage.getData();
++        const unsigned char* data = itemInventoryFrmImage.getData();
+         mouseSetFrame(data, width, height, width, width / 2, height / 2, 0);
+         soundPlayFile("ipickup1");
+     }
+@@ -4883,7 +4883,7 @@ static void _barter_move_from_table_inventory(Object* item, int quantity, int sl
+     if (itemInventoryFrmImage.lock(itemInventoryFid)) {
+         int width = itemInventoryFrmImage.getWidth();
+         int height = itemInventoryFrmImage.getHeight();
+-        unsigned char* data = itemInventoryFrmImage.getData();
++        const unsigned char* data = itemInventoryFrmImage.getData();
+         mouseSetFrame(data, width, height, width, width / 2, height / 2, 0);
+         soundPlayFile("ipickup1");
+     }
+@@ -5561,7 +5561,7 @@ static void _draw_amount(int value, int inventoryWindowType)
+         windowBuffer += rect.top * windowWidth + rect.left;
+ 
+         for (int index = 0; index < 5; index++) {
+-            unsigned char* src = numbersFrmImage.getData() + 14 * ranks[index];
++            const unsigned char* src = numbersFrmImage.getData() + 14 * ranks[index];
+             blitBufferToBuffer(src, 14, 24, 336, windowBuffer, windowWidth);
+             windowBuffer += 14;
+         }
+diff --git a/src/light.cc b/src/light.cc
+--- a/src/light.cc
++++ b/src/light.cc
+@@ -1,5 +1,7 @@
+ #include "light.h"
+ 
++#include "debug.h"
++
+ #include <algorithm>
+ #include <stdint.h>
+ 
+@@ -47,7 +49,108 @@ static int gAmbientIntensity = LIGHT_INTENSITY_MAX;
+ 
+ // light intensity per elevation per tile
+ // 0x59E994
+-static int16_t gTileIntensity[ELEVATION_COUNT][HEX_GRID_SIZE];
++/*
++ * ARGON: the per-tile light, sparse.
++ *
++ * It was int16_t[ELEVATION_COUNT][HEX_GRID_SIZE] - three elevations of a
++ * 200x200 grid, 240 KB - and it is permanent, which on this board means it
++ * comes out of the same 8 MB as the game's arena.  The town maps are short of
++ * about two hundred kilobytes, so 240 spent on this is worth looking at.
++ *
++ * The array is nearly all one value.  Every tile starts at 655 (see
++ * lightResetTileIntensity) and only tiles within a light's radius ever move
++ * off it - a few thousand on a lit map, out of a hundred and twenty thousand
++ * cells.  So the table holds the exceptions and the default is implied.
++ *
++ * Why not the other obvious shapes, both of which were tried on paper first:
++ *
++ *   - a narrower type: the value was already narrowed once, from int to
++ *     int16_t with a shift of two, and the range is needed - light sums from
++ *     many sources and clamping shows up on the screen.
++ *   - one elevation instead of three: objects on OTHER elevations adjust light
++ *     (see _obj_adjust_light with obj->elevation), so a single plane would
++ *     have to be rebuilt on every elevation change, and a rebuild that is
++ *     wrong is wrong in a way you can see.  This keeps all three exact.
++ *
++ * The cost is a hash instead of an index on a path the drawing code uses a few
++ * thousand times a frame - a multiply and usually one probe.  If that turns
++ * out to matter, the answer is a dense plane for the elevation being drawn
++ * with this table behind it for the other two; the measurement comes first.
++ *
++ * If the table ever fills, the extra tiles read back as the default: the map
++ * is lit slightly wrong rather than the game falling over, and it says so.
++ */
++#define AG_LIGHT_CELLS 8192u
++#define AG_LIGHT_DEFAULT ((int16_t)(655 >> LIGHT_STORE_SHIFT))
++
++typedef struct AgLightCell {
++    int32_t key;              /* elevation * HEX_GRID_SIZE + tile; -1 empty */
++    int16_t value;
++} AgLightCell;
++
++static AgLightCell gLightCells[AG_LIGHT_CELLS];
++static unsigned gLightUsed;
++static bool gLightFullSaid;
++
++static inline int32_t ag_light_key(int elevation, int tile)
++{
++    return (int32_t)elevation * (int32_t)HEX_GRID_SIZE + (int32_t)tile;
++}
++
++static inline unsigned ag_light_hash(int32_t key)
++{
++    return ((unsigned)key * 2654435761u) & (AG_LIGHT_CELLS - 1u);
++}
++
++/* The stored cell for a tile, or null.  Creates one when asked to. */
++static int16_t* ag_light_cell(int elevation, int tile, bool create)
++{
++    const int32_t key = ag_light_key(elevation, tile);
++    unsigned at = ag_light_hash(key);
++    unsigned i;
++
++    for (i = 0; i < AG_LIGHT_CELLS; i++) {
++        AgLightCell* c = &gLightCells[(at + i) & (AG_LIGHT_CELLS - 1u)];
++
++        if (c->key == key) {
++            return &(c->value);
++        }
++        if (c->key == -1) {
++            if (!create) {
++                return nullptr;
++            }
++            c->key = key;
++            c->value = AG_LIGHT_DEFAULT;
++            gLightUsed++;
++            return &(c->value);
++        }
++    }
++
++    if (create && !gLightFullSaid) {
++        gLightFullSaid = true;
++        debugPrint("\n[argon] light: the tile table is FULL at %u cells; the "
++                   "rest of the map is lit at the default\n",
++                   (unsigned)AG_LIGHT_CELLS);
++    }
++
++    return nullptr;
++}
++
++static inline int16_t ag_light_read(int elevation, int tile)
++{
++    const int16_t* c = ag_light_cell(elevation, tile, false);
++
++    return (c != nullptr) ? *c : AG_LIGHT_DEFAULT;
++}
++
++static inline void ag_light_write(int elevation, int tile, int16_t value)
++{
++    int16_t* c = ag_light_cell(elevation, tile, true);
++
++    if (c != nullptr) {
++        *c = value;
++    }
++}
+ 
+ static inline int16_t lightPackIntensity(int intensity)
+ {
+@@ -132,7 +235,7 @@ int lightGetTileIntensity(int elevation, int tile)
+         return 0;
+     }
+ 
+-    return std::min(lightUnpackIntensity(gTileIntensity[elevation][tile]),
++    return std::min(lightUnpackIntensity(ag_light_read(elevation, tile)),
+         LIGHT_INTENSITY_MAX);
+ }
+ 
+@@ -147,7 +250,7 @@ int lightGetTrueTileIntensity(int elevation, int tile)
+         return 0;
+     }
+ 
+-    return lightUnpackIntensity(gTileIntensity[elevation][tile]);
++    return lightUnpackIntensity(ag_light_read(elevation, tile));
+ }
+ 
+ // 0x47A9EC
+@@ -161,7 +264,7 @@ void lightSetTileIntensity(int elevation, int tile, int intensity)
+         return;
+     }
+ 
+-    gTileIntensity[elevation][tile] = lightPackIntensity(intensity);
++    ag_light_write(elevation, tile, lightPackIntensity(intensity));
+ }
+ 
+ // 0x47AA10
+@@ -175,8 +278,8 @@ void lightIncreaseTileIntensity(int elevation, int tile, int intensity)
+         return;
+     }
+ 
+-    gTileIntensity[elevation][tile] =
+-        lightAddPacked(gTileIntensity[elevation][tile], intensity);
++    ag_light_write(elevation, tile,
++        lightAddPacked(ag_light_read(elevation, tile), intensity));
+ }
+ 
+ // 0x47AA48
+@@ -190,18 +293,24 @@ void lightDecreaseTileIntensity(int elevation, int tile, int intensity)
+         return;
+     }
+ 
+-    gTileIntensity[elevation][tile] =
+-        lightAddPacked(gTileIntensity[elevation][tile], -intensity);
++    ag_light_write(elevation, tile,
++        lightAddPacked(ag_light_read(elevation, tile), -intensity));
+ }
+ 
+ // 0x47AA84
+ void lightResetTileIntensity()
+ {
+-    for (int elevation = 0; elevation < ELEVATION_COUNT; elevation++) {
+-        for (int tile = 0; tile < HEX_GRID_SIZE; tile++) {
+-            gTileIntensity[elevation][tile] = lightPackIntensity(655);
+-        }
++    /* ARGON: 655 IS the default, so resetting is emptying the table - and it
++     * is a hundred and twenty thousand writes that no longer happen on every
++     * map load. */
++    unsigned i;
++
++    for (i = 0; i < AG_LIGHT_CELLS; i++) {
++        gLightCells[i].key = -1;
++        gLightCells[i].value = AG_LIGHT_DEFAULT;
+     }
++    gLightUsed = 0;
++    gLightFullSaid = false;
+ }
+ 
+ } // namespace fallout
+diff --git a/src/loadsave.cc b/src/loadsave.cc
+--- a/src/loadsave.cc
++++ b/src/loadsave.cc
+@@ -1,5 +1,9 @@
+ #include "loadsave.h"
+ 
++#include <dirent.h>
++
++#include "ag_diag.h"
++
+ #include <assert.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -178,6 +182,7 @@ static int _EraseSave();
+ 
+ // 0x47B7C0
+ static const int gLoadSaveFrmIds[LOAD_SAVE_FRM_COUNT] = {
++
+     237, // lsgame.frm - load/save game
+     238, // lsgbox.frm - load/save game
+     239, // lscover.frm - load/save game
+@@ -900,6 +905,17 @@ static int _QuickSnapShot()
+ // 0x47C640
+ int lsgLoadGame(int mode)
+ {
++    /*
++     * ARGON: the whole wait, as the player experiences it.
++     *
++     * The store already timed its own part of a map load and reported tens of
++     * seconds while a stopwatch in the room said three and a half minutes.
++     * Both were true: that counter covered the window in which art may be
++     * written to flash, not the time from choosing a save to standing on the
++     * map.  This one starts where the waiting starts.
++     */
++    const unsigned ag_load_started = (unsigned)getTicks();
++
+     ScopedGameMode gm(GameMode::kLoadGame);
+ 
+     MessageListItem messageListItem;
+@@ -1296,6 +1312,14 @@ int lsgLoadGame(int mode)
+         }
+     }
+ 
++    /* ARGON: the wait as the player sees it - from choosing a save to
++     * standing on the map, panel and all. */
++    if (rc == 1) {
++        const unsigned took = (unsigned)getTicks() - ag_load_started;
++
++        ag_load_note(took);
++    }
++
+     return rc;
+ }
+ 
+@@ -2584,6 +2608,17 @@ static int _GameMap2Slot(File* stream)
+ // 0x47F990
+ static int _SlotMap2Game(File* stream)
+ {
++    /*
++     * ARGON: where a load actually goes.
++     *
++     * The whole wait is 124 seconds and the map itself is 59 of them;
++     * the other 65 were never measured.  Most of what happens here is
++     * unpacking the saved slot onto the card one file at a time.
++     */
++    const unsigned ag_sm0 = (unsigned)getTicks();
++    unsigned ag_sm_protos = 0, ag_sm_maps = 0, ag_sm_automap = 0;
++    unsigned ag_sm_erase = 0;
++
+     debugPrint("LOADSAVE: in SlotMap2Game\n");
+ 
+     int fileNameListLength;
+@@ -2619,6 +2654,10 @@ static int _SlotMap2Game(File* stream)
+     snprintf(_str0, sizeof(_str0), "%s%s\\%s", _patches, "MAPS", "AUTOMAP.DB");
+     compat_remove(_str0);
+ 
++    /* The three MapDirErase calls above, alone: they walk the card and
++     * delete every .PRO and .SAV before anything is unpacked. */
++    ag_sm_erase = (unsigned)getTicks() - ag_sm0;
++
+     for (int index = 1; index < gPartyMemberDescriptionsLength; index += 1) {
+         int pid = gPartyMemberPids[index];
+         if (pid != -2) {
+@@ -2638,6 +2677,9 @@ static int _SlotMap2Game(File* stream)
+         }
+     }
+ 
++    ag_sm_protos = (unsigned)getTicks() - ag_sm0;
++
++
+     for (int index = 0; index < fileNameListLength; index += 1) {
+         char fileName[COMPAT_MAX_PATH];
+         if (_mygets(fileName, stream) == -1) {
+@@ -2653,6 +2695,9 @@ static int _SlotMap2Game(File* stream)
+         }
+     }
+ 
++    ag_sm_maps = (unsigned)getTicks() - ag_sm0 - ag_sm_protos;
++
++
+     const char* automapFileName = _strmfe(_str1, "AUTOMAP.DB", "SAV");
+     snprintf(_str0, sizeof(_str0), "%s%s\\%s%.2d\\%s", _patches, "SAVEGAME", "SLOT", _slot_cursor + 1, automapFileName);
+     snprintf(_str1, sizeof(_str1), "%s%s\\%s", _patches, "MAPS", "AUTOMAP.DB");
+@@ -2669,6 +2714,11 @@ static int _SlotMap2Game(File* stream)
+         return -1;
+     }
+ 
++    ag_sm_automap = (unsigned)getTicks() - ag_sm0
++                     - ag_sm_protos - ag_sm_maps;
++    ag_unpack_note(ag_sm_erase, ag_sm_protos - ag_sm_erase,
++                   ag_sm_maps + ag_sm_automap);
++
+     if (mapLoadSaved(_LSData[_slot_cursor].fileName) == -1) {
+         debugPrint("LOADSAVE: returning 13\n");
+         return -1;
+@@ -2704,6 +2754,31 @@ static int _mygets(char* dest, File* stream)
+     return 0;
+ }
+ 
++/*
++ * ARGON: the copy buffer, taken once and kept.
++ *
++ * This function used to ask the arena for 65535 bytes every time it was
++ * called, and saving calls it once per map file - four of them on a Temple
++ * save.  Measured on the board, 9 September 2026, with the save panel already
++ * open:
++ *
++ *     refused 65536 B with 5933 KB used of 6000, hole 45056 B
++ *     LOADSAVE: ** Error writing save function #3 data! **
++ *
++ * Sixty-six kilobytes free in holes of forty, and sixty-four wanted, four
++ * times over - so the panel opened and the save died anyway, in _GameMap2Slot.
++ * Both reserves had already gone to the panel's own 307200.
++ *
++ * The chunk size was never load-bearing: this is a file copy onto an SD card,
++ * where the transfer is the cost and the chunk only decides how many times
++ * round the loop.  Eight kilobytes of BSS costs the arena nothing at all and
++ * cannot be refused, so a save can no longer fail for want of somewhere to
++ * put a kilobyte of map on its way past.
++ */
++#define ARGON_COPY_CHUNK 8192
++
++static unsigned char argonCopyChunk[ARGON_COPY_CHUNK];
++
+ // 0x47FE58
+ static int _copy_file(const char* existingFileName, const char* newFileName)
+ {
+@@ -2734,13 +2809,10 @@ static int _copy_file(const char* existingFileName, const char* newFileName)
+         goto out;
+     }
+ 
+-    buf = internal_malloc(0xFFFF);
+-    if (buf == nullptr) {
+-        goto out;
+-    }
++    buf = argonCopyChunk;
+ 
+     while (length != 0) {
+-        chunk_length = std::min(length, 0xFFFF);
++        chunk_length = std::min(length, ARGON_COPY_CHUNK);
+ 
+         if (fileRead(buf, chunk_length, 1, stream1) != 1) {
+             break;
+@@ -2769,9 +2841,7 @@ out:
+         fileClose(stream2);
+     }
+ 
+-    if (buf != nullptr) {
+-        internal_free(buf);
+-    }
++    /* buf is argonCopyChunk and outlives every caller; nothing to free. */
+ 
+     return result;
+ }
+@@ -2788,17 +2858,65 @@ void lsgInit()
+ // 0x480040
+ int MapDirErase(const char* relativePath, const char* extension)
+ {
+-    char path[COMPAT_MAX_PATH];
+-    snprintf(path, sizeof(path), "%s*.%s", relativePath, extension);
++    /*
++     * ARGON: read the directory once, delete by the names it gave.
++     *
++     * This is a fifth of every load - 17 seconds per directory, twice
++     * over, erasing the thousand stale prototypes.  Measured in three
++     * parts, it was 3.8 s of trying each name as spelled (the case does
++     * not match, so every one fails), 9.7 s of searching the card for the
++     * right case, and 3.6 s of the deletes themselves.
++     *
++     * Both searches exist only because the names came from a pattern
++     * match against master.dat, in that file's spelling.  Names read
++     * from the directory itself need no resolving at all, so the listing
++     * that fileNameListInit did for the pattern is replaced by one
++     * opendir, and remove() is called with what readdir returned.
++     */
++    const unsigned ag_t0 = (unsigned)ag_millis();
++
++    char dirPath[COMPAT_MAX_PATH];
++
++    snprintf(dirPath, sizeof(dirPath), "%s%s", _patches, relativePath);
++    compat_windows_path_to_native(dirPath);
++
++    /* Trailing slash: the callers pass "proto\\items\\". */
++    size_t dirLen = strlen(dirPath);
++
++    while (dirLen > 1 && dirPath[dirLen - 1] == '/') {
++        dirPath[--dirLen] = '\0';
++    }
++    compat_resolve_path(dirPath);
++
++    DIR* dir = opendir(dirPath);
++
++    if (dir == nullptr) {
++        ag_direrase_note(relativePath, 0, (unsigned)ag_millis() - ag_t0, 0);
++        return 0;
++    }
+ 
+-    char** fileList;
+-    int fileListLength = fileNameListInit(path, &fileList, 0, 0);
+-    while (--fileListLength >= 0) {
+-        snprintf(path, sizeof(path), "%s%s%s", _patches, relativePath, fileList[fileListLength]);
+-        compat_remove(path);
++    const unsigned ag_listed = (unsigned)ag_millis() - ag_t0;
++    int            removed = 0;
++
++    for (struct dirent* entry = readdir(dir); entry != nullptr;
++            entry = readdir(dir)) {
++        const char* dot = strrchr(entry->d_name, '.');
++
++        if (dot == nullptr || compat_stricmp(dot + 1, extension) != 0) {
++            continue;
++        }
++
++        char victim[COMPAT_MAX_PATH];
++
++        snprintf(victim, sizeof(victim), "%s/%s", dirPath, entry->d_name);
++        if (remove(victim) == 0) {
++            removed++;
++        }
+     }
+-    fileNameListFree(&fileList, 0);
++    closedir(dir);
+ 
++    ag_direrase_note(relativePath, removed, ag_listed,
++                     (unsigned)ag_millis() - ag_t0 - ag_listed);
+     return 0;
+ }
+ 
+diff --git a/src/main.cc b/src/main.cc
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -37,6 +37,7 @@
+ #include "text_font.h"
+ #include "window.h"
+ #include "window_manager.h"
++#include "tile.h"
+ #include "window_manager_private.h"
+ #include "word_wrap.h"
+ #include "worldmap.h"
+@@ -45,6 +46,7 @@
+ // Defined in apps/fallout/port/sdl_shim.cc, outside any namespace.
+ extern "C" {
+ uint32_t ag_us(void);
++extern unsigned ag_walk_tiles;
+ extern uint32_t ag_ml_input_us;
+ extern uint32_t ag_ml_keys_us;
+ extern uint32_t ag_ml_scripts_us;
+@@ -486,6 +488,44 @@ static void mainLoop()
+          */
+         ag_frame_note(ml1 - ml0, ml2 - ml1, ml3 - ml2, ml4 - ml3,
+             ml6 - ml5, ml7 - ml6, ag_doing_now());
++
++        /*
++         * ARGON: how far he has walked, in hexes.  See ag_walk_tiles.
++         *
++         * A count of cache misses tells you how much walking there was; misses
++         * per hundred hexes tells you about the cache.  Taken here because the
++         * dude's tile is a field, the distance is a closed form since patch
++         * 0051, and this is the one place the loop passes every frame.
++         */
++        /*
++         * ARGON: hold this character's animation against eviction.
++         *
++         * Critter art is 5% of the misses and half of the time lost to them -
++         * 49 ms each, because a walk animation is a single 116 KB file - and
++         * the tiles that scroll into view evict it between one step and the
++         * next.  Pinning the last few the dude actually used costs about half
++         * a megabyte of a 1800 KB cache and removes the most expensive repeat
++         * read in the game.  See artPin in art.cc.
++         */
++        if (gDude != nullptr) {
++            artPin(gDude->fid);
++        }
++
++        {
++            static int argonLastTile = -1;
++
++            if (gDude != nullptr) {
++                const int tile = gDude->tile;
++
++                if (argonLastTile >= 0 && tile >= 0 && tile != argonLastTile) {
++                    ag_walk_tiles += (unsigned)tileDistanceBetween(
++                        argonLastTile, tile);
++                }
++                if (tile >= 0) {
++                    argonLastTile = tile;
++                }
++            }
++        }
+     }
+ 
+     scriptsDisable();
+diff --git a/src/map.cc b/src/map.cc
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -1,5 +1,12 @@
+ #include "map.h"
+ 
++/* ARGON: the map change borrows from the art cache while it runs; see
++ * ag_loan_map_begin in apps/fallout/fallout_main.cc. */
++extern "C" void ag_loan_map_begin(void);
++extern "C" void ag_loan_map_end(void);
++
++#include "../../../apps/fallout/port/art_store.h"
++
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -13,6 +20,8 @@
+  * from a walk's.  See port/ag_diag.h. */
+ #include "ag_diag.h"
+ 
++extern "C" uint32_t ag_us(void);
++
+ /* ARGON: for aiMessagesRelease; see the release below. */
+ #include "combat_ai.h"
+ #include "color.h"
+@@ -622,7 +631,10 @@ int mapScroll(int dx, int dy)
+         return -1;
+     }
+ 
++    /* ARGON: the four parts of a scroll step; see ag_scroll_* in ag_diag.h. */
++    const uint32_t ag_t0 = ag_us();
+     gameMouseObjectsHide();
++    const uint32_t ag_t1 = ag_us();
+ 
+     int centerScreenX;
+     int centerScreenY;
+@@ -689,11 +701,14 @@ int mapScroll(int dx, int dy)
+         step = pitch;
+     }
+ 
++    const uint32_t ag_t2 = ag_us();
++
+     for (int y = 0; y < height; y++) {
+         memmove(dest, src, width);
+         dest += step;
+         src += step;
+     }
++    const uint32_t ag_t3 = ag_us();
+ 
+     if (screenDx != 0) {
+         _map_scroll_refresh(&r2);
+@@ -702,8 +717,16 @@ int mapScroll(int dx, int dy)
+     if (screenDy != 0) {
+         _map_scroll_refresh(&r1);
+     }
++    const uint32_t ag_t4 = ag_us();
+ 
+     windowRefresh(gIsoWindow);
++    const uint32_t ag_t5 = ag_us();
++
++    ag_scroll_steps++;
++    ag_scroll_mouse_us += ag_t1 - ag_t0;
++    ag_scroll_move_us += ag_t3 - ag_t2;
++    ag_scroll_strip_us += ag_t4 - ag_t3;
++    ag_scroll_window_us += ag_t5 - ag_t4;
+ 
+     return 0;
+ }
+@@ -924,6 +947,33 @@ static int mapLoad(File* stream)
+      */
+     artCacheFlush();
+ 
++    /*
++     * ARGON: and the loan is taken HERE, straight after the flush, because
++     * this is the emptiest the art cache heap ever is.
++     *
++     * A map change needs some seven hundred kilobytes more than the arena has
++     * and borrows them from the cache - but a borrowed block is locked and has
++     * to be placed in one piece.  Taken earlier, with the outgoing map still
++     * in the heap, the largest piece to be had was too small; the heap went
++     * looking in an arena that was already empty and printed its own fatal
++     * error, with 55 locked blocks holding 1312780 bytes between them.  Here
++     * the only things still locked are the interface and the party.
++     *
++     * See ag_loan_map_begin in apps/fallout/fallout_main.cc.
++     */
++    ag_loan_map_begin();
++
++    /* ARGON: the only window in which art may be written to flash.  Erasing a
++     * sector stops everything executing from flash for tens of milliseconds,
++     * so it happens here, where the game is already waiting, and nowhere in
++     * the parts that have to be smooth.  See apps/fallout/port/art_store.h. */
++    ag_art_store_fill_begin();
++
++    /* ARGON: and the art that was asked for since the last load - the save
++     * panel, a dialogue head, a critter first seen in a fight.  It goes in
++     * here, where the wait is already happening. */
++    artStoreTopUp();
++
+     /*
+      * ARGON: and the sound cache with it, for the same reason and a measured
+      * price.
+@@ -1150,6 +1200,8 @@ err:
+     if (ag_map_loading != 0u) {
+         ag_map_loading--;
+     }
++    ag_art_store_fill_end();
++    ag_loan_map_end();
+     AG_STEP("playing");
+ 
+     return rc;
+diff --git a/src/mouse.cc b/src/mouse.cc
+--- a/src/mouse.cc
++++ b/src/mouse.cc
+@@ -45,7 +45,7 @@ static int _mouse_idling = 0;
+ static unsigned char* gMouseCursorData = nullptr;
+ 
+ // 0x51E298
+-static unsigned char* _mouse_shape = nullptr;
++static const unsigned char* _mouse_shape = nullptr;
+ 
+ // 0x51E29C
+ static unsigned char* _mouse_fptr = nullptr;
+@@ -185,7 +185,7 @@ static void mousePrepareDefaultCursor()
+ }
+ 
+ // 0x4CA0AC
+-int mouseSetFrame(unsigned char* a1, int width, int height, int pitch, int a5, int a6, char a7)
++int mouseSetFrame(const unsigned char* a1, int width, int height, int pitch, int a5, int a6, char a7)
+ {
+     Rect rect;
+     unsigned char* v9;
+diff --git a/src/mouse.h b/src/mouse.h
+--- a/src/mouse.h
++++ b/src/mouse.h
+@@ -33,7 +33,7 @@ extern WINDOWDRAWINGPROC _mouse_blit;
+ 
+ int mouseInit();
+ void mouseFree();
+-int mouseSetFrame(unsigned char* a1, int width, int height, int pitch, int a5, int a6, char a7);
++int mouseSetFrame(const unsigned char* a1, int width, int height, int pitch, int a5, int a6, char a7);
+ void mouseShowCursor();
+ void mouseHideCursor();
+ void _mouse_info();
+diff --git a/src/object.cc b/src/object.cc
+--- a/src/object.cc
++++ b/src/object.cc
+@@ -28,6 +28,11 @@
+ #include "tile.h"
+ #include "worldmap.h"
+ 
++/* ARGON: the render-pass counters; see _obj_render_pre_roof. */
++#include "../../../apps/fallout/port/ag_diag.h"
++
++extern "C" uint32_t ag_us(void);
++
+ namespace fallout {
+ 
+ static int objectLoadAllInternal(File* stream);
+@@ -242,8 +247,75 @@ static Rect gObjectsUpdateAreaPixelBounds;
+ // Contains objects that are bounded to tiles.
+ //
+ // 0x639DA0
++/*
++ * ARGON: this was a sparse table, and the board said no.
++ *
++ * One pointer per tile is 40000 of them - 160 KB, permanent, out of the same
++ * 8 MB as the arena - and a map "has only a few hundred objects", so a hash
++ * keyed by tile looked like 128 KB for nothing.  It is not: on 10 September
++ * 2026 a town filled a 4096-entry table ten times over.  Walls and scenery
++ * occupy tiles in their thousands, so the array is not sparse where it
++ * matters, and a table big enough for a town costs what the array costs.
++ *
++ * The message that caught it was worth more than the change: "the by-tile
++ * index is FULL at 4096 entries; objects on new tiles will not be indexed" -
++ * an entry that does not fit is an object that has quietly left the map, and
++ * that is the one failure not worth trading anything for.
++ *
++ * The 170 KB that DID come out of permanent data is in light.cc, where the
++ * table really is nearly all one value.  See the note there.
++ */
+ static ObjectListNode* gObjectListHeadByTile[HEX_GRID_SIZE];
+ 
++/*
++ * ARGON: one bit per tile - "there might be something here".
++ *
++ * The object pass walks a fixed table of 2952 tiles for every map refresh,
++ * however small the rectangle, and reads gObjectListHeadByTile for each one
++ * that falls in range.  Measured on the board: three million turns of that
++ * loop every thirty seconds, a million of those reads, and only six per cent
++ * of them find anything.  The array is 160 KB and the reads are scattered
++ * across it, so nearly every one is a miss out to PSRAM - about a hundred
++ * cycles each.  Two thirds of the most expensive layer in the game is spent
++ * discovering that a tile is empty.
++ *
++ * The bitmap is five kilobytes.  It stays in the processor's cache, so the
++ * same question costs a load and a shift, and the 160 KB array is only
++ * touched for tiles that really hold something.
++ *
++ * It is a HINT, and the direction of the error is what makes it safe:
++ *
++ *   - a bit set over an empty list costs one wasted read and nothing else,
++ *     and the pass clears it when it notices;
++ *   - a bit clear over a non-empty list would lose objects, so the only place
++ *     that adds to a list sets the bit, unconditionally, before it does.
++ *
++ * Every other write to the index in this file removes a node, which can only
++ * make a list shorter - never turn an empty one into a full one - so none of
++ * them can break the rule above.
++ */
++static uint32_t gObjTileBits[(HEX_GRID_SIZE + 31) / 32];
++
++static inline void obj_tile_mark(int tile)
++{
++    if (tile >= 0 && tile < HEX_GRID_SIZE) {
++        gObjTileBits[(unsigned)tile >> 5] |= 1u << ((unsigned)tile & 31u);
++    }
++}
++
++static inline void obj_tile_unmark(int tile)
++{
++    if (tile >= 0 && tile < HEX_GRID_SIZE) {
++        gObjTileBits[(unsigned)tile >> 5] &= ~(1u << ((unsigned)tile & 31u));
++    }
++}
++
++static inline bool obj_tile_maybe(int tile)
++{
++    return (unsigned)tile < (unsigned)HEX_GRID_SIZE
++        && (gObjTileBits[(unsigned)tile >> 5]
++            & (1u << ((unsigned)tile & 31u))) != 0u;
++}
+ // 0x660EA0
+ static unsigned char _glassGrayTable[256];
+ 
+@@ -298,6 +370,7 @@ int objectsInit(unsigned char* buf, int width, int height, int pitch)
+     gObjectsUpdateAreaHexSize = gObjectsUpdateAreaHexWidth * gObjectsUpdateAreaHexHeight;
+ 
+     memset(gObjectListHeadByTile, 0, sizeof(gObjectListHeadByTile));
++    memset(gObjTileBits, 0, sizeof(gObjTileBits));
+ 
+     if (_obj_offset_table_init() == -1) {
+         return -1;
+@@ -903,14 +976,45 @@ void _obj_render_pre_roof(Rect* rect, int elevation)
+ 
+     _outlineCount = 0;
+ 
++    /*
++     * ARGON: what this loop actually costs, split three ways.
++     *
++     * The table is 41 x 81 = 3321 entries and it is walked in full on every
++     * refresh, however small the rectangle - the search area is the dirty
++     * rectangle grown by a whole screen in each direction, because a tall
++     * wall standing on a far tile is drawn upwards and can still reach into
++     * it.  A thousand refreshes every thirty seconds is three and a half
++     * million turns of this loop, and the measurements say this pass is 61%
++     * of a map refresh.  Which part of it - the walking, the scattered reads
++     * into the by-tile index, or the drawing - decides what can be done
++     * about it, and guessing has been wrong twice today.
++     */
++    ag_render_calls++;
++
+     int renderCount = 0;
+     for (int i = 0; i < gObjectsUpdateAreaHexSize; i++) {
++        ag_render_steps++;
+         int offsetIndex = _orderTable[parity][i];
+         if (updateAreaHexHeight > _offsetDivTable[offsetIndex] && updateAreaHexWidth > _offsetModTable[offsetIndex]) {
++            ag_render_inrange++;
+             int tile = upperLeftTile + _offsetTable[parity][offsetIndex];
++
++            /* ARGON: the cheap question first - five kilobytes in cache
++             * instead of a scattered read out of a 160 KB array. */
++            if (!obj_tile_maybe(tile)) {
++                continue;
++            }
++
+             ObjectListNode* objectListNode = hexGridTileIsValid(tile)
+                 ? gObjectListHeadByTile[tile]
+                 : nullptr;
++            if (objectListNode != nullptr) {
++                ag_render_tiles++;
++            } else {
++                /* Set over an empty list: put it right while we are here. */
++                obj_tile_unmark(tile);
++                continue;
++            }
+ 
+             int lightIntensity;
+             if (objectListNode != nullptr) {
+@@ -929,7 +1033,10 @@ void _obj_render_pre_roof(Rect* rect, int elevation)
+                     }
+ 
+                     if ((objectListNode->obj->flags & OBJECT_HIDDEN) == 0) {
++                        ag_render_objects++;
++                        const uint32_t ag_o0 = ag_us();
+                         _obj_render_object(objectListNode->obj, &updatedRect, lightIntensity);
++                        ag_render_draw_us += ag_us() - ag_o0;
+ 
+                         if ((objectListNode->obj->outline & OUTLINE_TYPE_MASK) != 0) {
+                             if ((objectListNode->obj->outline & OUTLINE_DISABLED) == 0 && _outlineCount < 100) {
+@@ -965,7 +1072,15 @@ void _obj_render_pre_roof(Rect* rect, int elevation)
+ 
+             if (elevation == objectListNode->obj->elevation) {
+                 if ((objectListNode->obj->flags & OBJECT_HIDDEN) == 0) {
++                    /* ARGON: the OTHER draw, and in a town it is the one that
++                     * matters: walls and buildings are not flat, so they come
++                     * through here.  Measured in Arroyo the flat branch was
++                     * everything; in a town twelve seconds of a layer went
++                     * somewhere this counter could not see. */
++                    ag_render_objects2++;
++                    const uint32_t ag_o1 = ag_us();
+                     _obj_render_object(object, &updatedRect, lightIntensity);
++                    ag_render_draw2_us += ag_us() - ag_o1;
+ 
+                     if ((objectListNode->obj->outline & OUTLINE_TYPE_MASK) != 0) {
+                         if ((objectListNode->obj->outline & OUTLINE_DISABLED) == 0 && _outlineCount < 100) {
+@@ -2878,9 +2993,9 @@ void _translucent_trans_buf_to_buf(unsigned char* src, int srcWidth, int srcHeig
+ }
+ 
+ // 0x48BEFC
+-void _dark_trans_buf_to_buf(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destX, int destY, int destPitch, int intensity)
++void _dark_trans_buf_to_buf(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destX, int destY, int destPitch, int intensity)
+ {
+-    unsigned char* sp = src;
++    const unsigned char* sp = src;
+     unsigned char* dp = dest + destPitch * destY + destX;
+ 
+     int srcStep = srcPitch - srcWidth;
+@@ -2908,7 +3023,7 @@ void _dark_trans_buf_to_buf(unsigned char* src, int srcWidth, int srcHeight, int
+ }
+ 
+ // 0x48BF88
+-void _dark_translucent_trans_buf_to_buf(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destX, int destY, int destPitch, int intensity, unsigned char* a10, unsigned char* a11)
++void _dark_translucent_trans_buf_to_buf(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destX, int destY, int destPitch, int intensity, unsigned char* a10, unsigned char* a11)
+ {
+     int srcStep = srcPitch - srcWidth;
+     int destStep = destPitch - srcWidth;
+@@ -2936,7 +3051,7 @@ void _dark_translucent_trans_buf_to_buf(unsigned char* src, int srcWidth, int sr
+ }
+ 
+ // 0x48C03C
+-void _intensity_mask_buf_to_buf(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destPitch, unsigned char* mask, int maskPitch, int intensity)
++void _intensity_mask_buf_to_buf(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destPitch, const unsigned char* mask, int maskPitch, int intensity)
+ {
+     int srcStep = srcPitch - srcWidth;
+     int destStep = destPitch - srcWidth;
+@@ -3054,7 +3169,7 @@ int _obj_intersects_with(Object* object, int x, int y)
+             }
+ 
+             if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+-                unsigned char* data = artGetFrameData(art, object->frame, object->rotation);
++                const unsigned char* data = artGetFrameData(art, object->frame, object->rotation);
+                 if (data != nullptr) {
+                     if (data[width * (y - minY) + x - minX] != 0) {
+                         flags |= 0x01;
+@@ -4013,6 +4128,9 @@ static void _obj_insert(ObjectListNode* objectListNode)
+ 
+     objectListNode->next = *objectListNodePtr;
+     *objectListNodePtr = objectListNode;
++
++    /* ARGON: the one place a tile's list can grow; see gObjTileBits. */
++    obj_tile_mark(objectListNode->obj->tile);
+ }
+ 
+ // 0x48DA58
+@@ -4820,7 +4938,7 @@ static void objectDrawOutline(Object* object, Rect* rect)
+         v49.right = v49.left + (objectRect.right - objectRect.left);
+         v49.bottom = v49.top + (objectRect.bottom - objectRect.top);
+ 
+-        unsigned char* src = artGetFrameData(art, object->frame, object->rotation);
++        const unsigned char* src = artGetFrameData(art, object->frame, object->rotation);
+ 
+         unsigned char* dest = gObjectsWindowBuffer + gObjectsWindowPitch * object->sy + object->sx;
+         int destStep = gObjectsWindowPitch - frameWidth;
+@@ -4885,7 +5003,7 @@ static void objectDrawOutline(Object* object, Rect* rect)
+ 
+         unsigned char v54 = color;
+         unsigned char* dest14 = dest;
+-        unsigned char* src15 = src;
++        const unsigned char* src15 = src;
+         for (int y = 0; y < frameHeight; y++) {
+             bool cycle = true;
+             if (v44 != 0) {
+@@ -4948,7 +5066,7 @@ static void objectDrawOutline(Object* object, Rect* rect)
+             bool cycle = true;
+             unsigned char v28 = color;
+             unsigned char* dest27 = dest + x;
+-            unsigned char* src27 = src + x;
++            const unsigned char* src27 = src + x;
+             for (int y = 0; y < frameHeight; y++) {
+                 if (v44 != 0) {
+                     if (y % v44 == 0) {
+@@ -5006,15 +5124,159 @@ static void objectDrawOutline(Object* object, Rect* rect)
+ }
+ 
+ // 0x48F1B0
++/*
++ * ARGON: the size of a picture, remembered so that it need not be fetched to
++ * find out that it will not be drawn.
++ *
++ * Measured in a town: of 98072 calls to _obj_render_object, 90635 ended at the
++ * intersection test having drawn nothing - and every one of them had already
++ * locked its art, which for the three thousand that were not resident meant
++ * reading it out of flash or off the card.  Ten seconds of every thirty went
++ * into fetching pictures for objects that do not touch the rectangle.
++ *
++ * The rectangle an object occupies is computed from its tile - which is free -
++ * and the width and height of the frame - which is not.  So the largest width
++ * and height ever seen for a fid are kept here, and the test is done with
++ * those before anything is locked.
++ *
++ * Every part of this errs towards drawing:
++ *
++ *   - the LARGEST frame seen is used, never the current one, so a fid whose
++ *     frames differ in size is judged by its biggest;
++ *   - a margin is added on top of that, because the first frames seen may not
++ *     be the biggest the animation has;
++ *   - a fid that has never been seen is never rejected.
++ *
++ * Rejecting something that should have been drawn leaves a hole in the
++ * picture, and a hole is worse than a slow frame.  Drawing something that
++ * would have been rejected costs one intersection test.
++ */
++/* 512 entries, 4 KB.  It was 2048 and the application stopped loading at all:
++ * permanent data comes out of the same eight megabytes as the arena, and at
++ * 6340 KB of arena there is no room to spare.  A collision costs the loser its
++ * shortcut and nothing else, so the small table is a fair trade. */
++#define AG_SIZES 512u
++#define AG_SIZE_MARGIN 64
++
++typedef struct {
++    int32_t fid;        /* 0 means empty: no real fid is zero here */
++    /*
++     * Where this art's rectangle sat relative to its tile's screen point, at
++     * its most extreme over every frame and rotation seen.
++     *
++     * The first version kept width and height and rebuilt the rectangle as
++     * "centred on the tile, hanging above it" - and that is not what the
++     * engine does: it also adds the art's own xOffsets and yOffsets for the
++     * rotation, which are part of the picture and can be tens of pixels.  A
++     * fixed margin was supposed to cover them and did not, so objects with
++     * large offsets were refused when they should have been drawn and pieces
++     * of the town flickered away.
++     *
++     * Keeping the bounds the engine actually computed removes the guess.
++     */
++    int16_t dleft, dright, dtop, dbottom;
++} AgArtSize;
++
++static AgArtSize gArtSizes[AG_SIZES];
++
++static inline unsigned ag_size_slot(int fid)
++{
++    return ((unsigned)fid * 2654435761u) % AG_SIZES;
++}
++
++/* Remember the widest this fid's rectangle has ever reached around its tile. */
++static void ag_size_note(int fid, int dleft, int dright, int dtop, int dbottom)
++{
++    AgArtSize* e = &gArtSizes[ag_size_slot(fid)];
++
++    if (e->fid != fid) {
++        /* One slot per hash, last writer wins: a collision costs the other
++         * fid its shortcut, never its correctness. */
++        e->fid = fid;
++        e->dleft = (int16_t)dleft;
++        e->dright = (int16_t)dright;
++        e->dtop = (int16_t)dtop;
++        e->dbottom = (int16_t)dbottom;
++        return;
++    }
++    if (dleft < e->dleft) {
++        e->dleft = (int16_t)dleft;
++    }
++    if (dright > e->dright) {
++        e->dright = (int16_t)dright;
++    }
++    if (dtop < e->dtop) {
++        e->dtop = (int16_t)dtop;
++    }
++    if (dbottom > e->dbottom) {
++        e->dbottom = (int16_t)dbottom;
++    }
++}
++
++/*
++ * True when this object certainly cannot touch the rectangle.  False when it
++ * might, or when nothing is known about it.
++ */
++static bool ag_cannot_touch(Object* object, Rect* rect)
++{
++    if (object->tile == -1) {
++        return false; /* positioned in screen coordinates; leave it alone */
++    }
++
++    const AgArtSize* e = &gArtSizes[ag_size_slot(object->fid)];
++
++    if (e->fid != object->fid) {
++        return false; /* never seen: never rejected */
++    }
++
++    int sx;
++    int sy;
++
++    tileToScreenXY(object->tile, &sx, &sy, object->elevation);
++    sx += 16 + object->x;
++    sy += 8 + object->y;
++
++    /* The bounds the engine itself produced for this art, widened a little in
++     * case a frame not yet seen reaches further. */
++    const int left = sx + e->dleft - AG_SIZE_MARGIN;
++    const int right = sx + e->dright + AG_SIZE_MARGIN;
++    const int top = sy + e->dtop - AG_SIZE_MARGIN;
++    const int bottom = sy + e->dbottom + AG_SIZE_MARGIN;
++
++    return right < rect->left || left > rect->right
++        || bottom < rect->top || top > rect->bottom;
++}
++
+ static void _obj_render_object(Object* object, Rect* rect, int light)
+ {
++    /* ARGON: how many of these draw nothing at all.
++     *
++     * The art is locked and its header read before anything checks whether
++     * the object even touches the rectangle being refreshed - and in a town
++     * there are 317 of these calls for every map refresh.  If most of them
++     * end at the intersection test below, the whole cost is avoidable; if
++     * most of them draw, it is honest work and the answer is elsewhere.
++     * Eighty-four thousand calls cost four and a half seconds, which is
++     * fifty-three microseconds each - too much for a rejection and too
++     * little for a big blit, so the split matters. */
++    ag_draw_calls++;
++
+     int type = FID_TYPE(object->fid);
+     if (artIsObjectTypeHidden(type)) {
++        ag_draw_hidden++;
+         return;
+     }
+ 
++    /* ARGON: the cheap refusal, before the art is fetched.  See ag_size_note. */
++    if (ag_cannot_touch(object, rect)) {
++        ag_draw_early++;
++        return;
++    }
++
++    const uint32_t ag_d0 = ag_us();
+     CacheEntry* cacheEntry;
+     Art* art = artLock(object->fid, &cacheEntry);
++    ag_draw_lock_us += ag_us() - ag_d0;
+     if (art == nullptr) {
+         return;
+     }
+@@ -5022,6 +5284,7 @@ static void _obj_render_object(Object* object, Rect* rect, int light)
+     int frameWidth = artGetWidth(art, object->frame, object->rotation);
+     int frameHeight = artGetHeight(art, object->frame, object->rotation);
+ 
++
+     Rect objectRect;
+     if (object->tile == -1) {
+         objectRect.left = object->sx;
+@@ -5048,15 +5311,30 @@ static void _obj_render_object(Object* object, Rect* rect, int light)
+ 
+         object->sx = objectRect.left;
+         object->sy = objectRect.top;
++
++        /* ARGON: the real bounds around this tile, for the cheap refusal. */
++        {
++            int tsx;
++            int tsy;
++
++            tileToScreenXY(object->tile, &tsx, &tsy, object->elevation);
++            tsx += 16 + object->x;
++            tsy += 8 + object->y;
++            ag_size_note(object->fid, objectRect.left - tsx,
++                         objectRect.right - tsx, objectRect.top - tsy,
++                         objectRect.bottom - tsy);
++        }
+     }
+ 
+     if (rectIntersection(&objectRect, rect, &objectRect) != 0) {
++        ag_draw_missed++;
+         artUnlock(cacheEntry);
+         return;
+     }
++    ag_draw_hit++;
+ 
+     unsigned char* src = artGetFrameData(art, object->frame, object->rotation);
+-    unsigned char* src2 = src;
++    const unsigned char* src2 = src;
+     int v50 = objectRect.left - object->sx;
+     int v49 = objectRect.top - object->sy;
+     src += frameWidth * v49 + v50;
+@@ -5166,12 +5444,12 @@ static void _obj_render_object(Object* object, Rect* rect, int light)
+                     for (int i = 0; i < 4; i++) {
+                         Rect* v21 = &(rects[i]);
+                         if (v21->left <= v21->right && v21->top <= v21->bottom) {
+-                            unsigned char* sp = src + frameWidth * (v21->top - objectRect.top) + (v21->left - objectRect.left);
++                            const unsigned char* sp = src + frameWidth * (v21->top - objectRect.top) + (v21->left - objectRect.left);
+                             _dark_trans_buf_to_buf(sp, v21->right - v21->left + 1, v21->bottom - v21->top + 1, frameWidth, gObjectsWindowBuffer, v21->left, v21->top, gObjectsWindowPitch, light);
+                         }
+                     }
+ 
+-                    unsigned char* mask = artGetFrameData(egg, 0, 0);
++                    const unsigned char* mask = artGetFrameData(egg, 0, 0);
+                     _intensity_mask_buf_to_buf(
+                         src + frameWidth * (updatedEggRect.top - objectRect.top) + (updatedEggRect.left - objectRect.left),
+                         updatedEggRect.right - updatedEggRect.left + 1,
+diff --git a/src/object.h b/src/object.h
+--- a/src/object.h
++++ b/src/object.h
+@@ -81,9 +81,9 @@ int objectGetDistanceBetweenTiles(Object* object1, int tile1, Object* object2, i
+ int objectListCreate(int tile, int elevation, int objectType, Object*** objectsPtr);
+ void objectListFree(Object** objects);
+ void _translucent_trans_buf_to_buf(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destX, int destY, int destPitch, unsigned char* a9, unsigned char* a10);
+-void _dark_trans_buf_to_buf(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destX, int destY, int destPitch, int light);
+-void _dark_translucent_trans_buf_to_buf(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destX, int destY, int destPitch, int light, unsigned char* a10, unsigned char* a11);
+-void _intensity_mask_buf_to_buf(unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destPitch, unsigned char* mask, int maskPitch, int light);
++void _dark_trans_buf_to_buf(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destX, int destY, int destPitch, int light);
++void _dark_translucent_trans_buf_to_buf(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destX, int destY, int destPitch, int light, unsigned char* a10, unsigned char* a11);
++void _intensity_mask_buf_to_buf(const unsigned char* src, int srcWidth, int srcHeight, int srcPitch, unsigned char* dest, int destPitch, const unsigned char* mask, int maskPitch, int light);
+ int objectSetOutline(Object* obj, int a2, Rect* rect);
+ int objectClearOutline(Object* obj, Rect* rect);
+ int _obj_intersects_with(Object* object, int x, int y);
+diff --git a/src/platform_compat.cc b/src/platform_compat.cc
+--- a/src/platform_compat.cc
++++ b/src/platform_compat.cc
+@@ -14,6 +14,8 @@
+ #else
+ #include <dirent.h>
+ #include <sys/stat.h>
++
++#include "ag_diag.h"
+ #include <unistd.h>
+ #endif
+ 
+@@ -313,6 +315,7 @@ void compat_windows_path_to_native(char* path)
+ void compat_resolve_path(char* path)
+ {
+ #ifndef _WIN32
++
+     char* pch = path;
+ 
+     DIR* dir;
+diff --git a/src/svga.cc b/src/svga.cc
+--- a/src/svga.cc
++++ b/src/svga.cc
+@@ -17,6 +17,8 @@
+ // ARGON: the port decides how often a palette change may redraw the screen.
+ // See the note in directDrawSetPaletteInRange below.
+ extern "C" int ag_palette_blit_wanted(void);
++extern "C" void ag_palette_only_begin(void);
++extern "C" void ag_palette_only_end(void);
+ 
+ namespace fallout {
+ 
+@@ -277,7 +279,12 @@ void directDrawSetPaletteInRange(unsigned char* palette, int start, int count)
+         // from the same palette.  So the port is asked, and says no to most of
+         // them.  -cycle 0 restores the original behaviour for a comparison.
+         if (ag_palette_blit_wanted()) {
++            /* ARGON: and this pass only has to touch the rows that hold one
++             * of the animated colours.  The port keeps that map; see
++             * s_row_cycled in port/sdl_shim.cc. */
++            ag_palette_only_begin();
+             SDL_BlitSurface(gSdlSurface, nullptr, gSdlTextureSurface, nullptr);
++            ag_palette_only_end();
+         }
+     }
+ }
+diff --git a/src/tile.cc b/src/tile.cc
+--- a/src/tile.cc
++++ b/src/tile.cc
+@@ -20,6 +20,11 @@
+ #include "settings.h"
+ #include "svga.h"
+ 
++/* ARGON: the layer timers; see tileRefreshGame. */
++#include "ag_diag.h"
++
++extern "C" uint32_t ag_us(void);
++
+ namespace fallout {
+ 
+ typedef struct RightsideUpTableEntry {
+@@ -641,17 +646,45 @@ static void tileRefreshGame(Rect* rect, int elevation)
+ 
+     // CE: Clear dirty rect to prevent most of the visual artifacts near map
+     // edges.
++    const uint32_t ag_lclear0 = ag_us();
+     bufferFill(gTileWindowBuffer + rectToUpdate.top * gTileWindowPitch + rectToUpdate.left,
+         rectGetWidth(&rectToUpdate),
+         rectGetHeight(&rectToUpdate),
+         gTileWindowPitch,
+         0);
+ 
++    /*
++     * ARGON: the six layers of a map refresh, timed apart.
++     *
++     * This call is a third of the machine - about a thousand of them every
++     * thirty seconds while animals walk, twelve million pixels, nine seconds -
++     * and it works out at six hundred nanoseconds a pixel, which is a hundred
++     * and forty processor cycles.  No single copy costs that, so the pixel is
++     * being touched several times over: cleared, floored, objects under the
++     * roof, the roof, objects over it, and then handed to the window.  Which
++     * of those it is cannot be guessed, and twice today a guess about this
++     * game was wrong.
++     */
++    const uint32_t ag_l0 = ag_us();
++
+     tileRenderFloorsInRect(&rectToUpdate, elevation);
++    const uint32_t ag_l1 = ag_us();
+     _obj_render_pre_roof(&rectToUpdate, elevation);
++    const uint32_t ag_l2 = ag_us();
+     tileRenderRoofsInRect(&rectToUpdate, elevation);
++    const uint32_t ag_l3 = ag_us();
+     _obj_render_post_roof(&rectToUpdate, elevation);
++    const uint32_t ag_l4 = ag_us();
+     gTileWindowRefreshProc(&rectToUpdate);
++    const uint32_t ag_l5 = ag_us();
++
++    ag_layer_n++;
++    ag_layer_clear_us += ag_l0 - ag_lclear0;
++    ag_layer_floor_us += ag_l1 - ag_l0;
++    ag_layer_pre_us += ag_l2 - ag_l1;
++    ag_layer_roof_us += ag_l3 - ag_l2;
++    ag_layer_post_us += ag_l4 - ag_l3;
++    ag_layer_window_us += ag_l5 - ag_l4;
+ }
+ 
+ // 0x4B1634
+@@ -1506,7 +1539,7 @@ static void tileRenderRoof(int fid, int x, int y, Rect* rect, int light)
+     tileRect.bottom = y + tileHeight - 1;
+ 
+     if (rectIntersection(&tileRect, rect, &tileRect) == 0) {
+-        unsigned char* tileFrmBuffer = artGetFrameData(tileFrm, 0, 0);
++        const unsigned char* tileFrmBuffer = artGetFrameData(tileFrm, 0, 0);
+         tileFrmBuffer += tileWidth * (tileRect.top - y) + (tileRect.left - x);
+ 
+         CacheEntry* eggFrmHandle;
+@@ -1576,7 +1609,7 @@ static void tileRenderRoof(int fid, int x, int y, Rect* rect, int light)
+                     }
+                 }
+ 
+-                unsigned char* eggBuf = artGetFrameData(eggFrm, 0, 0);
++                const unsigned char* eggBuf = artGetFrameData(eggFrm, 0, 0);
+                 _intensity_mask_buf_to_buf(tileFrmBuffer + tileWidth * (intersectedRect.top - tileRect.top) + (intersectedRect.left - tileRect.left),
+                     intersectedRect.right - intersectedRect.left + 1,
+                     intersectedRect.bottom - intersectedRect.top + 1,
+@@ -1670,7 +1703,7 @@ bool _square_roof_intersect(int x, int y, int elevation)
+             CacheEntry* handle;
+             Art* art = artLock(fid, &handle);
+             if (art != nullptr) {
+-                unsigned char* data = artGetFrameData(art, 0, 0);
++                const unsigned char* data = artGetFrameData(art, 0, 0);
+                 if (data != nullptr) {
+                     int v18;
+                     int v17;
+@@ -1854,7 +1887,7 @@ static void tileRenderFloor(int fid, int x, int y, Rect* rect)
+         }
+ 
+         if (v23 == 9) {
+-            unsigned char* buf = artGetFrameData(art, 0, 0);
++            const unsigned char* buf = artGetFrameData(art, 0, 0);
+             _dark_trans_buf_to_buf(buf + frameWidth * v78 + v79, v77, v76, frameWidth, gTileWindowBuffer, x, y, gTileWindowPitch, _verticies[0].intensity);
+             goto out;
+         }
+@@ -1968,7 +2001,7 @@ static void tileRenderFloor(int fid, int x, int y, Rect* rect)
+         }
+ 
+         unsigned char* v66 = gTileWindowBuffer + gTileWindowPitch * y + x;
+-        unsigned char* v67 = artGetFrameData(art, 0, 0) + frameWidth * v78 + v79;
++        const unsigned char* v67 = artGetFrameData(art, 0, 0) + frameWidth * v78 + v79;
+         int* v68 = &(_intensity_map[160 + 80 * v78]) + v79;
+         int v86 = frameWidth - v77;
+         int v85 = gTileWindowPitch - v77;
+diff --git a/src/window_manager.cc b/src/window_manager.cc
+--- a/src/window_manager.cc
++++ b/src/window_manager.cc
+@@ -1,3 +1,4 @@
++#include "art.h"
+ #include "window_manager.h"
+ 
+ #include <string.h>
+@@ -237,6 +238,7 @@ int windowManagerInit(VideoSystemInitProc* videoSystemInitProc, VideoSystemExitP
+     window->tx = 0;
+     window->ty = 0;
+     window->buffer = nullptr;
++    window->argonArtHandle = -1;
+     window->buttonListHead = nullptr;
+     window->hoveredButton = nullptr;
+     window->clickedButton = nullptr;
+@@ -331,7 +333,42 @@ int windowCreate(int x, int y, int width, int height, int color, int flags)
+         return -1;
+     }
+ 
+-    window->buffer = (unsigned char*)internal_malloc(width * height);
++    /*
++     * ARGON: a big window's pixels come out of the art cache, not the arena.
++     *
++     * A full-screen window is 307200 contiguous bytes and the save panel wants
++     * two of them.  A played-in arena has no hole that size - measured, 351 KB
++     * free in pieces of 270336 - so the panel did not open and the game said
++     * "Error loading save game screen data".  Making the arena roomier by
++     * shrinking the art cache is the wrong direction: the cache is already
++     * smaller than the art the game asks for, and raising it to 2600 KB killed
++     * the game outright, out of arena on a 2452-byte script allocation.
++     *
++     * The art cache's own heap is the right lender.  It can evict art to make
++     * room and it can compact, and while a full-screen panel is up nothing is
++     * drawing the map, so the art it gives up is art nobody needs this second.
++     * It is handed back the moment the window is destroyed.
++     *
++     * 128 KB is the line: below it the arena has never been the problem, and a
++     * borrow costs the cache a sweep.  A refusal falls straight through to the
++     * arena, which is where all of this used to come from.
++     */
++    window->argonArtHandle = -1;
++
++    if (width * height >= 128 * 1024) {
++        int handle = -1;
++        unsigned char* borrowed = nullptr;
++
++        if (artBorrow(width * height, &handle, &borrowed)) {
++            window->buffer = borrowed;
++            window->argonArtHandle = handle;
++        }
++    }
++
++    if (window->argonArtHandle < 0) {
++        window->buffer = (unsigned char*)internal_malloc(width * height);
++    }
++
+     if (window->buffer == nullptr) {
+         internal_free(window);
+         return -1;
+@@ -446,7 +483,12 @@ void windowFree(int win)
+         return;
+     }
+ 
+-    if (window->buffer != nullptr) {
++    if (window->argonArtHandle >= 0) {
++        /* Borrowed from the art cache; give it back rather than free it. */
++        artReturn(&(window->argonArtHandle));
++        window->argonArtHandle = -1;
++        window->buffer = nullptr;
++    } else if (window->buffer != nullptr) {
+         internal_free(window->buffer);
+     }
+ 
+@@ -1398,7 +1440,7 @@ bool showMesageBox(const char* text)
+ }
+ 
+ // 0x4D8260
+-int buttonCreate(int win, int x, int y, int width, int height, int mouseEnterEventCode, int mouseExitEventCode, int mouseDownEventCode, int mouseUpEventCode, unsigned char* up, unsigned char* dn, unsigned char* hover, int flags)
++int buttonCreate(int win, int x, int y, int width, int height, int mouseEnterEventCode, int mouseExitEventCode, int mouseDownEventCode, int mouseUpEventCode, const unsigned char* up, const unsigned char* dn, const unsigned char* hover, int flags)
+ {
+     Window* window = windowGetWindow(win);
+ 
+@@ -1522,7 +1564,7 @@ int _win_register_text_button(int win, int x, int y, int mouseEnterEventCode, in
+ }
+ 
+ // 0x4D8674
+-int _win_register_button_disable(int btn, unsigned char* up, unsigned char* down, unsigned char* hover)
++int _win_register_button_disable(int btn, const unsigned char* up, const unsigned char* down, const unsigned char* hover)
+ {
+     if (!gWindowSystemInitialized) {
+         return -1;
+@@ -1541,7 +1583,7 @@ int _win_register_button_disable(int btn, unsigned char* up, unsigned char* down
+ }
+ 
+ // 0x4D86A8
+-int _win_register_button_image(int btn, unsigned char* up, unsigned char* down, unsigned char* hover, bool draw)
++int _win_register_button_image(int btn, const unsigned char* up, const unsigned char* down, const unsigned char* hover, bool draw)
+ {
+     if (!gWindowSystemInitialized) {
+         return -1;
+diff --git a/src/window_manager.h b/src/window_manager.h
+--- a/src/window_manager.h
++++ b/src/window_manager.h
+@@ -103,6 +103,11 @@ typedef struct Window {
+     Button* clickedButton;
+     MenuBar* menuBar;
+     WindowBlitProc* blitProc;
++
++    /* ARGON: when this window's buffer was borrowed from the art cache's heap
++     * rather than taken from the arena, the heap handle to give back; -1
++     * otherwise.  See argonCacheBorrow in cache.cc. */
++    int argonArtHandle;
+ } Window;
+ 
+ typedef void ButtonCallback(int btn, int keyCode);
+@@ -180,10 +185,10 @@ int _win_check_all_buttons();
+ int _GNW_check_menu_bars(int input);
+ void programWindowSetTitle(const char* title);
+ bool showMesageBox(const char* str);
+-int buttonCreate(int win, int x, int y, int width, int height, int mouseEnterEventCode, int mouseExitEventCode, int mouseDownEventCode, int mouseUpEventCode, unsigned char* up, unsigned char* dn, unsigned char* hover, int flags);
++int buttonCreate(int win, int x, int y, int width, int height, int mouseEnterEventCode, int mouseExitEventCode, int mouseDownEventCode, int mouseUpEventCode, const unsigned char* up, const unsigned char* dn, const unsigned char* hover, int flags);
+ int _win_register_text_button(int win, int x, int y, int mouseEnterEventCode, int mouseExitEventCode, int mouseDownEventCode, int mouseUpEventCode, const char* title, int flags);
+-int _win_register_button_disable(int btn, unsigned char* up, unsigned char* down, unsigned char* hover);
+-int _win_register_button_image(int btn, unsigned char* up, unsigned char* down, unsigned char* hover, bool draw);
++int _win_register_button_disable(int btn, const unsigned char* up, const unsigned char* down, const unsigned char* hover);
++int _win_register_button_image(int btn, const unsigned char* up, const unsigned char* down, const unsigned char* hover, bool draw);
+ int buttonSetMouseCallbacks(int btn, ButtonCallback* mouseEnterProc, ButtonCallback* mouseExitProc, ButtonCallback* mouseDownProc, ButtonCallback* mouseUpProc);
+ int buttonSetRightMouseCallbacks(int btn, int rightMouseDownEventCode, int rightMouseUpEventCode, ButtonCallback* rightMouseDownProc, ButtonCallback* rightMouseUpProc);
+ int buttonSetCallbacks(int btn, ButtonCallback* pressSoundFunc, ButtonCallback* releaseSoundFunc);
+diff --git a/src/worldmap.cc b/src/worldmap.cc
+--- a/src/worldmap.cc
++++ b/src/worldmap.cc
+@@ -428,7 +428,7 @@ typedef struct SubtileInfo {
+ typedef struct TileInfo {
+     int fid;
+     CacheEntry* handle;
+-    unsigned char* data;
++    const unsigned char* data;
+     char walkMaskName[TILE_WALK_MASK_NAME_SIZE];
+     unsigned char* walkMaskData;
+     int encounterDifficultyModifier;
+@@ -5711,14 +5711,14 @@ static void wmInterfaceRefreshDate(bool shouldRefreshWindow)
+ 
+     int numbersFrmWidth = wmGenData.numbersFrmImage.getWidth();
+     int numbersFrmHeight = wmGenData.numbersFrmImage.getHeight();
+-    unsigned char* numbersFrmData = wmGenData.numbersFrmImage.getData();
++    const unsigned char* numbersFrmData = wmGenData.numbersFrmImage.getData();
+ 
+     dest += WM_WINDOW_WIDTH * 12 + 487;
+     blitBufferToBuffer(numbersFrmData + 9 * (day / 10), 9, numbersFrmHeight, numbersFrmWidth, dest, WM_WINDOW_WIDTH);
+     blitBufferToBuffer(numbersFrmData + 9 * (day % 10), 9, numbersFrmHeight, numbersFrmWidth, dest + 9, WM_WINDOW_WIDTH);
+ 
+     int monthsFrmWidth = wmGenData.monthsFrmImage.getWidth();
+-    unsigned char* monthsFrmData = wmGenData.monthsFrmImage.getData();
++    const unsigned char* monthsFrmData = wmGenData.monthsFrmImage.getData();
+     blitBufferToBuffer(monthsFrmData + monthsFrmWidth * 15 * month, 29, 14, 29, dest + WM_WINDOW_WIDTH + 26, WM_WINDOW_WIDTH);
+ 
+     dest += 98;
+@@ -6568,7 +6568,7 @@ static int wmRefreshInterfaceOverlay(bool shouldRefreshWindow)
+     wmRefreshInterfaceDial(false);
+ 
+     if (wmGenData.isInCar) {
+-        unsigned char* data = artGetFrameData(wmGenData.carImageFrm, wmGenData.carImageCurrentFrameIndex, 0);
++        const unsigned char* data = artGetFrameData(wmGenData.carImageFrm, wmGenData.carImageCurrentFrameIndex, 0);
+         if (data == nullptr) {
+             return -1;
+         }
+@@ -6648,7 +6648,7 @@ static int wmRefreshTabs()
+ 
+     // CE: Skip first empty tab (original code does this in the
+     // `wmInterfaceInit`).
+-    unsigned char* src = wmGenData.tabsBackgroundFrmImage.getData() + wmGenData.tabsBackgroundFrmImage.getWidth() * 27;
++    const unsigned char* src = wmGenData.tabsBackgroundFrmImage.getData() + wmGenData.tabsBackgroundFrmImage.getWidth() * 27;
+     blitBufferToBufferTrans(src + wmGenData.tabsBackgroundFrmImage.getWidth() * wmGenData.tabsOffsetY + 9,
+         119,
+         178,
+@@ -6813,7 +6813,7 @@ static int wmFreeTabsLabelList(int** quickDestinationsListPtr, int* quickDestina
+ // 0x4C5734
+ static void wmRefreshInterfaceDial(bool shouldRefreshWindow)
+ {
+-    unsigned char* data = artGetFrameData(wmGenData.dialFrm, wmGenData.dialFrmCurrentFrameIndex, 0);
++    const unsigned char* data = artGetFrameData(wmGenData.dialFrm, wmGenData.dialFrmCurrentFrameIndex, 0);
+     blitBufferToBufferTrans(data,
+         wmGenData.dialFrmWidth,
+         wmGenData.dialFrmHeight,

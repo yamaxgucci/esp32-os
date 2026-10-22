@@ -28,6 +28,19 @@
  * board that "seems to have restarted" into a board that says why.
  *   void       ag_port_restart(void)         does not return
  *
+ *   bool       ag_port_download_boot_capable(void)
+ *   void       ag_port_download_boot(void)   does not return, when capable
+ *
+ * download_boot restarts into the chip's OWN ROM LOADER, so that something on
+ * the other end of a wire can flash this board.  It is a separate call and not
+ * a flag on restart because it is not a restart in the sense anything else
+ * means: what comes back up is not this system.
+ *
+ * A port with no such facility answers false and does nothing, which is the
+ * honest answer for a part whose only way into the loader is a pin held low
+ * while the reset line is pulsed.  The two are not interchangeable and the
+ * caller has to be able to tell, because the wiring differs.
+ *
  *   uint8_t  ag_port_cpu_cores(void)
  *   uint8_t  ag_port_cpu_revision(void)      major revision, 0 if unknown
  *   uint32_t ag_port_cpu_hz(void)
@@ -45,8 +58,9 @@
  * it will never see one; the same restraint one layer down keeps that promise
  * cheap to keep.
  *
- * ag_reset_t has three values because the kernel distinguishes three cases and
+ * ag_reset_t has four values because the kernel distinguishes four cases and
  * no more: a cold start clears the crash streak, a deliberate restart keeps it,
+ * a console or debugger attach is somebody else's decision and is not a crash,
  * and anything else increments it.  Map an unknown reason to AG_RESET_OTHER -
  * being counted as a crash is the safe direction.
  *
@@ -64,6 +78,16 @@
 typedef enum {
     AG_RESET_POWERON = 0, /* cold start: no history to carry */
     AG_RESET_SOFTWARE,    /* asked for it: `reboot`, or a restart after update */
+    /*
+     * A HOST did it, not the firmware: opening the console of a chip whose
+     * console is its own USB-Serial-JTAG resets it (rst:0x15), and attaching a
+     * JTAG debugger does the same.  It is the same act as typing at a prompt -
+     * an operator looking at the board - and it says nothing about whether the
+     * board was healthy, so it is not a crash.  The port is the only layer that
+     * can tell these two apart from a watchdog: both are just "a reset" to
+     * everything above.
+     */
+    AG_RESET_ATTACH,
     AG_RESET_OTHER        /* watchdog, panic, brownout - something went wrong */
 } ag_reset_t;
 

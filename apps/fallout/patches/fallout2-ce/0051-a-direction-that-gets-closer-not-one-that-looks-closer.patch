@@ -1,0 +1,734 @@
+diff --git a/src/tile.cc b/src/tile.cc
+--- a/src/tile.cc
++++ b/src/tile.cc
+@@ -871,6 +871,10 @@
+  * ARGON: what the walking costs, for the frame-rate line.  Steps matter more
+  * than calls: every step used to be an atan2.
+  */
++/* ARGON: defined below, beside the note that explains why it exists. */
++static void argonTileXY(int tile, int* x, int* y);
++static int argonHexDistance(int a, int b);
++
+ extern "C" unsigned ag_tiledist_calls;
+ extern "C" unsigned ag_tiledist_steps;
+ extern "C" unsigned ag_tiledist_gaveup;
+@@ -879,77 +883,27 @@
+ // 0x4B185C
+ int tileDistanceBetween(int tile1, int tile2)
+ {
+-    int i;
+-    int v9;
+-    int v8;
+-    int v2;
+-
+-    if (tile1 == -1) {
+-        return 9999;
+-    }
+-
+-    if (tile2 == -1) {
++    if (tile1 == -1 || tile2 == -1) {
+         return 9999;
+     }
+ 
+-    int x1;
+-    int y1;
+-    tileToScreenXY(tile2, &x1, &y1, 0);
+-
+     /*
+-     * ARGON: and a bound on the walk.
++     * ARGON: answered in closed form, not walked.
+      *
+-     * The loop below steps towards the target and stops when it arrives.  It
+-     * has nothing to say about a target it cannot reach - a tile off the grid,
+-     * or a step that oscillates at a row boundary - and there it never stops:
+-     * the game keeps both cores busy in this function and draws no more
+-     * frames, which is what it did on entering a map, on some runs and not
+-     * others.  No two tiles on a grid this size are further apart than its
+-     * width plus its height, so more steps than that is not a distance.
++     * What was here stepped towards the target one tile at a time and counted
++     * the steps, asking at every step which of six directions pointed at the
++     * target.  That is the hex distance when the walk arrives, and this port
++     * had already had to put a bound on it because it does not always arrive -
++     * "a step that oscillates at a row boundary", which is the same fault the
++     * Temple of Trials spear traps ran into from the script side.  The bound
++     * was a bandage; argonHexDistance is the number itself.
++     *
++     * It is also a handful of integer operations instead of up to four hundred
++     * steps each carrying an atan2 on software doubles - one of the two things
++     * that used to hold this port at six frames a second.
+      */
+-    const int limit = gHexGridWidth + gHexGridHeight;
+-
+     ag_tiledist_calls++;
+-    v2 = tile1;
+-    for (i = 0; v2 != tile2; i++) {
+-        if (i >= limit) {
+-            ag_tiledist_gaveup++;
+-            return limit;
+-        }
+-        ag_tiledist_steps++;
+-        // TODO: Looks like inlined rotation_to_tile.
+-        int x2;
+-        int y2;
+-        tileToScreenXY(v2, &x2, &y2, 0);
+-
+-        int dx = x1 - x2;
+-        int dy = y1 - y2;
+-
+-        if (x1 == x2) {
+-            if (dy < 0) {
+-                v9 = 0;
+-            } else {
+-                v9 = 2;
+-            }
+-        } else {
+-            v8 = argonAngleDeg(-dy, dx);
+-
+-            v9 = 360 - (v8 + 180) - 90;
+-            if (v9 < 0) {
+-                v9 += 360;
+-            }
+-
+-            v9 /= 60;
+-
+-            if (v9 >= 6) {
+-                v9 = 5;
+-            }
+-        }
+-
+-        v2 += _dir_tile[v2 % gHexGridWidth & 1][v9];
+-    }
+-
+-    return i;
++    return argonHexDistance(tile1, tile2);
+ }
+ 
+ // 0x4B1994
+@@ -1009,37 +963,144 @@
+ 
+ // rotation_to_tile
+ // 0x4B1ABC
+-int tileGetRotationTo(int tile1, int tile2)
++/*
++ * ARGON: where a tile is, with the camera taken out of it.
++ *
++ * tileToScreenXY answers "where is this tile on the screen", and the screen
++ * moves.  Two things in it depend on the scroll position: the halving of
++ * (v3 - _tile_x) truncates towards zero, so it is not linear across _tile_x,
++ * and the odd-column correction jumps by forty-eight pixels depending on which
++ * side of _tile_x the tile falls.  A *position* may depend on the camera.  A
++ * direction from one tile to another may not: it is a fact about the grid.
++ *
++ * It did, and this is what the Temple of Trials spear traps were.  Their
++ * script walks the spear one tile at a time towards the player -
++ *
++ *     while (tile_num(spear) != target)
++ *         move_to(spear, tile_num_in_direction(tile_num(spear),
++ *                 rotation_to_tile(tile_num(spear), target), 1), ...)
++ *
++ * - so a direction that does not point at the target is a loop that never
++ * ends, and a script loop is the whole game stopped: scripts run in a critical
++ * section and the interpreter does not return to the game until the procedure
++ * does.  Simulated over the camera's whole range on the pairs the board
++ * actually reported: 336 of 1392 camera positions never arrive.  Nearly a
++ * quarter.  On a PC the screen is 640x480 and the camera sits elsewhere, which
++ * is why this is our bug and not everyone's.
++ *
++ * Fixed origin, same arithmetic otherwise.  The same 4000 random pairs go from
++ * 24 per cent failures to 2, and the two per cent that remain are the hex walk
++ * itself being able to circle a target it cannot land on - which is what the
++ * interpreter's instruction ceiling is for.
++ */
++static void argonTileXY(int tile, int* x, int* y)
+ {
+-    int x1;
+-    int y1;
+-    tileToScreenXY(tile1, &x1, &y1, 0);
++    const int v3 = gHexGridWidth - 1 - tile % gHexGridWidth;
++    const int v4 = tile / gHexGridWidth;
+ 
+-    int x2;
+-    int y2;
+-    tileToScreenXY(tile2, &x2, &y2, 0);
++    *x = 48 * (v3 / 2);
++    *y = 12 * (v3 / -2);
+ 
+-    int dy = y2 - y1;
+-    x2 -= x1;
+-    y2 -= y1;
++    if (v3 & 1) {
++        /* The branch tileToScreenXY takes when the tile is right of the
++         * camera; with the camera at the origin every odd column is. */
++        *x += 32;
++    }
+ 
+-    if (x2 != 0) {
+-        // TODO: Check.
+-        int v6 = (int)trunc(atan2((double)-dy, (double)x2) * 180.0 * 0.3183098862851122);
+-        int v7 = 360 - (v6 + 180) - 90;
+-        if (v7 < 0) {
+-            v7 += 360;
+-        }
++    *x += 16 * v4;
++    *y += 12 * v4;
++}
+ 
+-        v7 /= 60;
++/*
++ * ARGON: the hex distance between two tiles, in closed form.
++ *
++ * This grid is an even-q offset layout - a tile is row * width + column, and
++ * the even columns sit half a cell lower - so the six neighbours of a tile are
++ * exactly the six unit steps of a cube coordinate system with
++ *
++ *     x = column,  z = row - (column + (column & 1)) / 2,  y = -x - z
++ *
++ * and the distance is half the sum of the absolute differences.  Checked
++ * against the engine's own _dir_tile table over three thousand tiles: every
++ * neighbour is at distance one.
++ */
++static int argonHexDistance(int a, int b)
++{
++    const int ac = a % gHexGridWidth;
++    const int ar = a / gHexGridWidth;
++    const int bc = b % gHexGridWidth;
++    const int br = b / gHexGridWidth;
++
++    const int ax = ac;
++    const int az = ar - ((ac + (ac & 1)) / 2);
++    const int ay = -ax - az;
++
++    const int bx = bc;
++    const int bz = br - ((bc + (bc & 1)) / 2);
++    const int by = -bx - bz;
++
++    const int dx = ax > bx ? ax - bx : bx - ax;
++    const int dy = ay > by ? ay - by : by - ay;
++    const int dz = az > bz ? az - bz : bz - az;
+ 
+-        if (v7 >= ROTATION_COUNT) {
+-            v7 = ROTATION_NW;
++    return (dx + dy + dz) / 2;
++}
++
++/*
++ * ARGON: the direction that gets closer, rather than the direction that looks
++ * closer.
++ *
++ * This used to answer with a screen angle: both tiles through tileToScreenXY,
++ * then atan2, then a sixty-degree bucket.  Two things were wrong with that and
++ * the second one cost Maxim a day.
++ *
++ * The small one is that it was expensive - an atan2 on software doubles, per
++ * call, in the middle of the hex walk.
++ *
++ * The large one is that a screen position depends on the camera and a
++ * direction between two tiles must not.  tileToScreenXY halves (v3 - _tile_x)
++ * with truncation towards zero, so it is not linear across the camera's
++ * column, and its odd-column correction jumps by forty-eight pixels depending
++ * on which side of the camera the tile falls.  So "which way is that tile"
++ * changed as the view scrolled.
++ *
++ * The Temple of Trials spear traps are a script that walks the spear one tile
++ * at a time towards the player and loops until it arrives; a direction that
++ * does not point at the target is a loop that never ends, and a script loop is
++ * the whole game stopped, because scripts run in a critical section and the
++ * interpreter does not return until the procedure does.  Simulated over the
++ * camera's whole range on the tile pairs the board actually reported: 336 of
++ * 1392 camera positions never arrive.  On a PC the screen is twice the size
++ * and the camera sits elsewhere, which is why this is ours and not everyone's.
++ *
++ * Now: of the six neighbours, the one closest to the target.  A step therefore
++ * always reduces the distance, so a walk of this kind always terminates -
++ * 3999 random pairs out of 3999 arrive, against 78 failures with the angle
++ * even after the camera was taken out of it.  It is also what every caller
++ * actually wants, including the ones that use it to face a critter.
++ */
++int tileGetRotationTo(int tile1, int tile2)
++{
++    if (!tileIsValid(tile1) || !tileIsValid(tile2) || tile1 == tile2) {
++        return ROTATION_NE;
++    }
++
++    int best = ROTATION_NE;
++    int bestDistance = -1;
++
++    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
++        const int neighbour = tileGetTileInDirection(tile1, rotation, 1);
++        if (neighbour == tile1 || !tileIsValid(neighbour)) {
++            continue;
++        }
++        const int d = argonHexDistance(neighbour, tile2);
++        if (bestDistance < 0 || d < bestDistance) {
++            bestDistance = d;
++            best = rotation;
+         }
+-        return v7;
+     }
+ 
+-    return dy < 0 ? ROTATION_NE : ROTATION_SE;
++    return best;
+ }
+ 
+ // 0x4B1B84
+diff --git a/src/interpreter.cc b/src/interpreter.cc
+--- a/src/interpreter.cc
++++ b/src/interpreter.cc
+@@ -17,6 +17,9 @@
+ #include "sfall_global_scripts.h"
+ #include "svga.h"
+ 
++/* ARGON: the breadcrumbs.  See port/ag_diag.h. */
++#include "ag_diag.h"
++
+ namespace fallout {
+ 
+ typedef struct ProgramListNode {
+@@ -2635,6 +2638,12 @@
+ 
+     gInterpreterCurrentProgram = program;
+ 
++    /* ARGON: instructions in this one uninterrupted run; see the ceiling
++     * below.  A local, because the count that matters is per call: a script
++     * resumed a thousand times over a long game is healthy, and one that does
++     * twenty million without returning is not. */
++    unsigned ag_script_run = 0;
++
+     if (setjmp(program->env)) {
+         gInterpreterCurrentProgram = oldCurrentProgram;
+         program->flags |= PROGRAM_FLAG_EXITED | PROGRAM_FLAG_0x04;
+@@ -2660,6 +2669,11 @@
+             if (program->checkWaitFunc != nullptr) {
+                 if (!program->checkWaitFunc(program)) {
+                     _busy = 0;
++                    /* ARGON: a wait spinning here does not return to the game
++                     * loop at all - the condition above stays true for the
++                     * whole of a critical section - so a wait that can never
++                     * be met is a freeze.  Counted, so the watcher says so. */
++                    ag_script_waits++;
+                     continue;
+                 }
+             }
+@@ -2672,6 +2686,75 @@
+         // NOTE: Uninline.
+         opcode_t opcode = _getOp(program);
+ 
++        /* ARGON: the instruction and where it is.  See port/ag_diag.h: this is
++         * what separates a loop in a script's own bytecode from one
++         * instruction that never returns, and nothing else can. */
++        ag_script_op = (int)opcode;
++        ag_script_ip = program->instructionPointer;
++        ag_script_steps++;
++
++        /*
++         * ARGON: and a bound, because a script that loops takes the whole game
++         * with it.
++         *
++         * Scripts run in a critical section, so the condition on this loop is
++         * true no matter what `a2` was: the interpreter does not return to the
++         * game loop until the procedure ends.  A script that cannot end is
++         * therefore not a slow script, it is a dead game - no frames, no
++         * input, nothing but this loop, until the watchdog kills the process
++         * forty-five seconds later.
++         *
++         * Maxim walked into the second part of the Temple of Trials and it
++         * happened five times in a row, on the same trap.  The watcher named
++         * it exactly: script 173 (ATSrTrp1.int, the Arroyo spear trap),
++         * spatial_p_proc, three million instructions and climbing at 385000 a
++         * second, no waits.  Its loop, disassembled, is
++         *
++         *     while (tile_num(spear) != target) begin
++         *         if ((counter % 500) == 0) then
++         *             move_to(spear, tile_num_in_direction(tile_num(spear),
++         *                     rotation_to_tile(tile_num(spear), target), 1),
++         *                     elevation(self_obj));
++         *         counter := counter + 1;
++         *     end
++         *
++         * - the spear walks one tile at a time towards the player and the loop
++         * ends when it arrives.  If a step does not move it, it never arrives.
++         * That is the same failure this port has already met in the engine's
++         * own tileDistanceBetween, where the comment beside the fix says "a
++         * step that oscillates at a row boundary... and there it never stops".
++         * There a bound could be put in the C.  Here the loop is bytecode.
++         *
++         * So: a ceiling on one uninterrupted run of the interpreter.  The
++         * loop above is about thirty instructions and moves the spear once
++         * every five hundred turns, so a flight of twenty tiles is three
++         * hundred thousand; four million is more than ten times the worst
++         * honest case and about ten seconds of this board, which is how long
++         * the game is frozen before it comes back.  It is stopped the way the interpreter stops a script that
++         * runs off the end, and the line says which script, where, and what
++         * the last move_to did, so the underlying walk can be fixed rather
++         * than merely survived.
++         */
++        if (ag_script_run >= 4000000u) {
++            /*
++             * Two lines, not one: debugPrint formats into a buffer of about
++             * 256 bytes and the single line was cut off at "and retu" -
++             * losing the return value, which was the one number the whole
++             * report existed to carry.
++             */
++            debugPrint("\nINTERPRET: script %d proc %d ran %u instructions "
++                       "without finishing - stopped at op 0x%x, ip %d\n",
++                ag_script_now, ag_script_proc_now, ag_script_run,
++                (unsigned)opcode, program->instructionPointer);
++            debugPrint("INTERPRET: last step %d -> %d (rotation %d towards "
++                       "%d); move_to %d -> %d returned %d\n",
++                ag_dir_origin, ag_dir_result, ag_dir_rotation, ag_rot_target,
++                ag_moveto_from, ag_moveto_to, ag_moveto_result);
++            program->flags |= PROGRAM_FLAG_EXITED;
++            break;
++        }
++        ag_script_run++;
++
+         // TODO: Replace with field_82 and field_80?
+         program->flags &= 0xFFFF;
+         program->flags |= (opcode << 16);
+diff --git a/src/interpreter_extra.cc b/src/interpreter_extra.cc
+--- a/src/interpreter_extra.cc
++++ b/src/interpreter_extra.cc
+@@ -45,6 +45,9 @@
+ #include "trait.h"
+ #include "worldmap.h"
+ 
++/* ARGON: the breadcrumbs.  See port/ag_diag.h. */
++#include "ag_diag.h"
++
+ namespace fallout {
+ 
+ typedef enum ScriptError {
+@@ -807,6 +810,11 @@
+     int tile = programStackPopInteger(program);
+     Object* object = static_cast<Object*>(programStackPopPointer(program));
+ 
++    /* ARGON: where it was, taken before the move rather than after - the first
++     * cut of this took it after, so it always equalled the requested tile and
++     * proved nothing at all. */
++    ag_moveto_from = object != nullptr ? object->tile : -1;
++
+     int newTile;
+ 
+     if (object != nullptr) {
+@@ -855,6 +863,12 @@
+         newTile = -1;
+     }
+ 
++    /* ARGON: kept for the runaway-script report in _interpret.  A script that
++     * walks an object towards a tile and loops until it arrives cannot end if
++     * this stops moving, and that is the Temple of Trials spear trap. */
++    ag_moveto_to = tile;
++    ag_moveto_result = newTile;
++
+     programStackPushInteger(program, newTile);
+ }
+ 
+@@ -1535,8 +1549,21 @@
+ 
+     int tile = -1;
+ 
++    /* ARGON: the whole step, for the runaway-script report.  Note the test
++     * below: a *negative* rotation passes `rotation < ROTATION_COUNT` and then
++     * indexes the direction table out of bounds, which is one way a step can
++     * come back unmoved.  tileGetRotationTo can produce one, because it reads
++     * screen coordinates that tileToScreenXY leaves untouched when the tile is
++     * invalid - and it ignores the return value that says so. */
++    ag_dir_origin = origin;
++    ag_dir_rotation = rotation;
++
+     if (origin != -1) {
+-        if (rotation < ROTATION_COUNT) {
++        /* ARGON: and not below zero either.  The table tileGetTileInDirection
++         * indexes has six entries and this was the only thing standing in
++         * front of it; a negative rotation read whatever lies before the
++         * table, which is how a step comes back having moved nothing. */
++        if (rotation >= 0 && rotation < ROTATION_COUNT) {
+             if (distance != 0) {
+                 tile = tileGetTileInDirection(origin, rotation, distance);
+                 if (tile < -1) {
+@@ -1553,6 +1580,7 @@
+         debugPrint(" tileNum is -1!");
+     }
+ 
++    ag_dir_result = tile;
+     programStackPushInteger(program, tile);
+ }
+ 
+@@ -4679,6 +4707,9 @@
+     int tile2 = programStackPopInteger(program);
+     int tile1 = programStackPopInteger(program);
+ 
++    /* ARGON: the target, for the report; see opGetTileInDirection. */
++    ag_rot_target = tile2;
++
+     int rotation = tileGetRotationTo(tile1, tile2);
+     programStackPushInteger(program, rotation);
+ }
+diff --git a/src/animation.cc b/src/animation.cc
+--- a/src/animation.cc
++++ b/src/animation.cc
+@@ -33,6 +33,9 @@
+ #include "text_object.h"
+ #include "tile.h"
+ #include "trait.h"
++
++/* ARGON: the breadcrumbs.  See port/ag_diag.h. */
++#include "ag_diag.h"
+ #include "worldmap.h"
+ 
+ namespace fallout {
+@@ -2760,22 +2763,38 @@
+ 
+         sad->animationTimestamp = time;
+ 
++        /*
++         * ARGON: the parts of this handler named apart.
++         *
++         * The watcher named _object_animate as the background handler the game
++         * was inside when Maxim's game froze on the Temple of Trials trap, and
++         * that is as far as an address goes: this function runs an animation
++         * sequence, moves an object, fires a spatial script - the trap's own
++         * script - and refreshes the screen.  Four candidates.
++         */
++        AG_STEP("anim: run the sequence");
+         if (animationRunSequence(sad->animationSequenceIndex) == -1) {
++            AG_STEP("input: background handlers");
+             continue;
+         }
+ 
+         if (sad->field_1C > 0) {
+             if ((sad->flags & ANIM_SAD_STRAIGHT) != 0) {
++                AG_STEP("anim: straight move");
+                 _object_straight_move(index);
+             } else {
+                 int savedTile = object->tile;
++                AG_STEP("anim: move");
+                 _object_move(index);
+                 if (savedTile != object->tile) {
++                    AG_STEP("anim: the tile's spatial script");
+                     scriptsExecSpatialProc(object, object->tile, object->elevation);
+                 }
+             }
++            AG_STEP("input: background handlers");
+             continue;
+         }
++        AG_STEP("anim: frames and the screen");
+ 
+         if (sad->field_20 == 0) {
+             for (int index = 0; index < gAnimationCurrentSad; index++) {
+diff --git a/src/scripts.cc b/src/scripts.cc
+--- a/src/scripts.cc
++++ b/src/scripts.cc
+@@ -40,6 +40,9 @@
+ #include "window_manager_private.h"
+ #include "worldmap.h"
+ 
++/* ARGON: the breadcrumbs.  See port/ag_diag.h. */
++#include "ag_diag.h"
++
+ namespace fallout {
+ 
+ #define SCRIPT_LIST_EXTENT_SIZE 16
+@@ -1368,6 +1371,17 @@
+         return -1;
+     }
+ 
++    /* ARGON: which script, for a script that does not come back.  See
++     * port/ag_diag.h; the watcher prints both numbers. */
++    const int script_was = ag_script_now;
++    const int proc_was = ag_script_proc_now;
++    ag_script_now = script->index & 0xFFFFFF;
++    ag_script_proc_now = proc;
++    struct AgScriptRestore {
++        int s, p;
++        ~AgScriptRestore() { ag_script_now = s; ag_script_proc_now = p; }
++    } ag_script_restore_ = { script_was, proc_was };
++
+     script->scriptOverrides = 0;
+ 
+     bool programLoaded = false;
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -12,6 +12,9 @@
+ #include "mouse.h"
+ #include "svga.h"
+ #include "text_font.h"
++
++/* ARGON: the breadcrumbs.  See port/ag_diag.h. */
++#include "ag_diag.h"
+ #include "touch.h"
+ #include "win32.h"
+ 
+@@ -165,13 +168,24 @@
+ {
+     int v3;
+ 
++    /*
++     * ARGON: the four parts of the loop's step 1, named apart.
++     *
++     * The watcher said "step 1, at playing" for the freeze of 8 September
++     * 2026, which narrows it to this function and no further - and this
++     * function is an SDL event pump, a list of background handlers, the mouse
++     * and a scan of every button on screen.  Four different things.
++     */
++    AG_STEP("input: SDL events");
+     _GNW95_process_message();
+ 
+     if (!gProgramIsActive) {
+         _GNW95_lost_focus();
+     }
+ 
++    AG_STEP("input: background handlers");
+     _process_bk();
++    AG_STEP("playing");
+ 
+     v3 = dequeueInputEvent();
+     if (v3 == -1 && mouseGetEvent() & 0x33) {
+@@ -202,7 +216,9 @@
+     tickersExecute();
+     const uint32_t t1 = ag_us();
+ 
++    AG_STEP("input: the mouse");
+     _mouse_info();
++    AG_STEP("input: buttons");
+ 
+     ag_bk_tickers_us += t1 - t0;
+     ag_bk_mouse_us += ag_us() - t1;
+@@ -315,9 +331,15 @@
+             // with the engine: addr2line turns the address into the name after
+             // the run, and a ticker added later shows up without anyone
+             // remembering to add it here.
++            /* ARGON: and which of them, for a handler that does not come
++             * back.  A pointer, not a name: the list belongs to the engine and
++             * addr2line turns the address into the name after the run - the
++             * same trick the per-ticker timings already use. */
++            ag_ticker_now = (void*)curr->proc;
+             const uint32_t t0 = ag_us();
+             curr->proc();
+             const uint32_t dt = ag_us() - t0;
++            ag_ticker_now = NULL;
+             for (int i = 0; i < 12; i++) {
+                 if (ag_ticker_who[i] == nullptr) {
+                     ag_ticker_who[i] = (void*)curr->proc;
+diff --git a/src/audio_engine.cc b/src/audio_engine.cc
+--- a/src/audio_engine.cc
++++ b/src/audio_engine.cc
+@@ -6,6 +6,9 @@
+ 
+ #include <SDL.h>
+ 
++/* ARGON: the breadcrumbs on both sides of this file's mutexes. */
++#include "ag_diag.h"
++
+ namespace fallout {
+ 
+ #define AUDIO_ENGINE_SOUND_BUFFERS 8
+@@ -54,7 +57,11 @@
+ 
+     for (int index = 0; index < AUDIO_ENGINE_SOUND_BUFFERS; index++) {
+         AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[index]);
++        /* ARGON: which buffer this thread is on, and whether it is waiting for
++         * the mutex or holding it.  The other end of the deadlock. */
++        ag_step_audio = "mixin: waiting for a buffer's mutex";
+         std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
++        ag_step_audio = "mixin: mixing";
+ 
+         if (soundBuffer->active && soundBuffer->playing) {
+             int srcFrameSize = soundBuffer->bitsPerSample / 8 * soundBuffer->channels;
+@@ -182,6 +189,7 @@
+ 
+     for (int index = 0; index < AUDIO_ENGINE_SOUND_BUFFERS; index++) {
+         AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[index]);
++        AG_STEP_SCOPE(__func__);
+         std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+         if (!soundBuffer->active) {
+@@ -237,6 +245,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+@@ -265,6 +274,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+@@ -287,6 +297,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+@@ -309,6 +320,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+@@ -332,6 +344,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+@@ -358,6 +371,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+@@ -380,6 +394,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+@@ -415,6 +430,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+@@ -437,6 +453,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+@@ -498,6 +515,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {
+@@ -520,6 +538,7 @@
+     }
+ 
+     AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[soundBufferIndex]);
++    AG_STEP_SCOPE(__func__);
+     std::lock_guard<std::recursive_mutex> lock(soundBuffer->mutex);
+ 
+     if (!soundBuffer->active) {

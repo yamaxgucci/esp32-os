@@ -1,0 +1,23 @@
+# ArgonOS - the CYD as a monitor: no radios at all, every byte to the heap.
+#
+#   argon target esp32-cyd
+#
+# The CYD's job in this project is to be a screen at the end of a wire, and the
+# thing that job needs is memory: a 320x240 frame is 150 KB, and a frame that
+# cannot be assembled whole appears on the glass in pieces.  With the radios in
+# the image the heap tops out around 125 KB free - and 92 in one piece - which
+# is not enough however the code is arranged.
+#
+# `wifi off` does not help.  Switching the radio off hands back about 27 KB of
+# what it had allocated; the rest is the stacks, the buffers and the static
+# data the Wi-Fi and Bluetooth stacks reserve at link time, and only leaving
+# them out of the image gets that back.
+#
+# What is lost with them: uploading files over HTTP, which is how a driver gets
+# onto this board in one second instead of a minute of hex over the console.
+# That is a real cost and it is worth paying here, because the console path
+# still works and the picture does not.
+CONFIG_ARGON_ENABLE_NET=n
+CONFIG_ARGON_NET_WIFI=n
+CONFIG_ARGON_ENABLE_BLE=n
+CONFIG_BT_ENABLED=n

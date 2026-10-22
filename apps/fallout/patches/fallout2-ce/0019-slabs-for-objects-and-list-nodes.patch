@@ -1,0 +1,190 @@
+diff --git a/src/object.cc b/src/object.cc
+--- a/src/object.cc
++++ b/src/object.cc
+@@ -384,6 +384,125 @@
+ }
+ 
+ // 0x488A30
++
++/*
++ * ARGON: slabs for the two fixed-size things a map is made of.
++ *
++ * A map is mostly objects, and each one used to cost two calls to malloc: an
++ * Object and the ObjectListNode that threads it onto the map's list.  On
++ * BROKEN2.MAP, the largest map in the game, that is 7102 objects and 14204
++ * blocks - and the second of the two carries eight bytes of payload, so
++ * whatever the allocator puts around a block is paid twice for every object and
++ * doubled for half of them.  Measured: the map load takes the arena from 5200 KB
++ * to 6273 in one step, and the arena is 6340.
++ *
++ * Both types are one fixed size, which is exactly what a free list suits.  The
++ * slabs are chained so objectsExit() can give them all back; the free lists are
++ * threaded through the items themselves - Object::owner and
++ * ObjectListNode::next, both of which are meaningless in a free item and both
++ * of which are read before anything is cleared.
++ *
++ * The slabs are not returned between maps, which is deliberate: the next map
++ * wants them straight back, and a 17 KB block is easier on a fragmented arena
++ * than seven thousand small ones.
++ */
++#define OBJ_POOL_OBJECTS 128
++#define OBJ_POOL_NODES 512
++
++// Every slab, chained through its first word.  Eight bytes rather than four, so
++// that what follows keeps the alignment malloc gave us.
++#define OBJ_POOL_SLAB_HEADER 8
++
++static void* gObjectPoolSlabs = nullptr;
++static Object* gObjectPoolFree = nullptr;
++static ObjectListNode* gObjectNodePoolFree = nullptr;
++
++static unsigned char* objectPoolAddSlab(size_t itemSize, int count)
++{
++    unsigned char* slab = (unsigned char*)internal_malloc(
++        OBJ_POOL_SLAB_HEADER + itemSize * (size_t)count);
++    if (slab == nullptr) {
++        return nullptr;
++    }
++
++    *(void**)slab = gObjectPoolSlabs;
++    gObjectPoolSlabs = slab;
++
++    return slab + OBJ_POOL_SLAB_HEADER;
++}
++
++static void objectPoolFreeSlabs()
++{
++    while (gObjectPoolSlabs != nullptr) {
++        void* next = *(void**)gObjectPoolSlabs;
++        internal_free(gObjectPoolSlabs);
++        gObjectPoolSlabs = next;
++    }
++
++    gObjectPoolFree = nullptr;
++    gObjectNodePoolFree = nullptr;
++}
++
++static Object* objectPoolTake()
++{
++    Object* object = gObjectPoolFree;
++
++    if (object != nullptr) {
++        gObjectPoolFree = object->owner;
++        return object;
++    }
++
++    unsigned char* items = objectPoolAddSlab(sizeof(Object), OBJ_POOL_OBJECTS);
++    if (items == nullptr) {
++        return nullptr;
++    }
++
++    for (int index = 1; index < OBJ_POOL_OBJECTS; index++) {
++        Object* spare = (Object*)(items + (size_t)index * sizeof(Object));
++        spare->owner = gObjectPoolFree;
++        gObjectPoolFree = spare;
++    }
++
++    return (Object*)items;
++}
++
++static void objectPoolGiveBack(Object* object)
++{
++    object->owner = gObjectPoolFree;
++    gObjectPoolFree = object;
++}
++
++static ObjectListNode* objectNodePoolTake()
++{
++    ObjectListNode* node = gObjectNodePoolFree;
++
++    if (node != nullptr) {
++        gObjectNodePoolFree = node->next;
++        return node;
++    }
++
++    unsigned char* items = objectPoolAddSlab(sizeof(ObjectListNode),
++        OBJ_POOL_NODES);
++    if (items == nullptr) {
++        return nullptr;
++    }
++
++    for (int index = 1; index < OBJ_POOL_NODES; index++) {
++        ObjectListNode* spare =
++            (ObjectListNode*)(items + (size_t)index * sizeof(ObjectListNode));
++        spare->next = gObjectNodePoolFree;
++        gObjectNodePoolFree = spare;
++    }
++
++    return (ObjectListNode*)items;
++}
++
++static void objectNodePoolGiveBack(ObjectListNode* node)
++{
++    node->next = gObjectNodePoolFree;
++    gObjectNodePoolFree = node;
++}
++
+ void objectsExit()
+ {
+     if (gObjectsInitialized) {
+@@ -405,6 +524,9 @@
+         _obj_order_table_exit();
+ 
+         _obj_offset_table_exit();
++
++        // ARGON: after _obj_remove_all, so every item is on a free list.
++        objectPoolFreeSlabs();
+     }
+ }
+ 
+@@ -1122,7 +1244,9 @@
+     }
+ 
+     if (node != nullptr) {
+-        internal_free(node);
++        // ARGON: the one node freed without objectListNodeDestroy, and it has
++        // to reach the slab like all the others.
++        objectNodePoolGiveBack(node);
+     }
+ 
+     obj->tile = -1;
+@@ -3705,7 +3829,8 @@
+         return -1;
+     }
+ 
+-    Object* object = *objectPtr = (Object*)internal_malloc(sizeof(Object));
++    // ARGON: from the slab; see objectPoolTake.
++    Object* object = *objectPtr = objectPoolTake();
+     if (object == nullptr) {
+         return -1;
+     }
+@@ -3737,7 +3862,8 @@
+         return;
+     }
+ 
+-    internal_free(*objectPtr);
++    // ARGON: back to the slab; see objectPoolGiveBack.
++    objectPoolGiveBack(*objectPtr);
+ 
+     *objectPtr = nullptr;
+ }
+@@ -3751,7 +3877,8 @@
+         return -1;
+     }
+ 
+-    ObjectListNode* node = *nodePtr = (ObjectListNode*)internal_malloc(sizeof(*node));
++    // ARGON: from the slab; see objectNodePoolTake.
++    ObjectListNode* node = *nodePtr = objectNodePoolTake();
+     if (node == nullptr) {
+         return -1;
+     }
+@@ -3775,7 +3902,8 @@
+         return;
+     }
+ 
+-    internal_free(*nodePtr);
++    // ARGON: back to the slab; see objectNodePoolGiveBack.
++    objectNodePoolGiveBack(*nodePtr);
+ 
+     *nodePtr = nullptr;
+ }
