@@ -255,6 +255,7 @@ $py = "D:\Espressif\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe"
 | FatFs BPB subtype | `components/fatfs` + `tools/patch_fatfs_bpb.py` | ✅ FAT12/16/32 по BPB, не только по nclst |
 | Шелл | `src/shell/` | ✅ история, перенаправление, 47 команд в таблице (`k_commands[]` в `shell.c`; сеть и радио за `#if`) |
 | Загрузчик `.AXE` | `src/loader/`, `tools/mkaxe.py` | ✅ две части; R-1 flash XIP; HMAC в `reserved[6]` (`axesig`, `signaxe.py`) |
+| Магазин программ | `apps/store/`, `store/`, [`plans/app-store.md`](plans/app-store.md) | ✅ `STORE.AXE` (каталог, установка, подписи), сервер `store/` с сайтом, AGX1 по проводу и Wi-Fi-заказы; руководство — [`user/08-app-store.md`](user/08-app-store.md). Не развёрнут нигде, кроме `localhost`; Bluetooth-доставка написана, но в прошивку не влезает (нет 38 224 байт DRAM) |
 | Арена кода | `src/core/arena.c` | ✅ несколько образов в 64 КБ |
 | Модель процессов | `src/proc/proc.c` | ✅ до 4 процессов, арена, cwd, учёт ресурсов |
 | Потоки приложения | `src/proc/threads.c` | ✅ до 4 на процесс, мьютексы, семафоры, очереди |
