@@ -110,6 +110,7 @@ typedef struct {
     char webpass[64]; /* the page's password; empty means the page is open  */
     bool have_cfg;    /* a network has been configured                      */
     bool authed;      /* this phone has given the password (or none is set) */
+    bool panel;       /* the board's own screen is ours to draw on          */
 } kvm_t;
 
 /* The phone went away, for whatever reason; declared here because the picture
@@ -540,6 +541,69 @@ static void send_cfg_state(kvm_t *k)
 }
 
 /* ------------------------------------------------------------------------ */
+/* The board's own screen                                                   */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Paint the dongle's state onto its soldered panel, so it can be read without a
+ * phone: the name, the address once it is on the network, and whether it has
+ * been set up.  The panel is taken once (acquire suspends the console on it)
+ * and redrawn only when a line would change, so it is not fighting the picture
+ * for the SPI bus every tick.  A board with no panel - QEMU, a bare module -
+ * just skips it.
+ */
+static void kvm_screen(kvm_t *k)
+{
+    uint32_t   addr = 0;
+    char       ip[16] = "";
+    const bool ready = ag_net_is_ready() && ag_net_ifaddr(&addr) == AG_OK;
+    if (ready) {
+        (void)snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
+                       (unsigned)((addr >> 24) & 0xFFu),
+                       (unsigned)((addr >> 16) & 0xFFu),
+                       (unsigned)((addr >> 8) & 0xFFu),
+                       (unsigned)(addr & 0xFFu));
+    }
+
+    /* One line that stands for what is on the glass, so a redraw happens only
+     * on a real change. */
+    static char shown[48] = "\x01";
+    char        now[48];
+    (void)snprintf(now, sizeof(now), "%d|%s", k->have_cfg ? 1 : 0, ip);
+    if (strcmp(now, shown) == 0) {
+        return;
+    }
+
+    if (!k->panel) {
+        if (g_ag_api->gfx == NULL) {
+            return; /* a build with no display at all */
+        }
+        ag_gfxinfo_t gi;
+        if (ag_gfx_acquire(&gi) != AG_OK) {
+            return; /* no panel, or something else holds it */
+        }
+        k->panel = true;
+    }
+    strncpy(shown, now, sizeof(shown) - 1);
+    shown[sizeof(shown) - 1] = 0;
+
+    ag_gfx_clear(0x001018);
+    ag_gfx_text(10, 12, "ArgonOS  KVM", 0x33CCFF, AG_GFX_TRANS);
+    if (ready) {
+        char line[40];
+        (void)snprintf(line, sizeof(line), "http://%s/", ip);
+        ag_gfx_text(10, 44, line, 0x40FF80, AG_GFX_TRANS);
+        ag_gfx_text(10, 68, "open on the phone", 0x9AA5AD, AG_GFX_TRANS);
+    } else if (k->have_cfg) {
+        ag_gfx_text(10, 44, "joining Wi-Fi...", 0xFFC640, AG_GFX_TRANS);
+    } else {
+        ag_gfx_text(10, 44, "not set up yet", 0xFFC640, AG_GFX_TRANS);
+        ag_gfx_text(10, 68, "run the agent to set me up", 0x9AA5AD, AG_GFX_TRANS);
+    }
+    ag_gfx_flush(0, 0, 320, 240);
+}
+
+/* ------------------------------------------------------------------------ */
 /* HTTP                                                                     */
 /* ------------------------------------------------------------------------ */
 
@@ -933,6 +997,7 @@ int ag_main(int argc, char **argv)
         if ((int32_t)(ag_millis() - next_cfg) >= 0) {
             next_cfg = ag_millis() + 700u;
             send_cfg_state(&k);
+            kvm_screen(&k);
         }
 
         if (!busy) {
@@ -940,6 +1005,9 @@ int ag_main(int argc, char **argv)
         }
     }
 
+    if (k.panel) {
+        ag_gfx_release(); /* hand the glass back to the console */
+    }
     ws_drop(&k, "stopping");
     (void)ag_net_close(k.lfd);
     ag_free(k.mem);
