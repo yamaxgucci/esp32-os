@@ -54,6 +54,8 @@
 #include <argon/port/camera.h>
 #include <argon/port/usbd.h>
 #include <argon/port/flash.h>
+/* api->crypto: Ed25519 and the two hashes, from components/argon_crypto. */
+#include <argon/crypto.h>
 
 #include "console/uart_console.h"
 #include "dev/io.h"
@@ -1936,6 +1938,17 @@ static const ag_api_t k_api = {
     .usbd = &k_usbd,
 #else
     .usbd = NULL,
+#endif
+    /*
+     * The maths a signature needs, ABI 0.71.  One copy in flash for every image
+     * that checks one - the shop was carrying 11 KB of Monocypher of its own.
+     * A board that turns ARGON_ENABLE_CRYPTO off answers NULL, and the shop
+     * says "this firmware has no signature checking" rather than crashing.
+     */
+#if defined(CONFIG_ARGON_ENABLE_CRYPTO) && CONFIG_ARGON_ENABLE_CRYPTO
+    .crypto = &ag_crypto_api_impl,
+#else
+    .crypto = NULL,
 #endif
 };
 

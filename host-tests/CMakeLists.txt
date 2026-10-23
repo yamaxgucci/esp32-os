@@ -16,6 +16,16 @@ enable_testing()
 
 set(ARGON_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 
+# The kernel's crypto library (ABI 0.71): Ed25519 as RFC 8032, SHA-256 and
+# SHA-512 as FIPS 180-4.  It lives in the kernel so that an image does not have
+# to, and it builds for the host from the same sources, so the tests below sign
+# the standard's vectors with the maths that ships.
+set(ARGON_CRYPTO_SRCS
+    "${ARGON_ROOT}/components/argon_crypto/src/crypto.c"
+    "${ARGON_ROOT}/components/argon_crypto/src/sha256.c"
+    "${ARGON_ROOT}/components/argon_crypto/vendor/monocypher.c"
+    "${ARGON_ROOT}/components/argon_crypto/vendor/monocypher-ed25519.c")
+
 # Everything in the kernel that has no dependency on the chip.  These build for
 # the host and the target from the same sources.
 set(ARGON_PORTABLE_SRCS
@@ -188,13 +198,14 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/store/store_index.c"
     "${ARGON_ROOT}/apps/store/store_pick.c"
     "${ARGON_ROOT}/apps/store/store_db.c"
-    "${ARGON_ROOT}/apps/store/sha256.c"
     # The signatures: certificates, the AXS1 tail, the catalogue's AGS1.  The
-    # maths is Monocypher, vendored in apps/store/vendor.
+    # maths is the kernel's crypto library now (ABI 0.71): api_stub.c is the
+    # piece of a kernel that hands it to store_sig.c, so what is tested is the
+    # call an application makes rather than a shortcut around it.
+    api_stub.c
     test_store_sig.c
     "${ARGON_ROOT}/apps/store/store_sig.c"
-    "${ARGON_ROOT}/apps/store/vendor/monocypher.c"
-    "${ARGON_ROOT}/apps/store/vendor/monocypher-ed25519.c"
+    ${ARGON_CRYPTO_SRCS}
     # AGX1: the frames a program arrives in, checked against the same
     # vectors as the Python sender and the site.
     test_agx.c
@@ -213,6 +224,8 @@ target_include_directories(argon_tests BEFORE PRIVATE
     "${ARGON_ROOT}/tools/host_stub")
 target_include_directories(argon_tests PRIVATE
     "${ARGON_ROOT}/components/argon_kernel/src"
+    "${ARGON_ROOT}/components/argon_crypto/include"
+    "${ARGON_ROOT}/components/argon_crypto/vendor"
     "${ARGON_ROOT}/tools"
     "${ARGON_ROOT}/apps/common/agvm"
     ${ARGON_INCLUDES}
@@ -235,8 +248,8 @@ target_compile_definitions(argon_tests PRIVATE
 # keeps its own file list and its own flag rather than a blanket -w.
 if(NOT MSVC)
     set_source_files_properties(
-        "${ARGON_ROOT}/apps/store/vendor/monocypher.c"
-        "${ARGON_ROOT}/apps/store/vendor/monocypher-ed25519.c"
+        "${ARGON_ROOT}/components/argon_crypto/vendor/monocypher.c"
+        "${ARGON_ROOT}/components/argon_crypto/vendor/monocypher-ed25519.c"
         PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 
@@ -245,12 +258,13 @@ endif()
 # implementations of RFC 8032 agreeing on the same bytes is the evidence.
 add_executable(storeverify
     storeverify.c
+    api_stub.c
     "${ARGON_ROOT}/apps/store/store_sig.c"
-    "${ARGON_ROOT}/apps/store/sha256.c"
-    "${ARGON_ROOT}/apps/store/vendor/monocypher.c"
-    "${ARGON_ROOT}/apps/store/vendor/monocypher-ed25519.c")
+    ${ARGON_CRYPTO_SRCS})
 target_include_directories(storeverify PRIVATE
     "${ARGON_ROOT}/sdk/include"
+    "${ARGON_ROOT}/components/argon_crypto/include"
+    "${ARGON_ROOT}/components/argon_crypto/vendor"
     "${ARGON_ROOT}/apps/store")
 if(NOT MSVC)
     target_link_libraries(storeverify PRIVATE m)

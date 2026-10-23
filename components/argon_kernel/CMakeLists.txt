@@ -138,6 +138,10 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
     REQUIRES argon_abi argon_port
+    # api->crypto (ABI 0.71): Ed25519, SHA-256 and SHA-512, one copy in flash
+    # for every image that checks a signature.  It is a component of its own so
+    # a board with no room can leave it out - CONFIG_ARGON_ENABLE_CRYPTO.
+    PRIV_REQUIRES argon_crypto
     PRIV_REQUIRES esp_psram esp_timer esp_partition nvs_flash spi_flash
                   esp_system esp_hw_support esp_driver_uart log
                   fatfs wear_levelling vfs sdmmc esp_driver_sdmmc

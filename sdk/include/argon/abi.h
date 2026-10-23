@@ -501,7 +501,7 @@ extern "C" {
  *      absent, and api->net being NULL is how a caller learns that.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 70u
+#define AG_ABI_MINOR 71u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -3844,6 +3844,61 @@ typedef struct ag_store_api {
 } ag_store_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* ABI 0.71: the maths behind a signature                                     */
+/* ------------------------------------------------------------------------ */
+/*
+ * An application cannot have a crypto library: Monocypher is 46 KB of C, and
+ * an image has 64 KB of code for everything it does.  The shop was carrying
+ * its own copy - 11 KB of the 39 KB it spent - to check three Ed25519
+ * signatures.  So the maths lives in the kernel, once, and this table is how
+ * an image reaches it.
+ *
+ * The state structs are the caller's, not the kernel's: a signature is checked
+ * over a file that does not fit in a buffer, so the hash has to go in chunks,
+ * and the kernel keeps no per-application memory.  Their layout is the ABI -
+ * these types are the ones the kernel itself hashes with, so a mismatch is a
+ * compile error inside the kernel rather than a wrong digest at run time.
+ *
+ * NULL when the build set CONFIG_ARGON_ENABLE_CRYPTO=n (a board with no room),
+ * so a caller must probe: AG_HAS(ag_api()->crypto, ed25519_verify).  What is
+ * checked is RFC 8032 Ed25519, and the two hashes of FIPS 180-4.
+ */
+typedef struct {
+    uint32_t h[8];
+    uint64_t bytes;   /* total input, for the length padding                 */
+    uint8_t  buf[64];
+    uint32_t have;    /* bytes sitting in buf                                */
+} ag_sha256_t;
+
+typedef struct {
+    uint64_t hash[8];
+    uint64_t input[16];
+    uint64_t input_size[2];
+    size_t   input_idx;
+} ag_sha512_t;
+
+typedef struct ag_crypto_api {
+    uint32_t size;
+
+    void (*sha256_init)(ag_sha256_t *c);
+    void (*sha256_update)(ag_sha256_t *c, const void *data, size_t len);
+    void (*sha256_final)(ag_sha256_t *c, uint8_t out[32]);
+
+    void (*sha512_init)(ag_sha512_t *c);
+    void (*sha512_update)(ag_sha512_t *c, const void *data, size_t len);
+    void (*sha512_final)(ag_sha512_t *c, uint8_t out[64]);
+
+    /*
+     * True when `sig` is `pub`'s signature over the `len` bytes at `msg`.
+     * Written in the order a person says it - the signature, the message, the
+     * key - and not in Monocypher's (sig, pub, msg, len), which is the sort of
+     * thing that gets passed backwards exactly once.
+     */
+    bool (*ed25519_verify)(const uint8_t sig[64], const void *msg, size_t len,
+                           const uint8_t pub[32]);
+} ag_crypto_api_t;
+
+/* ------------------------------------------------------------------------ */
 
 typedef struct ag_api {
     uint32_t size;
@@ -3906,6 +3961,10 @@ typedef struct ag_api {
     /* ABI 0.55+: the board as a USB mass-storage device, on demand.  NULL
      * unless CONFIG_ARGON_USB_MSC (off by default) - probe with AG_HAS. */
     const ag_usbd_api_t *usbd;
+
+    /* ABI 0.71+: the maths a signature needs, in the kernel rather than in
+     * every image that checks one.  NULL unless CONFIG_ARGON_ENABLE_CRYPTO. */
+    const ag_crypto_api_t *crypto;
 } ag_api_t;
 /* ------------------------------------------------------------------------ */
 /* Executable image header                                                  */

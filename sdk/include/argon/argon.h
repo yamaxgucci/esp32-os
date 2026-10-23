@@ -1644,6 +1644,80 @@ static inline ag_err_t ag_usbd_status(ag_usbd_status_t *out)
     return g_ag_api->usbd->status(out);
 }
 
+/* ---- crypto (ABI 0.71) --------------------------------------------------- */
+/*
+ * Ed25519 (RFC 8032) and SHA-256/SHA-512 (FIPS 180-4), done by the kernel.
+ *
+ * An image cannot carry its own: Monocypher is 46 KB of C and an image has
+ * 64 KB of code for everything it does.  The shop used to keep a copy - 11 KB
+ * of its 39 KB - to check three signatures, and this is the same maths, once,
+ * for every program that needs it.
+ *
+ * The state is yours, so a hash can go over a file in chunks:
+ *
+ *     ag_sha512_t ctx;
+ *     ag_sha512_init(&ctx);
+ *     while (read(chunk)) { ag_sha512_update(&ctx, chunk, n); }
+ *     ag_sha512_final(&ctx, digest);
+ *
+ * A build with CONFIG_ARGON_ENABLE_CRYPTO=n has no table at all, so probe with
+ * ag_crypto_ready() and say so rather than computing with nothing.
+ */
+static inline bool ag_crypto_ready(void)
+{
+    return g_ag_api->crypto != NULL &&
+           AG_HAS(g_ag_api->crypto, ed25519_verify);
+}
+
+static inline void ag_sha256_init(ag_sha256_t *c)
+{
+    g_ag_api->crypto->sha256_init(c);
+}
+static inline void ag_sha256_update(ag_sha256_t *c, const void *data,
+                                    size_t len)
+{
+    g_ag_api->crypto->sha256_update(c, data, len);
+}
+static inline void ag_sha256_final(ag_sha256_t *c, uint8_t out[32])
+{
+    g_ag_api->crypto->sha256_final(c, out);
+}
+static inline void ag_sha256(const void *data, size_t len, uint8_t out[32])
+{
+    ag_sha256_t c;
+    ag_sha256_init(&c);
+    ag_sha256_update(&c, data, len);
+    ag_sha256_final(&c, out);
+}
+
+static inline void ag_sha512_init(ag_sha512_t *c)
+{
+    g_ag_api->crypto->sha512_init(c);
+}
+static inline void ag_sha512_update(ag_sha512_t *c, const void *data,
+                                    size_t len)
+{
+    g_ag_api->crypto->sha512_update(c, data, len);
+}
+static inline void ag_sha512_final(ag_sha512_t *c, uint8_t out[64])
+{
+    g_ag_api->crypto->sha512_final(c, out);
+}
+static inline void ag_sha512(const void *data, size_t len, uint8_t out[64])
+{
+    ag_sha512_t c;
+    ag_sha512_init(&c);
+    ag_sha512_update(&c, data, len);
+    ag_sha512_final(&c, out);
+}
+
+/* True when `sig` is `pub`'s signature over the len bytes at `msg`. */
+static inline bool ag_ed25519_verify(const uint8_t sig[64], const void *msg,
+                                     size_t len, const uint8_t pub[32])
+{
+    return g_ag_api->crypto->ed25519_verify(sig, msg, len, pub);
+}
+
 #ifdef __cplusplus
 }
 #endif
