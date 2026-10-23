@@ -131,6 +131,8 @@ add_executable(argon_tests
     main.c
     test_path.c
     test_cfg.c
+    test_appcfg.c
+    "${ARGON_ROOT}/components/argon_kernel/src/core/appcfg_text.c"
     test_place.c
     test_screen.c
     test_vtout.c

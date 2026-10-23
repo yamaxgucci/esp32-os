@@ -18,6 +18,9 @@
 #include <argon/cfg.h>
 #include <argon/journal.h>
 #include "core/sysconfig.h"
+/* api->cfg.app_*: the per-application settings file (C:\CFG\<APP>.CFG). */
+#include "core/appcfg.h"
+#include "proc/proc_internal.h"
 
 #include <argon/codepage.h>
 #include <argon/console.h>
@@ -1875,6 +1878,18 @@ static ag_err_t api_cfg_commit(void)
     return -AG_ENOTSUP;
 }
 
+/*
+ * An application's own settings, C:\CFG\<APP>.CFG - the facility itself is
+ * core/appcfg.c, which finds the name of the calling process from its image
+ * header.  Nothing here needs the pid: an application cannot name another's
+ * file, which is what makes this a place rather than a convention.
+ */
+static ag_err_t api_cfg_app_path(char *buf, size_t len)
+{
+    const proc_t *p = ag_proc_current();
+    return ag_appcfg_dos_path((p != NULL) ? p->name : "", buf, len);
+}
+
 static const ag_cfg_api_t k_cfg = {
     .size = sizeof(ag_cfg_api_t),
     .get_str = api_cfg_get_str,
@@ -1882,6 +1897,10 @@ static const ag_cfg_api_t k_cfg = {
     .get_bool = api_cfg_get_bool,
     .set_str = api_cfg_set_str,
     .commit = api_cfg_commit,
+    .app_get = ag_appcfg_get,
+    .app_get_int = ag_appcfg_get_int,
+    .app_set = ag_appcfg_set,
+    .app_path = api_cfg_app_path,
 };
 
 static const ag_api_t k_api = {

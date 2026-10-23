@@ -1718,6 +1718,60 @@ static inline bool ag_ed25519_verify(const uint8_t sig[64], const void *msg,
     return g_ag_api->crypto->ed25519_verify(sig, msg, len, pub);
 }
 
+/* ---- settings of this application (ABI 0.71) ----------------------------- */
+/*
+ * What this program must remember between runs, in `C:\CFG\<APP>.CFG` - one
+ * file per program, named from the program's own name, so no program can name
+ * another's and every program's settings are where a person would look.
+ *
+ * The format is the system's: `key = value`, comments with `;`.  A write
+ * rewrites the file through a temporary, so a power cut leaves the old settings
+ * rather than half of the new ones.
+ *
+ *     char dir[AG_PATH_MAX];
+ *     if (ag_setting_get("install.dir", dir, sizeof(dir)) != AG_OK) {
+ *         ag_strlcpy(dir, "C:\\APPS", sizeof(dir));
+ *         (void)ag_setting_set("install.dir", dir);
+ *     }
+ */
+static inline bool ag_settings_ready(void)
+{
+    return g_ag_api->cfg != NULL && AG_HAS(g_ag_api->cfg, app_set);
+}
+
+static inline ag_err_t ag_setting_get(const char *key, char *buf, size_t len)
+{
+    if (!ag_settings_ready()) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->cfg->app_get(key, buf, len);
+}
+
+static inline int32_t ag_setting_get_int(const char *key, int32_t def)
+{
+    if (!ag_settings_ready() || g_ag_api->cfg->app_get_int == NULL) {
+        return def;
+    }
+    return g_ag_api->cfg->app_get_int(key, def);
+}
+
+static inline ag_err_t ag_setting_set(const char *key, const char *value)
+{
+    if (!ag_settings_ready()) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->cfg->app_set(key, value);
+}
+
+/* Where those settings are, for a message a person can act on. */
+static inline ag_err_t ag_settings_path(char *buf, size_t len)
+{
+    if (!ag_settings_ready() || g_ag_api->cfg->app_path == NULL) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->cfg->app_path(buf, len);
+}
+
 #ifdef __cplusplus
 }
 #endif

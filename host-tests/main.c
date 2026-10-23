@@ -11,6 +11,7 @@ int ag_test_checks = 0;
 void run_rdcodec_tests(void);
 void run_path_tests(void);
 void run_cfg_tests(void);
+void run_appcfg_tests(void);
 void run_screen_tests(void);
 void run_vtout_tests(void);
 void run_vtin_tests(void);
@@ -59,6 +60,7 @@ int main(void)
     run_rdcodec_tests();
     run_path_tests();
     run_cfg_tests();
+    run_appcfg_tests();
     run_place_tests();
     run_screen_tests();
     run_vtout_tests();

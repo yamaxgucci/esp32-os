@@ -9,6 +9,9 @@ set(ARGON_KERNEL_SRCS
     "src/core/place_parse.c"
     "src/core/cmdline.c"
     "src/core/sysconfig.c"
+    # api->cfg.app_*: each application's own settings file.
+    "src/core/appcfg.c"
+    "src/core/appcfg_text.c"
     "src/core/nodename.c"
     "src/dev/devdefault.c"
     "src/core/journal.c"

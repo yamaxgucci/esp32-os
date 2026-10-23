@@ -2639,6 +2639,30 @@ typedef struct ag_cfg_api {
     bool (*get_bool)(const char *key, bool def);
     ag_err_t (*set_str)(const char *key, const char *value);
     ag_err_t (*commit)(void);
+
+    /*
+     * ABI 0.71: this application's OWN settings, in `C:\CFG\<APP>.CFG`.
+     *
+     * The system's file above is the board's - a network, a driver, a screen -
+     * and an application has no business writing it.  What an application does
+     * have is a handful of things it must remember between runs: where the shop
+     * keeps programs, which session it was paired with, whether the user likes
+     * green.  That lives in a file of its own, named from the application's own
+     * name in its image header, so the name is not an argument and one program
+     * cannot reach another's settings by asking for them.
+     *
+     * The format is SYSTEM.CFG's: `key = value`, `;` for comments.  A person may
+     * open it, and the shop's answer to "where do my programs go" is one line in
+     * it.  app_path() is there so a program can tell the user where to look.
+     *
+     * Nothing here is required to be fast - a settings read is a small file read
+     * and a write is a whole-file rewrite through a temporary - because the
+     * calls are rare by nature.
+     */
+    ag_err_t (*app_get)(const char *key, char *buf, size_t len);
+    int32_t (*app_get_int)(const char *key, int32_t def);
+    ag_err_t (*app_set)(const char *key, const char *value);
+    ag_err_t (*app_path)(char *buf, size_t len);
 } ag_cfg_api_t;
 
 /* ------------------------------------------------------------------------ */
