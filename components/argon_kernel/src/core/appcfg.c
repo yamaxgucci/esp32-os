@@ -172,8 +172,23 @@ ag_err_t ag_appcfg_set(const char *key, const char *value)
     (void)ag_vfs_close(h);
 
     /* Through a temporary, and renamed at the end: a power cut in the middle of
-     * a settings write leaves the old file, not half of the new one. */
-    const ag_err_t err = ag_vfs_rename(temp, path, NULL);
+     * a settings write leaves the old file, not half of the new one.
+     *
+     * A rename over a file that is already there is not what every backend
+     * does.  littlefs answers -AG_EEXIST rather than replacing the target, so
+     * the *first* write of a settings file worked and every later one failed:
+     * `install.dir` was remembered once and never changed again, and the shop
+     * printed "cannot remember that (already exists)" the second time it was
+     * asked.  Found on the S3-CAM on 23 Oct 2026 (the earlier warning in the
+     * same log, `/sys/CFG/STORE.CFG: -17`, was this from the very first
+     * `-web`).  So: replace, and only when the backend refuses to, remove the
+     * old file and try again - the window in which a power cut costs the file
+     * is the length of one syscall, and the common path keeps its atomicity. */
+    ag_err_t err = ag_vfs_rename(temp, path, NULL);
+    if (err == -AG_EEXIST) {
+        (void)ag_vfs_unlink(path, NULL);
+        err = ag_vfs_rename(temp, path, NULL);
+    }
     if (err != AG_OK) {
         (void)ag_vfs_unlink(temp, NULL);
         ag_log(AG_LOG_WARN, TAG, "%s: %d", path, (int)err);
