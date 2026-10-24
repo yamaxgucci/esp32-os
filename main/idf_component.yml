@@ -47,8 +47,10 @@ dependencies:
   # cannot find it, and the whole configure dies with `Missing required kconfig
   # option after retry` before a single file is compiled.  Found on 22 Oct 2026,
   # on the first build after this block came back from the KVM work.
-  # SOC_USB_OTG_SUPPORTED is an SoC capability and is always defined.
+  # Nor SOC_USB_OTG_SUPPORTED: a capability a chip lacks is not defined as
+  # false, it is not defined, and the classic ESP32 (the CYD) died the same way
+  # on 24 Oct 2026.  The target is always known.
   espressif/esp_tinyusb:
     version: "^2.2.1"
     rules:
-      - if: "$CONFIG{SOC_USB_OTG_SUPPORTED} == True"
+      - if: "target in [esp32s2, esp32s3, esp32p4]"
