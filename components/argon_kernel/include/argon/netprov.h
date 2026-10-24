@@ -41,6 +41,8 @@
  * kernel network client in place of ag_port_net_*. */
 ag_err_t ag_netprov_start(void);
 bool     ag_netprov_ready(void);
+/* Up, and with an address, or as ready as `ms` can make it. */
+bool     ag_netprov_bring_up(uint32_t ms);
 ag_err_t ag_netprov_ifaddr(uint32_t *addr);
 ag_err_t ag_netprov_resolve(const char *host, uint32_t *addr);
 

@@ -372,6 +372,10 @@ static ag_err_t api_http_request(const char *method, const char *url,
                                  uint32_t body_len, const char *dest,
                                  uint16_t *status)
 {
+    /* An application asking for a URL is asking for the network: see the note
+     * on `net_bring_up`.  Not fatal when it cannot be had - the request then
+     * fails the way it always did, with the caller's own message. */
+    (void)ag_netprov_bring_up(8000u);
     return ag_http_exchange(method, url, headers, body, body_len, dest, status);
 }
 
