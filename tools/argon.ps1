@@ -794,6 +794,16 @@ switch ($Command.ToLowerInvariant()) {
         exit $LASTEXITCODE
     }
 
+    'webtest' {
+        # The shop's site and a board in the emulator: found, connected by a
+        # person who answers the board's question, installed on - once over
+        # the board's own network and once over the console, the way a page
+        # with Web Serial carries it.  Not part of `check` either: it runs the
+        # shop and wants its ports.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'webtest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
     'rlinktest' {
         # The same network, but over an external radio: EXTRADIO.SYS bound with
         # `net use extradio`, talking RLINK to a fake coprocessor (rlinkd.py) on

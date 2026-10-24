@@ -212,6 +212,9 @@ add_executable(argon_tests
     # vectors as the Python sender and the site.
     test_agx.c
     "${ARGON_ROOT}/apps/store/agx.c"
+    # `store -web`: the hello the board MACs and the reply it reads.
+    test_store_web.c
+    "${ARGON_ROOT}/apps/store/store_web.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     test_rv32.c

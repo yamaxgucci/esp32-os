@@ -75,6 +75,7 @@ assets/pwd
 # in git.
 logs/*.log
 logs/*.txt
+logs/*.raw
 # the emulator harnesses' per-run folders: raw logs too
 logs/*/
 logs/SYSTEM-*.CFG
