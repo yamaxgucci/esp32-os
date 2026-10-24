@@ -4031,6 +4031,18 @@ enum ag_axe_flags {
      */
     AG_AXE_WANT_XIP = 1u << 7,
     /*
+     * Code from the PSRAM arena first, where this build has one.
+     *
+     * For a program that does not need internal SRAM's speed and does need it
+     * left whole for something else: the shop, whose `store -web` brings up a
+     * radio that wants one 30 KB block of internal RAM, measured short by
+     * exactly the shop's own 32 KB of code on the S3-CAM (24 Oct 2026).  Not
+     * flash (WANT_XIP): a run from flash costs a flash write and is slow.  When
+     * the PSRAM arena cannot take it the usual order applies.  An older loader
+     * ignores the bit and places the program as it always did.
+     */
+    AG_AXE_WANT_PSRAM = 1u << 9,
+    /*
      * ABI 0.53: this program can be moved to another node while it runs.
      *
      * It is a PROMISE, not a permission, and the system will not move anything

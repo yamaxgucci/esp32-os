@@ -910,6 +910,24 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
      * XIP from the appfs partition.  An image that asked for flash XIP goes
      * straight there, as it always did.
      */
+#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
+    /*
+     * A program that asked for PSRAM (AG_AXE_WANT_PSRAM) goes there before
+     * the board's order is consulted: it is saying it does not need internal
+     * SRAM's speed and does need it left alone.  If the arena cannot take it,
+     * the usual order below decides as if nothing had been asked.
+     */
+    if (!want_xip && !contiguous &&
+        (header->flags & AG_AXE_WANT_PSRAM) != 0 &&
+        (size_t)header->code.size <= AG_PSRAM_ARENA_BYTES && psram_ready() &&
+        ag_arena_largest_free(&s_psram, 16) >= (size_t)header->code.size &&
+        place_psram(header, out) == AG_OK) {
+        ag_place_note("app.code", AG_PLACE_PSRAM,
+                      (int32_t)out->place.code_capacity);
+        return AG_OK;
+    }
+#endif
+
     ag_place_kind_t kinds[AG_PLACE_KINDS];
     const unsigned  n = want_xip ? 0u : ag_place_order("app.code", kinds);
     bool            flash_allowed = want_xip;
