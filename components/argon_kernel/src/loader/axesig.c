@@ -351,18 +351,31 @@ ag_err_t ag_axe_sig_stream_feed(ag_axe_sig_stream_t *st, const uint8_t *bytes,
             p += take;
             left -= take;
         } else if (st->at < st->header) {
-            /* Inside `reserved`: the MAC has zeros here, the tag lives here. */
+            /*
+             * The tag's bytes: the MAC has exactly 24 zeros here and then jumps
+             * to `sizeof(header)`, skipping whatever else the header carries
+             * after `reserved` (the instruction-relocation fields, added
+             * later).  Feeding those bytes - or feeding more zeros than 24 -
+             * is a different MAC, which is what the first version of this did.
+             */
             size_t take = st->header - st->at;
             if (take > left) {
                 take = left;
             }
-            size_t zeros_left = take;
-            while (zeros_left > 0) {
-                const size_t n = (zeros_left > sizeof(zeros))
+            const size_t zeros_end = st->prefix + sizeof(zeros);
+            size_t zeros_take = 0;
+            if (st->at < zeros_end) {
+                zeros_take = zeros_end - st->at;
+                if (zeros_take > take) {
+                    zeros_take = take;
+                }
+            }
+            for (size_t done = 0; done < zeros_take;) {
+                const size_t n = ((zeros_take - done) > sizeof(zeros))
                                      ? sizeof(zeros)
-                                     : zeros_left;
+                                     : (zeros_take - done);
                 sha256_update(ctx, zeros, n);
-                zeros_left -= n;
+                done += n;
             }
             st->at += take;
             p += take;

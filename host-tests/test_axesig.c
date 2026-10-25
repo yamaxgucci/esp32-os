@@ -121,6 +121,76 @@ static void test_algo_zero_dirty(void)
     free(a.data);
 }
 
+/* The same image through both checks, with the tag inside `reserved`. */
+static ag_err_t sig_stream_of(const uint8_t *file, size_t size)
+{
+    ag_axe_sig_stream_t st;
+    const ag_axe_header_t *h = (const ag_axe_header_t *)file;
+    ag_err_t err = ag_axe_sig_stream_begin(&st, h, size);
+    if (err != AG_OK) {
+        return err;
+    }
+    /* Chunks that are not a divisor of anything: the boundaries between the
+     * header, the tag and the tail are where a stream goes wrong. */
+    static const size_t steps[] = {7, 1, 512, 13, 4096};
+    size_t at = 0;
+    size_t step = 0;
+    while (at < size) {
+        size_t want = steps[step++ % (sizeof(steps) / sizeof(steps[0]))];
+        if (want > size - at) {
+            want = size - at;
+        }
+        err = ag_axe_sig_stream_feed(&st, file + at, want);
+        if (err != AG_OK) {
+            return err;
+        }
+        at += want;
+    }
+    return ag_axe_sig_stream_finish(&st);
+}
+
+static void check_stream_agrees(uint8_t *data, size_t size)
+{
+    /* `size` may be short of the real file when a test truncates it, so the
+     * header's file length is taken from the caller. */
+    const ag_err_t whole = ag_axe_check_sig(data, size);
+    const ag_err_t stream = sig_stream_of(data, size);
+    AG_CHECK_INT(stream, whole);
+}
+
+static void test_stream_matches_whole(void)
+{
+    blob_t a = load_fixture("sample-nominal.axe");
+    if (a.size == 0) {
+        return;
+    }
+    AG_CHECK_INT(ag_axe_sign(a.data, a.size, AG_AXE_SIG_KEY_DEV), AG_OK);
+
+    /* Good image: both accept. */
+    check_stream_agrees(a.data, a.size);
+
+    /* A byte in the body. */
+    a.data[a.size / 2] ^= 0xFFu;
+    check_stream_agrees(a.data, a.size);
+    a.data[a.size / 2] ^= 0xFFu;
+
+    /* A byte inside the tag itself: the stream substitutes zeros there, so a
+     * changed tag has to fail the comparison and not the hash. */
+    ag_axe_header_t *h = (ag_axe_header_t *)a.data;
+    const uint8_t   keep = ((const uint8_t *)&h->reserved[2])[0];
+    ((uint8_t *)&h->reserved[2])[0] = (uint8_t)(keep ^ 0xFFu);
+    check_stream_agrees(a.data, a.size);
+    ((uint8_t *)&h->reserved[2])[0] = keep;
+
+    /* Truncated: the stream must notice it saw fewer bytes than the file has. */
+    if (a.size > sizeof(ag_axe_header_t) + 1u) {
+        /* One byte short is a file the MAC cannot match: any refusal is
+         * right, and the stream must not say AG_OK. */
+        AG_CHECK(sig_stream_of(a.data, a.size - 1u) != AG_OK);
+    }
+    free(a.data);
+}
+
 void run_axesig_tests(void)
 {
     printf("axesig\n");
@@ -130,4 +200,5 @@ void run_axesig_tests(void)
     test_bad_tag();
     test_unknown_algo();
     test_algo_zero_dirty();
+    test_stream_matches_whole();
 }
