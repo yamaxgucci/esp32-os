@@ -169,6 +169,16 @@ static bool entry_matches(const ag_cfg_entry_t *e, const char *section,
     return ag_path_icmp(e->key, key) == 0;
 }
 
+size_t ag_cfg_bytes(const ag_cfg_t *cfg, const char *dotted_key,
+                    size_t fallback)
+{
+    const int32_t n = ag_cfg_parse_size(ag_cfg_get(cfg, dotted_key, NULL), -1);
+    if (n < 1024 || n > 65536) {
+        return fallback; /* missing, or not a size a task stack can be */
+    }
+    return (size_t)n & ~(size_t)7u;
+}
+
 const char *ag_cfg_get(const ag_cfg_t *cfg, const char *dotted_key,
                        const char *fallback)
 {

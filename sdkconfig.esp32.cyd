@@ -31,9 +31,27 @@ CONFIG_BT_NIMBLE_GATT_SERVER=y
 # The network, with the smallest buffers that still talk: this board is a shop
 # terminal, not a downloader, and every kilobyte the radio takes is a kilobyte
 # its shop cannot have (24-25 Oct 2026).
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=2
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+#
+# The numbers here are the ones that matter, and they are not small by accident.
+# With the radio joined the byte-addressable heap was down to 10 KB free in
+# pieces of 9, and the shop application needs its data in one piece of 18980
+# bytes: `flash XIP needs 18980 data, heap has 372 free`.  Measured on the CYD,
+# 25 Oct 2026:
+#
+#   static rx buffers 20 x 1600 = 32 KB   -> 4 x 1600 = 6 KB
+#   lwIP tcp window    11520 B            -> 4096 B
+#   lwIP tcp send buf  11520 B            -> 4096 B
+#   lwIP sockets       12                 -> 8
+#
+# The window is the one that could matter to a customer: it is what the shop's
+# page has to fit in flight.  The catalog page is 4 KB and one image is 20 KB,
+# so a smaller window costs a few more round trips over the local network and
+# nothing else.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=2
+CONFIG_LWIP_TCP_WND_DEFAULT=4096
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=4096
+CONFIG_LWIP_MAX_SOCKETS=8
 
 # Bluetooth stays off here on purpose: the peripheral comes with the keyboard
 # host (esp_hid), and on the ESP32 that host needs Bluedroid's HID service -

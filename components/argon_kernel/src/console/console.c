@@ -3,6 +3,8 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
+#include "core/sysconfig.h"
+#include <argon/cfg.h>
 #include <argon/proc.h>
 #include <argon/console.h>
 #include <argon/input.h>
@@ -152,6 +154,7 @@ static ag_port_queue_t s_events;
 
 static ag_port_task_t       s_task;
 static ag_place_kind_t      s_task_kind;     /* where its stack is          */
+static uint32_t             s_task_bytes;    /* and how much was asked for  */
 static volatile bool        s_painter_stop;  /* asked to end, for a move    */
 static volatile bool        s_painter_gone;  /* and it has                  */
 static bool               s_ready;
@@ -1033,24 +1036,35 @@ ag_err_t ag_console_init(uint16_t cols, uint16_t rows)
      * meant to stay free for the application.  Its stack goes to PSRAM where
      * there is some (8 Oct 2026): it paints text, and nothing it does wants
      * internal memory held for the life of the board.
+     *
+     * [stacks] console cannot be in force yet - this runs in the console
+     * stage, three stages before any file is read - so the size asked for is
+     * the default and ag_console_place() asks again afterwards.
      */
-    if (!ag_place_task("console", console_task, "ag_con", AG_CON_STACK, NULL,
-                       10, 0, (void **)&s_task, &s_task_kind)) {
+    const size_t stack =
+        ag_cfg_bytes(ag_sysconfig(), "stacks.console", AG_CON_STACK);
+    if (!ag_place_task("console", console_task, "ag_con", stack, NULL, 10, 0,
+                       (void **)&s_task, &s_task_kind)) {
         s_ready = false;
         ag_place_free("console", mem);
         return -AG_ENOMEM;
     }
+    s_task_bytes = (uint32_t)stack;
 
     return AG_OK;
 }
 
 /*
  * After the configuration is read (ag_place_configure), the console moves to
- * where [memory] console says - it was made in the console stage, before any
- * file could be read, by the default.  The screens are copied under the lock;
- * the painter is asked to end between two paints and a new one is started
- * with its stack in the new place, never two at once (two painters hung the
- * CYD's console once, 29 Sep 2026).
+ * where [memory] console says and takes the stack [stacks] console asks for -
+ * it was made in the console stage, before any file could be read, by the
+ * default.  The screens are copied under the lock; the painter is asked to end
+ * between two paints and a new one is started with its stack in the new place,
+ * never two at once (two painters hung the CYD's console once, 29 Sep 2026).
+ *
+ * A size is the one thing here that is worth a restart on its own: a stack is
+ * handed out for the life of the task, and a board with a small heap has no
+ * other way to get the unused part of it back than a line in a file.
  */
 void ag_console_place(void)
 {
@@ -1058,6 +1072,8 @@ void ag_console_place(void)
         return;
     }
     const ag_place_kind_t want = ag_place_first("console");
+    const size_t stack =
+        ag_cfg_bytes(ag_sysconfig(), "stacks.console", AG_CON_STACK);
 
     ag_console_lock();
     for (int i = 0; i < CON_SCREENS; i++) {
@@ -1086,7 +1102,9 @@ void ag_console_place(void)
     }
     ag_console_unlock();
 
-    if (want == s_task_kind || want == AG_PLACE_NONE) {
+    const bool move = (want != s_task_kind && want != AG_PLACE_NONE);
+    const bool resize = ((uint32_t)stack != s_task_bytes);
+    if (!move && !resize) {
         return;
     }
     s_painter_gone = false;
@@ -1099,11 +1117,26 @@ void ag_console_place(void)
         ag_log(AG_LOG_WARN, "console", "the painter did not stop; it stays");
         return;
     }
-    if (!ag_place_task("console", console_task, "ag_con", AG_CON_STACK, NULL,
-                       10, 0, (void **)&s_task, &s_task_kind)) {
-        ag_log(AG_LOG_ERROR, "console", "no room for a new painter");
+    if (ag_place_task("console", console_task, "ag_con", stack, NULL, 10, 0,
+                      (void **)&s_task, &s_task_kind)) {
+        s_task_bytes = (uint32_t)stack;
         return;
     }
+    /*
+     * No painter at all is worse than a stack that is too big, so the size
+     * it had is the second attempt: `mem /t` will show the old one and the
+     * journal says why.
+     */
+    if (resize && ag_place_task("console", console_task, "ag_con",
+                                s_task_bytes, NULL, 10, 0, (void **)&s_task,
+                                &s_task_kind)) {
+        ag_log(AG_LOG_WARN, "console",
+               "no room for %u bytes of stack; the old size stays",
+               (unsigned)stack);
+        return;
+    }
+    ag_log(AG_LOG_ERROR, "console", "no room for a new painter");
+    return;
 }
 
 /*

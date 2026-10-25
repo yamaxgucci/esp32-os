@@ -16,6 +16,7 @@
 #include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/nodename.h>
+#include <argon/path.h>
 #include <argon/vfs.h>
 
 #include <argon/port/mem.h>
@@ -211,6 +212,30 @@ ag_err_t ag_sysconfig_init(void)
 
     /* What this node is called, before anything can be addressed by it. */
     (void)ag_node_name_init();
+
+    /*
+     * [stacks]: the sizes the kernel's own tasks ask for (argon/cfg.h).  Each
+     * one is read where its task is made, which is what makes a change a
+     * reboot and not a rebuild - and also what would make a misspelt key do
+     * nothing at all and say nothing, the same trap as a misspelt [memory]
+     * piece.  Named here, once, so the check is in one place.
+     */
+    static const char *const stack_keys[] = {"supervisor", "console", "link",
+                                             "shell"};
+    for (uint16_t e = 0; e < s_cfg.count; e++) {
+        const ag_cfg_entry_t *en = &s_cfg.entries[e];
+        if (ag_path_icmp(en->section, "stacks") != 0) {
+            continue;
+        }
+        bool known = false;
+        for (size_t k = 0; k < sizeof(stack_keys) / sizeof(stack_keys[0]); k++) {
+            known = known || ag_path_icmp(en->key, stack_keys[k]) == 0;
+        }
+        if (!known) {
+            ag_log(AG_LOG_WARN, "config", "[stacks] %s: no task of that name",
+                   en->key);
+        }
+    }
 
     /*
      * The code page is applied here rather than in the console stage, which runs

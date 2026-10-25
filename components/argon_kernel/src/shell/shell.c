@@ -2419,102 +2419,231 @@ static int hex_digit(char c)
 /*
  * Rewrites one section of SYSTEM.CFG, keeping the rest as it stands.
  *
- * The two buffers come from the heap, and that is a fix rather than a taste.
- * As stack arrays they were four kilobytes each in a task with twelve, and the
- * shell reaches this function several frames deep: `wifi connect` remembers the
- * network here, and remembering it overflowed the stack of the task the shell
- * runs in.
+ * Line by line, into a temporary file, which is then renamed over the original.
+ * It used to read the whole file into four kilobytes of heap and write the
+ * result from a second four, and that put a ceiling on a file which is
+ * documentation as much as configuration: the CYD's SYSTEM.CFG is 5.4 KB of
+ * comments around a dozen settings, and what `wifi connect` said there was
  *
- * What that looked like from outside was a board that restarts when a Wi-Fi
- * password is typed - so the password was the suspect, then the memory the radio
- * takes, and neither had anything to do with it.  What said otherwise was one
- * line the chip prints and nobody had been reading:
+ *     SYSTEM.CFG: -28 (joining anyway)
  *
- *     ***ERROR*** A stack overflow in task main has been detected.
+ * - the board could not remember its own network, because of a buffer size.  It
+ * also truncated the file before writing the replacement, so a failure part-way
+ * lost the configuration instead of leaving it as it was.
  *
- * Rewriting a configuration file happens when somebody types a command, so a
- * heap allocation and a free cost nothing that matters, and eight kilobytes of
- * stack in a twelve kilobyte task was never going to be safe for long.
+ * Streaming costs no memory beyond one line, and the rename is what makes a
+ * half-written file invisible: either the old file is there or the new one is.
+ * (The four kilobyte heap buffers were themselves a fix, and stay in the
+ * story: as stack arrays they were eight kilobytes in a twelve kilobyte task,
+ * and `wifi connect` overflowed it - a board that restarts when a password is
+ * typed.  A line at a time answers both.)
  */
-static ag_err_t cfg_replace_section(const char *section, const char *body)
+#define CFG_TMP_PATH "/sys/SYSTEM.NEW"
+#define CFG_BAK_PATH "/sys/SYSTEM.OLD"
+
+/* Writes all of `n` bytes, or why not. */
+static ag_err_t cfg_write_all(ag_handle_t h, const char *text, size_t n)
 {
-    size_t      used = 0;
-    size_t      len = 0;
-
-    char *const text = (char *)ag_port_alloc(DRV_CFG_MAX * 2u,
-                                             AG_MEM_FAST | AG_MEM_BYTE);
-    if (text == NULL) {
-        return -AG_ENOMEM;
+    size_t off = 0;
+    while (off < n) {
+        const int32_t w = ag_vfs_write(h, text + off, n - off);
+        if (w <= 0) {
+            return (w < 0) ? (ag_err_t)w : -AG_ENOSPC;
+        }
+        off += (size_t)w;
     }
-    char *const out = text + DRV_CFG_MAX;
-
-    ag_handle_t h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
-
-    if (h >= 0) {
-        const int32_t n = ag_vfs_read(h, text, DRV_CFG_MAX - 1u);
-        ag_vfs_close(h);
-        if (n < 0) {
-            ag_port_free(text);
-            return (ag_err_t)n;
-        }
-        used = (size_t)n;
-    }
-    text[used] = '\0';
-
-    const size_t seclen = strlen(section);
-    bool         drop = false;
-    const char  *p = text;
-    while (p < text + used) {
-        const char  *eol = strchr(p, '\n');
-        const size_t line = (eol != NULL) ? (size_t)(eol - p) + 1u
-                                          : (size_t)(text + used - p);
-        const char  *s = p;
-        while (*s == ' ' || *s == '\t') {
-            s++;
-        }
-        if (*s == '[') {
-            const char *close = strchr(s, ']');
-            drop = (close != NULL) && ((size_t)(close - s) == seclen + 1u) &&
-                   (ag_path_icmpn_local(s + 1, section, seclen) == 0);
-        }
-        if (!drop) {
-            if (len + line >= DRV_CFG_MAX) {
-                ag_port_free(text);
-                return -AG_ENOSPC;
-            }
-            memcpy(out + len, p, line);
-            len += line;
-        }
-        if (eol == NULL) {
-            break;
-        }
-        p = eol + 1;
-    }
-
-    if (body != NULL && body[0] != '\0') {
-        if (len > 0 && out[len - 1u] != '\n') {
-            out[len++] = '\n';
-        }
-        const int n = snprintf(out + len, DRV_CFG_MAX - len, "[%s]\n%s",
-                               section, body);
-        if (n < 0 || (size_t)n >= DRV_CFG_MAX - len) {
-            ag_port_free(text);
-            return -AG_ENOSPC;
-        }
-        len += (size_t)n;
-    }
-
-    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
-    if (h < 0) {
-        ag_port_free(text);
-        return (ag_err_t)h;
-    }
-    const int32_t w = ag_vfs_write(h, out, len);
-    (void)ag_vfs_close(h);
-    ag_port_free(text);
-    return (w < 0) ? (ag_err_t)w : AG_OK;
+    return AG_OK;
 }
 
+/* Whether this line opens any section at all. */
+static bool cfg_line_starts_section(const char *line, size_t len)
+{
+    size_t i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    return i < len && line[i] == '[';
+}
+
+/* Whether this line opens `section` - the header this write replaces. */
+static bool cfg_line_is_section(const char *line, size_t len,
+                                const char *section, size_t seclen)
+{
+    size_t i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    if (i >= len || line[i] != '[') {
+        return false;
+    }
+    const char *close = (const char *)memchr(line + i, ']', len - i);
+    return close != NULL && (size_t)(close - (line + i)) == seclen + 1u &&
+           ag_path_icmpn_local(line + i + 1u, section, seclen) == 0;
+}
+
+static ag_err_t cfg_emit_section(ag_handle_t out, const char *section,
+                                 const char *body)
+{
+    if (body == NULL || body[0] == '\0') {
+        return AG_OK; /* nothing to add, and an empty header is noise */
+    }
+    char head[64];
+    const int n = snprintf(head, sizeof(head), "\n[%s]\n", section);
+    if (n <= 0 || (size_t)n >= sizeof(head)) {
+        return -AG_EINVAL;
+    }
+    ag_err_t err = cfg_write_all(out, head, (size_t)n);
+    if (err == AG_OK) {
+        err = cfg_write_all(out, body, strlen(body));
+    }
+    return err;
+}
+
+/* What the copy of the file is doing, from one line to the next. */
+typedef struct {
+    ag_handle_t out;
+    const char *section;
+    size_t      seclen;
+    const char *body;
+    bool        drop;    /* inside the section being replaced */
+    bool        written; /* the new section has been written        */
+} cfg_rw_t;
+
+/*
+ * One complete line, newline included on the way out.  `cut` says the line was
+ * longer than the buffer, so it cannot be a section header - it goes through as
+ * it is, in as many pieces as it takes, and nothing is dropped.
+ */
+static ag_err_t cfg_rw_line(cfg_rw_t *rw, const char *line, size_t len, bool cut)
+{
+    const bool header = !cut && cfg_line_starts_section(line, len);
+    if (header && cfg_line_is_section(line, len, rw->section, rw->seclen)) {
+        rw->drop = true;
+        if (!rw->written) {
+            const ag_err_t err =
+                cfg_emit_section(rw->out, rw->section, rw->body);
+            if (err != AG_OK) {
+                return err;
+            }
+            rw->written = true;
+        }
+        return AG_OK;
+    }
+    if (header) {
+        rw->drop = false; /* the section being replaced ended here */
+    }
+    if (rw->drop) {
+        return AG_OK;
+    }
+    ag_err_t err = cfg_write_all(rw->out, line, len);
+    if (err == AG_OK) {
+        err = cfg_write_all(rw->out, "\n", 1);
+    }
+    return err;
+}
+
+static ag_err_t cfg_replace_section(const char *section, const char *body)
+{
+    /* A leftover from a write that did not finish - this one or an older one. */
+    (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+
+    const ag_handle_t in = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
+    const ag_handle_t out =
+        ag_vfs_open(CFG_TMP_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (out < 0) {
+        if (in >= 0) {
+            (void)ag_vfs_close(in);
+        }
+        return (ag_err_t)out;
+    }
+
+    cfg_rw_t rw = {.out = out, .section = section, .seclen = strlen(section),
+                   .body = body};
+    char     line[256];
+    size_t   len = 0;
+    bool     cut = false;
+    ag_err_t err = AG_OK;
+
+    while (in >= 0) {
+        char          chunk[128];
+        const int32_t n = ag_vfs_read(in, chunk, sizeof(chunk));
+        if (n < 0) {
+            err = (ag_err_t)n;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        for (int32_t i = 0; i < n && err == AG_OK; i++) {
+            const char c = chunk[i];
+            if (c == '\r') {
+                continue; /* the file is written back with plain newlines */
+            }
+            if (c != '\n') {
+                if (len + 1u >= sizeof(line)) {
+                    /* Longer than a section header can be: out it goes, and
+                     * the rest of the line follows as more of the same. */
+                    err = cfg_rw_line(&rw, line, len, true);
+                    len = 0;
+                    cut = true;
+                }
+                if (err == AG_OK) {
+                    line[len++] = c;
+                }
+                continue;
+            }
+            err = cfg_rw_line(&rw, line, len, cut);
+            len = 0;
+            cut = false;
+        }
+        if (err != AG_OK) {
+            break;
+        }
+    }
+
+    if (err == AG_OK && len > 0) { /* a last line with no newline after it */
+        err = cfg_rw_line(&rw, line, len, cut);
+    }
+    if (err == AG_OK && !rw.written) {
+        err = cfg_emit_section(out, section, body); /* a section that was absent */
+    }
+    if (in >= 0) {
+        (void)ag_vfs_close(in);
+    }
+    const ag_err_t cerr = ag_vfs_close(out);
+    if (err == AG_OK) {
+        err = cerr;
+    }
+    if (err != AG_OK) {
+        (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+        return err;
+    }
+
+    /*
+     * The old file becomes the backup for as long as it takes the new one to
+     * take its name, and is deleted only once that worked.  Two renames rather
+     * than an unlink and a rename, because a board that loses its file loses
+     * everything it was told - the network it joins, the drivers it loads.
+     */
+    (void)ag_vfs_unlink(CFG_BAK_PATH, NULL);
+    if (ag_vfs_rename(DRV_CFG_PATH, CFG_BAK_PATH, NULL) == AG_OK) {
+        err = ag_vfs_rename(CFG_TMP_PATH, DRV_CFG_PATH, NULL);
+        if (err == AG_OK) {
+            (void)ag_vfs_unlink(CFG_BAK_PATH, NULL);
+        } else {
+            (void)ag_vfs_rename(CFG_BAK_PATH, DRV_CFG_PATH, NULL);
+            (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+        }
+        return err;
+    }
+    /* No rename on this filesystem: replace it in place, as it used to. */
+    (void)ag_vfs_unlink(DRV_CFG_PATH, NULL);
+    err = ag_vfs_rename(CFG_TMP_PATH, DRV_CFG_PATH, NULL);
+    if (err != AG_OK) {
+        (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+    }
+    return err;
+}
 #endif /* ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID || CONFIG_ARGON_NET_SSH */
 
 #if ARGON_SHELL_HAS_WIFI

@@ -454,10 +454,23 @@ void ag_kernel_main(void)
      * goes through the port's relay (flashop_hw.c): copy and dir slower by a
      * sixth and a half, measured on the S3-Zero (9 Oct 2026), which a prompt
      * can afford.  Otherwise it stays where it is.
+     *
+     * [stacks] shell (argon/cfg.h) says how big that task's stack should be,
+     * and a number there is reason enough to move even where the stack stays
+     * internal.  ESP-IDF makes the main task with CONFIG_ESP_MAIN_TASK_STACK_SIZE
+     * before any of this runs, and its stack is the biggest thing `mem /t`
+     * reports as unused - 12 KB of which the prompt touches five - but a size
+     * fixed at build time is memory a board with a small heap cannot get back.
+     * Returning from here hands the whole of it to the heap; the prompt goes on
+     * in a task the file sized, and what that costs is a reboot.
      */
-    if (ag_place_first("shell.stack") == AG_PLACE_PSRAM &&
-        ag_place_task("shell.stack", shell_task, "shell", AG_SHELL_STACK,
-                      NULL, AG_SHELL_PRIORITY, 0, NULL, NULL)) {
+    size_t shell_stack = ag_cfg_bytes(ag_sysconfig(), "stacks.shell", 0);
+    if (shell_stack == 0 && ag_place_first("shell.stack") == AG_PLACE_PSRAM) {
+        shell_stack = AG_SHELL_STACK; /* where it goes was asked for, not how big */
+    }
+    if (shell_stack > 0 &&
+        ag_place_task("shell.stack", shell_task, "shell", shell_stack, NULL,
+                      AG_SHELL_PRIORITY, 0, NULL, NULL)) {
         return;
     }
     ag_place_adopt("shell.stack", (void *)ag_port_task_self());

@@ -749,12 +749,19 @@ ag_err_t ag_uartlink_open(int port, uint32_t baud, uint32_t frame,
 
     const int core = (int)ag_sysinfo()->app_core;
     /* [memory] link.tasks: internal first by default - these two carry the
-     * wire's every frame. */
+     * wire's every frame.
+     *
+     * [stacks] link: the same two are mostly waiting, and `mem /t` on a CYD
+     * showed four kilobytes of eleven hundred used between them.  The default
+     * does not change; a board that wants the memory back says so in its
+     * configuration, and changing it is a reboot rather than a rebuild. */
+    const size_t link_stack =
+        ag_cfg_bytes(ag_sysconfig(), "stacks.link", UL_STACK);
     const bool ok_rx = ag_place_task("link.tasks", rx_task, "uartlink",
-                                     UL_STACK, u, UL_PRIO, core,
+                                     link_stack, u, UL_PRIO, core,
                                      (void **)&u->rx_task, NULL);
     const bool ok_tx = ok_rx && ag_place_task("link.tasks", tx_task, "uartltx",
-                                              UL_STACK, u, UL_PRIO, core,
+                                              link_stack, u, UL_PRIO, core,
                                               (void **)&u->tx_task, NULL);
     if (!ok_tx) {
         u->stop = true;
