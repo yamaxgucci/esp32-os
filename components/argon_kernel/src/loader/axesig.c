@@ -248,6 +248,166 @@ bool ag_axe_is_signed(const ag_axe_header_t *h)
     return h != NULL && !reserved_is_unsigned(h);
 }
 
+/* ---------------------------------------------------------------------- */
+/* The same check, one chunk at a time                                     */
+/* ---------------------------------------------------------------------- */
+
+_Static_assert(sizeof(sha256_ctx_t) <= sizeof(((ag_axe_sig_stream_t *)0)->state),
+               "the streaming state must hold a hash context");
+
+static sha256_ctx_t *stream_ctx(ag_axe_sig_stream_t *st)
+{
+    return (sha256_ctx_t *)(void *)st->state;
+}
+
+/* ipad/opad for this key, the same bytes hmac_axe_image builds. */
+static void stream_pads(uint32_t key_id, uint8_t ipad[64], uint8_t opad[64])
+{
+    size_t         key_len = 0;
+    const uint8_t *key = key_for(key_id, &key_len);
+    uint8_t        k0[64];
+    memset(k0, 0, sizeof(k0));
+    if (key != NULL) {
+        if (key_len > 64u) {
+            sha256_ctx_t t;
+            sha256_init(&t);
+            sha256_update(&t, key, key_len);
+            sha256_final(&t, k0);
+        } else {
+            memcpy(k0, key, key_len);
+        }
+    }
+    for (int i = 0; i < 64; i++) {
+        ipad[i] = (uint8_t)(k0[i] ^ 0x36u);
+        opad[i] = (uint8_t)(k0[i] ^ 0x5cu);
+    }
+}
+
+ag_err_t ag_axe_sig_stream_begin(ag_axe_sig_stream_t *st,
+                                 const ag_axe_header_t *h, size_t file_bytes)
+{
+    if (st == NULL || h == NULL || file_bytes < sizeof(ag_axe_header_t)) {
+        return -AG_EFORMAT;
+    }
+    memset(st, 0, sizeof(*st));
+    st->file_bytes = file_bytes;
+    st->prefix = offsetof(ag_axe_header_t, reserved);
+    st->header = sizeof(ag_axe_header_t);
+
+    if (reserved_is_unsigned(h)) {
+        st->unsigned_image = true;
+        return AG_OK;
+    }
+    if (h->reserved[0] == AG_AXE_SIG_ALGO_NONE) {
+        return -AG_EFORMAT;
+    }
+    if (h->reserved[0] != AG_AXE_SIG_ALGO_HMAC_SHA256_128) {
+        return -AG_ENOTSUP;
+    }
+    size_t         key_len = 0;
+    const uint8_t *key = key_for(h->reserved[1], &key_len);
+    if (key == NULL) {
+        return -AG_ENOENT;
+    }
+    st->key_id = h->reserved[1];
+    memcpy(st->tag, &h->reserved[2], AG_AXE_SIG_TAG_LEN);
+
+    uint8_t ipad[64];
+    uint8_t opad[64];
+    stream_pads(st->key_id, ipad, opad);
+    (void)opad;
+    sha256_init(stream_ctx(st));
+    sha256_update(stream_ctx(st), ipad, 64);
+    st->started = true;
+    return AG_OK;
+}
+
+ag_err_t ag_axe_sig_stream_feed(ag_axe_sig_stream_t *st, const uint8_t *bytes,
+                                size_t len)
+{
+    static const uint8_t zeros[24] = {0};
+    if (st == NULL || bytes == NULL) {
+        return -AG_EINVAL;
+    }
+    if (!st->started || st->unsigned_image) {
+        st->at += len;
+        return AG_OK;
+    }
+    if (st->at + len > st->file_bytes) {
+        return -AG_EFORMAT;
+    }
+
+    sha256_ctx_t *ctx = stream_ctx(st);
+    size_t        left = len;
+    const uint8_t *p = bytes;
+    while (left > 0) {
+        if (st->at < st->prefix) {
+            size_t take = st->prefix - st->at;
+            if (take > left) {
+                take = left;
+            }
+            sha256_update(ctx, p, take);
+            st->at += take;
+            p += take;
+            left -= take;
+        } else if (st->at < st->header) {
+            /* Inside `reserved`: the MAC has zeros here, the tag lives here. */
+            size_t take = st->header - st->at;
+            if (take > left) {
+                take = left;
+            }
+            size_t zeros_left = take;
+            while (zeros_left > 0) {
+                const size_t n = (zeros_left > sizeof(zeros))
+                                     ? sizeof(zeros)
+                                     : zeros_left;
+                sha256_update(ctx, zeros, n);
+                zeros_left -= n;
+            }
+            st->at += take;
+            p += take;
+            left -= take;
+        } else {
+            sha256_update(ctx, p, left);
+            st->at += left;
+            left = 0;
+        }
+    }
+    return AG_OK;
+}
+
+ag_err_t ag_axe_sig_stream_finish(ag_axe_sig_stream_t *st)
+{
+    if (st == NULL) {
+        return -AG_EINVAL;
+    }
+    if (!st->started || st->unsigned_image) {
+        return AG_OK;
+    }
+    if (st->at != st->file_bytes) {
+        return -AG_EFORMAT;
+    }
+
+    sha256_ctx_t *ctx = stream_ctx(st);
+    uint8_t       inner[32];
+    uint8_t       mac[32];
+    sha256_final(ctx, inner);
+
+    uint8_t ipad[64];
+    uint8_t opad[64];
+    stream_pads(st->key_id, ipad, opad);
+    (void)ipad;
+    sha256_init(ctx);
+    sha256_update(ctx, opad, 64);
+    sha256_update(ctx, inner, 32);
+    sha256_final(ctx, mac);
+
+    if (!tag_equal(st->tag, mac, AG_AXE_SIG_TAG_LEN)) {
+        return -AG_EPERM;
+    }
+    return AG_OK;
+}
+
 ag_err_t ag_axe_check_sig(const void *file, size_t file_bytes)
 {
     if (file == NULL) {

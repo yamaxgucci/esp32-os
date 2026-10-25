@@ -42,3 +42,6 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
 # port without the keyboard host, not a line in this file.
 CONFIG_ARGON_ENABLE_BLE=n
 CONFIG_BT_ENABLED=n
+# The shop's code never fits an arena this board can afford, so it always runs
+# from flash: the eight kilobytes are better spent on the heap.
+CONFIG_ARGON_APP_ARENA_KB=4

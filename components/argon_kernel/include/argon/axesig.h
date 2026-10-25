@@ -43,6 +43,39 @@ ag_err_t ag_axe_check_sig(const void *file, size_t file_bytes);
 bool ag_axe_is_signed(const ag_axe_header_t *h);
 
 /*
+ * The same check, fed a chunk at a time.
+ *
+ * One pass, in file order, from offset 0 to the end: an image can be verified
+ * while it is being read, so the memory a signed image needs is a chunk and not
+ * a file.  `begin` decides whether there is anything to check at all; an
+ * unsigned image answers AG_OK and every later call is a no-op.
+ */
+typedef struct {
+    uint8_t state[176]; /* the hash context; its size is checked in axesig.c */
+    uint8_t mac[32];
+    uint8_t tag[AG_AXE_SIG_TAG_LEN];
+    size_t  at;       /* bytes of the image fed so far */
+    size_t  file_bytes;
+    size_t  prefix;   /* offsetof(ag_axe_header_t, reserved) */
+    size_t  header;   /* sizeof(ag_axe_header_t) */
+    uint32_t key_id;
+    bool    started;
+    bool    unsigned_image;
+} ag_axe_sig_stream_t;
+
+ag_err_t ag_axe_sig_stream_begin(ag_axe_sig_stream_t *st,
+                                 const ag_axe_header_t *h, size_t file_bytes);
+
+/* Sequential: the next `len` bytes of the image, starting at what was fed
+ * before.  Anything that falls inside `reserved` is counted but not used - the
+ * MAC has zeros there. */
+ag_err_t ag_axe_sig_stream_feed(ag_axe_sig_stream_t *st, const uint8_t *bytes,
+                                size_t len);
+
+/* The tag, against what has been fed.  AG_OK when the image is whole. */
+ag_err_t ag_axe_sig_stream_finish(ag_axe_sig_stream_t *st);
+
+/*
  * Writes algo/key_id/tag into the file's reserved field (mutates in place).
  * Used by host tests; host tooling signs with tools/signaxe.py.
  */

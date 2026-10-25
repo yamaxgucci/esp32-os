@@ -14,6 +14,8 @@
 
 #include <argon/arena.h>
 #include <argon/axesig.h>
+#include <argon/cfg.h>
+#include "core/sysconfig.h"
 #include <argon/log.h>
 #include <argon/module.h>
 #include <argon/proc.h>
@@ -1444,6 +1446,84 @@ const char *ag_loader_why(ag_err_t err)
     }
 }
 
+/* ---------------------------------------------------------------------- */
+/* Which way to read an image                                              */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * [loader] path = auto | streamed | whole   (SYSTEM.CFG; auto when unset)
+ *
+ * This used to be decided by whether the image was signed, because the MAC
+ * covers every byte and the older code held the whole file to hash it - so a
+ * signature cost a buffer the size of the image.  It no longer has to
+ * (axesig.c verifies as it reads), and the choice belongs to the board's
+ * memory, which is what the settings are for.
+ */
+#define LOADER_AUTO 0
+#define LOADER_STREAMED 1
+#define LOADER_WHOLE 2
+
+static int loader_path_mode(void)
+{
+    const char *const what = ag_cfg_get(ag_sysconfig(), "loader.path", "auto");
+    if (what == NULL) {
+        return LOADER_AUTO;
+    }
+    if (strcmp(what, "streamed") == 0 || strcmp(what, "stream") == 0) {
+        return LOADER_STREAMED;
+    }
+    if (strcmp(what, "whole") == 0) {
+        return LOADER_WHOLE;
+    }
+    return LOADER_AUTO;
+}
+
+/* Whether the whole image can be held with room to breathe: the file, its data
+ * (already counted in the file) and the scratch a flash-XIP image needs, which
+ * is the code part again. */
+static bool whole_path_fits(const ag_axe_header_t *header, size_t file_bytes)
+{
+    const size_t scratch = ((header->flags & AG_AXE_CONTIGUOUS) != 0)
+                               ? 0u
+                               : header->code.size;
+    const size_t need = file_bytes + scratch;
+    return ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE) >= need;
+}
+
+/* Feeds the file through the MAC in 512-byte bites.  No buffer the size of the
+ * image, which is the whole point. */
+static ag_err_t check_signature_streamed(ag_handle_t h,
+                                         const ag_axe_header_t *header,
+                                         size_t file_bytes)
+{
+    if (!ag_axe_is_signed(header)) {
+        return AG_OK;
+    }
+    ag_axe_sig_stream_t sig;
+    ag_err_t err = ag_axe_sig_stream_begin(&sig, header, file_bytes);
+    if (err != AG_OK) {
+        return err;
+    }
+    uint8_t chunk[512];
+    size_t  at = 0;
+    while (at < file_bytes) {
+        size_t want = file_bytes - at;
+        if (want > sizeof(chunk)) {
+            want = sizeof(chunk);
+        }
+        err = read_at(h, (uint32_t)at, chunk, want);
+        if (err != AG_OK) {
+            return err;
+        }
+        err = ag_axe_sig_stream_feed(&sig, chunk, want);
+        if (err != AG_OK) {
+            return err;
+        }
+        at += want;
+    }
+    return ag_axe_sig_stream_finish(&sig);
+}
+
 ag_err_t ag_loader_load(const char *path, const char *cwd,
                         ag_loaded_app_t *out)
 {
@@ -1478,11 +1558,23 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
         return err;
     }
 
-    if (ag_axe_is_signed(&header)) {
+    const int mode = loader_path_mode();
+    const bool whole = (mode == LOADER_WHOLE) ||
+                       (mode == LOADER_AUTO &&
+                        whole_path_fits(&header, (size_t)size));
+    if (whole) {
         ag_vfs_close(h);
         err = load_whole(path, cwd, &header, out);
     } else {
-        err = load_streamed(h, &header, out);
+        /* Signed or not, the image is verified as it is read; the MAC does not
+         * need the file, only its bytes in order. */
+        err = check_signature_streamed(h, &header, (size_t)size);
+        if (err == AG_OK) {
+            err = load_streamed(h, &header, out);
+        } else {
+            ag_log(AG_LOG_ERROR, "loader", "%s: bad signature (%d)", path,
+                   (int)err);
+        }
         ag_vfs_close(h);
     }
     if (err != AG_OK) {
