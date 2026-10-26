@@ -1478,15 +1478,26 @@ static int loader_path_mode(void)
     return LOADER_AUTO;
 }
 
-/* Whether the whole image can be held with room to breathe: the file, its data
- * (already counted in the file) and the scratch a flash-XIP image needs, which
- * is the code part again. */
+/*
+ * Whether the whole image can be held with room to breathe.  Three blocks are
+ * alive at once on that path - the file, the scratch a flash-XIP image is
+ * relocated in (the code part again), and the data part with its bss - and
+ * the data is NOT in the file's count: bss is not stored.  Asked of the largest
+ * piece, because three blocks out of a heap that has the sum only in pieces do
+ * not fit.
+ *
+ * It used to count the file and the scratch only: the CYD had 86 016 bytes in
+ * one piece against 80 KB, chose the whole path, read 46 KB, and then had
+ * 41 KB left for 34 KB of scratch and 19 KB of data - `store -web` refused with
+ * -12 on a board with 102 KB free (26 Oct 2026).  Streaming would have needed
+ * the data and half a kilobyte.
+ */
 static bool whole_path_fits(const ag_axe_header_t *header, size_t file_bytes)
 {
     const size_t scratch = ((header->flags & AG_AXE_CONTIGUOUS) != 0)
                                ? 0u
                                : header->code.size;
-    const size_t need = file_bytes + scratch;
+    const size_t need = file_bytes + scratch + header->data.size;
     return ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE) >= need;
 }
 
@@ -1563,8 +1574,20 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
                        (mode == LOADER_AUTO &&
                         whole_path_fits(&header, (size_t)size));
     if (whole) {
-        ag_vfs_close(h);
         err = load_whole(path, cwd, &header, out);
+        /* A guess about a heap that other tasks are using at the same moment:
+         * when it was wrong, the other path is still there, and it needs the
+         * least.  Only for `auto` - `whole` asked for exactly this. */
+        if (err == -AG_ENOMEM && mode == LOADER_AUTO) {
+            ag_log(AG_LOG_INFO, "loader",
+                   "%s: no room to hold it whole; reading it in pieces", path);
+            memset(out, 0, sizeof(*out));
+            err = check_signature_streamed(h, &header, (size_t)size);
+            if (err == AG_OK) {
+                err = load_streamed(h, &header, out);
+            }
+        }
+        ag_vfs_close(h);
     } else {
         /* Signed or not, the image is verified as it is read; the MAC does not
          * need the file, only its bytes in order. */
