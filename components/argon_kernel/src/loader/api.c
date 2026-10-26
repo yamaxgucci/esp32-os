@@ -30,6 +30,7 @@
 #include <argon/display.h>
 #include <argon/hostfs.h>
 #include <argon/input.h>
+#include <argon/board.h>
 #include <argon/kernel.h>
 #include <argon/keys.h>
 #include <argon/cfg.h>
@@ -97,6 +98,17 @@ static void api_info(ag_sysinfo_t *out)
 {
     if (out != NULL) {
         *out = *ag_sysinfo();
+        /*
+         * The board's name as BOARD.CFG says it, asked now.  The rest of the
+         * record is made at the platform stage, before any file can be read,
+         * so `board` said "generic" on every board - and the shop's site
+         * listed a CYD as "generic" beside an S3-CAM that was "generic" too
+         * (26 Oct 2026).
+         */
+        const ag_board_t *b = ag_board();
+        if (b != NULL && b->name[0] != '\0') {
+            snprintf(out->board, sizeof(out->board), "%s", b->name);
+        }
     }
 }
 
