@@ -38,7 +38,8 @@ CONFIG_BT_NIMBLE_GATT_SERVER=y
 # bytes: `flash XIP needs 18980 data, heap has 372 free`.  Measured on the CYD,
 # 25 Oct 2026:
 #
-#   static rx buffers 20 x 1600 = 32 KB   -> 4 x 1600 = 6 KB
+#   static rx buffers 20 x 1600 = 32 KB   -> 2 x 1600 = 3 KB
+#   static tx buffers  4 x 1600 =  6 KB   -> dynamic, taken while sending
 #   lwIP tcp window    11520 B            -> 4096 B
 #   lwIP tcp send buf  11520 B            -> 4096 B
 #   lwIP sockets       12                 -> 8
@@ -47,11 +48,24 @@ CONFIG_BT_NIMBLE_GATT_SERVER=y
 # page has to fit in flight.  The catalog page is 4 KB and one image is 20 KB,
 # so a smaller window costs a few more round trips over the local network and
 # nothing else.
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+#
+# Two receive buffers is the floor, and it is a shop terminal's floor: the board
+# polls the shop every three seconds with one connection in flight.  The
+# transmission side is dynamic because a terminal sends rarely and holds the
+# buffers all the same otherwise.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=2
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=2
+# CONFIG_ESP_WIFI_STATIC_TX_BUFFER is not set
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
 CONFIG_LWIP_TCP_WND_DEFAULT=4096
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=4096
 CONFIG_LWIP_MAX_SOCKETS=8
+
+# ESP-IDF's own timer task: 3584 by default and measured at 529 bytes used, so
+# 2048 keeps a 4x margin.  This one is a build option and cannot be a line of
+# SYSTEM.CFG - IDF creates the task before any file is read.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=2048
 
 # Bluetooth stays off here on purpose: the peripheral comes with the keyboard
 # host (esp_hid), and on the ESP32 that host needs Bluedroid's HID service -
