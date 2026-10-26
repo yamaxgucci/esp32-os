@@ -61,9 +61,23 @@
 
 #include "net/netio.h"
 
-#define HTTP_HDR_MAX 1024
+/*
+ * One block, because a board with a small heap is one allocation away from
+ * failing: the reply header and the read chunk used to be 1024 + 1536 and
+ * nothing else, so a shop terminal polling every three seconds needed 2560
+ * contiguous bytes with an application already holding most of the heap.  What
+ * it got instead was 'not enough memory for a transfer' (CYD, 25 Oct 2026:
+ * 7 KB free in pieces of 6, right after the application loaded).
+ *
+ * The sizes are what each part carries.  A reply header from this shop is
+ * under a hundred bytes, and a longer one is a server doing something this
+ * system would rather not trust; the body is streamed to its destination a
+ * chunk at a time and never held whole, so the chunk decides only how many
+ * round trips a reply costs.
+ */
+#define HTTP_HDR_MAX 512
 #define HTTP_REQ_MAX 1024
-#define HTTP_BODY_BUF 1536
+#define HTTP_BODY_BUF 1024
 #define HTTP_CONNECT_MS 15000
 #define HTTP_MAX_REDIRECTS 4
 
