@@ -149,7 +149,17 @@ static ag_err_t lookup_ci(const char *dirpath, const char *want, char *found,
  * When `force` is false and the exact path already exists, leave it alone
  * (open/stat fast path).  When `force` is true, always rebuild from directory
  * entries so `cd` / realpath get the real names.
+ *
+ * The walk is a function of its own, kept out of line, because its frame is
+ * 784 bytes of names and paths and the fast path's stat is the deepest thing
+ * here - littlefs, then the flash driver, then an interrupt on top.  Inlined,
+ * every open on every task paid for the walk it almost never does, and that
+ * was the stack overflow that rebooted the CYD when the supervisor opened
+ * /sys/crash.log after Ctrl+\ stopped an application (27 Oct 2026).
  */
+static ag_err_t __attribute__((noinline))
+walk_case(const ag_idfvfs_t *fs, char *path, size_t pathlen);
+
 static ag_err_t fixup_case(const ag_idfvfs_t *fs, char *path, size_t pathlen,
                            bool force)
 {
@@ -157,7 +167,11 @@ static ag_err_t fixup_case(const ag_idfvfs_t *fs, char *path, size_t pathlen,
     if (!force && stat(path, &st) == 0) {
         return AG_OK;
     }
+    return walk_case(fs, path, pathlen);
+}
 
+static ag_err_t walk_case(const ag_idfvfs_t *fs, char *path, size_t pathlen)
+{
     if (strncmp(path, fs->base, fs->base_len) != 0) {
         return -AG_ENOENT;
     }
@@ -196,12 +210,14 @@ static ag_err_t fixup_case(const ag_idfvfs_t *fs, char *path, size_t pathlen,
             return err;
         }
 
-        char next[AG_PATH_MAX];
-        const int n = snprintf(next, sizeof(next), "%s/%s", built, found);
-        if (n < 0 || (size_t)n >= sizeof(next)) {
+        /* Appended in place: a second path buffer was 256 more bytes of a
+         * stack that littlefs is about to go deep on. */
+        const size_t have = strlen(built);
+        const int    n = snprintf(built + have, sizeof(built) - have, "/%s",
+                                  found);
+        if (n < 0 || have + (size_t)n >= sizeof(built)) {
             return -AG_ERANGE;
         }
-        memcpy(built, next, (size_t)n + 1);
 
         p += len;
         while (*p == '/') {
