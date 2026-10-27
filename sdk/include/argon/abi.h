@@ -499,9 +499,15 @@ extern "C" {
  *      optional members elsewhere, the slot is never NULL in a build that has
  *      the network at all: without CONFIG_ARGON_ENABLE_NET the whole table is
  *      absent, and api->net being NULL is how a caller learns that.
+ *
+ * 0.72 AG_AXE_LICENSED (27 Oct 2026): a program bought in the shop, its parts
+ *      XORed for one account's key (argon/licence.h), undone by the loader
+ *      with C:\STORE\OWNER.KEY.  The shop stamps such a copy 0.72, so a kernel
+ *      that does not know the flag refuses it by version instead of running
+ *      the keystream as code.  Nothing in the api table moves.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 71u
+#define AG_ABI_MINOR 72u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -4064,6 +4070,13 @@ enum ag_axe_flags {
      *     it was holding and why.
      */
     AG_AXE_CAN_MIGRATE = 1u << 8,
+    /*
+     * ABI 0.72: a copy the shop made for one account (argon/licence.h).  Set
+     * by the shop, never by a build: the code and data parts are XORed with a
+     * keystream from that account's key, and the loader refuses the file on a
+     * board without it.
+     */
+    AG_AXE_LICENSED = 1u << 10,
 };
 
 /*

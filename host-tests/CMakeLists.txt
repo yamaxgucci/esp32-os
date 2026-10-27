@@ -51,6 +51,7 @@ set(ARGON_PORTABLE_SRCS
     "${ARGON_ROOT}/components/argon_kernel/src/core/arena.c"
     "${ARGON_ROOT}/components/argon_kernel/src/loader/axeload.c"
     "${ARGON_ROOT}/components/argon_kernel/src/loader/axesig.c"
+    "${ARGON_ROOT}/components/argon_kernel/src/loader/licence.c"
     "${ARGON_ROOT}/components/argon_kernel/src/loader/probe.c"
     "${ARGON_ROOT}/components/argon_kernel/src/net/netmsg.c")
 
@@ -149,6 +150,7 @@ add_executable(argon_tests
     test_arena.c
     test_axeload.c
     test_axesig.c
+    test_licence.c
     test_codepage.c
     test_hidrep.c
     test_probe.c

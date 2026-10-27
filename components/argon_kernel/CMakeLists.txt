@@ -56,6 +56,7 @@ set(ARGON_KERNEL_SRCS
     "src/fs/hostfs.c"
     "src/loader/axeload.c"
     "src/loader/axesig.c"
+    "src/loader/licence.c"
     "src/loader/appfs.c"
     "src/loader/loader.c"
     "src/loader/module.c"

@@ -14,6 +14,7 @@
 
 #include <argon/arena.h>
 #include <argon/axesig.h>
+#include <argon/licence.h>
 #include <argon/cfg.h>
 #include "core/sysconfig.h"
 #include <argon/log.h>
@@ -1058,6 +1059,51 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
  * from the image's own header, so a read that stops early means the file does
  * not match what it says about itself.
  */
+/*
+ * A licensed image (argon/licence.h) is read through its owner's key: every
+ * read of an open file that has one passes the bytes through it, whichever of
+ * the paths below is doing the reading.  Keyed by the handle, a few at once,
+ * because two slots can be loading at the same moment.
+ */
+#define LICENCE_OPEN 4
+static struct {
+    ag_handle_t   h1; /* the handle plus one: 0 is free, and 0 is a handle */
+    ag_licence_t *lic;
+} s_licensed[LICENCE_OPEN];
+
+static ag_licence_t *licence_of(ag_handle_t h)
+{
+    for (int i = 0; i < LICENCE_OPEN; i++) {
+        if (s_licensed[i].h1 == h + 1 && s_licensed[i].lic != NULL) {
+            return s_licensed[i].lic;
+        }
+    }
+    return NULL;
+}
+
+static bool licence_attach(ag_handle_t h, ag_licence_t *lic)
+{
+    for (int i = 0; i < LICENCE_OPEN; i++) {
+        ag_handle_t expect = 0;
+        if (__atomic_compare_exchange_n(&s_licensed[i].h1, &expect, h + 1, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            s_licensed[i].lic = lic;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void licence_detach(ag_handle_t h)
+{
+    for (int i = 0; i < LICENCE_OPEN; i++) {
+        if (s_licensed[i].h1 == h + 1) {
+            s_licensed[i].lic = NULL;
+            __atomic_store_n(&s_licensed[i].h1, 0, __ATOMIC_RELEASE);
+        }
+    }
+}
+
 static ag_err_t read_at(ag_handle_t h, uint64_t at, void *dst, size_t bytes)
 {
     if (ag_vfs_seek(h, (int64_t)at, AG_SEEK_SET) < 0) {
@@ -1072,6 +1118,7 @@ static ag_err_t read_at(ag_handle_t h, uint64_t at, void *dst, size_t bytes)
         }
         got += (size_t)n;
     }
+    ag_licence_apply(licence_of(h), at, p, bytes);
     return AG_OK;
 }
 
@@ -1106,6 +1153,8 @@ static ag_err_t stream_code(ag_handle_t h, const ag_axe_part_t *part, void *dst)
             }
             got += (size_t)n;
         }
+        ag_licence_apply(licence_of(h), (uint64_t)part->offset + done, buf,
+                         want);
         copy_image(out + done, buf, want);
         done += want;
     }
@@ -1216,7 +1265,8 @@ static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
 
 /* The older path, for an image whose signature has to be checked. */
 static ag_err_t load_whole(const char *path, const char *cwd,
-                           const ag_axe_header_t *header, ag_loaded_app_t *out)
+                           const ag_axe_header_t *header, ag_licence_t *lic,
+                           ag_loaded_app_t *out)
 {
     uint8_t *file = NULL;
     size_t   file_size = 0;
@@ -1224,6 +1274,7 @@ static ag_err_t load_whole(const char *path, const char *cwd,
     if (err != AG_OK) {
         return err;
     }
+    ag_licence_apply(lic, 0, file, file_size);
 
     err = ag_axe_check_sig(file, file_size);
     if (err != AG_OK) {
@@ -1535,6 +1586,64 @@ static ag_err_t check_signature_streamed(ag_handle_t h,
     return ag_axe_sig_stream_finish(&sig);
 }
 
+/*
+ * The owner's key for a licensed image, from the block near the end of the
+ * file and C:\STORE\OWNER.KEY.  Said in the journal by name: "it does not
+ * start" is all a person sees otherwise.
+ */
+static ag_err_t licence_open(ag_handle_t h, const char *path,
+                             const ag_axe_header_t *header, int64_t size,
+                             ag_licence_t *lic)
+{
+    /* From the heap, not the stack: this runs on the program's own task,
+     * whose stack is the program's size, and a kilobyte here left a TICKER
+     * that failed to load with "0 stack bytes unused" (CYD, 27 Oct 2026). */
+    const size_t want = (size < (int64_t)AG_LICENCE_SEARCH)
+                            ? (size_t)size
+                            : (size_t)AG_LICENCE_SEARCH;
+    uint8_t *tail = (uint8_t *)ag_port_alloc(want, AG_MEM_SLOW | AG_MEM_BYTE);
+    if (tail == NULL) {
+        tail = (uint8_t *)ag_port_alloc(want, AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    if (tail == NULL) {
+        return -AG_ENOMEM;
+    }
+    ag_err_t err = read_at(h, (uint64_t)size - want, tail, want);
+    ag_licence_block_t block;
+    if (err == AG_OK && ag_licence_find(tail, want, &block) != AG_OK) {
+        ag_log(AG_LOG_ERROR, "loader", "%s: licensed, but says for whom",
+               path);
+        err = -AG_EFORMAT;
+    }
+    ag_port_free(tail);
+    if (err != AG_OK) {
+        return err;
+    }
+
+    char              text[80];
+    uint8_t           key[32];
+    const ag_handle_t k = ag_vfs_open(AG_LICENCE_KEY_PATH, NULL, AG_O_RDONLY);
+    int32_t           n = -1;
+    if (k >= 0) {
+        n = ag_vfs_read(k, text, sizeof(text));
+        ag_vfs_close(k);
+    }
+    if (n <= 0 || !ag_licence_parse_key(text, (size_t)n, key)) {
+        ag_log(AG_LOG_ERROR, "loader",
+               "%s: bought in the shop, and this board has no owner's key "
+               "(connect it to the account that bought it)", path);
+        return -AG_EPERM;
+    }
+    err = ag_licence_begin(lic, header, &block, key);
+    memset(key, 0, sizeof(key));
+    if (err != AG_OK) {
+        ag_log(AG_LOG_ERROR, "loader",
+               "%s: bought by another account; this board's owner has not "
+               "bought it", path);
+    }
+    return err;
+}
+
 ag_err_t ag_loader_load(const char *path, const char *cwd,
                         ag_loaded_app_t *out)
 {
@@ -1569,12 +1678,26 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
         return err;
     }
 
+    ag_licence_t  lic_state;
+    ag_licence_t *lic = NULL;
+    if ((header.flags & AG_AXE_LICENSED) != 0u) {
+        err = licence_open(h, path, &header, size, &lic_state);
+        if (err == AG_OK && !licence_attach(h, &lic_state)) {
+            err = -AG_EBUSY;
+        }
+        if (err != AG_OK) {
+            ag_vfs_close(h);
+            return err;
+        }
+        lic = &lic_state;
+    }
+
     const int mode = loader_path_mode();
     const bool whole = (mode == LOADER_WHOLE) ||
                        (mode == LOADER_AUTO &&
                         whole_path_fits(&header, (size_t)size));
     if (whole) {
-        err = load_whole(path, cwd, &header, out);
+        err = load_whole(path, cwd, &header, lic, out);
         /* A guess about a heap that other tasks are using at the same moment:
          * when it was wrong, the other path is still there, and it needs the
          * least.  Only for `auto` - `whole` asked for exactly this. */
@@ -1587,6 +1710,7 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
                 err = load_streamed(h, &header, out);
             }
         }
+        licence_detach(h);
         ag_vfs_close(h);
     } else {
         /* Signed or not, the image is verified as it is read; the MAC does not
@@ -1598,8 +1722,10 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
             ag_log(AG_LOG_ERROR, "loader", "%s: bad signature (%d)", path,
                    (int)err);
         }
+        licence_detach(h);
         ag_vfs_close(h);
     }
+    memset(&lic_state, 0, sizeof(lic_state));
     if (err != AG_OK) {
         return err;
     }
