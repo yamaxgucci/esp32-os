@@ -769,6 +769,8 @@ bool ag_proc_take_crash_record(char *out, size_t len)
     return waiting;
 }
 
+bool ag_proc_crash_record_waiting(void) { return s_crash_waiting; }
+
 /*
  * The panic the port could not recover, reported in the same form as a process
  * that faulted - because it is the same question being asked, and the answer

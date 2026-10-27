@@ -21,6 +21,7 @@
 
 /* Sized for one HostFS WRITE (HSFS_MAX_DATA). Heap, not static — see cp(). */
 #define AG_COPY_CHUNK 4096
+#define AG_TYPE_CHUNK 256
 
 /* ---------------------------------------------------------------------- */
 /* Shared plumbing                                                        */
@@ -265,7 +266,14 @@ int ag_cmd_type(int argc, char **argv)
         return 1;
     }
 
-    char    chunk[AG_COPY_CHUNK];
+    /*
+     * Small, because it is on the shell's stack and the read below goes all
+     * the way down to the flash driver with it there.  It was AG_COPY_CHUNK -
+     * four of the shell's eight kilobytes - and `type` of any file at all
+     * overflowed the shell on the CYD (27 Oct 2026).  The console is slower
+     * than the disk either way; a bigger chunk bought nothing.
+     */
+    char    chunk[AG_TYPE_CHUNK];
     int32_t n;
     bool    stopped = false;
     while ((n = ag_vfs_read(h, chunk, sizeof(chunk))) > 0) {

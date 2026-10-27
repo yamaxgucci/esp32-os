@@ -252,14 +252,30 @@ static void interrupt_foreground(void)
  */
 static bool s_panic_waiting;
 
-static void write_crash_record(void)
+/*
+ * The record and a journal line, on the heap and only while one is written.
+ *
+ * On this task's stack they were 776 bytes of a 4 KB budget, and inlined into
+ * the loop they were there on every tick and under every call from it - while
+ * the open below goes down through the VFS, littlefs and the flash driver.
+ * Stopping an application from the keyboard leaves a record, and on the CYD
+ * opening /sys/crash.log for it overflowed this stack and rebooted the board,
+ * four times out of four (27 Oct 2026).  Not static either: internal SRAM is
+ * the memory every board is short of, for a moment that may never come.  The
+ * application whose death this records has just been reaped, so its memory is
+ * what pays; if even that is not enough the record stays where it is and the
+ * next tick tries again.
+ */
+#define AG_CRASH_RECORD_MAX 512
+
+typedef struct {
+    char text[AG_CRASH_RECORD_MAX];
+    char line[AG_JOURNAL_LINE_MAX];
+} crash_buffers_t;
+
+static void write_crash_record_with(const char *text, char *line,
+                                    size_t line_len)
 {
-    char text[512];
-
-    if (!ag_proc_take_crash_record(text, sizeof(text))) {
-        return;
-    }
-
     /*
      * Show it on the console, not only in the file.  crash_record itself can no
      * longer do this: it runs on the fault-recovery path where taking the log
@@ -300,9 +316,8 @@ static void write_crash_record(void)
     ag_journal_iter_t it;
     ag_journal_begin(journal, &it);
 
-    char     line[AG_JOURNAL_LINE_MAX];
     uint32_t index = 0;
-    while (ag_journal_next(journal, &it, line, sizeof(line))) {
+    while (ag_journal_next(journal, &it, line, line_len)) {
         if (index++ < skip) {
             continue;
         }
@@ -328,6 +343,24 @@ static void write_crash_record(void)
         s_panic_waiting = false;
         ag_port_fault_panic_reported();
     }
+}
+
+static void write_crash_record(void)
+{
+    if (!ag_proc_crash_record_waiting()) {
+        return;
+    }
+    crash_buffers_t *b = ag_port_alloc(sizeof(*b), AG_MEM_SLOW | AG_MEM_BYTE);
+    if (b == NULL) {
+        b = ag_port_alloc(sizeof(*b), AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    if (b == NULL) {
+        return;
+    }
+    if (ag_proc_take_crash_record(b->text, sizeof(b->text))) {
+        write_crash_record_with(b->text, b->line, sizeof(b->line));
+    }
+    ag_port_free(b);
 }
 
 void ag_supervisor_poke_isr(void)

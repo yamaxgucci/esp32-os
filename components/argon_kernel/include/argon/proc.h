@@ -259,6 +259,10 @@ ag_pid_t ag_proc_overdue(uint32_t *late_by_ms);
  */
 bool ag_proc_take_crash_record(char *out, size_t len);
 
+/* Whether a record is waiting, without taking it: lets the supervisor find the
+ * memory to write it with only when there is something to write. */
+bool ag_proc_crash_record_waiting(void);
+
 /*
  * The threads-and-synchronisation subtable of the ABI, defined by the process
  * layer because everything in it belongs to a process.  A constant, so the
