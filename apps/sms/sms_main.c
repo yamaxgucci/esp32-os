@@ -95,6 +95,9 @@ static volatile int      s_ring_run;
 static ag_thread_t       s_presenter;
 static int               s_async;
 static uint32_t          s_ring_wait_us;
+/* What the glass said: bands it took, and the last refusal if it refused. */
+static volatile uint32_t s_present_ok, s_present_bad;
+static volatile int32_t  s_present_err;
 
 /*
  * Which bands this frame draws, when the bus cannot take them all.
@@ -546,7 +549,13 @@ static void band_present(const uint16_t *px, uint16_t y0, uint16_t rows)
         .h = rows,
     };
     const ag_time_t t0 = ag_micros();
-    (void)ag_gfx_present(&b);
+    const ag_err_t perr = ag_gfx_present(&b);
+    if (perr == AG_OK) {
+        s_present_ok++;
+    } else {
+        s_present_bad++;
+        s_present_err = perr;
+    }
     if (!s_async) {
         s_present_us += (uint32_t)(ag_micros() - t0);
     }
@@ -1121,7 +1130,15 @@ int ag_main(int argc, char **argv)
         system_frame(show ? 0 : 1);
 #ifdef ARGON_SMS_SMALL
         if (show) {
-            s_band_valid = 1;
+            /*
+             * Once a second every band goes again, changed or not.  The glass
+             * is not only ours: the console paints on it - a printed line,
+             * the loading view - and an unchanged band is then not what the
+             * glass shows.  Measured: with `stats` printing every two seconds
+             * Sonic's title stayed under the text, because nothing on it moved
+             * and so nothing was sent.  24 bands a second is 4% of the bus.
+             */
+            s_band_valid = ((ran % 60) != 0);
         }
 #endif
 
@@ -1187,6 +1204,10 @@ int ag_main(int argc, char **argv)
                       "%u bands left for later\n",
                       present_div, (unsigned)s_ring_wait_us,
                       (unsigned)s_bands_dropped);
+            ag_printf("sms: the glass took %u bands, refused %u (last %d)\n",
+                      (unsigned)s_present_ok, (unsigned)s_present_bad,
+                      (int)s_present_err);
+            s_present_ok = s_present_bad = 0;
             s_ring_wait_us = 0;
             s_bands_dropped = 0;
             ag_printf("sms: %u bands of %u not sent, unchanged\n",
