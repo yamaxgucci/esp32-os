@@ -1207,6 +1207,9 @@ static void code_written(const ag_loaded_app_t *out)
                            ? out->place.code_writable
                            : out->place.code;
     ag_port_execmem_sync(code, out->place.code_capacity);
+}
+
+/*
  * Where the parts go: the hot ones by the rules above, and the cold one always
  * in flash.
  *

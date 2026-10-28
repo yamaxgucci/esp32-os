@@ -572,8 +572,24 @@ menu "ArgonOS"
             board.
 
     config ARGON_USB_DEVICE
+        # NO `depends on SOC_USB_OTG_SUPPORTED` HERE, however much it belongs.
+        #
+        # main/idf_component.yml decides whether to fetch esp_tinyusb with
+        # `if: "$CONFIG{ARGON_USB_DEVICE} == True"`, and the component manager
+        # treats a symbol that does not exist as an error rather than as
+        # false.  Gated on the SOC, the symbol vanished on every chip without
+        # USB OTG - the original ESP32 among them - and the configure died
+        # with "Missing required kconfig option" before a line was compiled:
+        # the Audio Kit could not be built from main at all (28 Oct 2026).
+        # A conditional prompt (`bool "..." if SOC_...`) does not help either;
+        # the symbol still does not reach sdkconfig.
+        #
+        # So the symbol is always there, off unless somebody asks, and the
+        # hardware requirement is enforced where it can be enforced: the port
+        # compiles nothing for it on a chip with no OTG peripheral, and the
+        # help below says so.
         bool "USB device: be a HID keyboard and mouse for another computer"
-        depends on SOC_USB_OTG_SUPPORTED && !ARGON_USB_HOST
+        depends on !ARGON_USB_HOST
         default n
         help
             The other direction of the same cable.  With this on, the board
