@@ -148,8 +148,10 @@ int32_t z80_cycle_count = 0;        /* running total of cycles executed */
 static int32_t z80_exec = 0;
 static int32_t z80_requested_cycles = 0;
 
+#ifndef ARGON_MD_Z80 /* the Mega Drive reads through argon_z80_read */
 uint8_t *cpu_readmap[64];
 uint8_t *cpu_writemap[64];
+#endif
 
 void (*cpu_writemem16)(uint16_t address, uint8_t data);
 void (*cpu_writeport16)(uint16_t port, uint8_t data);
@@ -262,7 +264,22 @@ static inline uint8_t flags_sub(uint32_t a, uint32_t v, uint32_t full)
 }
 #endif
 
-static const uint8_t cc_op[0x100] = {
+/*
+ * The CYD: the cycle tables are read a byte at a time, and 1.5 KB of internal
+ * memory is worth more there than one shift per instruction - so in the small
+ * build they sit in flash with the code, which the ESP32 reads only by whole
+ * words, and the byte is cut out of its word (volatile, or GCC folds a
+ * constant index back into a byte load).
+ */
+#if defined(ARGON_SMS_SMALL) && !defined(AG_BUILTIN)
+#define Z80_CC_PLACE __attribute__((aligned(4), section(".hot_rodata")))
+#define CC_OF(t, op) ((((const volatile uint32_t *)(const void *)cc[t])[(op) >> 2] >> (((op) & 3) << 3)) & 0xFF)
+#else
+#define Z80_CC_PLACE
+#define CC_OF(t, op) (cc[t][op])
+#endif
+
+static Z80_CC_PLACE const uint8_t cc_op[0x100] = {
 	4,10, 7, 6, 4, 4, 7, 4, 4,11, 7, 6, 4, 4, 7, 4,
 	8,10, 7, 6, 4, 4, 7, 4,12,11, 7, 6, 4, 4, 7, 4,
 	7,10,16, 6, 4, 4, 7, 4, 7,11,16, 6, 4, 4, 7, 4,
@@ -281,7 +298,7 @@ static const uint8_t cc_op[0x100] = {
 	5,10,10, 4,10,11, 7,11, 5, 6,10, 4,10, 0, 7,11      /* fd -> cc_xy */
 };
 
-static const uint8_t cc_cb[0x100] = {
+static Z80_CC_PLACE const uint8_t cc_cb[0x100] = {
 	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
 	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
 	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
@@ -300,7 +317,7 @@ static const uint8_t cc_cb[0x100] = {
 	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8
 };
 
-static const uint8_t cc_ed[0x100] = {
+static Z80_CC_PLACE const uint8_t cc_ed[0x100] = {
 	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
 	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
 	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
@@ -320,7 +337,7 @@ static const uint8_t cc_ed[0x100] = {
 };
 
 /* ix/iy: with the exception of (i+offset) opcodes, t-states are main_opcode_table + 4 */
-static const uint8_t cc_xy[0x100] = {
+static Z80_CC_PLACE const uint8_t cc_xy[0x100] = {
 	4+4,10+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4, 4+4,11+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4,
 	8+4,10+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4,12+4,11+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4,
 	7+4,10+4,16+4, 6+4, 4+4, 4+4, 7+4, 4+4, 7+4,11+4,16+4, 6+4, 4+4, 4+4, 7+4, 4+4,
@@ -339,7 +356,7 @@ static const uint8_t cc_xy[0x100] = {
 	5+4,10+4,10+4, 4+4,10+4,11+4, 7+4,11+4, 5+4, 6+4,10+4, 4+4,10+4, 4  , 7+4,11+4      /* fd -> cc_xy again */
 };
 
-static const uint8_t cc_xycb[0x100] = {
+static Z80_CC_PLACE const uint8_t cc_xycb[0x100] = {
 23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
 23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
 23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
@@ -359,7 +376,7 @@ static const uint8_t cc_xycb[0x100] = {
 };
 
 /* extra cycles if jr/jp/call taken and 'interrupt latency' on rst 0-7 */
-static const uint8_t cc_ex[0x100] = {
+static Z80_CC_PLACE const uint8_t cc_ex[0x100] = {
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* DJNZ */
 	5, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, /* JR NZ/JR Z */
@@ -499,7 +516,7 @@ PROTOTYPES(Z80xycb,xycb);
 /***************************************************************
  * adjust cycle count by n T-states
  ***************************************************************/
-#define CC(prefix,opcode) do { Z80.icount -= cc[Z80_TABLE_##prefix][opcode]; } while (0)
+#define CC(prefix,opcode) do { Z80.icount -= CC_OF(Z80_TABLE_##prefix, opcode); } while (0)
 
 /***************************************************************
  * execute an opcode
@@ -3354,7 +3371,7 @@ void take_interrupt()
 		push(Z80.pc);
 		rm16(irq_vector, Z80.pc);
 		/* CALL opcode timing + 'interrupt latency' cycles */
-		Z80.icount -= cc[Z80_TABLE_op][0xcd] + cc[Z80_TABLE_ex][0xff];
+		Z80.icount -= CC_OF(Z80_TABLE_op, 0xcd) + CC_OF(Z80_TABLE_ex, 0xff);
 	}
 	else
 	/* Interrupt mode 1. RST 38h */
@@ -3363,7 +3380,7 @@ void take_interrupt()
 		push(Z80.pc);
 		PCD = 0x0038;
 		/* RST $38 + 'interrupt latency' cycles */
-		Z80.icount -= cc[Z80_TABLE_op][0xff] + cc[Z80_TABLE_ex][0xff];
+		Z80.icount -= CC_OF(Z80_TABLE_op, 0xff) + CC_OF(Z80_TABLE_ex, 0xff);
 	}
 	else
 	{
@@ -3380,24 +3397,24 @@ void take_interrupt()
 					push(Z80.pc);
 					PCD = irq_vector & 0xffff;
 					/* CALL $xxxx cycles */
-					Z80.icount -= cc[Z80_TABLE_op][0xcd];
+					Z80.icount -= CC_OF(Z80_TABLE_op, 0xcd);
 					break;
 				case 0xc30000:  /* jump */
 					PCD = irq_vector & 0xffff;
 					/* JP $xxxx cycles */
-					Z80.icount -= cc[Z80_TABLE_op][0xc3];
+					Z80.icount -= CC_OF(Z80_TABLE_op, 0xc3);
 					break;
 				default:        /* rst (or other opcodes?) */
 					push(Z80.pc);
 					PCD = irq_vector & 0x0038;
 					/* RST $xx cycles */
-					Z80.icount -= cc[Z80_TABLE_op][0xff];
+					Z80.icount -= CC_OF(Z80_TABLE_op, 0xff);
 					break;
 			}
 		}
 
 		/* 'interrupt latency' cycles */
-		Z80.icount -= cc_ex[0xff];
+		Z80.icount -= CC_OF(Z80_TABLE_ex, 0xff);
 	}
 	WZ=PCD;
 #if HAS_LDAIR_QUIRK == 1

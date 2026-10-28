@@ -59,8 +59,9 @@ idx = [index[p] for p in zip(names, cycles)]
 for i in range(0, 0x10000, 16):
     out.append('  ' + ', '.join(str(v) for v in idx[i:i + 16]) + ',')
 out.append('};')
-out.append('/* The index is in flash, which the ESP32 reads only a word at a time. */')
-out.append('#define MD_OP(op) (&md_ops[(((const unsigned int *)(const void *)md_op_index)'
+out.append('/* The index is in flash, which the ESP32 reads only a word at a time')
+out.append('   (volatile: a constant opcode would otherwise fold into a byte load). */')
+out.append('#define MD_OP(op) (&md_ops[(((const volatile unsigned int *)(const void *)md_op_index)'
            '[(op) >> 1] >> (((op) & 1) << 4)) & 0xFFFF])')
 open(os.path.join(DIR, 'm68ki_jump_small.h'), 'w', encoding='latin-1', newline='\n').write('\n'.join(out) + '\n')
 print('handler/cycle pairs:', len(order))

@@ -437,9 +437,9 @@ void draw_pattern_sprite(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
+    pattern = VRAM_W((((name & 0x07FF) << 5) + ((7 - paty) * 4))); //) pat_addr;
   else
-    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
+    pattern = VRAM_W((((name & 0x07FF) << 5) + (paty * 4)));
 
   // Horizontal flip ?
   if (name & 0x0800)
@@ -471,9 +471,9 @@ void draw_pattern_sprite_over_planes(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
+    pattern = VRAM_W((((name & 0x07FF) << 5) + ((7 - paty) * 4))); //) pat_addr;
   else
-    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
+    pattern = VRAM_W((((name & 0x07FF) << 5) + (paty * 4)));
 
   // Horizontal flip ?
   if (name & 0x0800)
@@ -495,9 +495,9 @@ void draw_pattern_planeB(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
+    pattern = VRAM_W((((name & 0x07FF) << 5) + ((7 - paty) * 4))); //) pat_addr;
   else
-    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
+    pattern = VRAM_W((((name & 0x07FF) << 5) + (paty * 4)));
 
 //  if ((*(unsigned int *)pattern) == 0 ) return;
  // uint8_t *pattern = VRAM + ((name << 5) & 0xFFFF); //) pat_addr;
@@ -534,9 +534,9 @@ void draw_pattern_planeA(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
+    pattern = VRAM_W((((name & 0x07FF) << 5) + ((7 - paty) * 4))); //) pat_addr;
   else
-    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
+    pattern = VRAM_W((((name & 0x07FF) << 5) + (paty * 4)));
 
   // Horizontal flip ?
   if (name & 0x0800)
@@ -753,7 +753,7 @@ void draw_sprites_over_planes(int line)
     {
 #ifdef ARGON_MD_SMALL
         unsigned int ent_[2];   /* the entry by words: VRAM is in IRAM */
-        { unsigned int o_ = (unsigned int)(start_table - VRAM) + sidx * 8;
+        { unsigned int o_ = (unsigned int)(REG5_SAT_ADDRESS & VRAM_MASK) + sidx * 8;
           ent_[0] = VRAM_W(o_); ent_[1] = VRAM_W(o_ + 4); }
         uint8_t *table = (uint8_t *)ent_;
 #else
@@ -867,7 +867,7 @@ void draw_sprites(int line)
   for (int i = 0; i < SPRITE_TABLE_SIZE && sidx < SPRITE_TABLE_SIZE; ++i) {
 #ifdef ARGON_MD_SMALL
     unsigned int ent_[2];   /* the entry by words: VRAM is in IRAM */
-    { unsigned int o_ = (unsigned int)(start_table - VRAM) + sidx * 8;
+    { unsigned int o_ = (unsigned int)(REG5_SAT_ADDRESS & VRAM_MASK) + sidx * 8;
       ent_[0] = VRAM_W(o_); ent_[1] = VRAM_W(o_ + 4); }
     uint8_t *table = (uint8_t *)ent_;
 #else

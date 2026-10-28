@@ -193,13 +193,13 @@
 #ifdef ARGON_MD_SMALL
 /*
  * The CYD: 64 KB in one piece is more than its heap has to give once the image
- * is loaded, so work RAM is sixteen 4 KB pages, chosen by bits 12-15: what the heap has left after the image is in pieces.  A long access
- * is two word accesses, so one that crosses from one page to the next (or
- * wraps at the top) is still right.  Words are stored as the core always kept
- * them: a long's high word at the lower address.
+ * is loaded, so work RAM is in 1 KB pages (md_pages.h).  A long access is two
+ * word accesses, so one that crosses from one page to the next (or wraps at
+ * the top) is still right.  Words are stored as the core always kept them: a
+ * long's high word at the lower address.
  */
-extern unsigned char *md_ram[16];
-#define MD_RAMP(A) (md_ram[((A) >> 12) & 15] + ((A) & 0xFFF))
+#include "md_pages.h"
+#define MD_RAMP(A) (md_ram[((A) & 0xFFFFu) >> MD_PAGE_SHIFT] + ((A) & MD_PAGE_MASK))
 #define FETCH8RAM(A) (*MD_RAMP((A) ^ 1))
 #define FETCH16RAM(A) (*(unsigned short *)MD_RAMP(A))
 #define FETCH32RAM(A) ((((unsigned int)FETCH16RAM(A)) << 16) | FETCH16RAM((A) + 2))
@@ -344,7 +344,11 @@ typedef struct
 
 typedef struct
 {
+#ifndef ARGON_MD_SMALL
   cpu_memory_map memory_map[256]; /* memory mapping */
+#endif
+  /* (the CYD: nothing reads memory_map - the bus is FETCH/WRITE macros - and
+   * it was 5 KB of the image's internal memory) */
 
   cpu_idle_t poll;      /* polling detection */
 

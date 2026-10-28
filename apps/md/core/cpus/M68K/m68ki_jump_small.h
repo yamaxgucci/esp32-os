@@ -4672,5 +4672,6 @@ static const unsigned short md_op_index[0x10000] =
   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 };
-/* The index is in flash, which the ESP32 reads only a word at a time. */
-#define MD_OP(op) (&md_ops[(((const unsigned int *)(const void *)md_op_index)[(op) >> 1] >> (((op) & 1) << 4)) & 0xFFFF])
+/* The index is in flash, which the ESP32 reads only a word at a time
+   (volatile: a constant opcode would otherwise fold into a byte load). */
+#define MD_OP(op) (&md_ops[(((const volatile unsigned int *)(const void *)md_op_index)[(op) >> 1] >> (((op) & 1) << 4)) & 0xFFFF])

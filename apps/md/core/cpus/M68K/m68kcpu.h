@@ -572,7 +572,21 @@ void gwenesis_m68k_load_state();
 /* ======================================================================== */
 
 /* Used by shift & rotate instructions */
-static const uint8 m68ki_shift_8_table[65] =
+/*
+ * The CYD: these tables go to flash with the code, which the ESP32 reads only
+ * by whole words - so there they are kept as words, whatever their width.
+ */
+#if defined(ARGON_MD_SMALL) && !defined(AG_BUILTIN)
+#define MD_FLASH_TABLE __attribute__((aligned(4), section(".hot_rodata")))
+typedef uint md_tab8;
+typedef uint md_tab16;
+#else
+#define MD_FLASH_TABLE
+typedef uint8 md_tab8;
+typedef uint16 md_tab16;
+#endif
+
+static MD_FLASH_TABLE const md_tab8 m68ki_shift_8_table[65] =
 {
   0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe, 0xff, 0xff, 0xff, 0xff,
   0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -582,7 +596,7 @@ static const uint8 m68ki_shift_8_table[65] =
   0xff, 0xff, 0xff, 0xff, 0xff
 };
 
-static const uint16 m68ki_shift_16_table[65] =
+static MD_FLASH_TABLE const md_tab16 m68ki_shift_16_table[65] =
 {
   0x0000, 0x8000, 0xc000, 0xe000, 0xf000, 0xf800, 0xfc00, 0xfe00, 0xff00,
   0xff80, 0xffc0, 0xffe0, 0xfff0, 0xfff8, 0xfffc, 0xfffe, 0xffff, 0xffff,
@@ -594,7 +608,7 @@ static const uint16 m68ki_shift_16_table[65] =
   0xffff, 0xffff
 };
 
-static const uint m68ki_shift_32_table[65] =
+static MD_FLASH_TABLE const uint m68ki_shift_32_table[65] =
 {
   0x00000000, 0x80000000, 0xc0000000, 0xe0000000, 0xf0000000, 0xf8000000,
   0xfc000000, 0xfe000000, 0xff000000, 0xff800000, 0xffc00000, 0xffe00000,
@@ -613,7 +627,7 @@ static const uint m68ki_shift_32_table[65] =
 /* Number of clock cycles to use for exception processing.
  * I used 4 for any vectors that are undocumented for processing times.
  */
-static const uint16 m68ki_exception_cycle_table[256] =
+static MD_FLASH_TABLE const md_tab16 m68ki_exception_cycle_table[256] =
 {
      40*MUL, /*  0: Reset - Initial Stack Pointer                      */
       4*MUL, /*  1: Reset - Initial Program Counter                    */

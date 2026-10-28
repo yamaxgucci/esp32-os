@@ -84,20 +84,24 @@ __license__ = "GPLv3"
 #endif
 #ifdef ARGON_MD_SMALL
 /*
- * The CYD keeps VRAM in IRAM - the 32 KB its byte-addressable heap does not
- * have - and the ESP32 reads and writes IRAM only a whole word at a time.  So
- * every VRAM access goes through an aligned word; the bytes sit in it exactly
- * as they would in ordinary memory, so word reads elsewhere (the patterns) are
- * unchanged.
+ * The CYD keeps VRAM in 1 KB pages (md_pages.h), as many as fit in IRAM - memory its
+ * byte-addressable heap does not have - and the rest wherever the heap has a
+ * piece.  The ESP32 reads and writes IRAM only a whole word at a time, so every
+ * VRAM access goes through an aligned word; the bytes sit in it exactly as
+ * they would in ordinary memory.  No 4-byte access crosses a page: patterns
+ * are 32-byte aligned, sprite entries 8.
  */
+#include "md_pages.h"
 /* volatile: GCC otherwise turns "a word, then one byte of it" back into a
  * byte load or store - l8ui into IRAM, a LoadStoreError on the first frame. */
-#define VRAM_W(A)   (((volatile unsigned int *)(void *)VRAM)[((A) & VRAM_MASK) >> 2])
+#define VRAM_W(A)   (((volatile unsigned int *)(void *)md_vram[((A) & VRAM_MASK) >> MD_PAGE_SHIFT]) \
+                     [((A) & MD_PAGE_MASK) >> 2])
 #define VRAM_RD8(A) ((unsigned char)(VRAM_W(A) >> (((A) & 3u) << 3)))
 #define VRAM_WR8(A, V) do { unsigned int a_ = (A), s_ = (a_ & 3u) << 3;      \
     VRAM_W(a_) = (VRAM_W(a_) & ~(0xFFu << s_)) |                              \
                  ((unsigned int)(unsigned char)(V) << s_); } while (0)
 #else
+#define VRAM_W(A)   (((unsigned int *)(void *)VRAM)[((A) & VRAM_MASK) >> 2])
 #define VRAM_RD8(A) (VRAM[(A) & VRAM_MASK])
 #define VRAM_WR8(A, V) (VRAM[(A) & VRAM_MASK] = (V))
 #endif

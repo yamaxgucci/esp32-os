@@ -66,7 +66,8 @@ void vdpm_log(const char *subs, const char *fmt, ...) {
   unsigned char* VRAM = &emulator_framebuffer[0];
 #else
 #ifdef ARGON_MD_SMALL
-  unsigned char *VRAM;
+  unsigned char *VRAM;            /* = md_vram[0]; every access is paged */
+  unsigned char *md_vram[MD_VRAM_PAGES]; /* 1 KB pages (md_pages.h) */
 #else
   unsigned char VRAM[VRAM_MAX_SIZE];
 #endif

@@ -27,10 +27,10 @@
  * The CYD (ESP32, no PSRAM): the machine's own memory is asked for at start
  * (md_small_alloc), the cartridge is mapped out of flash, and with no display
  * driver loaded it runs without a picture - which is how it is measured.
- * 8 KB of stack: a run that stopped at its allocations left 8.5 of 12 unused,
- * and the 4 KB was the Z80's last page.
+ * 6 KB of stack: a run that stopped at its allocations, printf included, left
+ * 4.2 of 8 unused, and the Z80's last 2 KB were what it lacked.
  */
-AG_APP_SIZED("MD", "0.1", "argon", 0, 8 * 1024, 4 * 1024);
+AG_APP_SIZED("MD", "0.1", "argon", 0, 6 * 1024, 4 * 1024);
 #else
 AG_APP_SIZED("MD", "0.1", "argon", AG_AXE_NEEDS_GFX, 24 * 1024, 5 * 1024 * 1024);
 #endif
@@ -263,43 +263,75 @@ extern unsigned char *VRAM;
 static int            s_headless;
 static unsigned short s_line[MD_WIDTH];
 
-static void *small_alloc(size_t n, const char *what)
+static int s_blocks; /* blocks the pages were cut from */
+
+/*
+ * Fill `pages[0..count)` from the largest blocks the heap gives, a page at a
+ * time cut out of each: what is left after the image is in pieces, and every
+ * system-heap block is one of the process's 32 resources, so asking page by
+ * page would run out of either.  `iram` asks for IRAM, which only VRAM can
+ * use; otherwise internal byte memory, then the process's own arena.
+ */
+static unsigned fill_pages(unsigned char **pages, unsigned count, int iram)
 {
-    void *p = ag_malloc_caps(n, AG_MEM_FAST);
-    if (p == NULL) {
-        p = ag_malloc(n);
+    static const size_t k_sizes[] = {32768, 16384, 8192, 4096, 2048, 1024};
+    unsigned got = 0;
+    unsigned s = 0;
+
+    while (got < count && s < sizeof(k_sizes) / sizeof(k_sizes[0])) {
+        const size_t size = k_sizes[s];
+        if (size > (size_t)(count - got) * MD_PAGE) {
+            s++;
+            continue;
+        }
+        unsigned char *b;
+        if (iram) {
+            b = (unsigned char *)ag_malloc_caps(size, AG_MEM_EXEC);
+        } else {
+            b = (unsigned char *)ag_malloc_caps(size, AG_MEM_FAST);
+            if (b == NULL) {
+                b = (unsigned char *)ag_malloc(size);
+            }
+        }
+        if (b == NULL) {
+            s++;
+            continue;
+        }
+        s_blocks++;
+        for (size_t o = 0; o < size; o += MD_PAGE) {
+            pages[got++] = b + o;
+        }
     }
-    if (p == NULL) {
-        ag_meminfo_t mi;
-        ag_meminfo(&mi);
-        ag_printf("md: no %u bytes for %s (internal %u free to this process)\n",
-                  (unsigned)n, what, (unsigned)mi.fast_free);
-    }
-    return p;
+    return got;
 }
 
-/* The machine's memory: VRAM out of the way first, then RAM in 4 KB pages. */
+/*
+ * The machine's memory, in 1 KB pages (md_pages.h).  VRAM first into IRAM,
+ * which takes only word accesses - the VDP makes no other kind (VRAM_W in
+ * gwenesis_vdp.h) - and which nothing else here could use; the VRAM pages that
+ * do not fit there come from the heap last.
+ */
 static int md_small_alloc(void)
 {
-    extern unsigned char *md_ram[16];
-    /* VRAM in IRAM, which only takes word accesses - the VDP makes no other
-     * kind (VRAM_W in gwenesis_vdp.h) - and keeps the byte heap for the rest. */
-    VRAM = (unsigned char *)ag_malloc_caps(VRAM_MASK + 1u, AG_MEM_EXEC);
-    if (VRAM == NULL) {
-        VRAM = (unsigned char *)small_alloc(VRAM_MASK + 1u, "VRAM");
-    }
-    for (int i = 0; i < 16; i++)
-        md_ram[i] = (VRAM && (i == 0 || md_ram[i - 1])) ? (unsigned char *)small_alloc(0x1000, "68000 RAM page") : NULL;
-    M68K_RAM = md_ram[15];
-    extern unsigned char *md_zram[2];
-    md_zram[0] = M68K_RAM ? (unsigned char *)small_alloc(0x1000, "Z80 RAM page") : NULL;
-    md_zram[1] = md_zram[0] ? (unsigned char *)small_alloc(0x1000, "Z80 RAM page") : NULL;
-    ZRAM = md_zram[1];
-    if (ZRAM == NULL) {
+    const unsigned in_iram = fill_pages(md_vram, MD_VRAM_PAGES, 1);
+    const unsigned ram = fill_pages(md_ram, MD_RAM_PAGES, 0);
+    const unsigned zram = (ram == MD_RAM_PAGES) ? fill_pages(md_zram, MD_ZRAM_PAGES, 0) : 0;
+    const unsigned vram = (zram == MD_ZRAM_PAGES)
+        ? in_iram + fill_pages(md_vram + in_iram, MD_VRAM_PAGES - in_iram, 0)
+        : in_iram;
+    if (ram < MD_RAM_PAGES || zram < MD_ZRAM_PAGES || vram < MD_VRAM_PAGES) {
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        ag_printf("md: short of memory - 68000 RAM %u/64 KB, Z80 RAM %u/8 KB, "
+                  "VRAM %u/64 KB (%u in IRAM), %d blocks; internal %u free\n",
+                  ram, zram, vram, in_iram, s_blocks, (unsigned)mi.fast_free);
         return 0;
     }
-    ag_printf("md: 68000 RAM 16 x 4 KB, VRAM %u KB at %p, Z80 RAM 8 KB\n",
-              (unsigned)((VRAM_MASK + 1u) / 1024u), (void *)VRAM);
+    M68K_RAM = md_ram[MD_RAM_PAGES - 1];
+    ZRAM = md_zram[MD_ZRAM_PAGES - 1];
+    VRAM = md_vram[0];
+    ag_printf("md: 68000 RAM 64 KB, Z80 RAM 8 KB, VRAM 64 KB (%u KB in IRAM) - "
+              "1 KB pages from %d blocks\n", in_iram, s_blocks);
     return 1;
 }
 
@@ -588,8 +620,13 @@ int ag_main(int argc, char **argv)
     int         present_div = 1;
     int         stats = 0;
     int         want_livepad = 1;
+    int         wait_card = 0;
 
     for (int i = 1; i < argc; i++) {
+        if (arg_eq(argv[i], "waitcard")) {
+            wait_card = 1;
+            continue;
+        }
         if (arg_eq(argv[i], "fps30")) {
             present_div = 2;
         } else if (arg_eq(argv[i], "fps60")) {
@@ -659,6 +696,27 @@ int ag_main(int argc, char **argv)
      */
     unsigned char *rom_data = (rom != NULL) ? map_rom(rom, &rom_size)
                                             : make_tiny_rom(&rom_size);
+    /*
+     * `waitcard`: the cartridge now reads out of flash, and the card's file
+     * system holds 11 KB the machine needs.  An application cannot release the
+     * card itself, so it waits for `eject` (typed, or the next line of a .bat)
+     * - and goes on after 30 s either way.
+     */
+    if (rom_data != NULL && rom != NULL && wait_card) {
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        const size_t before = mi.fast_free;
+        ag_printf("md: waiting for the card to be released (eject)\n");
+        for (int t = 0; t < 150; t++) {
+            ag_delay(200);
+            ag_meminfo(&mi);
+            if (mi.fast_free >= before + 8u * 1024u) {
+                ag_printf("md: card released, %u KB back\n",
+                          (unsigned)((mi.fast_free - before) / 1024u));
+                break;
+            }
+        }
+    }
     if (rom_data == NULL || !md_small_alloc()) {
         return 1;
     }
