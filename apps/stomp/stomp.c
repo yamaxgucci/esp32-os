@@ -61,6 +61,7 @@
 #include <string.h>
 
 #include "ag_amp.h"
+#include "ag_biq.h" /* ag_sincosf, for the sine test input */
 #include "ag_ckt.h"
 #include "ag_ir.h"
 #include "ag_pcm.h"
@@ -281,6 +282,156 @@ static uint32_t     s_worst_in;
 static int          s_journal;
 /* `noadaa`: the antialiasing off, to measure what it costs.  Never to play. */
 static int          s_no_adaa;
+/* `bypass`: no amplifier at all; see the valve loop. */
+static int          s_bypass;
+/* `dc`: one unchanging input; see the valve loop. */
+static int          s_dc;
+/* `sine`: a loud repeatable input; see the valve loop. */
+static int          s_sine;
+static float        s_sine_ph;
+/*
+ * `gaps`: time every sample separately, to find the ones that cost several
+ * times the rest.  Off unless asked, because it is a clock read a sample -
+ * 64 calls into the kernel in a block whose whole budget is 2902 us, and
+ * measured at 103 us a block, three and a half per cent of it.  That is
+ * cheap for an afternoon's hunt and far too dear to leave in a pedal.
+ */
+static int          s_gaps;
+/*
+ * The click log: what happened to each block that could have been heard, kept
+ * in memory and printed when the run ends.  See the block in the loop.
+ */
+#define AG_EV_MAX 40
+/*
+ * The ring the audio thread fills and the reporter empties.  A power of two
+ * so the wrap is an AND, and large enough that a second's worth of bad
+ * blocks survives until the reporter wakes.
+ */
+#define AG_EV_RING 64
+static struct {
+    uint32_t n, busy, v, c;
+    uint8_t  what;
+} s_ring[AG_EV_RING];
+static volatile uint32_t s_ring_head;
+static struct {
+    uint32_t n;    /* the block */
+    uint32_t busy; /* and what it was busy for */
+    uint8_t  what; /* O late, R resync, D dropped, H hole, I in clip, C out */
+} s_ev[AG_EV_MAX];
+static uint32_t s_ev_kept;
+static uint32_t s_ev_seen;
+static uint32_t s_ev_cause[7];
+static uint32_t s_ev_clip, s_ev_rsy, s_ev_drop, s_ev_hole, s_ev_out;
+static uint32_t s_ev_at;
+/*
+ * This block's own stage times.
+ *
+ * "The block did not fit" is half an answer: a block can miss its time
+ * because the arithmetic in it grew, or because something outside the pedal
+ * stood in its way - a flash read with the cache off stops both cores, and
+ * the amplifier never sees why.  The two have opposite cures, so the click
+ * log carries the breakdown of the block it is complaining about: valves,
+ * cabinet, and what is left after them and the two waits.
+ */
+static uint32_t s_blk_valves, s_blk_cab;
+static uint32_t s_blk_gap;
+static int      s_blk_gap_at;
+static uint32_t s_blk_dear, s_blk_dear_us;
+/*
+ * The block number of the last block that held a dear sample, and the gap to
+ * the one before it.  The bursts are periodic, and the period is the whole
+ * question: 34 blocks at 64 frames is the scheduler's 100 ms budget window,
+ * and nothing else on this board has that beat.
+ */
+static uint32_t s_dear_last, s_dear_gap;
+/*
+ * And how many dear samples a second, which is the one number that names the
+ * source: 100 a second is the scheduler at its old rate, 1000 is this one's
+ * tick, and anything else is neither.
+ */
+static uint32_t s_dear_sec, s_dear_sec_us, s_dear_at;
+static uint32_t s_cost_band[4];
+/*
+ * THE ONE NUMBER: blocks a second that did not finish in their own time.
+ *
+ * Every other figure in this app is an average, and an average says a
+ * setting fits while Maxim hears it break - a block in fifty is nothing to a
+ * mean and is a click every second to an ear.  This is counted on every
+ * block, costs nothing, and is said once a second whatever else is switched
+ * on.
+ */
+static uint32_t s_over_sec, s_over_worst, s_blocks_sec;
+
+/*
+ * THE REPORTER.
+ *
+ * It wakes once a second, says what the second held, and goes back to sleep.
+ * Ordinary priority and a small stack: it must never be in a position to
+ * delay the block loop, and whatever it costs it costs once a second rather
+ * than inside a block.
+ */
+static volatile int s_report_stop;
+
+/* Declared here because the reporter says them; they live further down with
+   the rest of the block loop's state. */
+static float s_peak;     /* of the last block at the converter */
+static float s_amp_peak; /* and at the amplifier, before the cabinet */
+
+static void report_thread(void *arg)
+{
+    uint32_t tail = 0;
+    (void)arg;
+    while (!s_report_stop) {
+        uint32_t over, blocks, worst, dear, dear_us, head, i;
+
+        ag_delay(1000u);
+
+        over = s_over_sec;
+        blocks = s_blocks_sec;
+        worst = s_over_worst;
+        dear = s_dear_sec;
+        dear_us = s_dear_sec_us;
+        s_over_sec = 0u;
+        s_blocks_sec = 0u;
+        s_over_worst = 0u;
+        s_dear_sec = 0u;
+        s_dear_sec_us = 0u;
+        if (blocks == 0u) {
+            continue;
+        }
+        ag_log(AG_LOG_INFO, "click", "LATE %u of %u, worst %u",
+               (unsigned)over, (unsigned)blocks, (unsigned)worst);
+        /* How loud it actually is, because a measurement of a chain that is
+           not being driven is a measurement of nothing - which is what the
+           quiet bench had been doing all afternoon. */
+        ag_log(AG_LOG_INFO, "click", "amp %u%% out %u%%",
+               (unsigned)(s_amp_peak * 100.0f), (unsigned)(s_peak * 100.0f));
+        if (dear != 0u) {
+            ag_log(AG_LOG_INFO, "click", "dear %u/s %u us", (unsigned)dear,
+                   (unsigned)dear_us);
+        }
+        /*
+         * And at most four of the blocks themselves, newest last.  Four
+         * because the journal is read on a forty-column screen and a second
+         * that printed sixty lines would be a second nobody can read.
+         */
+        head = s_ring_head;
+        if (head - tail > 4u) {
+            tail = head - 4u;
+        }
+        for (i = tail; i != head; i++) {
+            const uint32_t at = i & (AG_EV_RING - 1u);
+            const unsigned w = s_ring[at].what;
+            ag_log(AG_LOG_INFO, "click", "n%u b%u v%u c%u %s%s%s%s",
+                   (unsigned)s_ring[at].n, (unsigned)s_ring[at].busy,
+                   (unsigned)s_ring[at].v, (unsigned)s_ring[at].c,
+                   (w & 1u) ? "O" : "", (w & 2u) ? "R" : "",
+                   (w & 8u) ? "H" : "", (w & 64u) ? "S" : "");
+        }
+        tail = head;
+    }
+    ag_thread_exit();
+}
 static uint32_t     s_in_clip;
 static uint32_t     s_in_clip_win;
 /* The worst single pass through each stage in the window just ended. */
@@ -306,8 +457,6 @@ static uint32_t     s_av_budget;
 static uint32_t     s_over;
 static int16_t      s_mono[CHUNK];
 static int16_t      s_stereo[CHUNK * 2];
-static float        s_peak;     /* of the last block at the converter */
-static float        s_amp_peak; /* and at the amplifier, before the cabinet */
 /* The output trim as a numerator over 64, so a block is one shift and no
  * floating point: 64 is unity, 128 is +6 dB, 255 is +12. */
 static int          s_vol_num = 64;
@@ -2175,7 +2324,27 @@ static int tab_reserve(int want, int stages)
 static int amp_reserve(void)
 {
     if (s_amp == NULL) {
-        s_amp = (ag_amp_t *)ag_malloc(sizeof(ag_amp_t));
+        /*
+         * INTERNAL MEMORY FOR THE MODEL'S STATE, not only for its curves.
+         *
+         * The curves were moved into internal SRAM long ago and the state was
+         * left where the arena put it, which on this board is the external
+         * chip behind the shared cache.  9 KB of it - every filter's two
+         * state words, the three halfband histories - is touched on every
+         * one of the 88200 oversampled samples a second, and the cabinet
+         * sweeps its own megabyte of convolution buffers through the same
+         * cache between blocks.  Measured: the dear samples that overran
+         * blocks sat on the FIRST samples of a block, which is where a line
+         * that was evicted while the cabinet ran has to be fetched again.
+         *
+         * It falls back to the arena, because 9 KB of internal memory is not
+         * always there and a pedal that will not start is worse than one
+         * that stutters.
+         */
+        s_amp = (ag_amp_t *)ag_malloc_caps(sizeof(ag_amp_t), AG_MEM_FAST);
+        if (s_amp == NULL) {
+            s_amp = (ag_amp_t *)ag_malloc(sizeof(ag_amp_t));
+        }
         if (s_amp == NULL) {
             return -1;
         }
@@ -2732,9 +2901,57 @@ static AG_HOT void audio_block(void)
     }
     const ag_time_t t_valves = ag_micros();
 
+    /*
+     * The longest single sample in this block, and which one it was.
+     *
+     * "The valves took twice as long" has two completely different causes
+     * and the same symptom: arithmetic that is dearer on this signal than on
+     * the last one, which is spread over every sample in the block, or
+     * something that stopped this core dead, which is one sample carrying
+     * the lot.  A block is 64 samples of about 20 us each; a sample that
+     * took a thousand is not arithmetic, whatever it is.
+     *
+     * 64 clock reads against 2900 us of work is a fifth of one per cent, and
+     * this is the only way to tell the two apart.
+     */
+    ag_time_t t_prev = t_valves;
+    s_blk_gap = 0u;
+    s_blk_gap_at = 0;
+    s_blk_dear = 0u;
+    s_blk_dear_us = 0u;
     for (i = 0; i < s_chunk; i++) {
         float x = 0.0f, y;
         int   v;
+        if (s_gaps) {
+            const ag_time_t t_now = ag_micros();
+            const uint32_t  gap = (uint32_t)(t_now - t_prev);
+            t_prev = t_now;
+            if (gap > s_blk_gap) {
+                s_blk_gap = gap;
+                s_blk_gap_at = i;
+            }
+            /*
+             * And how much of the block went into samples that were dear,
+             * which is what says whether the overrun is a few moments or
+             * the whole block being slower.  60 us is three times the
+             * ordinary sample here and well clear of the clock's own grain.
+             */
+            /*
+             * The shape of it, not just the count.  A fixed interruption
+             * taken a fixed number of times a second lands in one band; work
+             * that is simply dearer on some samples spreads across all of
+             * them.  The ordinary sample here is 20 us.
+             */
+            if (gap > 30u) {
+                s_cost_band[gap > 240u ? 3 : gap > 120u ? 2 : gap > 60u ? 1 : 0]++;
+            }
+            if (gap > 60u) {
+                s_blk_dear++;
+                s_blk_dear_us += gap;
+                s_dear_sec++;
+                s_dear_sec_us += gap;
+            }
+        }
         if (s_live) {
             /*
              * What the converter sent, before anything is done to it.
@@ -2774,7 +2991,45 @@ static AG_HOT void audio_block(void)
                 }
             }
         }
-        y = (s_amp != NULL) ? ag_amp_tick(s_amp, x) : x;
+        /*
+         * `bypass` takes the amplifier out and leaves everything else - the
+         * block loop, the clock reads that measure it, the sink.  It is here
+         * to check the instrument rather than the pedal: the dear samples
+         * are measured by reading a clock between samples, that read is a
+         * call into the kernel, and an instrument that is itself the
+         * expensive thing would have had me chasing my own shadow.
+         */
+        /*
+         * `dc` holds the input at one number for ever.  Then every sample
+         * is the same arithmetic on the same values - nothing decays, the
+         * curve is read at one place, and the only thing left that could
+         * make one sample dearer than the next is the machine.
+         */
+        if (s_dc) {
+            x = 0.25f;
+        }
+        /*
+         * `sine` is a loud signal that repeats exactly, which a guitar does
+         * not.  It exists because the overruns Maxim still hears are on loud
+         * playing and nothing in a quiet file reproduces them: at four times
+         * oversampling a big signal crosses many more cells of the curve per
+         * sample, and the walk through them is the dearest path in the
+         * model.  110 Hz and nine tenths of full scale is a low E hit hard.
+         */
+        if (s_sine) {
+            s_sine_ph += 110.0f * 6.28318531f / (float)RATE;
+            if (s_sine_ph > 6.28318531f) {
+                s_sine_ph -= 6.28318531f;
+            }
+            {
+                /* A sine from the model's own trigonometry, which is in the
+                   hot half and costs nothing worth counting here. */
+                float sn, cs;
+                ag_sincosf(s_sine_ph, &sn, &cs);
+                x = 0.9f * sn;
+            }
+        }
+        y = (s_bypass || s_amp == NULL) ? x : ag_amp_tick(s_amp, x);
         if (y > peak) {
             peak = y;
         } else if (-y > peak) {
@@ -2800,6 +3055,7 @@ static AG_HOT void audio_block(void)
            a window of three hundred, and it disappears into the mean. */
         const uint32_t took = (uint32_t)(ag_micros() - t_valves);
         s_us_valves += took;
+        s_blk_valves = took;
         if (took > s_win_v_max) {
             s_win_v_max = took;
         }
@@ -2847,6 +3103,7 @@ static AG_HOT void audio_block(void)
     {
         const uint32_t took = (uint32_t)(ag_micros() - t_ir);
         s_us_cab += took;
+        s_blk_cab = took;
         if (took > s_win_c_max) {
             s_win_c_max = took;
         }
@@ -2972,12 +3229,16 @@ static AG_HOT void audio_block(void)
         const int32_t wrote =
             ag_pcm_write(&s_out, s_stereo, (int32_t)s_chunk);
         const uint32_t out_us = (uint32_t)(ag_micros() - t_out);
+        /* Kept past the block below so the click log can say what the block
+           was busy for without timing it a second time. */
+        uint32_t busy_blk = 0u;
         s_us_out += out_us;
         {
             /* What this block cost with neither wait in it. */
             const uint32_t spent = (uint32_t)(ag_micros() - t0);
             const uint32_t waits = s_us_in_blk + out_us;
             const uint32_t busy = (spent > waits) ? (spent - waits) : 0u;
+            busy_blk = busy;
             if (busy > s_worst_busy) {
                 s_worst_busy = busy;
             }
@@ -2989,6 +3250,62 @@ static AG_HOT void audio_block(void)
             }
         }
         s_blocks++;
+        /*
+         * WHAT HAPPENED TO THIS BLOCK, counted here and said elsewhere.
+         *
+         * The one number that matters is how many blocks a second did not
+         * finish in their own time: an average says a setting fits while
+         * Maxim hears it break, because a block in fifty is nothing to a
+         * mean and a click a second to an ear.
+         *
+         * Everything here is a store into memory.  The journal line that
+         * used to be written from this thread took the pedal down with it
+         * when the console's reader was a page on a telephone - see
+         * report_thread, which does the talking now.
+         */
+        {
+            const uint32_t budget_us = (s_chunk * 1000000u) / RATE;
+            unsigned       what = 0u;
+
+            /* The window counters are zeroed by the status line, so a smaller
+               number than last time is a reset and not an event. */
+            if (s_in_clip < s_ev_clip)    { s_ev_clip = s_in_clip; }
+            if (s_out.resync < s_ev_rsy)  { s_ev_rsy = s_out.resync; }
+            if (s_out.drop < s_ev_drop)   { s_ev_drop = s_out.drop; }
+            if (s_in_holes < s_ev_hole)   { s_ev_hole = s_in_holes; }
+            if (s_out_clipped < s_ev_out) { s_ev_out = s_out_clipped; }
+
+            if (busy_blk > budget_us) {
+                what |= 1u;
+                s_over_sec++;
+                if (busy_blk > s_over_worst) {
+                    s_over_worst = busy_blk;
+                }
+            }
+            if (s_out.resync != s_ev_rsy)  { what |= 2u; }
+            if (s_out.drop != s_ev_drop)   { what |= 4u; }
+            if (s_in_holes != s_ev_hole)   { what |= 8u; }
+            if (s_in_clip != s_ev_clip)    { what |= 16u; }
+            if (s_out_clipped != s_ev_out) { what |= 32u; }
+            if (s_blk_dear != 0u)          { what |= 64u; }
+            s_blocks_sec++;
+
+            s_ev_rsy = s_out.resync;
+            s_ev_drop = s_out.drop;
+            s_ev_hole = s_in_holes;
+            s_ev_clip = s_in_clip;
+            s_ev_out = s_out_clipped;
+
+            if (what != 0u && s_blocks > 100u) {
+                const uint32_t at = s_ring_head & (AG_EV_RING - 1u);
+                s_ring[at].n = s_blocks;
+                s_ring[at].busy = busy_blk;
+                s_ring[at].what = (uint8_t)what;
+                s_ring[at].v = s_blk_valves;
+                s_ring[at].c = s_blk_cab;
+                s_ring_head++;
+            }
+        }
         if (s_blocks == 1u) {
             /* The first block is the one worth saying out loud: on a box with
              * no screen it is the only evidence that the chain reached the
@@ -3595,6 +3912,18 @@ int ag_main(int argc, char **argv)
              * nothing.
              */
             cab_path = argv[++i];
+        } else if (strcmp(argv[i], "gaps") == 0) {
+            s_gaps = 1;
+        } else if (strcmp(argv[i], "sine") == 0) {
+            s_sine = 1;
+        } else if (strcmp(argv[i], "dc") == 0) {
+            s_dc = 1;
+        } else if (strcmp(argv[i], "bypass") == 0) {
+            s_bypass = 1;
+        } else if (strcmp(argv[i], "nostages") == 0) {
+            /* The oversampling and the input filters, with the valves taken
+               out: for finding which half of the chain holds a fault. */
+            g_ag_amp_no_stages = 1;
         } else if (strcmp(argv[i], "noadaa") == 0) {
             /* For measuring only: what the antialiasing costs, on the board,
                in the chain rather than in a bench of its own.  It is what
@@ -3849,6 +4178,17 @@ int ag_main(int argc, char **argv)
             }
             return 1;
         }
+        /*
+         * The reporter; see report_thread.  Ordinary priority, and nothing
+         * depends on it existing.
+         *
+         * 6 KB of stack and not the 2 KB it was given first: a journal line
+         * is formatted on the caller's stack - a 200 byte line buffer, the
+         * variadic formatting under it, and this thread's own frames - and
+         * 2 KB overflowed it.  The system caught that and restarted the
+         * board, in the middle of Maxim playing, twice.
+         */
+        (void)ag_thread_create(report_thread, NULL, "stompreport", 6144, 5, 0);
         ag_printf("stomp: sound = %s @ %u Hz, %u frames a block\n", s_out.path,
                   (unsigned)RATE, (unsigned)s_chunk);
         /*
@@ -4148,7 +4488,18 @@ int ag_main(int argc, char **argv)
                             s_paint_us = 0;
                         }
                     }
-                    if (!s_text) {
+                    if (!s_text && s_journal) {
+                        /*
+                         * Only when `stats` was asked for.
+                         *
+                         * Unasked, this is two lines every two seconds into
+                         * a journal that holds two hundred: a minute of
+                         * playing overwrites the ring six times over, and
+                         * the first click log written was destroyed by it
+                         * before anybody could read a line of it.  The
+                         * numbers are worth having; they are not worth the
+                         * record of what went wrong.
+                         */
                         /* The rail early in the line, because the console
                          * wraps at forty columns and a number that falls off
                          * the end is a number nobody reads. */
@@ -4254,6 +4605,33 @@ int ag_main(int argc, char **argv)
                   (unsigned)s_worst_busy);
         ag_printf("stomp: %u samples over the rail%s\n", (unsigned)s_clipped,
                   s_clipped > 0u ? " - turn the master down" : "");
+        /*
+         * The click log, now that nothing else is writing.
+         *
+         * Every block that could have been heard, counted by cause, and
+         * then the blocks themselves - the first few and one in sixteen
+         * after that.  It is printed here and nowhere earlier because
+         * this app's own status line had already overwritten the whole
+         * journal by the time the first attempt was read.
+         */
+        ag_printf("stomp: %u blocks could be heard: "
+                  "%u late, %u resync, %u drop, %u hole, %u inclip, "
+                  "%u outclip\n",
+                  (unsigned)s_ev_seen, (unsigned)s_ev_cause[0],
+                  (unsigned)s_ev_cause[1], (unsigned)s_ev_cause[2],
+                  (unsigned)s_ev_cause[3], (unsigned)s_ev_cause[4],
+                  (unsigned)s_ev_cause[5]);
+        {
+            uint32_t e;
+            for (e = 0; e < s_ev_kept; e++) {
+                const unsigned w = s_ev[e].what;
+                ag_printf("stomp: blk %u busy %u %s%s%s%s%s%s\n",
+                          (unsigned)s_ev[e].n, (unsigned)s_ev[e].busy,
+                          (w & 1u) ? "O" : "", (w & 2u) ? "R" : "",
+                          (w & 4u) ? "D" : "", (w & 8u) ? "H" : "",
+                          (w & 16u) ? "I" : "", (w & 32u) ? "C" : "");
+            }
+        }
     }
     ag_wav_free(&s_di);
     if (s_ir_ready) {
