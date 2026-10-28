@@ -1,0 +1,102 @@
+# ArgonOS - ESP32-P4, the M5Stack Stamp-P4 (S013) on the desk.
+#
+# The fifth chip this system builds for and the third RISC-V one, and the first
+# with no radio at all: the P4 is an application processor - two RISC-V cores
+# at 360 MHz with a single-precision FPU, 768 KB of L2 memory, 32 MB of HEX
+# PSRAM in the package - and Wi-Fi on this family is a C6 on the SDIO add-on
+# board, which this board does not have.
+#
+# The board: ESP32-P4NRW32, revision v1.3, 16 MB flash.  One USB-C socket, and
+# it goes to the chip's own USB-Serial/JTAG on GPIO 24/25 (VID 303A PID 1001) -
+# the same arrangement as the C6 and the C3, so the console is that device and
+# not a UART.  See boards/m5stack-stamp-p4.
+#
+# QEMU does not run this target; everything here is verified on the board.
+
+CONFIG_IDF_TARGET="esp32p4"
+
+# THE LINE WITHOUT WHICH NOTHING BOOTS.
+#
+# ESP-IDF 5.5 builds for P4 revision 3.x by default, and revision 3 is a
+# different chip as far as the bootloader is concerned: the ROM refuses an
+# image whose minimum revision is above its own, with nothing on the console
+# but the ROM's own banner.  This board is v1.3 (esptool: "Chip is ESP32-P4
+# (revision v1.3)"), and v1.x and v3.x are mutually exclusive in one image.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+# 360 MHz is the ceiling below revision 3 (400 is a v3 clock), and the default
+# IDF picks once the line above is set.  Written down so it is not a surprise.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+
+# 16 MB, in the mode the factory firmware ran it in: DIO at 80 MHz, read off
+# its image header (logs/stamp-p4-factory).  QIO is the first thing to try when
+# flash speed matters - it is what won the 2.8B its frame rate - but only once
+# measured on this chip, not before.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"
+
+# The console: the chip's own USB serial device, as on the C6.  UART0 (37/38)
+# is on the stamp holes and stays an application's.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+
+# 32 MB of HEX PSRAM in the package.  200 MHz is IDF's default for it and the
+# fastest a v1.x part allows (250 is v3 only).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+
+# Memory that is both writable and executable through one address, which is
+# what the loader needs and what ESP-IDF on a RISC-V part does not hand out by
+# default.  The same reasoning as the C6 (sdkconfig.defaults.esp32c6), and on
+# this chip two lines rather than one:
+#
+#   PMP_IDRAM_SPLIT     L2 memory above _iram_text_end is read-write only; the
+#                       code arena lives there, so an image loads, relocates,
+#                       and dies on its first instruction.
+#   PRE_CONFIGURE_...   PSRAM past the image is read-write only, which closes
+#                       PSRAM to code for good.  Off, the PSRAM range keeps the
+#                       read-write-execute entry IDF otherwise gives it.
+CONFIG_ESP_SYSTEM_PMP_IDRAM_SPLIT=n
+CONFIG_SPIRAM_PRE_CONFIGURE_MEMORY_PROTECTION=n
+
+# The code arena.  L2 memory is 768 KB and nothing on this board competes for
+# it the way Wi-Fi does on the C6, so the S3's 192.
+#
+# One difference from every chip before it: L2 memory is reached through the
+# L1 caches, data and instruction separately.  What the loader writes lands in
+# the data cache, and the instruction fetch does not look there - so after a
+# load the port writes the data cache back and drops the instruction cache
+# (ag_port_execmem_sync, execmem_hw.c).  On the C6 the same SRAM has no cache
+# in front of it and the step costs nothing.
+CONFIG_ARGON_APP_ARENA_KB=192
+
+# No radio on the chip.  No Ethernet either: the RMII pins are on the stamp
+# holes, but the PHY would be on a carrier board this board is not on.
+CONFIG_ARGON_ENABLE_NET=n
+CONFIG_ARGON_NET_WIFI=n
+CONFIG_ETH_USE_OPENETH=n
+CONFIG_ARGON_ENABLE_BLE=n
+CONFIG_BT_ENABLED=n
+CONFIG_ARGON_NET_WIFI_MON=n
+
+# A panic reboots rather than halting, as on the other boards with no fault
+# recovery: "reset: panic" on the next boot beats a board that stops with
+# nobody watching.
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=n
+
+# No development machine on UART1, no emulated panel, and nothing on this
+# board to make a sound or to measure: the bare stamp has no codec and no
+# speaker, and the ADC stays off until something on a carrier needs it.
+CONFIG_ARGON_ENABLE_HOSTFS=n
+CONFIG_ARGON_PANEL_QEMU=n
+CONFIG_ARGON_ENABLE_AUDIO=n
+CONFIG_ARGON_ENABLE_ADC=n
+
+# No glass on the bare board, so the console is the terminal's: 80 by 25.
+CONFIG_ARGON_CONSOLE_COLS=80
+CONFIG_ARGON_CONSOLE_ROWS=25

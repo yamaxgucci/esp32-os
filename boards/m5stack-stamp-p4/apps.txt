@@ -1,0 +1,17 @@
+# What goes on this board's C:, staged by tools\mksysfs.py.
+#
+# The RISC-V builds (rv32imc, which runs on this part as on the C3 and C6),
+# chosen to prove the board rather than to furnish it:
+#
+#   HELLORV   the loader: an image placed, relocated and entered.  On this chip
+#             that is also the cache: L2 memory is behind the L1 caches, and
+#             code that is not written back runs the previous program.
+#   CRASHRV   a fault in an application, and what the system does about it.
+#   GRINDRV   both cores, and an answer that has to agree with the serial one.
+#   DEVPOKRV  the device table from an application.
+#   AGVMRV    the bytecode rung.
+HELLORV.AXE
+CRASHRV.AXE
+GRINDRV.AXE
+DEVPOKRV.AXE
+AGVMRV.AXE

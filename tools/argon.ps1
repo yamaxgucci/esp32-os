@@ -105,6 +105,7 @@ ArgonOS
                            working tree (docs\16-test-pc.md); -Probe: is it up
   argon target             which chip the firmware is built for
   argon target esp32c6     the RISC-V board (docs\12-esp32-c6-lcd.md)
+  argon target esp32p4     the M5Stack Stamp-P4 (docs\17-esp32-p4-stamp.md)
   argon target esp32       switch to the board on the desk (docs\09-esp32-cyd.md);
                            esp32-dsp = no radios, big arena; esp32s3 switches
                            back.  esp32s3-cam = esp32s3-board with the camera
@@ -247,6 +248,7 @@ $script:BoardPackOf = @{
     'esp32s3-touch-lcd-2' = 'esp32s3-touch-lcd-2'
     'esp32c6'       = 'esp32-c6-lcd-1.47'
     'esp32c3'       = 'esp32c3-supermini'
+    'esp32p4'       = 'm5stack-stamp-p4'
 }
 
 # piece -> kinds it may take -> the sdkconfig switches each kind means.
@@ -428,6 +430,7 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
             Write-Host '                esp32c3     hardware: RISC-V, USB console, one core, 400 KB - the C3 SuperMini'
         Write-Host '                esp32c3-qemu  the same in the emulator: console on UART0, no radio'
+            Write-Host '                esp32p4     hardware: RISC-V x2 at 360 MHz, 32 MB PSRAM, no radio - the Stamp-P4'
             exit 0
         }
 
@@ -462,6 +465,7 @@ switch ($Command.ToLowerInvariant()) {
                              $chip = 'esp32s3' }
             'esp32c6'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c6' }
             'esp32c3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3' }
+            'esp32p4'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32p4' }
             'esp32c3-qemu' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32c3;sdkconfig.esp32c3.qemu'
                              $chip = 'esp32c3' }
             default {

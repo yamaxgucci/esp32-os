@@ -47,6 +47,7 @@ TOOLCHAIN_FOR_TARGET = {
     "esp32s3": ("xtensa", "xtensa-esp32s3-elf-gcc"),
     "esp32c3": ("riscv32", "riscv32-esp-elf-gcc"),
     "esp32c6": ("riscv32", "riscv32-esp-elf-gcc"),
+    "esp32p4": ("riscv32", "riscv32-esp-elf-gcc"),
 }
 
 

@@ -72,7 +72,9 @@ realtime-эмуляции — в [07-emulator-performance.md](07-emulator-perfor
 Fallout, USB и своя SPI-панель) — [14-esp32-s3-cam.md](14-esp32-s3-cam.md);
 ESP32-2432S028R («CYD», Xtensa LX6) — [09-esp32-cyd.md](09-esp32-cyd.md);
 Waveshare ESP32-C6-LCD-1.47 (**RISC-V**, консоль по USB) —
-[12-esp32-c6-lcd.md](12-esp32-c6-lcd.md).
+[12-esp32-c6-lcd.md](12-esp32-c6-lcd.md); M5Stack Stamp-P4 (**ESP32-P4**,
+два ядра RISC-V, 32 МБ PSRAM, без радио) —
+[17-esp32-p4-stamp.md](17-esp32-p4-stamp.md).
 
 ## Как работать
 

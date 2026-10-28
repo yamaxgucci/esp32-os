@@ -144,8 +144,15 @@ static void fill(uart_config_t *out, const ag_port_uart_cfg_t *cfg)
      * cycles a bit (the most the receiver can use) at 40 MHz is 2.5 Mbaud, so
      * that is the line.
      */
+#if CONFIG_IDF_TARGET_ESP32P4
+    /* The P4 has no APB choice for its UARTs; its fast clock is PLL_F80M, the
+     * same 80 MHz, and it does not follow the processor down either. */
+    out->source_clk =
+        (cfg->baud <= 2500000u) ? UART_SCLK_XTAL : UART_SCLK_PLL_F80M;
+#else
     out->source_clk =
         (cfg->baud <= 2500000u) ? UART_SCLK_XTAL : UART_SCLK_APB;
+#endif
 #elif SOC_UART_SUPPORT_REF_TICK
     out->source_clk =
         (cfg->baud <= 115200u) ? UART_SCLK_REF_TICK : UART_SCLK_APB;

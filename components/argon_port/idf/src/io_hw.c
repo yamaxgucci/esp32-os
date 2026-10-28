@@ -106,6 +106,14 @@ unsigned ag_port_reserved_pins(const ag_port_pin_range_t **out)
          * they are the machine's whatever the console is set to.
          */
         {12, 13, "usb"},
+#elif CONFIG_IDF_TARGET_ESP32P4
+        /*
+         * The flash and the in-package PSRAM are on the P4's own MSPI pins,
+         * which are not GPIOs at all, so there is no flash range to keep here.
+         * What is left is the USB-Serial/JTAG pair, and on the Stamp-P4 that
+         * is the console - the same reasoning as the C6 above.
+         */
+        {24, 25, "usb"},
 #else
         {0, -1, NULL}, /* nothing known for this target */
 #endif

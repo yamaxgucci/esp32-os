@@ -1,0 +1,3 @@
+# What goes into C:\drv on this board, staged by tools\mksysfs.py.
+#
+# Nothing: the bare stamp has no glass, no card slot and no wire to drive.

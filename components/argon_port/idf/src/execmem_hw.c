@@ -19,6 +19,7 @@
 #include <argon/port/execmem.h>
 
 #include "sdkconfig.h"
+#include "soc/soc_caps.h"
 
 #if defined(CONFIG_SPIRAM) && defined(SOC_MMU_PAGE_SIZE)
 #define AG_EXECMEM_HAVE 1
@@ -107,27 +108,6 @@ ag_err_t ag_port_execmem_map(size_t bytes, void **exec, void **writable,
     return AG_OK;
 }
 
-void ag_port_execmem_sync(void *writable, size_t bytes)
-{
-    if (writable == NULL || bytes == 0) {
-        return;
-    }
-    /*
-     * Two steps, and both matter.  The bytes were written through the data
-     * cache, so push them to PSRAM (C2M); then the instruction cache may hold
-     * the old contents of these addresses, so drop them (INVALIDATE).  The
-     * range is whatever the loader wrote and is not cache-line aligned, so
-     * allow the unaligned form rather than rejecting it.
-     */
-    (void)esp_cache_msync(writable, bytes,
-                          ESP_CACHE_MSYNC_FLAG_DIR_C2M |
-                          ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-    (void)esp_cache_msync(writable, bytes,
-                          ESP_CACHE_MSYNC_FLAG_INVALIDATE |
-                          ESP_CACHE_MSYNC_FLAG_TYPE_INST |
-                          ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-}
-
 void ag_port_execmem_unmap(ag_port_map_t h)
 {
     if (h != 0) {
@@ -151,15 +131,80 @@ ag_err_t ag_port_execmem_map(size_t bytes, void **exec, void **writable,
     return -AG_ENOTSUP;
 }
 
+void ag_port_execmem_unmap(ag_port_map_t h) { (void)h; }
+
+#endif /* CONFIG_SPIRAM */
+
+/*
+ * Making written code fetchable.  The loader calls this for every image it
+ * places in memory, wherever that is, and this decides whether there is any
+ * work: there is for PSRAM (behind the cache on every chip), and for internal
+ * memory only where the L1 caches stand in front of it too - the P4, whose L2
+ * memory is reached through them, data and instruction separately.  The S3's,
+ * the ESP32's and the C6's SRAM have no cache before them, and esp_cache_msync
+ * would refuse such an address with an error in the log.
+ */
+#if defined(CONFIG_SPIRAM) || SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+#include "esp_cache.h"
+#include "esp_memory_utils.h"
+#if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+#include "freertos/FreeRTOS.h"
+#include "hal/cache_ll.h"
+
+static portMUX_TYPE s_icache_lock = portMUX_INITIALIZER_UNLOCKED;
+#endif
+
+void ag_port_execmem_sync(void *writable, size_t bytes)
+{
+    if (writable == NULL || bytes == 0) {
+        return;
+    }
+#if !SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+    if (!esp_ptr_external_ram(writable)) {
+        return;
+    }
+#endif
+    /*
+     * Two steps, and both matter.  The bytes were written through the data
+     * cache, so push them out of it (C2M); then the instruction cache may hold
+     * the old contents of these addresses - on the P4 the arena is one block
+     * that every program is loaded into in turn - so drop those lines.
+     *
+     * The second step is not esp_cache_msync.  It was, as INVALIDATE|TYPE_INST,
+     * and IDF refuses that combination ("C2M direction doesn't support
+     * instruction type", seen on the Stamp-P4 on 28 Oct 2026) - so the
+     * instruction cache was never dropped on any chip, the S3's PSRAM arena
+     * included, and a stale line went unnoticed only because nothing had
+     * happened to hold one.  C2M|INVALIDATE would drop the instruction lines
+     * but the data lines with them, and the range is not cache-line aligned: a
+     * neighbour's byte written by the other core between the two steps would be
+     * lost.  So the instruction cache alone, level 1, every core's.  On the P4
+     * a miss there is filled from L2 memory, or for PSRAM from the L2 cache,
+     * which is what the first step wrote into.
+     *
+     * The P4 only.  The S3's cache_ll_invalidate_addr ignores the type and
+     * drops data lines too (Cache_Invalidate_Addr), which is the race above;
+     * and its PSRAM arena runs through a second mapping, so the lines to drop
+     * are at the executable alias, an address this contract does not carry.
+     * The S3 keeps what it has always effectively had: the write-back alone.
+     */
+    (void)esp_cache_msync(writable, bytes,
+                          ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                          ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+#if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+    portENTER_CRITICAL_SAFE(&s_icache_lock);
+    cache_ll_invalidate_addr(1, CACHE_TYPE_INSTRUCTION, CACHE_LL_ID_ALL,
+                             (uint32_t)(uintptr_t)writable, (uint32_t)bytes);
+    portEXIT_CRITICAL_SAFE(&s_icache_lock);
+#endif
+}
+#else
 void ag_port_execmem_sync(void *writable, size_t bytes)
 {
     (void)writable;
     (void)bytes;
 }
-
-void ag_port_execmem_unmap(ag_port_map_t h) { (void)h; }
-
-#endif /* CONFIG_SPIRAM */
+#endif
 
 /*
  * CODE FROM THE INTERNAL HEAP (9 Oct 2026).

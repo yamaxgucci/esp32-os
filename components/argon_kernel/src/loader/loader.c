@@ -102,7 +102,7 @@ static ag_err_t read_whole(const char *path, const char *cwd, uint8_t **out,
 #define AG_APP_ARENA_MIN_KB 4u
 
 static uint8_t s_arena[AG_APP_ARENA_BYTES]
-    __attribute__((aligned(16), section(".iram.bss.ag_app_arena")));
+    __attribute__((aligned(16))) AG_PORT_CODE_ARENA_BSS;
 
 #define AG_LOADER_SLOTS (AG_PROC_MAX + AG_MODULE_MAX)
 
@@ -1093,6 +1093,30 @@ static ag_err_t stream_code(ag_handle_t h, const ag_axe_part_t *part, void *dst)
 }
 
 /*
+ * The code is written and relocated; make it what the processor fetches before
+ * anything jumps into it.
+ *
+ * Every placement, not only PSRAM: on the ESP32-P4 the internal memory the
+ * arena lives in is behind the L1 caches too, data and instruction separately,
+ * so what the loader just wrote can still be sitting in the data cache while
+ * the instruction cache holds whatever was at those addresses before - the
+ * previous program.  The port knows which memory needs it and does nothing for
+ * the rest (the S3's and the C6's SRAM, which no cache stands in front of).
+ * Flash XIP is not this: the bytes went to flash, and mapping them in drops the
+ * cache on its own.
+ */
+static void code_written(const ag_loaded_app_t *out)
+{
+    if (out->code_from_xip) {
+        return;
+    }
+    void *const code = (out->place.code_writable != NULL)
+                           ? out->place.code_writable
+                           : out->place.code;
+    ag_port_execmem_sync(code, out->place.code_capacity);
+}
+
+/*
  * Loads an image without ever holding the whole file.
  *
  * The obvious way - read the file, then place it, then copy out of it - keeps
@@ -1174,18 +1198,9 @@ static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
     ag_port_free(irel);
     ag_port_free(rel);
 
-#if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
-    /*
-     * The code was written and relocated through the data window; make it
-     * visible to the instruction fetch before anything jumps into it - push the
-     * data cache to PSRAM, drop the stale instruction cache.  Only for a
-     * PSRAM-placed image: the internal arena is already coherent, and flash XIP
-     * has its own path.
-     */
-    if (err == AG_OK && out->code_from_psram) {
-        ag_port_execmem_sync(out->place.code_writable, out->place.code_capacity);
+    if (err == AG_OK) {
+        code_written(out);
     }
-#endif
 
     if (err != AG_OK) {
         release_image(out);
@@ -1255,6 +1270,10 @@ static ag_err_t load_whole(const char *path, const char *cwd,
                            (file + ag_axe_ireloc_offset(header)),
                        ag_axe_ireloc_count(header), &out->binding);
     ag_port_free(file);
+
+    if (err == AG_OK) {
+        code_written(out);
+    }
 
     if (err != AG_OK) {
         release_image(out);
