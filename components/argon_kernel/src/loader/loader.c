@@ -1474,6 +1474,14 @@ ag_err_t ag_loader_load(const char *path, const char *cwd,
 
     err = ag_axe_validate(&header, (size_t)size, ag_axe_native_arch(),
                           AG_ABI_MAJOR, AG_ABI_MINOR);
+    if (err == -AG_ENOTSUP &&
+        (ag_axe_arch_t)header.arch == ag_axe_native_arch() &&
+        (header.flags & AG_AXE_NEEDS_FPU) != 0u) {
+        ag_log(AG_LOG_ERROR, "loader",
+               "%s was built for a float unit this chip does not have "
+               "(an ESP32-P4 image?) - rebuild it for this target",
+               path);
+    }
     if (err != AG_OK) {
         ag_vfs_close(h);
         return err;

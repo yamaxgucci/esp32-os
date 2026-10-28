@@ -137,7 +137,18 @@ static bool radio_on(void)
  */
 uint32_t ag_port_power_cpu_steps(uint16_t *out, uint32_t max)
 {
+#if CONFIG_IDF_TARGET_ESP32P4
+    /*
+     * Not this family's tree at all: the P4's CPU_CLK comes off its own PLL,
+     * 360 MHz below revision 3 and 400 from it, divided by one, two or four
+     * (esp32p4 rtc_clk.c).  The table above it once gave this chip 240 as its
+     * ceiling, and the journal said "cpu 240-240 MHz" on a part running at 360.
+     */
+    static const uint16_t k_steps[] = {AG_CPU_MAX_MHZ, AG_CPU_MAX_MHZ / 2,
+                                       AG_CPU_MAX_MHZ / 4, AG_XTAL_MHZ};
+#else
     static const uint16_t k_steps[] = {240, 160, 80, AG_XTAL_MHZ};
+#endif
 
     const bool hold_bus = radio_on();
 

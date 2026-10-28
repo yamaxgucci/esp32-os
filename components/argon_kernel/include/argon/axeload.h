@@ -12,6 +12,8 @@
 #ifndef ARGON_AXELOAD_H
 #define ARGON_AXELOAD_H
 
+#include <stdbool.h>
+
 #include <argon/abi.h>
 #include <argon/axe.h>
 
@@ -116,6 +118,9 @@ void *ag_axe_resolve(const ag_axe_header_t *header, const ag_axe_place_t *place,
 
 /* Which architecture this build of the kernel can run. */
 ag_axe_arch_t ag_axe_native_arch(void);
+
+/* Can this machine run an image marked AG_AXE_NEEDS_FPU? */
+bool ag_axe_native_fpu(void);
 
 /* "xtensa", "riscv32" - for messages a person reads. */
 const char *ag_axe_arch_name(ag_axe_arch_t arch);

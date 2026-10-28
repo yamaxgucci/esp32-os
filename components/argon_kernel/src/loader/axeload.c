@@ -31,6 +31,27 @@ ag_axe_arch_t ag_axe_native_arch(void)
 #endif
 }
 
+/*
+ * Whether the float unit an AG_AXE_NEEDS_FPU image was compiled for is here.
+ * Asked of the compiler that built this kernel, because it was told by the same
+ * configuration that knows the chip: ESP-IDF builds the P4 with -mabi=ilp32f
+ * and the C3 and C6, which have no float unit, without F at all.  Xtensa images
+ * never carry the flag; everything else answers yes so a host build can load
+ * what it is given.
+ */
+bool ag_axe_native_fpu(void)
+{
+#if defined(__riscv)
+#if defined(__riscv_flen)
+    return true;
+#else
+    return false;
+#endif
+#else
+    return true;
+#endif
+}
+
 const char *ag_axe_arch_name(ag_axe_arch_t arch)
 {
     switch (arch) {
@@ -116,6 +137,11 @@ ag_err_t ag_axe_validate(const ag_axe_header_t *header, size_t file_bytes,
      * the version does not match.
      */
     if ((ag_axe_arch_t)header->arch != arch) {
+        return -AG_ENOTSUP;
+    }
+    /* The right instruction set, but a float unit this chip does not have: a
+     * P4 image on a C3 would load and die on its first float instruction. */
+    if ((header->flags & AG_AXE_NEEDS_FPU) != 0u && !ag_axe_native_fpu()) {
         return -AG_ENOTSUP;
     }
     if (header->abi_major != abi_major || header->abi_minor > abi_minor) {

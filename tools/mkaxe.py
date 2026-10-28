@@ -110,6 +110,7 @@ def read_icon(path):
 # Must match enum ag_axe_flags in sdk/include/argon/abi.h.
 AG_AXE_DRIVER = 1 << 3
 AG_AXE_CONTIGUOUS = 1 << 5
+AG_AXE_NEEDS_FPU = 1 << 9
 
 # RISC-V relocations that hold an absolute address inside an instruction.
 # Numbers from the psABI; the pairs the medlow code model produces for every
@@ -620,6 +621,10 @@ def main():
     ap.add_argument("--dump-relocs", action="store_true",
                     help="print a histogram of the relocation types the "
                          "linker emitted, and stop")
+    ap.add_argument("--fpu", action="store_true",
+                    help="riscv32 only: build for the float unit (rv32imafc, "
+                         "ilp32f) and mark the image AG_AXE_NEEDS_FPU - the "
+                         "ESP32-P4; a C3 or C6 refuses such an image")
     ap.add_argument("--contiguous", action="store_true",
                     help="one block, data straight after code: the code then "
                          "reaches its data PC-relatively (riscv32) and cannot "
@@ -694,14 +699,25 @@ def main():
         #
         # rv32imc is the common denominator: it runs on the C3, and on the C6,
         # whose extra atomics are a superset.  One image for both boards.
-        args.cflags += " -march=rv32imc_zicsr_zifencei -mabi=ilp32"
+        #
+        # The P4 is the exception, and --fpu asks for it: it has the single-
+        # precision unit, and an image that does its floats in software there
+        # ran the valve model ten times slower than the S3 does (28 Oct 2026).
+        # The image is then marked AG_AXE_NEEDS_FPU so a C3 or C6 refuses it
+        # by name rather than dying on its first float instruction.
+        march = ("rv32imafc_zicsr_zifencei" if args.fpu
+                 else "rv32imc_zicsr_zifencei")
+        mabi = "ilp32f" if args.fpu else "ilp32"
+        args.cflags += " -march=%s -mabi=%s" % (march, mabi)
         # And at the LINK, which picks the libgcc.  Without the pair there the
         # driver takes its default multilib, whose soft-float helpers read the
         # rounding mode with `frrm` - an F-extension instruction the C3 does
         # not have.  TONE was the first image to reach one and died on it with
         # an illegal instruction (25 Sep 2026); every image that ever divides
         # two floats would have.
-        link_arch = ["-march=rv32imc_zicsr_zifencei", "-mabi=ilp32"]
+        link_arch = ["-march=" + march, "-mabi=" + mabi]
+    if args.fpu and args.arch != "riscv32":
+        raise SystemExit("mkaxe: --fpu is for riscv32 images")
 
     if args.arch == "xtensa":
         pass
@@ -921,6 +937,8 @@ def main():
             # With no data part there is nothing to keep adjacent, and the flag
             # would only describe a promise about a part that does not exist.
             flags |= AG_AXE_CONTIGUOUS
+        if args.fpu:
+            flags |= AG_AXE_NEEDS_FPU
 
         # A .SYS provides ag_driver_init; an application provides ag_main.  The
         # flag in the header decides when both exist; when only the driver entry

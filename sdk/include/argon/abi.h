@@ -3921,6 +3921,19 @@ enum ag_axe_flags {
      *     it was holding and why.
      */
     AG_AXE_CAN_MIGRATE = 1u << 8,
+    /*
+     * Set by the build tool (mkaxe --fpu): this RISC-V image uses the
+     * single-precision float unit and its calling convention (rv32imafc,
+     * ilp32f).  Only the ESP32-P4 has one; the C3 and C6 do not, and an image
+     * like this would load there and die on its first float instruction, so
+     * their loader refuses it by name instead.  Without the flag an image is
+     * rv32imc and runs on all three - floats then cost a software routine
+     * each, which on the P4 made the valve model ten times slower than the
+     * S3's (28 Oct 2026).  No call in this ABI takes or returns a float, so
+     * an ilp32 image and an ilp32f kernel (the P4's) meet only at integers and
+     * pointers, and both kinds of image run on the P4.
+     */
+    AG_AXE_NEEDS_FPU = 1u << 9,
 };
 
 /*

@@ -50,6 +50,11 @@ TOOLCHAIN_FOR_TARGET = {
     "esp32p4": ("riscv32", "riscv32-esp-elf-gcc"),
 }
 
+# Targets whose own images use the float unit (mkaxe --fpu).  Only the images
+# built with the target's pair: an entry that names its arch - HELLORV and the
+# rest that travel to a C3 or C6 - stays rv32imc and runs on all three.
+FPU_TARGETS = {"esp32p4"}
+
 
 def target_from_sdkconfig():
     """The chip the current build is for, or None if there is no build yet."""
@@ -104,7 +109,8 @@ def toolchain_for(app, defaults, target_pair, forced_gcc):
     return arch, (forced_gcc or gcc)
 
 
-def command_for(app, defaults, extra_cflags, target_pair, forced_gcc):
+def command_for(app, defaults, extra_cflags, target_pair, forced_gcc,
+                fpu=False):
     include = list(defaults.get("include", [])) + list(app.get("include", []))
     cflags = app.get("cflags", defaults.get("cflags", ""))
     if extra_cflags:
@@ -112,6 +118,8 @@ def command_for(app, defaults, extra_cflags, target_pair, forced_gcc):
 
     arch, gcc = toolchain_for(app, defaults, target_pair, forced_gcc)
     cmd = [sys.executable, MKAXE, "--arch", arch, "--gcc", gcc]
+    if fpu and not ("arch" in app or "gcc" in app) and arch == "riscv32":
+        cmd += ["--fpu"]
     for inc in include:
         cmd += ["--include", inc]
     if cflags:
@@ -212,7 +220,8 @@ def main():
             continue
 
         proc = subprocess.run(
-            command_for(app, defaults, extra, target_pair, args.gcc), cwd=ROOT)
+            command_for(app, defaults, extra, target_pair, args.gcc,
+                        target in FPU_TARGETS), cwd=ROOT)
         if proc.returncode != 0:
             failed.append(name)
 
