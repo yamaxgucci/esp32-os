@@ -456,6 +456,9 @@ static inline uint32_t prof_now(void)
 void render_line(int32_t line)
 {
 	int32_t view = 1;
+#ifdef ARGON_SMS_SMALL
+	int32_t want = 1;
+#endif
 
 	/* Ensure we have not already rendered this line */
 	if (prev_line == line) return;
@@ -496,6 +499,16 @@ void render_line(int32_t line)
 	/* Active display */
 	else
 	{
+#ifdef ARGON_SMS_SMALL
+		/*
+		 * Whether this line's band will go to the glass at all (the front end
+		 * decides, by whether the bus has room for it).  When it will not,
+		 * the background and the RGB conversion are not done; the sprites
+		 * still are, over a blank line, because the VDP reports sprite
+		 * collisions as it draws them and a game may be waiting to read one.
+		 */
+		want = sms_line_wanted(vline - top_border);
+#endif
 		/* Display enabled ? */
 		if (vdp.reg[1] & 0x40)
 		{
@@ -506,7 +519,14 @@ void render_line(int32_t line)
 
 			/* Draw background */
 			PROF_T(t_bg);
+#ifdef ARGON_SMS_SMALL
+			if (want)
+				render_bg(line);
+			else
+				memset(linebuf, 0, 256);
+#else
 			render_bg(line);
+#endif
 			PROF_ADD(0, t_bg);
 
 			/* Draw sprites */
@@ -564,7 +584,11 @@ void render_line(int32_t line)
 	#endif
 	
 	/* Only draw lines within the video output range ! */
+#ifdef ARGON_SMS_SMALL
+	if (view && want)
+#else
 	if (view)
+#endif
 	{
 		/* adjust output line */
 		vline -= top_border;

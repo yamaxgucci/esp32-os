@@ -19,13 +19,13 @@
 
 #ifdef ARGON_SMS_SMALL
 /*
- * The CYD build: 10 KB of stack and next to no arena.  What is needed only
+ * The CYD build: 16 KB of stack (10 overflowed on Sonic) and a small arena.  What is needed only
  * sometimes - the cartridge's RAM (32 KB, for the games that have it) and the
  * built-in ROM when no cartridge is named (16 KB) - comes from the system heap
  * when it is asked for (sms_alloc_internal) instead of being reserved at start
  * by every game.  The cartridge itself is read out of flash and costs nothing.
  */
-AG_APP_SIZED("SMS", "1.0", "argon", AG_AXE_NEEDS_GFX, 10 * 1024, 20 * 1024);
+AG_APP_SIZED("SMS", "1.0", "argon", AG_AXE_NEEDS_GFX, 16 * 1024, 13 * 1024);
 #else
 AG_APP_SIZED("SMS", "1.0", "argon", AG_AXE_NEEDS_GFX, 32 * 1024, 2 * 1024 * 1024);
 #endif
@@ -58,12 +58,60 @@ static int          s_ox;
  * One band of the picture on its way to the panel (render.h): the CYD has no
  * frame to draw into.  8 lines are 4 KB and twenty-four presents a frame.
  */
-static uint16_t     s_band[VIDEO_WIDTH_SMS * ARGON_SMS_BAND];
+static uint16_t    *s_band;      /* the arena's: bands_alloc() */
+static uint16_t    *s_bands_mem; /* SMS_RING bands, or one */
+static int          s_bands_n;
 static uint32_t     s_present_us;
 /* What each band on the glass was, so an unchanged one is not sent again. */
 static uint32_t     s_band_hash[(SMS_MAX_LINES + ARGON_SMS_BAND - 1) / ARGON_SMS_BAND];
 static int          s_band_valid;
 static uint32_t     s_bands_skipped;
+
+/*
+ * The SPI on another core.
+ *
+ * Sending a band is the driver pushing 4 KB down a 40 MHz bus with the
+ * processor waiting on it - 1.6 ms a band, 15 ms for a picture that scrolls,
+ * which is most of a frame.  The CYD has two cores and the system's is nearly
+ * idle, and each has its own flash cache.  So the lines are drawn here, on the
+ * application core, into a ring of three bands, and a thread on the system
+ * core sends them.  The lines come out spread over the whole frame - the VDP
+ * draws a line as the Z80 reaches it - so three are enough for the drawing
+ * not to wait on the bus: measured, not hoped (s_ring_wait_us).
+ *
+ * The ring is the process arena's (12 KB, free whenever a cartridge is mapped
+ * rather than copied); without it the bands go out the old way, here.
+ *
+ * Counters, not indices: s_ring_put bands published, s_ring_got sent.  The one
+ * being drawn is s_ring_put % SMS_RING, and it may not be one still waiting.
+ */
+#define SMS_RING 3
+static uint16_t         *s_ring[SMS_RING];
+static uint16_t          s_ring_y[SMS_RING];
+static uint16_t          s_ring_rows[SMS_RING];
+static volatile uint32_t s_ring_put;
+static volatile uint32_t s_ring_got;
+static volatile int      s_ring_run;
+static ag_thread_t       s_presenter;
+static int               s_async;
+static uint32_t          s_ring_wait_us;
+
+/*
+ * Which bands this frame draws, when the bus cannot take them all.
+ *
+ * The emulation never waits for the glass: a band is drawn only if the ring
+ * has room for it when its first line comes up, and a frame that meets a full
+ * ring stops there.  The next frame starts from the band where this one
+ * stopped (s_cursor), so the picture is renewed top to bottom continuously at
+ * whatever rate the bus allows, instead of the top half every frame and the
+ * bottom never.  A game keeps its own time; the picture tears when it scrolls
+ * faster than the bus, which is the trade a slow screen has always made.
+ */
+static int32_t  s_cursor;       /* first band the next frame should send */
+static int32_t  s_from;         /* first band this frame sends */
+static int      s_frame_open;   /* still accepting bands this frame */
+static int      s_line_on = 1;  /* the current band is being drawn */
+static uint32_t s_bands_dropped;
 #endif
 static int          s_oy;
 static ag_gfxinfo_t s_gi;
@@ -301,6 +349,9 @@ static void bind_frame_to_fb(const ag_gfxinfo_t *info)
     bitmap.viewport.w = VIDEO_WIDTH_SMS;
     bitmap.viewport.h = VIDEO_HEIGHT_SMS;
     s_band_valid = 0; /* the glass may have been drawn over */
+    if (s_async) {
+        bitmap.data = (uint8_t *)s_ring[s_ring_put % SMS_RING];
+    }
     return;
 #endif
     uint8_t *origin;
@@ -374,6 +425,43 @@ static void present_fullscreen(void)
 }
 
 #ifdef ARGON_SMS_SMALL
+static void band_present(const uint16_t *px, uint16_t y0, uint16_t rows);
+
+static int32_t band_count(void)
+{
+    return ((int32_t)bitmap.viewport.h + ARGON_SMS_BAND - 1) / ARGON_SMS_BAND;
+}
+
+static void band_sent(int32_t band)
+{
+    s_cursor = (band + 1 >= band_count()) ? 0 : band + 1;
+}
+
+int sms_line_wanted(int32_t line)
+{
+    if (!s_async) {
+        return 1;
+    }
+    const int32_t row = line % ARGON_SMS_BAND;
+    const int32_t band = line / ARGON_SMS_BAND;
+    if (row == 0) {
+        if (band == 0) {
+            s_from = s_cursor;
+            s_frame_open = 1;
+        }
+        s_line_on = s_frame_open && band >= s_from &&
+                    (s_ring_put - s_ring_got) < SMS_RING;
+        if (!s_line_on && s_frame_open && band >= s_from) {
+            s_frame_open = 0; /* the bus is full: resume from here next frame */
+            s_cursor = band;
+            s_bands_dropped++;
+        } else if (!s_line_on && band >= s_from) {
+            s_bands_dropped++;
+        }
+    }
+    return s_line_on;
+}
+
 /*
  * A line has gone into the band; send the band when it is full or the picture
  * ends.  The driver centres a surface of the picture's size on the glass.
@@ -403,11 +491,38 @@ void sms_line_done(int32_t line)
         if (band < (int32_t)(sizeof(s_band_hash) / sizeof(s_band_hash[0]))) {
             if (s_band_valid && s_band_hash[band] == hash) {
                 s_bands_skipped++;
+                band_sent(band);
                 return;
             }
             s_band_hash[band] = hash;
         }
     }
+    if (s_async) {
+        /* Published; the system core sends it.  Wait only if the next band
+         * to draw into has not gone out yet. */
+        const uint32_t slot = s_ring_put % SMS_RING;
+        s_ring_y[slot] = (uint16_t)(line - row);
+        s_ring_rows[slot] = (uint16_t)(row + 1);
+        __sync_synchronize();
+        s_ring_put++;
+        band_sent(line / ARGON_SMS_BAND);
+        /*
+         * No waiting here for the next slot: the next band is drawn only if
+         * its slot is free when its first line comes up (sms_line_wanted),
+         * and if it is not, nothing is written to it.
+         */
+        bitmap.data = (uint8_t *)s_ring[s_ring_put % SMS_RING];
+        return;
+    }
+    band_present(s_band, (uint16_t)(line - row), (uint16_t)(row + 1));
+}
+
+/*
+ * One band to the glass, from whichever core sends it.
+ */
+static void band_present(const uint16_t *px, uint16_t y0, uint16_t rows)
+{
+    const int32_t h = (int32_t)bitmap.viewport.h;
     /*
      * The surface is the whole glass, with the picture placed in its middle
      * here, rather than a 256x192 surface the driver would scale.  The CYD's
@@ -421,18 +536,98 @@ void sms_line_done(int32_t line)
     const uint16_t sh = (s_gi.height >= (uint32_t)h) ? s_gi.height
                                                      : (uint16_t)h;
     const ag_blit_t b = {
-        .px = s_band,
+        .px = px,
         .stride = VIDEO_WIDTH_SMS * sizeof(uint16_t),
         .surf_w = sw,
         .surf_h = sh,
         .x = (uint16_t)((sw - VIDEO_WIDTH_SMS) / 2u),
-        .y = (uint16_t)((sh - h) / 2u + (uint16_t)(line - row)),
+        .y = (uint16_t)((sh - h) / 2u + y0),
         .w = VIDEO_WIDTH_SMS,
-        .h = (uint16_t)(row + 1),
+        .h = rows,
     };
     const ag_time_t t0 = ag_micros();
     (void)ag_gfx_present(&b);
-    s_present_us += (uint32_t)(ag_micros() - t0);
+    if (!s_async) {
+        s_present_us += (uint32_t)(ag_micros() - t0);
+    }
+}
+
+static void presenter(void *arg)
+{
+    (void)arg;
+    while (s_ring_run) {
+        if (s_ring_got != s_ring_put) {
+            const uint32_t slot = s_ring_got % SMS_RING;
+            __sync_synchronize();
+            band_present(s_ring[slot], s_ring_y[slot], s_ring_rows[slot]);
+            __sync_synchronize();
+            s_ring_got++;
+        } else {
+            ag_delay(1);
+        }
+    }
+    ag_thread_exit();
+}
+
+/*
+ * The bands live in the process arena, not in the image: 4 KB of data in one
+ * block that the image no longer has to find (the CYD has 90 KB at load, in
+ * pieces).  Three for the ring when there is room, one when there is not -
+ * then the bands go out from here, as before the ring existed.
+ */
+static int bands_alloc(void)
+{
+    const size_t one = (size_t)VIDEO_WIDTH_SMS * ARGON_SMS_BAND * sizeof(uint16_t);
+    s_bands_mem = (uint16_t *)ag_malloc((size_t)SMS_RING * one);
+    s_bands_n = SMS_RING;
+    if (s_bands_mem == NULL) {
+        s_bands_mem = (uint16_t *)ag_malloc(one);
+        s_bands_n = 1;
+    }
+    if (s_bands_mem == NULL) {
+        ag_printf("sms: no memory for even one band of the picture\n");
+        return 0;
+    }
+    s_band = s_bands_mem;
+    return 1;
+}
+
+static void async_start(void)
+{
+    uint16_t *all = s_bands_mem;
+    if (s_bands_n < SMS_RING) {
+        ag_printf("sms: no arena for the band ring - sending from here\n");
+        return;
+    }
+    for (int i = 0; i < SMS_RING; i++) {
+        s_ring[i] = all + (size_t)i * VIDEO_WIDTH_SMS * ARGON_SMS_BAND;
+    }
+    s_ring_put = s_ring_got = 0;
+    s_ring_run = 1;
+    s_presenter = ag_thread_create(presenter, NULL, "smsband", 4096, 4,
+                                   AG_THREAD_SYS_CORE);
+    if (s_presenter == NULL) {
+        s_ring_run = 0;
+        bitmap.data = (uint8_t *)s_band;
+        ag_printf("sms: no thread for the bands - sending from here\n");
+        return;
+    }
+    s_async = 1;
+    bitmap.data = (uint8_t *)s_ring[0];
+    ag_printf("sms: bands sent from the system core\n");
+}
+
+static void async_stop(void)
+{
+    if (!s_async) {
+        return;
+    }
+    while (s_ring_got != s_ring_put) {
+        ag_delay(1);
+    }
+    s_ring_run = 0;
+    (void)ag_thread_join(s_presenter, 1000);
+    s_async = 0;
 }
 
 void *sms_alloc_internal(size_t bytes)
@@ -735,15 +930,18 @@ int ag_main(int argc, char **argv)
     int         want_sound = 0;
     const char *wav_path = "mock";
     int         present_div = 1; /* frames of emulation per frame shown */
+    int         div_forced = 0;  /* fps30/fps60 named: do not adjust it */
     int         stats = 0;
 
     for (int i = 1; i < argc; i++) {
         if (arg_eq(argv[i], "fps30")) {
             present_div = 2;
+            div_forced = 1;
             continue;
         }
         if (arg_eq(argv[i], "fps60")) {
             present_div = 1;
+            div_forced = 1;
             continue;
         }
         if (arg_eq(argv[i], "stats")) {
@@ -825,6 +1023,11 @@ int ag_main(int argc, char **argv)
     }
 
     /* Graphics: 1:1 draws into the gfx back buffer; fullscreen uses s_frame. */
+#ifdef ARGON_SMS_SMALL
+    if (!bands_alloc()) {
+        return 1;
+    }
+#endif
     if (ag_gfx_acquire(&s_gi) != AG_OK) {
         ag_printf("gfx acquire failed\n");
         if (s_frame != NULL) {
@@ -867,6 +1070,9 @@ int ag_main(int argc, char **argv)
         Sound_SetPath(wav_path);
     }
     system_poweron();
+#ifdef ARGON_SMS_SMALL
+    async_start();
+#endif
     if (want_sound) {
         Sound_Init();
     }
@@ -941,10 +1147,48 @@ int ag_main(int argc, char **argv)
         window++;
         ran++;
 
+#ifdef ARGON_SMS_SMALL
+        /*
+         * How often a frame is shown, decided by measuring, as GB does: the
+         * game must keep its own time, and the picture is what gives.  Every
+         * two seconds: below 97% of real time, show one frame in one more;
+         * at real time for two windows running, one fewer.  Four is the floor
+         * of what still reads as motion - fifteen pictures a second.
+         */
+        {
+            static uint32_t  a_frames, a_good;
+            static ag_time_t a_t0;
+            if (a_t0 == 0) {
+                a_t0 = f2;
+            }
+            a_frames++;
+            if (!div_forced && (uint64_t)(f2 - a_t0) >= 2000000u) {
+                const uint32_t pct = (uint32_t)(((uint64_t)a_frames * 16667u * 100u) /
+                                                (uint64_t)(f2 - a_t0));
+                if (s_async) {
+                    /* bands decide what is drawn; every frame is offered */
+                } else if (pct < 97u && present_div < 4) {
+                    present_div++;
+                    a_good = 0;
+                } else if (pct >= 99u && present_div > 1 && ++a_good >= 2) {
+                    present_div--;
+                    a_good = 0;
+                }
+                a_frames = 0;
+                a_t0 = f2;
+            }
+        }
+#endif
         if (stats && (uint64_t)(f2 - window_t0) >= 2000000u) {
             report_stats("sms", window, (uint64_t)(f2 - window_t0), work_sum,
                          emu_sum, present_sum, work_max);
 #ifdef ARGON_SMS_SMALL
+            ag_printf("sms: showing 1 in %d; drawing waited %u us on the bus; "
+                      "%u bands left for later\n",
+                      present_div, (unsigned)s_ring_wait_us,
+                      (unsigned)s_bands_dropped);
+            s_ring_wait_us = 0;
+            s_bands_dropped = 0;
             ag_printf("sms: %u bands of %u not sent, unchanged\n",
                       (unsigned)s_bands_skipped,
                       (unsigned)(window * ((bitmap.viewport.h + ARGON_SMS_BAND - 1) /
@@ -982,6 +1226,9 @@ int ag_main(int argc, char **argv)
     }
     ag_printf("sms: %d frames, cart %u KB crc=%08x\n", ran,
               (unsigned)(cart.size / 1024u), (unsigned)cart.crc);
+#ifdef ARGON_SMS_SMALL
+    async_stop();
+#endif
     Sound_Close();
     ag_gfx_release();
     system_poweroff();
