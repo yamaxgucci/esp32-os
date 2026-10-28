@@ -643,6 +643,13 @@ int ag_main(int argc, char **argv)
 
     md_sound_set_path(sound_path);
 
+    /*
+     * The system cruises at a lower clock while nothing says otherwise (160 of
+     * 240 MHz on the ESP32), and a console paced by its own frame clock does
+     * not fit in two thirds of the speed.
+     */
+    (void)ag_power_declare(AG_POWER_FIT_FULL_ONLY, "a 60 Hz console");
+
 #ifdef ARGON_MD_SMALL
     size_t         rom_size = 0;
     /*
