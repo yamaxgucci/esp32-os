@@ -5,6 +5,8 @@
  *   run a:\MD.AXE a:\game.bin
  *   run a:\MD.AXE 600 stats          # bench the 68000 + VDP path
  *   run a:\MD.AXE a:\game.bin fps30  # emulate 60, show 30
+ *   the CYD (MD32.AXE, the ROM byte-swapped on the host):
+ *   run a:\md32.axe a:\game.swp fps15 noz80 waitcard   then Ctrl+\, eject, Alt+1
  *
  * Cores: gwenesis, GPLv3 (see LICENSE and README).  This file: Apache-2.0.
  *
@@ -263,6 +265,86 @@ extern unsigned char *VRAM;
 static int            s_headless;
 static unsigned short s_line[MD_WIDTH];
 
+/*
+ * The CYD's picture: the panel has no frame buffer to draw into, so lines are
+ * drawn into a band of a few rows and the band goes to the glass when full
+ * (ag_gfx_present).  The band is what is left after the machine's memory -
+ * eight rows if there is room, down to the one row of s_line if not.
+ */
+static unsigned short *s_band = s_line;
+static int             s_band_rows = 1;
+static uint32_t        s_present_us;
+static uint32_t        s_present_bad;
+
+static void md_band_alloc(void)
+{
+    static const int k_rows[] = {8, 4, 2};
+    for (unsigned i = 0; i < sizeof(k_rows) / sizeof(k_rows[0]); i++) {
+        const size_t bytes = (size_t)k_rows[i] * MD_WIDTH * sizeof(uint16_t);
+        unsigned short *b = (unsigned short *)ag_malloc_caps(bytes, AG_MEM_FAST);
+        if (b == NULL) {
+            b = (unsigned short *)ag_malloc(bytes);
+        }
+        if (b != NULL) {
+            s_band = b;
+            s_band_rows = k_rows[i];
+            return;
+        }
+    }
+}
+
+/* Black over the rows the picture does not cover, once: the console's text. */
+static void md_clear_glass(void)
+{
+    memset(s_band, 0, (size_t)s_band_rows * MD_WIDTH * sizeof(uint16_t));
+    for (int y = 0; y < (int)s_gi.height; y += s_band_rows) {
+        const int rows = ((int)s_gi.height - y < s_band_rows) ? (int)s_gi.height - y
+                                                               : s_band_rows;
+        const ag_blit_t b = {
+            .px = s_band, .stride = MD_WIDTH * sizeof(uint16_t),
+            .surf_w = s_gi.width, .surf_h = s_gi.height,
+            .x = 0, .y = (uint16_t)y, .w = s_gi.width, .h = (uint16_t)rows,
+        };
+        (void)ag_gfx_present(&b);
+    }
+}
+
+/* Before the VDP draws `line`: its row in the band. */
+static void md_line_begin(int line)
+{
+    if (!s_headless) {
+        gwenesis_vdp_set_buffer(s_band + (size_t)(line % s_band_rows) * MD_WIDTH);
+    }
+}
+
+/* After: send the band when it is full or the picture ends. */
+static void md_line_end(int line)
+{
+    if (s_headless) {
+        return;
+    }
+    const int row = line % s_band_rows;
+    if (row + 1 < s_band_rows && line + 1 < screen_height) {
+        return;
+    }
+    const int      w = screen_width;
+    const ag_blit_t b = {
+        .px = s_band,
+        .stride = MD_WIDTH * sizeof(uint16_t),
+        .surf_w = s_gi.width,
+        .surf_h = s_gi.height,
+        .x = (uint16_t)(((int)s_gi.width - w) / 2),
+        .y = (uint16_t)(((int)s_gi.height - screen_height) / 2 + line - row),
+        .w = (uint16_t)w,
+        .h = (uint16_t)(row + 1),
+    };
+    const ag_time_t t0 = ag_micros();
+    if (ag_gfx_present(&b) != AG_OK) {
+        s_present_bad++;
+    }
+    s_present_us += (uint32_t)(ag_micros() - t0);
+}
+
 static int s_blocks; /* blocks the pages were cut from */
 
 /*
@@ -284,20 +366,37 @@ static unsigned fill_pages(unsigned char **pages, unsigned count, int iram)
             s++;
             continue;
         }
-        unsigned char *b;
-        if (iram) {
-            b = (unsigned char *)ag_malloc_caps(size, AG_MEM_EXEC);
-        } else {
-            b = (unsigned char *)ag_malloc_caps(size, AG_MEM_FAST);
-            if (b == NULL) {
-                b = (unsigned char *)ag_malloc(size);
-            }
-        }
+        unsigned char *b = (unsigned char *)ag_malloc_caps(
+            size, iram ? AG_MEM_EXEC : AG_MEM_FAST);
         if (b == NULL) {
             s++;
             continue;
         }
         s_blocks++;
+        for (size_t o = 0; o < size; o += MD_PAGE) {
+            pages[got++] = b + o;
+        }
+    }
+    /*
+     * Then the process's own arena, by what its largest block actually holds
+     * rather than by powers of two: its allocator keeps its bookkeeping inside
+     * it, so a 16 KB arena never has a 16 KB block, and halving from there
+     * leaves kilobytes behind.
+     */
+    while (!iram && got < count) {
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        size_t size = (mi.arena_largest / MD_PAGE) * MD_PAGE;
+        if (size > (size_t)(count - got) * MD_PAGE) {
+            size = (size_t)(count - got) * MD_PAGE;
+        }
+        unsigned char *b = NULL;
+        while (size >= MD_PAGE && (b = (unsigned char *)ag_malloc(size)) == NULL) {
+            size -= MD_PAGE;
+        }
+        if (b == NULL) {
+            break;
+        }
         for (size_t o = 0; o < size; o += MD_PAGE) {
             pages[got++] = b + o;
         }
@@ -315,7 +414,27 @@ static int md_small_alloc(void)
 {
     const unsigned in_iram = fill_pages(md_vram, MD_VRAM_PAGES, 1);
     const unsigned ram = fill_pages(md_ram, MD_RAM_PAGES, 0);
-    const unsigned zram = (ram == MD_RAM_PAGES) ? fill_pages(md_zram, MD_ZRAM_PAGES, 0) : 0;
+    /*
+     * The Z80's first page is the image's own: allocated with it at load,
+     * before the heap is in pieces - by now what is left may not hold one more
+     * 1 KB block.
+     */
+    static unsigned char s_zram0[MD_PAGE] __attribute__((aligned(4)));
+    unsigned zram = 0;
+    md_zram[0] = s_zram0;
+    if (ram == MD_RAM_PAGES && !s_run_z80_cpu) {
+        /*
+         * `noz80`: nothing runs the Z80's 8 KB, so one page stands for all of
+         * them - the 68000 may still write its sound program there and read
+         * a byte back, and gets a byte.  7 KB the picture needs more.
+         */
+        for (unsigned i = 1; i < MD_ZRAM_PAGES; i++) {
+            md_zram[i] = md_zram[0];
+        }
+        zram = MD_ZRAM_PAGES;
+    } else if (ram == MD_RAM_PAGES) {
+        zram = 1u + fill_pages(md_zram + 1, MD_ZRAM_PAGES - 1u, 0);
+    }
     const unsigned vram = (zram == MD_ZRAM_PAGES)
         ? in_iram + fill_pages(md_vram + in_iram, MD_VRAM_PAGES - in_iram, 0)
         : in_iram;
@@ -330,8 +449,9 @@ static int md_small_alloc(void)
     M68K_RAM = md_ram[MD_RAM_PAGES - 1];
     ZRAM = md_zram[MD_ZRAM_PAGES - 1];
     VRAM = md_vram[0];
-    ag_printf("md: 68000 RAM 64 KB, Z80 RAM 8 KB, VRAM 64 KB (%u KB in IRAM) - "
-              "1 KB pages from %d blocks\n", in_iram, s_blocks);
+    ag_printf("md: 68000 RAM 64 KB, Z80 RAM %s, VRAM 64 KB (%u KB in IRAM) - "
+              "1 KB pages from %d blocks\n",
+              s_run_z80_cpu ? "8 KB" : "1 KB (no Z80)", in_iram, s_blocks);
     return 1;
 }
 
@@ -552,7 +672,13 @@ resume_m68k:
         }
 
         if (render && scan_line < screen_height) {
+#ifdef ARGON_MD_SMALL
+            md_line_begin(scan_line);
             gwenesis_vdp_render_line(scan_line);
+            md_line_end(scan_line);
+#else
+            gwenesis_vdp_render_line(scan_line);
+#endif
         }
         if (profile) {
             t1 = ag_micros();
@@ -627,7 +753,15 @@ int ag_main(int argc, char **argv)
             wait_card = 1;
             continue;
         }
-        if (arg_eq(argv[i], "fps30")) {
+        if (arg_eq(argv[i], "headless")) {
+            s_headless = 1;
+        } else if (arg_eq(argv[i], "fps20")) {
+            present_div = 3;
+        } else if (arg_eq(argv[i], "fps15")) {
+            present_div = 4;
+        } else if (arg_eq(argv[i], "fps10")) {
+            present_div = 6;
+        } else if (arg_eq(argv[i], "fps30")) {
             present_div = 2;
         } else if (arg_eq(argv[i], "fps60")) {
             present_div = 1;
@@ -721,14 +855,21 @@ int ag_main(int argc, char **argv)
         return 1;
     }
     /*
-     * Without a display: every line is drawn - the VDP's work is the same -
-     * into one row of 320 pixels, a stride of zero putting each line over the
-     * last.
+     * Lines are drawn one row at a time - a stride of zero, and md_line_begin
+     * says which row of the band.  Without a display (or with `headless`) the
+     * VDP's work is the same and the band is s_line, never sent.
      */
-    s_headless = 1;
     gwenesis_vdp_set_buffer(s_line);
     gwenesis_vdp_set_buffer_stride(0);
-    ag_printf("md: no picture - measuring\n");
+    if (!s_headless && ag_gfx_acquire(&s_gi) == AG_OK) {
+        md_band_alloc();
+        md_clear_glass();
+        ag_printf("md: picture on the %ux%u glass, a band of %d row(s)\n",
+                  (unsigned)s_gi.width, (unsigned)s_gi.height, s_band_rows);
+    } else {
+        s_headless = 1;
+        ag_printf("md: no picture - measuring\n");
+    }
 #else
     if (ag_gfx_acquire(&s_gi) != AG_OK) {
         ag_printf("md: gfx acquire failed\n");
@@ -804,20 +945,25 @@ int ag_main(int argc, char **argv)
         run_frame(show);
 
         const ag_time_t f1 = ag_micros();
-#ifdef ARGON_MD_SMALL
-        if (show && !s_headless) {
-#else
+#ifndef ARGON_MD_SMALL /* the CYD's bands went out as they were drawn */
         if (show) {
-#endif
             ag_gfx_flush((uint16_t)s_ox, (uint16_t)s_oy, MD_WIDTH,
                          (uint16_t)screen_height);
         }
+#endif
         const ag_time_t f2 = ag_micros();
 
         const uint64_t work = (uint64_t)(f2 - f0);
         work_sum += work;
+#ifdef ARGON_MD_SMALL
+        /* the bands went out inside the frame: count them as showing it */
+        emu_sum += (uint64_t)(f1 - f0) - s_present_us;
+        present_sum += (uint64_t)(f2 - f1) + s_present_us;
+        s_present_us = 0;
+#else
         emu_sum += (uint64_t)(f1 - f0);
         present_sum += (uint64_t)(f2 - f1);
+#endif
         if (work > work_max) {
             work_max = work;
         }

@@ -232,11 +232,49 @@ uint8_t (*cpu_readport16)(uint16_t port);
 #define WZ_H    Z80.wz.b.h
 #define WZ_L    Z80.wz.b.l
 
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+/*
+ * The CYD's Mega Drive: these five tables are 1.3 KB of internal memory the
+ * picture needs, and each entry is a few instructions to work out - so they
+ * are worked out (the same values z80_init filled the tables with).
+ */
+static inline uint8_t md_sz(unsigned v)
+{
+    v &= 0xFFu;
+    return (uint8_t)((v ? (v & SF) : ZF) | (v & (YF | XF)));
+}
+static inline uint8_t md_sz_bit(unsigned v)
+{
+    v &= 0xFFu;
+    return (uint8_t)((v ? (v & SF) : (ZF | PF)) | (v & (YF | XF)));
+}
+static inline uint8_t md_szp(unsigned v)
+{
+    unsigned x = v & 0xFFu;
+    x ^= x >> 4;
+    return (uint8_t)(md_sz(v) | (((0x6996u >> (x & 0x0Fu)) & 1u) ? 0 : PF));
+}
+static inline uint8_t md_szhv_inc(unsigned v)
+{
+    v &= 0xFFu;
+    return (uint8_t)(md_sz(v) | (v == 0x80u ? VF : 0) | ((v & 0x0Fu) == 0 ? HF : 0));
+}
+static inline uint8_t md_szhv_dec(unsigned v)
+{
+    v &= 0xFFu;
+    return (uint8_t)(md_sz(v) | NF | (v == 0x7Fu ? VF : 0) |
+                     ((v & 0x0Fu) == 0x0Fu ? HF : 0));
+}
+#define MD_Z80_FLAG_FORMULAS 1
+#define Z80_FLAGS(table, formula, v) formula(v)
+#else
+#define Z80_FLAGS(table, formula, v) table[v]
 static uint8_t SZ[256];       /* zero and sign flags */
 static uint8_t SZ_BIT[256];   /* zero, sign and parity/overflow (=zero) flags for BIT opcode */
 static uint8_t SZP[256];      /* zero, sign and parity flags */
 static uint8_t SZHV_inc[256]; /* zero, sign, half carry and overflow flags INC r8 */
 static uint8_t SZHV_dec[256]; /* zero, sign, half carry and overflow flags DEC r8 */
+#endif
 
 #ifndef ARGON_SMS_SMALL
 static uint8_t SZHVC_add[2*256*256];
@@ -252,14 +290,14 @@ static uint8_t SZHVC_sub[2*256*256];
 static inline uint8_t flags_add(uint32_t a, uint32_t v, uint32_t full)
 {
 	const uint32_t res = full & 0xff;
-	return (uint8_t)(SZ[res] | ((a ^ v ^ res) & HF) | ((full >> 8) & CF) |
+	return (uint8_t)(Z80_FLAGS(SZ, md_sz, res) | ((a ^ v ^ res) & HF) | ((full >> 8) & CF) |
 	                 (((~(a ^ v)) & (a ^ res) & 0x80) >> 5));
 }
 
 static inline uint8_t flags_sub(uint32_t a, uint32_t v, uint32_t full)
 {
 	const uint32_t res = full & 0xff;
-	return (uint8_t)(NF | SZ[res] | ((a ^ v ^ res) & HF) | ((full >> 8) & CF) |
+	return (uint8_t)(NF | Z80_FLAGS(SZ, md_sz, res) | ((a ^ v ^ res) & HF) | ((full >> 8) & CF) |
 	                 (((a ^ v) & (a ^ res) & 0x80) >> 5));
 }
 #endif
@@ -845,7 +883,7 @@ INLINE void ld_r_a()
 INLINE void ld_a_r()
 {
 	A = (Z80.r & 0x7f) | Z80.r2;
-	F = (F & CF) | SZ[A] | (Z80.iff2 << 2);
+	F = (F & CF) | Z80_FLAGS(SZ, md_sz, A) | (Z80.iff2 << 2);
 	Z80.after_ldair = 1;
 }
 
@@ -863,7 +901,7 @@ INLINE void ld_i_a()
 INLINE void ld_a_i()
 {
 	A = Z80.i;
-	F = (F & CF) | SZ[A] | (Z80.iff2 << 2);
+	F = (F & CF) | Z80_FLAGS(SZ, md_sz, A) | (Z80.iff2 << 2);
 	Z80.after_ldair = 1;
 }
 
@@ -883,7 +921,7 @@ INLINE void rst(uint16_t addr)
 INLINE uint8_t inc(uint8_t value)
 {
 	uint8_t res = value + 1;
-	F = (F & CF) | SZHV_inc[res];
+	F = (F & CF) | Z80_FLAGS(SZHV_inc, md_szhv_inc, res);
 	return (uint8_t)res;
 }
 
@@ -893,7 +931,7 @@ INLINE uint8_t inc(uint8_t value)
 INLINE uint8_t dec(uint8_t value)
 {
 	uint8_t res = value - 1;
-	F = (F & CF) | SZHV_dec[res];
+	F = (F & CF) | Z80_FLAGS(SZHV_dec, md_szhv_dec, res);
 	return res;
 }
 
@@ -947,7 +985,7 @@ INLINE void rrd()
 	WZ = HL+1;
 	wm(HL, (n >> 4) | (A << 4));
 	A = (A & 0xf0) | (n & 0x0f);
-	F = (F & CF) | SZP[A];
+	F = (F & CF) | Z80_FLAGS(SZP, md_szp, A);
 }
 
 /***************************************************************
@@ -959,7 +997,7 @@ INLINE void rld()
 	WZ = HL+1;
 	wm(HL, (n << 4) | (A & 0x0f));
 	A = (A & 0xf0) | (n >> 4);
-	F = (F & CF) | SZP[A];
+	F = (F & CF) | Z80_FLAGS(SZP, md_szp, A);
 }
 
 /***************************************************************
@@ -1047,7 +1085,7 @@ INLINE void daa()
 		if ((F&CF) | (A>0x99)) a+=0x60;
 	}
 
-	F = (F&(CF|NF)) | (A>0x99) | ((A^a)&HF) | SZP[a];
+	F = (F&(CF|NF)) | (A>0x99) | ((A^a)&HF) | Z80_FLAGS(SZP, md_szp, a);
 	A = a;
 }
 
@@ -1057,7 +1095,7 @@ INLINE void daa()
 INLINE void and_a(uint8_t value)
 {
 	A &= value;
-	F = SZP[A] | HF;
+	F = Z80_FLAGS(SZP, md_szp, A) | HF;
 }
 
 /***************************************************************
@@ -1066,7 +1104,7 @@ INLINE void and_a(uint8_t value)
 INLINE void or_a(uint8_t value)
 {
 	A |= value;
-	F = SZP[A];
+	F = Z80_FLAGS(SZP, md_szp, A);
 }
 
 /***************************************************************
@@ -1075,7 +1113,7 @@ INLINE void or_a(uint8_t value)
 INLINE void xor_a(uint8_t value)
 {
 	A ^= value;
-	F = SZP[A];
+	F = Z80_FLAGS(SZP, md_szp, A);
 }
 
 /***************************************************************
@@ -1181,7 +1219,7 @@ INLINE uint8_t rlc(uint8_t value)
 	unsigned res = value;
 	unsigned c = (res & 0x80) ? CF : 0;
 	res = ((res << 1) | (res >> 7)) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
@@ -1193,7 +1231,7 @@ INLINE uint8_t rrc(uint8_t value)
 	unsigned res = value;
 	unsigned c = (res & 0x01) ? CF : 0;
 	res = ((res >> 1) | (res << 7)) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
@@ -1205,7 +1243,7 @@ INLINE uint8_t rl(uint8_t value)
 	unsigned res = value;
 	unsigned c = (res & 0x80) ? CF : 0;
 	res = ((res << 1) | (F & CF)) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
@@ -1217,7 +1255,7 @@ INLINE uint8_t rr(uint8_t value)
 	unsigned res = value;
 	unsigned c = (res & 0x01) ? CF : 0;
 	res = ((res >> 1) | (F << 7)) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
@@ -1229,7 +1267,7 @@ INLINE uint8_t sla(uint8_t value)
 	unsigned res = value;
 	unsigned c = (res & 0x80) ? CF : 0;
 	res = (res << 1) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
@@ -1241,7 +1279,7 @@ INLINE uint8_t sra(uint8_t value)
 	unsigned res = value;
 	unsigned c = (res & 0x01) ? CF : 0;
 	res = ((res >> 1) | (res & 0x80)) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
@@ -1253,7 +1291,7 @@ INLINE uint8_t sll(uint8_t value)
 	unsigned res = value;
 	unsigned c = (res & 0x80) ? CF : 0;
 	res = ((res << 1) | 0x01) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
@@ -1265,7 +1303,7 @@ INLINE uint8_t srl(uint8_t value)
 	unsigned res = value;
 	unsigned c = (res & 0x01) ? CF : 0;
 	res = (res >> 1) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
@@ -1274,7 +1312,7 @@ INLINE uint8_t srl(uint8_t value)
  ***************************************************************/
 INLINE void bit(int bit, uint8_t value)
 {
-	F = (F & CF) | HF | (SZ_BIT[value & (1<<bit)] & ~(YF|XF)) | (value & (YF|XF));
+	F = (F & CF) | HF | (Z80_FLAGS(SZ_BIT, md_sz_bit, value & (1<<bit)) & ~(YF|XF)) | (value & (YF|XF));
 }
 
 /***************************************************************
@@ -1282,7 +1320,7 @@ INLINE void bit(int bit, uint8_t value)
  ***************************************************************/
 INLINE void bit_hl(int bit, uint8_t value)
 {
-	F = (F & CF) | HF | (SZ_BIT[value & (1<<bit)] & ~(YF|XF)) | (WZ_H & (YF|XF));
+	F = (F & CF) | HF | (Z80_FLAGS(SZ_BIT, md_sz_bit, value & (1<<bit)) & ~(YF|XF)) | (WZ_H & (YF|XF));
 }
 
 /***************************************************************
@@ -1290,7 +1328,7 @@ INLINE void bit_hl(int bit, uint8_t value)
  ***************************************************************/
 INLINE void bit_xy(int bit, uint8_t value)
 {
-	F = (F & CF) | HF | (SZ_BIT[value & (1<<bit)] & ~(YF|XF)) | ((Z80.ea>>8) & (YF|XF));
+	F = (F & CF) | HF | (Z80_FLAGS(SZ_BIT, md_sz_bit, value & (1<<bit)) & ~(YF|XF)) | ((Z80.ea>>8) & (YF|XF));
 }
 
 /***************************************************************
@@ -1332,7 +1370,7 @@ INLINE void cpi()
 	uint8_t res = A - val;
 	WZ++;
 	HL++; BC--;
-	F = (F & CF) | (SZ[res]&~(YF|XF)) | ((A^val^res)&HF) | NF;
+	F = (F & CF) | (Z80_FLAGS(SZ, md_sz, res)&~(YF|XF)) | ((A^val^res)&HF) | NF;
 	if (F & HF) res -= 1;
 	if (res & 0x02) F |= YF; /* bit 1 -> flag 5 */
 	if (res & 0x08) F |= XF; /* bit 3 -> flag 3 */
@@ -1350,11 +1388,11 @@ INLINE void ini()
 	B--;
 	wm(HL, io);
 	HL++;
-	F = SZ[B];
+	F = Z80_FLAGS(SZ, md_sz, B);
 	t = (unsigned)((C + 1) & 0xff) + (unsigned)io;
 	if (io & SF) F |= NF;
 	if (t & 0x100) F |= HF | CF;
-	F |= SZP[(uint8_t)(t & 0x07) ^ B] & PF;
+	F |= Z80_FLAGS(SZP, md_szp, (uint8_t)(t & 0x07) ^ B) & PF;
 }
 
 /***************************************************************
@@ -1368,11 +1406,11 @@ INLINE void outi()
 	WZ = BC + 1;
 	out(BC, io);
 	HL++;
-	F = SZ[B];
+	F = Z80_FLAGS(SZ, md_sz, B);
 	t = (unsigned)L + (unsigned)io;
 	if (io & SF) F |= NF;
 	if (t & 0x100) F |= HF | CF;
-	F |= SZP[(uint8_t)(t & 0x07) ^ B] & PF;
+	F |= Z80_FLAGS(SZP, md_szp, (uint8_t)(t & 0x07) ^ B) & PF;
 }
 
 /***************************************************************
@@ -1398,7 +1436,7 @@ INLINE void cpd()
 	uint8_t res = A - val;
 	WZ--;
 	HL--; BC--;
-	F = (F & CF) | (SZ[res]&~(YF|XF)) | ((A^val^res)&HF) | NF;
+	F = (F & CF) | (Z80_FLAGS(SZ, md_sz, res)&~(YF|XF)) | ((A^val^res)&HF) | NF;
 	if (F & HF) res -= 1;
 	if (res & 0x02) F |= YF; /* bit 1 -> flag 5 */
 	if (res & 0x08) F |= XF; /* bit 3 -> flag 3 */
@@ -1416,11 +1454,11 @@ INLINE void ind()
 	B--;
 	wm(HL, io);
 	HL--;
-	F = SZ[B];
+	F = Z80_FLAGS(SZ, md_sz, B);
 	t = ((unsigned)(C - 1) & 0xff) + (unsigned)io;
 	if (io & SF) F |= NF;
 	if (t & 0x100) F |= HF | CF;
-	F |= SZP[(uint8_t)(t & 0x07) ^ B] & PF;
+	F |= Z80_FLAGS(SZP, md_szp, (uint8_t)(t & 0x07) ^ B) & PF;
 }
 
 /***************************************************************
@@ -1434,11 +1472,11 @@ INLINE void outd()
 	WZ = BC - 1;
 	out(BC, io);
 	HL--;
-	F = SZ[B];
+	F = Z80_FLAGS(SZ, md_sz, B);
 	t = (unsigned)L + (unsigned)io;
 	if (io & SF) F |= NF;
 	if (t & 0x100) F |= HF | CF;
-	F |= SZP[(uint8_t)(t & 0x07) ^ B] & PF;
+	F |= Z80_FLAGS(SZP, md_szp, (uint8_t)(t & 0x07) ^ B) & PF;
 }
 
 /***************************************************************
@@ -2839,7 +2877,7 @@ OP(ed,3d) { illegal_2();                                     } /* DB   ED       
 OP(ed,3e) { illegal_2();                                     } /* DB   ED          */
 OP(ed,3f) { illegal_2();                                     } /* DB   ED          */
 
-OP(ed,40) { B = in(BC); F = (F & CF) | SZP[B];               } /* IN   B,(C)       */
+OP(ed,40) { B = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, B);               } /* IN   B,(C)       */
 OP(ed,41) { out(BC, B);                                      } /* OUT  (C),B       */
 OP(ed,42) { sbc_hl(Z80.bc);                                    } /* SBC  HL,BC       */
 OP(ed,43) { Z80.ea = arg16(); wm16(Z80.ea, Z80.bc); WZ = Z80.ea + 1; } /* LD   (w),BC      */
@@ -2848,7 +2886,7 @@ OP(ed,45) { retn();                                          } /* RETN          
 OP(ed,46) { im_0();                                        } /* IM   0           */
 OP(ed,47) { ld_i_a();                                        } /* LD   i,A         */
 
-OP(ed,48) { C = in(BC); F = (F & CF) | SZP[C];               } /* IN   C,(C)       */
+OP(ed,48) { C = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, C);               } /* IN   C,(C)       */
 OP(ed,49) { out(BC, C);                                      } /* OUT  (C),C       */
 OP(ed,4a) { adc_hl(Z80.bc);                                    } /* ADC  HL,BC       */
 OP(ed,4b) { Z80.ea = arg16(); rm16(Z80.ea, Z80.bc); WZ = Z80.ea + 1; } /* LD   BC,(w)      */
@@ -2857,7 +2895,7 @@ OP(ed,4d) { reti();                                          } /* RETI          
 OP(ed,4e) { im_0();                                        } /* IM   0           */
 OP(ed,4f) { ld_r_a();                                        } /* LD   r,A         */
 
-OP(ed,50) { D = in(BC); F = (F & CF) | SZP[D];               } /* IN   D,(C)       */
+OP(ed,50) { D = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, D);               } /* IN   D,(C)       */
 OP(ed,51) { out(BC, D);                                      } /* OUT  (C),D       */
 OP(ed,52) { sbc_hl(Z80.de);                                    } /* SBC  HL,DE       */
 OP(ed,53) { Z80.ea = arg16(); wm16(Z80.ea, Z80.de); WZ = Z80.ea + 1; } /* LD   (w),DE      */
@@ -2866,7 +2904,7 @@ OP(ed,55) { retn();                                          } /* RETN          
 OP(ed,56) { im_1();                                        } /* IM   1           */
 OP(ed,57) { ld_a_i();                                        } /* LD   A,i         */
 
-OP(ed,58) { E = in(BC); F = (F & CF) | SZP[E];               } /* IN   E,(C)       */
+OP(ed,58) { E = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, E);               } /* IN   E,(C)       */
 OP(ed,59) { out(BC, E);                                      } /* OUT  (C),E       */
 OP(ed,5a) { adc_hl(Z80.de);                                    } /* ADC  HL,DE       */
 OP(ed,5b) { Z80.ea = arg16(); rm16(Z80.ea, Z80.de); WZ = Z80.ea + 1; } /* LD   DE,(w)      */
@@ -2875,7 +2913,7 @@ OP(ed,5d) { reti();                                          } /* RETI          
 OP(ed,5e) { im_2();                                        } /* IM   2           */
 OP(ed,5f) { ld_a_r();                                        } /* LD   A,r         */
 
-OP(ed,60) { H = in(BC); F = (F & CF) | SZP[H];               } /* IN   H,(C)       */
+OP(ed,60) { H = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, H);               } /* IN   H,(C)       */
 OP(ed,61) { out(BC, H);                                      } /* OUT  (C),H       */
 OP(ed,62) { sbc_hl(Z80.hl);                                    } /* SBC  HL,HL       */
 OP(ed,63) { Z80.ea = arg16(); wm16(Z80.ea, Z80.hl); WZ = Z80.ea + 1; } /* LD   (w),HL      */
@@ -2884,7 +2922,7 @@ OP(ed,65) { retn();                                          } /* RETN          
 OP(ed,66) { im_0();                                        } /* IM   0           */
 OP(ed,67) { rrd();                                           } /* RRD  (HL)        */
 
-OP(ed,68) { L = in(BC); F = (F & CF) | SZP[L];               } /* IN   L,(C)       */
+OP(ed,68) { L = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, L);               } /* IN   L,(C)       */
 OP(ed,69) { out(BC, L);                                      } /* OUT  (C),L       */
 OP(ed,6a) { adc_hl(Z80.hl);                                    } /* ADC  HL,HL       */
 OP(ed,6b) { Z80.ea = arg16(); rm16(Z80.ea, Z80.hl); WZ = Z80.ea + 1; } /* LD   HL,(w)      */
@@ -2893,7 +2931,7 @@ OP(ed,6d) { reti();                                          } /* RETI          
 OP(ed,6e) { im_0();                                        } /* IM   0           */
 OP(ed,6f) { rld();                                           } /* RLD  (HL)        */
 
-OP(ed,70) { uint8_t res = in(BC); F = (F & CF) | SZP[res];     } /* IN   0,(C)       */
+OP(ed,70) { uint8_t res = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, res);     } /* IN   0,(C)       */
 OP(ed,71) { out(BC, 0);                                      } /* OUT  (C),0       */
 OP(ed,72) { sbc_hl(Z80.sp);                                    } /* SBC  HL,SP       */
 OP(ed,73) { Z80.ea = arg16(); wm16(Z80.ea, Z80.sp); WZ = Z80.ea + 1; } /* LD   (w),SP      */
@@ -2902,7 +2940,7 @@ OP(ed,75) { retn();                                          } /* RETN          
 OP(ed,76) { im_1();                                        } /* IM   1           */
 OP(ed,77) { illegal_2();                                     } /* DB   ED,77       */
 
-OP(ed,78) { A = in(BC); F = (F & CF) | SZP[A]; WZ = BC + 1;  } /* IN   A,(C)       */
+OP(ed,78) { A = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, A); WZ = BC + 1;  } /* IN   A,(C)       */
 OP(ed,79) { out(BC, A);  WZ = BC + 1;                        } /* OUT  (C),A       */
 OP(ed,7a) { adc_hl(Z80.sp);                                    } /* ADC  HL,SP       */
 OP(ed,7b) { Z80.ea = arg16(); rm16(Z80.ea, Z80.sp); WZ = Z80.ea + 1; } /* LD   SP,(w)      */
@@ -3498,6 +3536,7 @@ void z80_init(int32_t (*irqcallback)(int32_t))
 	}
 
 #endif
+#ifndef MD_Z80_FLAG_FORMULAS
 	for (i = 0; i < 256; i++)
 	{
 		p = 0;
@@ -3521,6 +3560,7 @@ void z80_init(int32_t (*irqcallback)(int32_t))
 		if( i == 0x7f ) SZHV_dec[i] |= VF;
 		if( (i & 0x0f) == 0x0f ) SZHV_dec[i] |= HF;
 	}
+#endif
 
 	/* Reset registers to their initial values */
 	PRVPC = 0;
