@@ -68,6 +68,20 @@ typedef struct {
     bool  code_from_psram;
 
     /*
+     * The cold part of a split image: the run-once code, always in flash.
+     *
+     * It is placed exactly the way the whole code part is under R-1 - an appfs
+     * slot, relocated in a scratch buffer and programmed once - because that
+     * path already exists and is the same job.  What is new is only that the
+     * hot part is somewhere else at the same time, which is the point: the
+     * arena holds the loop and flash holds the setup.
+     *
+     * `cold_scratch` is freed as soon as the slot is programmed and mapped.
+     */
+    void *cold_scratch;
+    void *cold_slot;
+
+    /*
      * Code in a block of the internal heap rather than the link-time arena
      * (ag_port_execmem_alloc): what to hand back to the heap on release.
      * place.code is inside it, rounded up to 16.  NULL otherwise.
@@ -79,6 +93,15 @@ typedef struct {
  * Reads a .AXE, places its code in executable memory and its data in writable
  * memory, and binds the syscall table into it.  Nothing runs yet.
  */
+/*
+ * Put drivers in flash rather than in the code arena.
+ *
+ * A board whose one large application must run from RAM says so here, because
+ * drivers load first and would otherwise have the arena.  Off unless a board
+ * asks; see the comment at the placement decision.
+ */
+void ag_loader_drivers_from_flash(bool on);
+
 ag_err_t ag_loader_load(const char *path, const char *cwd,
                         ag_loaded_app_t *out);
 

@@ -37,6 +37,11 @@
  *   ag_port_task_t ag_port_task_self(void)
  *   void ag_port_task_prio_set(ag_port_task_t t, unsigned prio)
  *   uint32_t ag_port_task_stack_unused(ag_port_task_t t)   NULL means "this task"
+ *   int ag_port_task_core(ag_port_task_t t)         NULL means "this task"
+ *       The core it is tied to, or AG_PORT_CORE_ANY when it may run on
+ *       either.  For reporting only: which core a thing ended up on is not
+ *       something the kernel can work out by arithmetic, and on the day an
+ *       application starves a shell it is the first question asked.
  *
  *   void ag_port_notify_give(ag_port_task_t t)
  *   void ag_port_notify_take(bool clear, ag_port_ticks_t ticks)
@@ -75,6 +80,9 @@
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef ARGON_PORT_TASK_H
+
+/* A task that is not tied to one core. */
+#define AG_PORT_CORE_ANY (-1)
 #define ARGON_PORT_TASK_H
 
 #include <stdbool.h>

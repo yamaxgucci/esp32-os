@@ -26,7 +26,10 @@
 #include "argon/log.h"
 
 #include <argon/port/audio.h>
+#include <argon/port/flash.h> /* the guard while frames are moving */
 #include <argon/port/time.h>
+
+#include "io.h" /* ag_io_i2c_up, for a board whose output is a codec */
 
 /*
  * Nothing at all where the build has no output.
@@ -43,6 +46,8 @@
 
 static ag_device_t    *s_dev;
 static ag_audio_fmt_t  s_fmt;
+/* The block an application last asked for, so saying it again is free. */
+static uint32_t        s_period_asked;
 static bool            s_hw_open;
 static uint64_t        s_frames_in;
 static uint64_t        s_frames_out;
@@ -76,6 +81,8 @@ static void hw_close(void)
     if (s_hw_open) {
         ag_port_audio_close();
         s_hw_open = false;
+        /* The flash may move again; see ag_port_flash_guard. */
+        ag_port_flash_guard(-1);
     }
 }
 
@@ -100,6 +107,24 @@ static ag_err_t hw_open(void)
     if (s_retry_us != 0 && now < s_retry_us) {
         return -AG_EIO;
     }
+    /*
+     * A codec has to be woken before it is clocked, and waking it is I2C.
+     * The bus is brought up here rather than at boot for the same reason the
+     * converter is opened here rather than at boot: a machine sitting at a
+     * prompt should pay for neither.  A failure is logged and not fatal -
+     * every board that has ever worked has no codec at all, and refusing to
+     * play because a bus nobody needs would not open would be a regression
+     * for all of them.
+     */
+    const int16_t codec_bus = ag_board()->audio.i2c;
+    if (codec_bus >= 0) {
+        const ag_err_t err = ag_io_i2c_up((int)codec_bus);
+        if (err != AG_OK) {
+            ag_log(AG_LOG_WARN, "pcm0",
+                   "codec bus i2c%d would not open (%d); the output may be "
+                   "clocked but silent", (int)codec_bus, (int)err);
+        }
+    }
     if (!ag_port_audio_open(s_fmt.rate, s_fmt.channels)) {
         s_backoff_ms = (s_backoff_ms == 0u) ? 1000u
                        : (s_backoff_ms < 8000u) ? s_backoff_ms * 2u
@@ -113,6 +138,18 @@ static ag_err_t hw_open(void)
     s_retry_us = 0;
     s_backoff_ms = 0;
     s_hw_open = true;
+    /*
+     * FROM HERE UNTIL THE CONVERTER STOPS, THE FLASH MUST STAND STILL.
+     *
+     * Not because this driver reads it - it does not - but because anything
+     * else on the board that does switches the cache off for both cores, and
+     * the frames this converter is clocking out do not wait.  The guard is
+     * raised here rather than by the application because the application is
+     * not who breaks the rule: the radio writing its calibration, a log line
+     * reaching a file and a configuration being read all do, and none of them
+     * can know that something is playing.  See ag_port_flash_guard.
+     */
+    ag_port_flash_guard(1);
     return AG_OK;
 }
 
@@ -142,6 +179,46 @@ static ag_err_t pcm_ioctl(ag_device_t *dev, uint32_t cmd, void *arg,
             return -AG_EINVAL;
         }
         *(ag_audio_fmt_t *)arg = s_fmt;
+        return AG_OK;
+    }
+    if (cmd == AG_IOC_AUDIO_GETPERIOD) {
+        if (arg == NULL || arglen < sizeof(uint32_t)) {
+            return -AG_EINVAL;
+        }
+        /*
+         * Half the ring, because the other half is playing.
+         *
+         * The board's `audio.dma_frames` is the whole ring in each
+         * direction; a block larger than half of it leaves the converter dry
+         * between blocks going out, and cannot be filled without waiting
+         * past its own deadline coming in.  BOARD.CFG has said so in
+         * capitals for a while - this is the same sentence where a program
+         * can read it instead of a person.
+         */
+        *(uint32_t *)arg = ag_port_audio_period(0u);
+        return AG_OK;
+    }
+    if (cmd == AG_IOC_AUDIO_SETPERIOD) {
+        if (arg == NULL || arglen < sizeof(uint32_t)) {
+            return -AG_EINVAL;
+        }
+        {
+            const uint32_t want = *(const uint32_t *)arg;
+            if (want == 0u || want > 4096u) {
+                return -AG_EINVAL;
+            }
+            if (want == s_period_asked) {
+                return AG_OK; /* saying it twice is not a reason to stop */
+            }
+            s_period_asked = want;
+            /*
+             * The ring is cut when the channel is created, so a converter
+             * already running has to come down and go back up - on the next
+             * write rather than here, which is how a rate change does it too.
+             */
+            hw_close();
+            (void)ag_port_audio_period(want);
+        }
         return AG_OK;
     }
     if (cmd == AG_IOC_AUDIO_SETFMT) {
@@ -344,9 +421,50 @@ static int32_t pcm_write(ag_device_t *dev, const void *buf, size_t len,
     return (int32_t)((size_t)done * frame_bytes);
 }
 
+/*
+ * The same device, the other way.
+ *
+ * Reading opens the hardware exactly as writing does, and for the same reason:
+ * a program that only listens - a tuner, a recorder, a pedal waiting for a
+ * string to be struck - never writes a frame, and opening on write alone would
+ * leave it reading from a peripheral that was never started.
+ *
+ * There is no separate device for it.  The converter is one piece of hardware
+ * on one clock, and a second node would invite two programs to open the two
+ * directions and expect them to stay together, which is the one thing they
+ * cannot do.
+ */
+static int32_t pcm_read(ag_device_t *dev, void *buf, size_t len, uint64_t off)
+{
+    (void)dev;
+    (void)off;
+
+    if (buf == NULL) {
+        return -AG_EINVAL;
+    }
+
+    const size_t frame_bytes = (size_t)s_fmt.channels * sizeof(int16_t);
+    const size_t frames = len / frame_bytes;
+    if (frames == 0u) {
+        return -AG_EINVAL;
+    }
+
+    const ag_err_t err = hw_open();
+    if (err != AG_OK) {
+        return err;
+    }
+
+    const int32_t done = ag_port_audio_read((int16_t *)buf, (int32_t)frames);
+    if (done < 0) {
+        return done;
+    }
+    return (int32_t)((size_t)done * frame_bytes);
+}
+
 static const ag_dev_ops_t k_pcm_ops = {
     .open = pcm_open,
     .close = pcm_close,
+    .read = pcm_read,
     .write = pcm_write,
     .ioctl = pcm_ioctl,
 };
@@ -366,7 +484,11 @@ ag_err_t ag_pcmhw_init(void)
         .bclk = a->bclk,
         .ws = a->ws,
         .dout = a->dout,
+        .din = a->din,
         .mclk = a->mclk,
+        .i2c = a->i2c,
+        .ingain = a->ingain,
+        .dma_frames = a->dma_frames,
         .rate = a->rate,
     };
     ag_port_audio_pins(&pins);
@@ -403,8 +525,9 @@ ag_err_t ag_pcmhw_init(void)
     if (err != AG_OK) {
         return err;
     }
-    ag_log(AG_LOG_INFO, TAG, "pcm0 ready (%s, %u Hz, opens on first write)",
-           ag_port_audio_name(), (unsigned)s_fmt.rate);
+    ag_log(AG_LOG_INFO, TAG, "pcm0 ready (%s, %u Hz, %s, opens on first use)",
+           ag_port_audio_name(), (unsigned)s_fmt.rate,
+           (a->din >= 0) ? "in and out" : "out only");
     return AG_OK;
 }
 #else /* !CONFIG_ARGON_ENABLE_AUDIO */

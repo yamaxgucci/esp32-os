@@ -240,6 +240,11 @@ static void driver_present_blit(const ag_blit_t *b)
  */
 static void drivers_held(bool held)
 {
+    /* A surfaceless screen decides by this alone whether to send a picture
+     * or the console's text, so when a panel stays text this is the line
+     * that says whether it was ever told otherwise. */
+    ag_log(AG_LOG_INFO, "display", "screen %s",
+           held ? "held by an application" : "let go");
     const ag_display_ops_t *ops[AG_DISPLAY_MAX];
     const unsigned n = collect_drivers(ops);
     for (unsigned k = 0; k < n; k++) {
@@ -562,10 +567,28 @@ static void *br_alloc(size_t bytes)
     return p;
 }
 
-/* Taken at acquire, given back at release: nothing is held while no
- * application has the screen. */
+/*
+ * Taken at the first acquire and kept.
+ *
+ * They used to be given back at every release, and that is a race this layer
+ * cannot win: the releasing is done by whoever takes the screen away - the
+ * session's task - and the writing by the owner's painting thread on the
+ * other core, so leaving a slot freed the list under a painter that was
+ * inside it.  The record it was holding became an offset from NULL and the
+ * application was killed for writing to address zero.  Sometimes.  Which is
+ * why a slot came back on one switch and not the next.
+ *
+ * Twelve kilobytes, cut from the screen's width, which does not change while
+ * the machine runs: what is kept always fits whoever takes the screen next.
+ */
 static void br_take(void)
 {
+    if (s_br_list != NULL && s_br_strip != NULL) {
+        s_br_len = 0;
+        s_br_lost = 0;
+        s_br_moaned = false;
+        return; /* already there, and the right size */
+    }
     br_free();
     if (s_w == 0 || s_h == 0) {
         return;
@@ -1274,6 +1297,18 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
         return -AG_ENODEV;
     }
     if (s_acquired) {
+        /*
+         * Unless it is already yours.
+         *
+         * An application re-acquires when it hears that the focus came back,
+         * which is the right thing to do and what the event is for - and the
+         * session has just handed it the screen, so the honest answer is yes.
+         * Saying -AG_EBUSY to the owner made the one safe habit look like a
+         * failure and left applications guessing whether they could draw.
+         */
+        if (s_owner != AG_PID_KERNEL && s_owner == ag_proc_self()) {
+            return disp_info(0, out);
+        }
         return -AG_EBUSY;
     }
 
@@ -1364,7 +1399,10 @@ static void gfx_release(void)
     s_taken_from = AG_PID_KERNEL; /* let go of: nothing to give back */
     if (s_surfaceless) {
         shim_kick(); /* whatever was still pending is this app's last frame */
-        br_free();   /* nothing is held while nobody has the screen */
+        /* The band list stays: see br_take.  Freeing it here is freeing it
+         * under the owner's painting thread, which is a fault at address
+         * zero and a dead application. */
+        s_br_len = 0;
         s_acquired = false;
         s_owner = AG_PID_KERNEL;
         drivers_held(false);
@@ -2103,12 +2141,34 @@ void ag_display_force_release(void)
 void ag_display_focus_back(ag_pid_t pid)
 {
     if (!s_ready || s_acquired || pid == AG_PID_KERNEL || pid != s_taken_from) {
+        /*
+         * Every one of these is a slot that cannot be returned to, and all
+         * four look the same from outside: the application runs on and the
+         * panel never changes.  Said once per switch, which is where the
+         * question is asked.
+         */
+        ag_log(AG_LOG_INFO, "display",
+               "focus_back refused for pid %u: ready %d, acquired %d (owner "
+               "pid %u), taken from pid %u",
+               (unsigned)pid, (int)s_ready, (int)s_acquired,
+               (unsigned)s_owner, (unsigned)s_taken_from);
         return;
     }
     s_taken_from = AG_PID_KERNEL;
     s_acquired = true;
     s_owner = pid;
     ag_noderdev_screen_taken();
+    /*
+     * And the drivers, because this is an acquire in all but name.
+     *
+     * A surfaceless screen decides what to send by this and nothing else: it
+     * was told the screen had been let go when the slot was left, and never
+     * told it had been taken again.  So the application owned a screen that
+     * went on sending the console's text, and the slot could be left and not
+     * returned to - the fault Maxim found with a browser, where Alt+2, 3 and
+     * 4 switched and Alt+1 did nothing at all.
+     */
+    drivers_held(true);
     ag_log(AG_LOG_INFO, "display", "pid %u has the screen back",
            (unsigned)pid);
     if (s_surfaceless) {

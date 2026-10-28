@@ -3,6 +3,20 @@
  *
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
+/*
+ * Speed rather than size, for this file alone.
+ *
+ * The application is built -Os because it has to fit the code arena - past
+ * 60 KB it relocates into flash and everything gets slower - but the valve curve: a table lookup and an interpolation per stage per sample is the
+ * inner loop of the whole pedal, and -Os there was measured at 8.4 cycles a
+ * tap where the chip should manage two or three.  A pragma keeps the choice
+ * next to the code it is about, and costs a kilobyte rather than the seven
+ * that -O2 over the whole image costs.
+ */
+#pragma GCC optimize("O2")
+
+#include <argon/argon.h>
+
 #include "ag_tube.h"
 
 #include "ag_mathf.h"
@@ -200,7 +214,19 @@ void ag_tube_reset(ag_tube_t *tb)
 
 int ag_tube_set_adaa(ag_tube_t *tb, int on)
 {
-    if (tb == 0 || (on && tb->h == 0)) {
+    /*
+     * The running sums are a shortcut, not a requirement.
+     *
+     * integ_inside uses them only for a span wider than walk_max cells and
+     * walks every other span, which is every span a guitar ever makes: the
+     * counters put the shortcut's share at nought per cent at every level
+     * from a whisper to full scale.  Refusing the antialiasing without them
+     * cost a stage a third of its table for a path nothing takes - and on the
+     * SLO, whose four stages want 96 KB against 80 of internal memory, that
+     * third is the difference between the curves being fast and being in
+     * external RAM at twice the price.
+     */
+    if (tb == 0) {
         return 0;
     }
     tb->adaa = on ? 1u : 0u;
@@ -562,6 +588,8 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
             if (tabg != 0) {
                 const float goff = tabg[i0];
                 tb->g_first = n - 1;
+    tb->g_first_f = (float)tb->g_first;
+                tb->g_first_f = (float)tb->g_first;
                 for (i = 0; i < n; i++) {
                     tabg[i] -= goff;
                     if (tabg[i] < 0.0f) {
@@ -573,6 +601,8 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
                 for (i = 0; i < n; i++) {
                     if (tabg[i] > 0.0f) {
                         tb->g_first = i > 0 ? i - 1 : 0;
+                tb->g_first_f = (float)tb->g_first;
+                        tb->g_first_f = (float)tb->g_first;
                         break;
                     }
                 }
@@ -608,14 +638,29 @@ int ag_tube_bake(ag_tube_t *tb, ag_ckt_t *scratch, const ag_tube_spec_t *sp,
     return 0;
 }
 
+/*
+ * Put these in their caller, whatever the inliner's budget says.
+ *
+ * The chain is one long dependency and the hot path through each of them is
+ * a handful of instructions; the call around it is not.  On this machine a
+ * call rotates the register window, which the processor pays for whether the
+ * callee does anything or not - and ag_tube_tick made one of them a sample,
+ * at four stages and four times oversampling.
+ */
+#if defined(__GNUC__) && !defined(AG_HOST)
+#define AG_INLINE_HOT static inline __attribute__((always_inline))
+#else
+#define AG_INLINE_HOT static
+#endif
+
 /* Value inside cell i at fraction f. */
-static float lin(const ag_tube_t *tb, int i, float f)
+AG_INLINE_HOT float lin(const ag_tube_t *tb, int i, float f)
 {
     return tb->t[i] + (tb->t[i + 1] - tb->t[i]) * f;
 }
 
 /* The antiderivative at index position p, exact within the cell. */
-static float hat(const ag_tube_t *tb, float p)
+AG_INLINE_HOT float hat(const ag_tube_t *tb, float p)
 {
     int   i = (int)p;
     float f;
@@ -643,7 +688,39 @@ static float hat(const ag_tube_t *tb, float p)
  * noise of constant size, so it grows relative to the music as the music
  * decays, and it was found by ear on a fading note (rake 12 in docs/08).
  */
-static float integ_inside(const ag_tube_t *tb, float a, float b)
+/*
+ * ONE OVER A POSITIVE FLOAT, WITHOUT CALLING THE DIVIDER THAT IS NOT THERE.
+ *
+ * This processor has no divide instruction, so `a / b` on it is a call into
+ * __divsf3 - and the antialiasing divides once for every sample whose span
+ * crossed a cell, which at anything but a whisper is nearly every sample.
+ *
+ * Newton on a seed taken from the exponent.  The seed is five per cent out,
+ * so each pass squares the error: 2.5e-3, then 6.5e-6, then 4e-11.  Two
+ * passes were not enough and the tests said so - a span entirely outside the
+ * table has to average to the edge value exactly, and at a few hundred volts
+ * 6.5e-6 of that is a millivolt.  Three, and the last bit of the float is the
+ * only thing left.  Only ever called with a span length: positive, and far
+ * from the denormals by construction.
+ */
+static AG_HOT float recip(float x)
+{
+    union {
+        float    f;
+        uint32_t u;
+    } v;
+    float r;
+
+    v.f = x;
+    v.u = 0x7ef311c3u - v.u;    /* the usual seed: halve the exponent's sign */
+    r = v.f;
+    r = r * (2.0f - x * r);
+    r = r * (2.0f - x * r);
+    r = r * (2.0f - x * r);
+    return r;
+}
+
+AG_INLINE_HOT float integ_inside(const ag_tube_t *tb, float a, float b)
 {
     int   i0 = (int)a, i1 = (int)b, i;
     float acc, fa, fb;
@@ -658,7 +735,12 @@ static float integ_inside(const ag_tube_t *tb, float a, float b)
         return (b - a) * lin(tb, i0, (a + b) * 0.5f - (float)i0);
     }
     if (i1 - i0 > tb->walk_max && tb->h != 0) {
+        AG_TUBE_COUNT(((ag_tube_t *)tb)->hats++);
         return hat(tb, b) - hat(tb, a);
+    }
+    if (i1 > i0) {
+        AG_TUBE_COUNT(((ag_tube_t *)tb)->walks++);
+        AG_TUBE_COUNT(((ag_tube_t *)tb)->walked += (uint32_t)(i1 - i0));
     }
     fa = a - (float)i0;
     fb = b - (float)i1;
@@ -671,7 +753,7 @@ static float integ_inside(const ag_tube_t *tb, float a, float b)
 }
 
 /* The curve at index position p, extended flat outside the table. */
-static float read_at(const ag_tube_t *tb, float p)
+AG_INLINE_HOT float read_at(const ag_tube_t *tb, float p)
 {
     const float last = (float)(tb->n - 1);
     int         i;
@@ -697,7 +779,7 @@ static float read_at(const ag_tube_t *tb, float p)
  * instead would make the average jump about as the signal crossed the edge,
  * which is a new nonlinearity in the place least able to afford one.
  */
-static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped)
+AG_INLINE_HOT float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped)
 {
     const float last = (float)(tb->n - 1);
     float       a = pa < pb ? pa : pb;
@@ -721,6 +803,7 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
      */
     if (a >= 0.0f && b <= last) {
         int i0 = (int)a, i1 = (int)b;
+        AG_TUBE_COUNT(((ag_tube_t *)tb)->one_cell += (i0 == i1) ? 1u : 0u);
         if (i0 > tb->n - 2) {
             i0 = tb->n - 2;
         }
@@ -730,7 +813,7 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
         if (i0 == i1) {
             return lin(tb, i0, (a + b) * 0.5f - (float)i0);
         }
-        return integ_inside(tb, a, b) / tot;
+        return integ_inside(tb, a, b) * recip(tot);
     }
 
     if (a < 0.0f) {
@@ -740,7 +823,8 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
         lenr = b - (a > last ? a : last);
     }
     if (lenl > 0.0f || lenr > 0.0f) {
-        (*clamped)++;
+        AG_TUBE_COUNT((*clamped)++);
+        AG_TUBE_COUNT(((ag_tube_t *)tb)->outside++);
     }
     ia = a < 0.0f ? 0.0f : (a > last ? last : a);
     ib = b < 0.0f ? 0.0f : (b > last ? last : b);
@@ -748,7 +832,7 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
     if (ib > ia) {
         acc += integ_inside(tb, ia, ib);
     }
-    return acc / tot;
+    return acc * recip(tot);
 }
 
 /*
@@ -756,25 +840,17 @@ static float span_avg(const ag_tube_t *tb, float pa, float pb, uint32_t *clamped
  * an index.  Split out so that blocking, which needs the index for its own
  * table, does not compute it twice.
  */
-static float tick_at(ag_tube_t *tb, float x, float p)
+AG_INLINE_HOT float tick_at(ag_tube_t *tb, float x, float p)
 {
     float y;
 
-    tb->samples++;
-    if (x < tb->seen_lo) {
-        tb->seen_lo = x;
-    }
-    if (x > tb->seen_hi) {
-        tb->seen_hi = x;
-    }
-
-    if (p <= 0.0f) {
-        tb->cut++;
-    }
+    AG_TUBE_COUNT(tb->samples++);
+    AG_TUBE_COUNT(x < tb->seen_lo ? (tb->seen_lo = x) : 0.0f);
+    AG_TUBE_COUNT(x > tb->seen_hi ? (tb->seen_hi = x) : 0.0f);
+    AG_TUBE_COUNT(p <= 0.0f ? (tb->cut++) : 0u);
     if (!tb->adaa) {
-        if (p <= 0.0f || p >= (float)(tb->n - 1)) {
-            tb->clamped++;
-        }
+        AG_TUBE_COUNT((p <= 0.0f || p >= (float)(tb->n - 1)) ? (tb->clamped++)
+                                                             : 0u);
         return read_at(tb, p);
     }
     if (!tb->have_prev) {
@@ -801,7 +877,7 @@ static float grid_at(const ag_tube_t *tb, float p)
     return tb->g[i] + (tb->g[i + 1] - tb->g[i]) * (p - (float)i);
 }
 
-float ag_tube_tick(ag_tube_t *tb, float v)
+AG_HOT float ag_tube_tick(ag_tube_t *tb, float v)
 {
     float y, u, p, ig;
 
@@ -845,7 +921,7 @@ float ag_tube_tick(ag_tube_t *tb, float v)
      * Euler rings, so test_tube.c drives a burst into it and checks that the
      * charge climbs monotonically.
      */
-    if (p < (float)tb->g_first) {
+    if (p < tb->g_first_f) {
         /* Below conduction, which is nearly all of the time: nothing is being
          * added, so all that is left is the leak. */
         if (tb->vc != 0.0f) {
@@ -861,7 +937,7 @@ float ag_tube_tick(ag_tube_t *tb, float v)
     return y;
 }
 
-float ag_tube_tick_bias(ag_tube_t *tb, float v, float vbias)
+AG_HOT float ag_tube_tick_bias(ag_tube_t *tb, float v, float vbias)
 {
     const float x = v + vbias;
     if (tb == 0 || tb->t == 0) {
@@ -870,7 +946,7 @@ float ag_tube_tick_bias(ag_tube_t *tb, float v, float vbias)
     return tick_at(tb, x, tb->zero_p + x * tb->step_inv);
 }
 
-float ag_tube_curve(const ag_tube_t *tb, float v)
+AG_HOT float ag_tube_curve(const ag_tube_t *tb, float v)
 {
     if (tb == 0 || tb->t == 0) {
         return 0.0f;
@@ -1336,10 +1412,12 @@ int ag_tube_attach(ag_tube_t *tb, const float *tab, const float *tabh,
         tb->walk_max = AG_TUBE_WALK_MAX;
     }
     tb->g_first = n - 1;
+    tb->g_first_f = (float)tb->g_first;
     if (tabg != 0) {
         for (i = 0; i < n; i++) {
             if (tabg[i] > 0.0f) {
                 tb->g_first = i > 0 ? i - 1 : 0;
+                tb->g_first_f = (float)tb->g_first;
                 break;
             }
         }
@@ -1573,10 +1651,12 @@ void ag_tube_blend(ag_tube_t *dst, const ag_tube_t *a, const ag_tube_t *b,
     dst->h = tabh;
     dst->g = tabg;
     dst->g_first = n - 1;
+    dst->g_first_f = (float)dst->g_first;
     if (tabg != 0) {
         for (i = 0; i < n; i++) {
             if (tabg[i] > 0.0f) {
                 dst->g_first = i > 0 ? i - 1 : 0;
+                dst->g_first_f = (float)dst->g_first;
                 break;
             }
         }

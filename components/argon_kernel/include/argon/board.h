@@ -165,7 +165,23 @@ typedef struct {
     int16_t  bclk;
     int16_t  ws;
     int16_t  dout;
+    /* Where the codec sends, on a board that records.  AG_PIN_NONE on one
+     * that only plays - which is every board here until the Audio Kit. */
+    int16_t  din;
     int16_t  mclk; /* optional; AG_PIN_NONE if unused */
+    int16_t  i2c;  /* bus the codec is programmed over; AG_PIN_NONE if none */
+    /*
+     * How much the codec's own preamplifier adds, in dB, 0 to 24.
+     *
+     * Not a taste setting: it is what the thing plugged in produces.  A line
+     * output swings a volt and wants none of this; a guitar pickup swings a
+     * tenth of that and is inaudible without it.  The codec has the gain in
+     * 3 dB steps and this is rounded to them.
+     */
+    int16_t  ingain;
+    /* Frames the converter may hold each way; 0 takes the port's default.
+     * It is latency - see ag_port_audio_pins_t. */
+    uint16_t dma_frames;
     uint32_t rate; /* default sample rate hint for pcmnull / drivers */
 } ag_board_audio_t;
 

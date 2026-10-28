@@ -12,6 +12,7 @@
 #include <argon/cfg.h>
 #include <argon/device.h>
 #include <argon/kernel.h>
+#include <argon/loader.h>
 #include <argon/log.h>
 #include <argon/path.h>
 #include <argon/probe.h>
@@ -557,6 +558,12 @@ ag_err_t ag_modules_boot(void)
     if (cfg == NULL) {
         return AG_OK;
     }
+
+    /*
+     * Before the first driver is placed, because it changes where they go.
+     * A board with one large application and a small arena says so here.
+     */
+    ag_loader_drivers_from_flash(ag_cfg_get_bool(cfg, "modules.xip", false));
 
     size_t      it = 0;
     const char *path;

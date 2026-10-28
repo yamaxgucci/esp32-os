@@ -106,6 +106,21 @@
 #define AG_AMP_TAB_FLOATS (AG_AMP_STAGES * 3 * AG_AMP_TAB_N)
 
 /*
+ * What each stage handed on, kept only for the tools that ask.
+ *
+ * tube_render reads these to show where a signal is in the chain; nothing on
+ * a board ever does.  Writing them is a store per stage per oversampled
+ * sample - sixteen a sample for four stages at four times - for a number
+ * nobody on the board will read.  The host tools define AG_AMP_TAPS; the
+ * firmware does not, exactly as the tube's own counters work.
+ */
+#ifdef AG_AMP_TAPS
+#define AG_AMP_TAP(a, i, v) ((a)->tap[(i)] = (v))
+#else
+#define AG_AMP_TAP(a, i, v) ((void)0)
+#endif
+
+/*
  * One band of either voicing bank.  db of 0 disables it.
  *
  * EIGHT, AND WHY THE EIGHTH IS AT 630 Hz
@@ -509,6 +524,20 @@ typedef struct ag_amp_cfg {
      * inside that bound the fit follows the signal.
      */
     float axis_tol;
+    /*
+     * Whether a stage's table carries the running sums (three arrays a stage)
+     * or only the curve and the grid current (two).
+     *
+     * The sums buy one thing: a span wider than walk_max cells costs a
+     * subtraction instead of a walk.  Measured on the board, that is worth
+     * five per cent - and nothing at all in practice, because no span a
+     * guitar makes is that wide.  Two arrays instead of three is 16 KB a
+     * stage instead of 24, which is what decides whether four stages live in
+     * internal memory or in external, and THAT is worth half the chain.
+     *
+     * 1 by default: the caller that is short of memory asks for 0.
+     */
+    uint8_t tab_hat;
 
     /*
      * Explicit axes, one pair per stage, used instead of fitting when hi > lo.
@@ -580,7 +609,11 @@ typedef struct ag_amp {
      * being argued about from the far end of the chain.
      */
     float tap[AG_AMP_STAGES];
+
 } ag_amp_t;
+
+/* Bisecting switch; see ag_amp.c.  Zero in every build that plays. */
+extern int g_ag_amp_no_stages;
 
 /* fs, two stages of a hot JCM800 front end, 4x with antialiasing, and the two
  * voicing numbers where the design asked for them.  The same as ag_amp_model
@@ -698,6 +731,24 @@ void ag_amp_probe_pluck(float *buf, int n, float fs);
  * and brings it to 364 ms.  Both are preset loads; see ag_tube.h for the change
  * that would make it a knob and why it has not been made.
  */
+/*
+ * The same build, with one block of floats per stage instead of one for all
+ * of them - `tabs[i]` holding 3 * n floats.
+ *
+ * It exists for a machine where the whole table will not fit in one piece of
+ * the memory worth having: on the ESP32-A1S it is 96 KB and the largest
+ * internal block is 76, so the stages fit separately where they do not fit
+ * together, and every curve lookup that would have gone to external memory
+ * stays inside.  Nothing else differs - the same floats in the same order.
+ */
+int ag_amp_build_split(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
+                       float *const *tabs, int n, const float *probe,
+                       int probe_n);
+
+/* The same preset, read into one block per stage. */
+int ag_amp_preset_load_split(ag_amp_t *a, const void *buf, uint32_t n,
+                             float *const *tabs, float fs);
+
 int ag_amp_build(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
                  float *tab, int n, const float *probe, int probe_n);
 

@@ -1450,6 +1450,76 @@ done:
  * the wrong corner rather than with no sound.  That is exactly how a chain would
  * fail if ag_amp_spec ever handed stage 2 the netlist for stage 1.
  */
+/*
+ * EVERY KNOB ON EVERY MODEL HAS TO CHANGE THE SOUND.
+ *
+ * The TS9's TONE did not, for as long as the model has existed: it wrote
+ * `tone_mid`, which only a tone stack reads, and the TS9 has no stack - so the
+ * number was stored and never looked at.  Nothing in the build, in the tests
+ * or in the panel said a word; Maxim found it by turning the knob and
+ * listening, which was the only instrument that could.
+ *
+ * So: for each model, each pot it puts on its panel is swept from a quarter to
+ * three quarters and the output has to move.  A knob that does nothing fails
+ * here from now on, whatever the reason.
+ */
+static void test_every_pot_does_something(void)
+{
+    ag_ckt_t    *k = (ag_ckt_t *)malloc(sizeof(ag_ckt_t));
+    float       *tab = (float *)malloc(sizeof(float) * AG_AMP_TAB_FLOATS);
+    ag_amp_t    *a = (ag_amp_t *)malloc(sizeof(ag_amp_t));
+    float       *probe = (float *)malloc(sizeof(float) * PROBE_N);
+    ag_amp_cfg_t fitted, cfg;
+    int          m, i, pot;
+
+    if (k == 0 || tab == 0 || a == 0 || probe == 0) {
+        AG_CHECK(0);
+        goto done;
+    }
+    ag_amp_probe_pluck(probe, PROBE_N, TFS);
+
+    for (m = 0; m < AG_AMP_MODEL_N; m++) {
+        const int n = ag_amp_pot_count(m);
+        AG_CHECK(n > 0);
+        ag_amp_model(&fitted, m, TFS);
+        fitted.os = 1;
+        fitted.adaa = 0;
+        AG_CHECK_INT(ag_amp_build(a, k, &fitted, tab, 0, probe, PROBE_N), 0);
+
+        for (pot = 0; pot < n; pot++) {
+            const int id = ag_amp_pot_id(m, pot);
+            double    sum[2];
+            int       pass;
+
+            AG_CHECK(id != AG_POT_NONE);
+            AG_CHECK(ag_amp_pot_name(m, pot)[0] != 0);
+            for (pass = 0; pass < 2; pass++) {
+                cfg = fitted;
+                cfg.pot[id] = pass == 0 ? 0.25f : 0.75f;
+                ag_amp_pot_apply(&cfg, &fitted, m);
+                AG_CHECK_INT(ag_amp_set_voicing(a, &cfg), 0);
+                ag_amp_reset(a);
+                sum[pass] = 0.0;
+                for (i = 0; i < 2000 && i < PROBE_N; i++) {
+                    const double y = (double)ag_amp_tick(a, probe[i]);
+                    sum[pass] += y * y;
+                }
+            }
+            /* A thousandth of the energy is far below anything audible and
+             * still a hundred times what float noise could produce, so a knob
+             * that fails this is not subtle - it is disconnected. */
+            AG_CHECK(fabs(sum[0] - sum[1]) >
+                     0.001 * (fabs(sum[0]) + fabs(sum[1])));
+        }
+    }
+
+done:
+    free(k);
+    free(tab);
+    free(a);
+    free(probe);
+}
+
 static void test_models(void)
 {
     ag_ckt_t    *k = (ag_ckt_t *)malloc(sizeof(ag_ckt_t));
@@ -2359,9 +2429,78 @@ static void test_couple_mul(void)
     free(probe);
 }
 
+/*
+ * A span too short to divide by.
+ *
+ * The antialiased reading is the integral of the curve over the span the input
+ * crossed, divided by the length of that span.  The span is measured as a
+ * position in a table of 2048 points, so near the top of the table two
+ * neighbouring float values are 1.2e-4 apart - and a span of a few of those is
+ * known to no useful precision at all, while the division by it multiplies
+ * whatever is left by ten thousand.
+ *
+ * The result is a single sample anywhere in the range of the curve: a click at
+ * full scale, with no block late and no frame lost, on a signal that is barely
+ * moving - which is the top of a loud note.  Maxim heard these as "a click
+ * every five to ten seconds" on settings where the converter was taking every
+ * frame it asked for, and the louder the model the more of them.
+ *
+ * The bound is the one an average obeys by definition, and that is the whole
+ * test: the average of a curve over a span cannot leave the range of the curve
+ * at the ends of it.
+ */
+static void test_short_span_does_not_explode(void)
+{
+    ag_ckt_t      *k = (ag_ckt_t *)malloc(sizeof(ag_ckt_t));
+    float         *tab = (float *)malloc(sizeof(float) * 2048 * 3);
+    ag_tube_spec_t sp;
+    ag_tube_t      tb;
+    int            i, step;
+
+    if (k == 0 || tab == 0) {
+        AG_CHECK(0);
+        free(k);
+        free(tab);
+        return;
+    }
+    ag_tube_spec_jcm800(&sp, 1);
+    ag_tube_init(&tb);
+    AG_CHECK_INT(ag_tube_bake(&tb, k, &sp, tab, tab + 2048, tab + 4096, 2048,
+                              1.0f, 0.0f, 0.01f), 0);
+    AG_CHECK(ag_tube_set_adaa(&tb, 1) != 0);
+
+    for (step = 1; step <= 64; step *= 2) {
+        for (i = 0; i <= 2000; i++) {
+            const float base = -3.0f + 6.0f * (float)i / 2000.0f;
+            float       v = base;
+            float       y, lo, hi, a, b;
+            int         u;
+
+            /* Settle on the base, so the span under test is base -> v. */
+            ag_tube_reset(&tb);
+            (void)ag_tube_tick(&tb, base);
+            (void)ag_tube_tick(&tb, base);
+
+            /* A few of the smallest steps this float can take. */
+            for (u = 0; u < step; u++) {
+                v = nextafterf(v, 1.0e9f);
+            }
+            y = ag_tube_tick(&tb, v);
+            a = ag_tube_curve(&tb, base);
+            b = ag_tube_curve(&tb, v);
+            lo = a < b ? a : b;
+            hi = a < b ? b : a;
+            AG_CHECK(y >= lo - 1.0e-3f && y <= hi + 1.0e-3f);
+        }
+    }
+    free(k);
+    free(tab);
+}
+
 void run_tube_tests(void)
 {
     test_spec_matches_bench();
+    test_short_span_does_not_explode();
     test_curve_is_a_valve();
     test_adaa_arithmetic();
     test_blocking();
@@ -2375,6 +2514,7 @@ void run_tube_tests(void)
     test_knobs_keep_state();
     test_voicing_banks();
     test_models();
+    test_every_pot_does_something();
     test_cold_clipper();
     test_model_gain_order();
     test_preset_models();

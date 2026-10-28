@@ -46,14 +46,23 @@
 #define AG_BIQ_MAX 8
 
 /*
- * Direct form I.  Transposed direct form II is quieter by a bit or two, and
- * this is not the place for it: a 7 Hz high pass at 22 kHz puts its pole at
- * 0.998, where what matters is that the coefficients are exact rather than that
- * the state is small, and DF1 keeps the coefficient error where it can be seen.
+ * TRANSPOSED DIRECT FORM II, FOR THE MEMORY RATHER THAN FOR THE NOISE.
+ *
+ * This said direct form I, and the reason given was numerical: a 7 Hz high
+ * pass at 22 kHz has its pole at 0.998, and DF1 keeps the coefficient error
+ * where it can be seen.  That argument is about coefficient quantisation,
+ * which is the same in both forms when the coefficients are floats - and the
+ * arithmetic is the same count either way.  What is not the same is the
+ * memory: DF1 carries four state words and touches all eight of them every
+ * sample, four loads and four stores; this carries two.
+ *
+ * On a chip whose FPU answers in four cycles and whose loop is one long
+ * dependency, those four words were measured - see the note in ag_amp.c on
+ * what each edit to this chain was worth.
  */
 typedef struct ag_biq {
     float b0, b1, b2, a1, a2;
-    float x1, x2, y1, y2;
+    float z1, z2;
 } ag_biq_t;
 
 typedef struct ag_biq_chain {
@@ -129,13 +138,52 @@ float ag_biq_peak(ag_biq_t *s, float fs, float f0, float db, float q);
  */
 float ag_biq_bandpass(ag_biq_t *s, float fs, float f0, float bw);
 
-float ag_biq_tick(ag_biq_t *s, float x);
+/*
+ * THE TWO TICKS LIVE HERE, BECAUSE THEY ARE CALLED FROM ANOTHER FILE.
+ *
+ * Each is three multiplies and a couple of adds; the call around it costs
+ * more than that on this machine, which rotates a register window for every
+ * one.  The amplifier calls the chain twice a stage, at every stage, on every
+ * oversampled sample - eight calls a sample at four stages and four times
+ * oversampling - and a compiler cannot inline across a translation unit
+ * without being asked to link the whole program at once.  So they are here,
+ * where the caller can see them.
+ *
+ * Measured: see the note in ag_amp.c on what each edit to this chain was
+ * worth.
+ */
+static inline float ag_biq_tick(ag_biq_t *s, float x)
+{
+    float y;
+    if (s == 0) {
+        return x;
+    }
+    y = s->b0 * x + s->z1;
+    s->z1 = s->b1 * x - s->a1 * y + s->z2;
+    s->z2 = s->b2 * x - s->a2 * y;
+    return y;
+}
 
 void      ag_biq_chain_init(ag_biq_chain_t *c);
 void      ag_biq_chain_reset(ag_biq_chain_t *c);
 /* A section to design into, or NULL if the chain is full. */
 ag_biq_t *ag_biq_chain_push(ag_biq_chain_t *c);
-float     ag_biq_chain_tick(ag_biq_chain_t *c, float x);
+static inline float ag_biq_chain_tick(ag_biq_chain_t *c, float x)
+{
+    int i, n;
+    if (c == 0) {
+        return x;
+    }
+    n = c->n;
+    for (i = 0; i < n; i++) {
+        ag_biq_t   *s = &c->s[i];
+        const float y = s->b0 * x + s->z1;
+        s->z1 = s->b1 * x - s->a1 * y + s->z2;
+        s->z2 = s->b2 * x - s->a2 * y;
+        x = y;
+    }
+    return x;
+}
 
 /*
  * |H(f)| in dB, evaluated from the coefficients rather than measured by running

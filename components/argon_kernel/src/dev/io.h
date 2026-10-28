@@ -31,6 +31,11 @@ extern const ag_io_api_t ag_io_api_table;
  */
 void ag_io_register_devices(void);
 
+/* Brings an I2C bus up on behalf of a caller that will talk on it elsewhere -
+ * see the comment on the definition.  Idempotent; -AG_ENODEV if BOARD.CFG
+ * never said where the bus is. */
+ag_err_t ag_io_i2c_up(int bus);
+
 /*
  * True when this layer has the port up for a caller: a wire, a Modbus session,
  * a scanner.  Asked by whatever opens a port behind io's back, because "give

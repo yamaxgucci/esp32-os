@@ -60,6 +60,45 @@ typedef struct ag_dsp_lfo {
     uint8_t  wave;
 } ag_dsp_lfo_t;
 
+/*
+ * Integer square root, bit by bit, with no division in it.
+ *
+ * Here rather than written out again wherever an RMS is wanted, because the
+ * obvious alternative does not terminate.  Newton on integers -
+ *
+ *     r = v; while (r != last) { last = r; r = (r + v / r) / 2; }
+ *
+ * - converges for most v and then, for some, settles into a two-value cycle
+ * that `last` cannot see: v = 3 runs 3, 2, 1, 2, 1, ... and v = 8 runs
+ * 4, 3, 2, 3, 2, ... for ever.  That was in LOOPBACK.AXE for months and only
+ * ever ran on loud input, where the first guesses are far enough apart to
+ * land.  It was found the day the board's noise floor was fixed and the mean
+ * square fell to single digits: the application stopped mid-run, holding a
+ * core, and took the console with it.
+ *
+ * This one runs a fixed 32 iterations, has no divide, and cannot loop.
+ */
+AG_DSP_INLINE uint32_t ag_isqrt64(uint64_t v)
+{
+    uint64_t rem = v;
+    uint64_t root = 0;
+    uint64_t bit = 1ull << 62;
+
+    while (bit > rem) {
+        bit >>= 2;
+    }
+    while (bit != 0ull) {
+        if (rem >= root + bit) {
+            rem -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (uint32_t)root;
+}
+
 AG_DSP_INLINE int16_t ag_sat16(int32_t x)
 {
     if (x > 32767) {

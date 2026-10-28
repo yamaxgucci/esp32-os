@@ -47,7 +47,7 @@
  * obvious place rather than by not having the function.
  */
 static ag_port_audio_pins_t s_pins = {
-    .bclk = -1, .ws = -1, .dout = -1, .mclk = -1, .rate = 22050,
+    .bclk = -1, .ws = -1, .dout = -1, .mclk = -1, .din = -1, .rate = 22050,
 };
 
 void ag_port_audio_pins(const ag_port_audio_pins_t *pins)
@@ -65,7 +65,7 @@ void ag_port_audio_pins(const ag_port_audio_pins_t *pins)
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 
-const char *ag_port_audio_name(void) { return "dac"; }
+static const char *dac_be_name(void) { return "dac"; }
 
 /*
  * Eight descriptors of a quarter kilobyte: still about ninety milliseconds at
@@ -234,7 +234,7 @@ static void dac_reserve(void)
     }
 }
 
-bool ag_port_audio_present(void)
+static bool dac_be_present(void)
 {
     dac_reserve(); /* asked once at boot, before anything else holds it */
     return true;
@@ -249,7 +249,7 @@ static void dac_drop(void)
     dac_reserve();
 }
 
-bool ag_port_audio_open(uint32_t rate, uint8_t channels)
+static bool dac_be_open(uint32_t rate, uint8_t channels)
 {
     if (s_dac_on) {
         return true;
@@ -350,7 +350,7 @@ static void ring_put(uint8_t v)
     s_w++;
 }
 
-void ag_port_audio_close(void)
+static void dac_be_close(void)
 {
     if (!s_dac_on) {
         return;
@@ -375,7 +375,7 @@ void ag_port_audio_close(void)
     s_dac_on = false; /* the channels and their memory stay, for the next */
 }
 
-int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
+static int32_t dac_be_write(const int16_t *pcm, int32_t frames)
 {
     if (!s_dac_on || pcm == NULL || frames <= 0) {
         return 0;
@@ -421,14 +421,31 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
     return done;
 }
 
-int32_t ag_port_audio_space(void)
+static int32_t dac_be_space(void)
 {
     return s_dac_on ? (int32_t)((DAC_RING - (s_w - s_r)) / s_up) : 0;
 }
 
-#elif SOC_I2S_SUPPORTED
+/* A converter on a pin plays and does not listen. */
+static bool dac_be_capture(void) { return false; }
+
+static int32_t dac_be_read(int16_t *pcm, int32_t frames)
+{
+    (void)pcm;
+    (void)frames;
+    return -AG_ENOSYS;
+}
+
+#endif /* SOC_DAC_SUPPORTED */
+
+#if SOC_I2S_SUPPORTED
 
 #include "driver/i2s_std.h"
+
+/* A codec on the far end of those wires has to be woken; see the header. */
+#include "codec_es8388.h"
+
+#include <argon/port/time.h> /* ag_port_us, to measure the rate rather than trust it */
 
 /*
  * Four descriptors of 240 frames is about forty milliseconds at 22 kHz: long
@@ -453,10 +470,38 @@ int32_t ag_port_audio_space(void)
 #define I2S_FRAMES  240
 #define I2S_WAIT_MS 120
 
-static i2s_chan_handle_t s_tx;
-static uint8_t           s_channels = 2;
+/* The block the stream asked for, in frames; 0 until something asks. */
+static uint32_t s_want_frames;
 
-const char *ag_port_audio_name(void) { return "i2s"; }
+/*
+ * The least a ring may be, whatever the block is.
+ *
+ * Two blocks is the floor for not running dry between them, and at a
+ * 64-frame block that is 5.8 ms each way - so anything that holds the audio
+ * thread up for six milliseconds is heard.  The block is about latency
+ * through the chain; the ring is about how long a hiccup may be.  They are
+ * different questions and this one has the same answer at every block.
+ */
+#define I2S_RING_MIN 256u
+static uint32_t i2s_ring_frames(void);
+
+static i2s_chan_handle_t s_tx;
+/*
+ * The same peripheral the other way.  It is opened with the transmitter and
+ * never on its own: one channel pair, one clock, both directions - see
+ * ag_port_audio_capture in the contract for why a second clock is a crackle.
+ */
+static i2s_chan_handle_t s_rx;
+static uint8_t           s_i2s_channels = 2;
+/* Kept so that close() can say what the whole session amounted to: a board
+ * that made no sound and a board that was never asked to are different
+ * faults and the journal should not need a person to tell them apart. */
+static uint32_t          s_i2s_ok;
+static uint32_t          s_i2s_bad;
+static uint32_t          s_i2s_frames;
+static int64_t           s_i2s_mark;
+
+static const char *i2s_be_name(void) { return "i2s"; }
 
 /*
  * Not "does this chip have I2S" - every S3 does - but "has anyone said where
@@ -464,12 +509,12 @@ const char *ag_port_audio_name(void) { return "i2s"; }
  * rather than clocking three arbitrary pins, and the only place that answer
  * can come from is BOARD.CFG.
  */
-bool ag_port_audio_present(void)
+static bool i2s_be_present(void)
 {
     return s_pins.bclk >= 0 && s_pins.ws >= 0 && s_pins.dout >= 0;
 }
 
-bool ag_port_audio_open(uint32_t rate, uint8_t channels)
+static bool i2s_be_open(uint32_t rate, uint8_t channels)
 {
     if (s_tx != NULL) {
         return true;
@@ -485,12 +530,35 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
         I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     chan.dma_desc_num = I2S_DESCS;
     chan.dma_frame_num = I2S_FRAMES;
+    /*
+     * Unless the board says how much it is willing to be behind.
+     *
+     * The default 4 x 240 is 960 frames, which at 22050 Hz is 43 ms in each
+     * direction - nearly a tenth of a second round trip before the chain has
+     * done anything, and on a guitar that is felt in the hands rather than
+     * heard.  A board that is an instrument says a smaller number and accepts
+     * that it must keep up.
+     *
+     * Two descriptors, because DMA needs one playing while the other is
+     * filled, and that is also the floor: a ring shorter than two of the
+     * application's blocks runs dry between them.
+     */
+    {
+        const uint32_t ring = i2s_ring_frames();
+        if (ring > 0u) {
+            chan.dma_desc_num = 2;
+            chan.dma_frame_num = ring / 2u;
+        }
+    }
     chan.auto_clear = true;
 
-    esp_err_t err = i2s_new_channel(&chan, &s_tx, NULL);
+    /* Both handles from one call: that is what makes them share a clock. */
+    const bool want_in = s_pins.din >= 0;
+    esp_err_t  err = i2s_new_channel(&chan, &s_tx, want_in ? &s_rx : NULL);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "i2s channel: %s", esp_err_to_name(err));
         s_tx = NULL;
+        s_rx = NULL;
         return false;
     }
 
@@ -505,7 +573,7 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
             .bclk = (gpio_num_t)s_pins.bclk,
             .ws = (gpio_num_t)s_pins.ws,
             .dout = (gpio_num_t)s_pins.dout,
-            .din = I2S_GPIO_UNUSED,
+            .din = want_in ? (gpio_num_t)s_pins.din : I2S_GPIO_UNUSED,
             .invert_flags = { .mclk_inv = false,
                               .bclk_inv = false,
                               .ws_inv = false },
@@ -528,28 +596,62 @@ bool ag_port_audio_open(uint32_t rate, uint8_t channels)
 #endif
 
     err = i2s_channel_init_std_mode(s_tx, &std);
+    if (err == ESP_OK && s_rx != NULL) {
+        /* The same configuration, so the two directions cannot be given
+         * different rates or slot widths by an edit to one of them. */
+        err = i2s_channel_init_std_mode(s_rx, &std);
+    }
     if (err == ESP_OK) {
         err = i2s_channel_enable(s_tx);
     }
+    if (err == ESP_OK && s_rx != NULL) {
+        err = i2s_channel_enable(s_rx);
+    }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "i2s start: %s", esp_err_to_name(err));
+        if (s_rx != NULL) {
+            (void)i2s_del_channel(s_rx);
+            s_rx = NULL;
+        }
         (void)i2s_del_channel(s_tx);
         s_tx = NULL;
         return false;
     }
 
-    s_channels = channels;
-    ESP_LOGI(TAG, "i2s out on bclk=%d ws=%d dout=%d mclk=%d, %u Hz, %u ch",
+    /*
+     * The clocks are running now, and only now.  A codec divides MCLK to make
+     * its own converter clock, so it is programmed after the peripheral is
+     * enabled rather than before: told to start converting with nothing to
+     * divide, the part comes up in a state the next write does not reliably
+     * clear.  It is also the reason this is not in present() - present() is
+     * asked at boot, when there is no clock at all.
+     *
+     * Whether it answers changes nothing about the I2S that is already up.  A
+     * board with no codec plays exactly as it did before this existed.
+     */
+    (void)ag_codec_es8388_begin((int)s_pins.i2c, s_rx != NULL,
+                                (int)s_pins.ingain);
+
+    s_i2s_channels = channels;
+    ESP_LOGI(TAG, "i2s buffer %u frames each way (%u ms)",
+             (unsigned)(chan.dma_desc_num * chan.dma_frame_num),
+             (unsigned)((chan.dma_desc_num * chan.dma_frame_num * 1000u) /
+                        (rate > 0u ? rate : 1u)));
+    ESP_LOGI(TAG, "i2s on bclk=%d ws=%d dout=%d din=%d mclk=%d, %u Hz, %u ch",
              (int)s_pins.bclk, (int)s_pins.ws, (int)s_pins.dout,
-             (int)s_pins.mclk, (unsigned)rate, (unsigned)channels);
+             (int)s_pins.din, (int)s_pins.mclk, (unsigned)rate,
+             (unsigned)channels);
     return true;
 }
 
-void ag_port_audio_close(void)
+static void i2s_be_close(void)
 {
     if (s_tx == NULL) {
         return;
     }
+    /* Mute the codec before the clock it is counting on goes away, not
+     * after. */
+    ag_codec_es8388_end((int)s_pins.i2c);
     /*
      * Nothing is walked down to silence the way the converter's output is.
      * What leaves this pin is a number, and the thing at the other end gets
@@ -557,21 +659,153 @@ void ag_port_audio_close(void)
      * takes twenty milliseconds to avoid belongs to a pin that idles at half
      * the supply, and this one does not.
      */
+    if (s_rx != NULL) {
+        (void)i2s_channel_disable(s_rx);
+        (void)i2s_del_channel(s_rx);
+        s_rx = NULL;
+    }
+    ESP_LOGI(TAG, "i2s closing: %u writes accepted whole, %u short or refused",
+             (unsigned)s_i2s_ok, (unsigned)s_i2s_bad);
+    s_i2s_ok = 0;
+    s_i2s_bad = 0;
+    s_i2s_frames = 0;
+    s_i2s_mark = 0;
     (void)i2s_channel_disable(s_tx);
     (void)i2s_del_channel(s_tx);
     s_tx = NULL;
 }
 
-int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
+static bool i2s_be_capture(void) { return s_rx != NULL; }
+
+/*
+ * How deep the ring should be, in frames each way.
+ *
+ * Twice the block the stream asked for, which is the whole point: a ring is
+ * one buffer playing while the other is filled, so a block larger than half
+ * of it cannot be served inside its own period.  The board's number is a
+ * ceiling - how much DMA memory this machine will spend - and not a target,
+ * because two programs with different blocks should not have to agree on one
+ * number in a config file.
+ *
+ * Zero means neither has an opinion, and the port's own default stands.
+ */
+static uint32_t i2s_ring_frames(void)
+{
+    const uint32_t ceiling =
+        (s_pins.dma_frames >= 64u) ? (uint32_t)s_pins.dma_frames : 0u;
+    uint32_t want = s_want_frames * 2u;
+
+    if (s_want_frames == 0u) {
+        /* Nobody asked; the board's number, if any, is the whole ring, which
+         * is what it meant before any of this existed. */
+        return ceiling;
+    }
+    if (want < I2S_RING_MIN) {
+        want = I2S_RING_MIN; /* tolerance, which the block does not decide */
+    }
+    if (ceiling > 0u && want > ceiling) {
+        want = ceiling;
+    }
+    return want;
+}
+
+uint32_t ag_port_audio_period(uint32_t frames)
+{
+    if (frames > 0u) {
+        s_want_frames = frames;
+    }
+    {
+        const uint32_t ring = i2s_ring_frames();
+        if (ring == 0u) {
+            return (uint32_t)(I2S_DESCS * I2S_FRAMES) / 2u;
+        }
+        return ring / 2u;
+    }
+}
+
+static int32_t i2s_be_read(int16_t *pcm, int32_t frames)
+{
+    if (pcm == NULL || frames <= 0) {
+        return 0;
+    }
+    if (s_rx == NULL) {
+        /* No line in, which is not the same as a quiet one. */
+        return -AG_ENOSYS;
+    }
+
+    const size_t    frame_bytes = (size_t)s_i2s_channels * sizeof(int16_t);
+    size_t          got = 0;
+    const esp_err_t err = i2s_channel_read(
+        s_rx, pcm, (size_t)frames * frame_bytes, &got, I2S_WAIT_MS);
+
+    if (err != ESP_OK && got == 0) {
+        return 0;
+    }
+    return (int32_t)(got / frame_bytes);
+}
+
+static int32_t i2s_be_write(const int16_t *pcm, int32_t frames)
 {
     if (s_tx == NULL || pcm == NULL || frames <= 0) {
         return 0;
     }
 
-    const size_t    frame_bytes = (size_t)s_channels * sizeof(int16_t);
+    const size_t    frame_bytes = (size_t)s_i2s_channels * sizeof(int16_t);
     size_t          wrote = 0;
     const esp_err_t err = i2s_channel_write(
         s_tx, pcm, (size_t)frames * frame_bytes, &wrote, I2S_WAIT_MS);
+
+    /*
+     * A refusal used to return zero and say nothing, which is the worst
+     * possible behaviour for this particular failure: the caller reads it as
+     * back-pressure, tries again, and the board spends the afternoon looking
+     * busy and sounding like nothing.  Say it once - repeating it every 11 ms
+     * would bury everything else in the journal - and then say how it ended.
+     */
+    if (err != ESP_OK || wrote != (size_t)frames * frame_bytes) {
+        if (s_i2s_bad == 0u) {
+            ESP_LOGW(TAG, "i2s write: %s, %u of %u bytes",
+                     esp_err_to_name(err), (unsigned)wrote,
+                     (unsigned)((size_t)frames * frame_bytes));
+        }
+        s_i2s_bad++;
+    } else {
+        s_i2s_ok++;
+        if (s_i2s_ok == 1u) {
+            ESP_LOGI(TAG, "i2s write: first %u bytes accepted",
+                     (unsigned)wrote);
+        }
+    }
+
+    /*
+     * HOW FAST THE HARDWARE IS EATING, measured rather than assumed.
+     *
+     * i2s_channel_write blocks until the chain has room, so the rate at which
+     * it accepts frames IS the rate the converter is clocking them out.  If
+     * that number holds at the rate that was asked for, the peripheral is
+     * running and the samples are leaving on DOUT; if it halves, or drifts, or
+     * stops, the clock is what broke - and none of that can be heard from
+     * another room, which is the whole reason it is counted here.
+     *
+     * The codec is asked at the same moment whether it is still configured, so
+     * that one line in the journal covers both halves of "is it still
+     * playing": the machine's side and the chip's.
+     */
+    s_i2s_frames += (uint32_t)(wrote / frame_bytes);
+    const int64_t now = ag_port_us();
+    if (s_i2s_mark == 0) {
+        s_i2s_mark = now;
+    } else if (now - s_i2s_mark >= 5000000) {
+        const int64_t  span = now - s_i2s_mark;
+        const uint32_t hz =
+            (uint32_t)(((int64_t)s_i2s_frames * 1000000) / span);
+        ESP_LOGI(TAG, "i2s: %u frames in %u ms = %u Hz out (%u refused)",
+                 (unsigned)s_i2s_frames, (unsigned)(span / 1000),
+                 (unsigned)hz, (unsigned)s_i2s_bad);
+        ag_codec_es8388_poll((int)s_pins.i2c);
+        s_i2s_frames = 0;
+        s_i2s_mark = now;
+    }
 
     if (err != ESP_OK && wrote == 0) {
         return 0;
@@ -585,15 +819,21 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
  * count of it in this layer would be keeping it wrong.  The caller uses it to
  * size a ring, and a ring the size of the chain is the right size.
  */
-uint32_t ag_port_audio_stops(void) { return 0; }
-uint32_t ag_port_audio_rate_mhz(void) { return 0; }
-
-int32_t ag_port_audio_space(void)
+static int32_t i2s_be_space(void)
 {
-    return (s_tx != NULL) ? (int32_t)(I2S_DESCS * I2S_FRAMES) : 0;
+    if (s_tx == NULL) {
+        return 0;
+    }
+    {
+        const uint32_t ring = i2s_ring_frames();
+        return (ring > 0u) ? (int32_t)ring
+                           : (int32_t)(I2S_DESCS * I2S_FRAMES);
+    }
 }
 
-#else /* a part with neither converters nor I2S */
+#endif /* SOC_I2S_SUPPORTED */
+
+#if !SOC_DAC_SUPPORTED && !SOC_I2S_SUPPORTED
 
 const char *ag_port_audio_name(void) { return "none"; }
 
@@ -615,12 +855,137 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
     return 0;
 }
 
+int32_t ag_port_audio_space(void) { return 0; }
+
+bool    ag_port_audio_capture(void) { return false; }
+/*
+ * The ring that stops and the clock that counts it are the built-in
+ * converter's; a part without one has neither, and says so rather than
+ * leaving the question unanswered at link time.
+ */
 uint32_t ag_port_audio_stops(void) { return 0; }
 uint32_t ag_port_audio_rate_mhz(void) { return 0; }
 
-int32_t ag_port_audio_space(void) { return 0; }
+int32_t ag_port_audio_read(int16_t *pcm, int32_t frames)
+{
+    (void)pcm;
+    (void)frames;
+    return -AG_ENOSYS;
+}
 
-#endif /* SOC_DAC_SUPPORTED / SOC_I2S_SUPPORTED */
+#endif /* neither */
+
+#if SOC_DAC_SUPPORTED || SOC_I2S_SUPPORTED
+
+/*
+ * WHICH WAY THE SOUND GOES OUT IS THE BOARD'S ANSWER, NOT THE CHIP'S.
+ *
+ * This used to be a #if: a part with the chip's own converters compiled the
+ * converter code and nothing else, because for a long time every board that
+ * had both was a board that used the converters.  The Audio Kit is not: it is
+ * an original ESP32, so the chip has two digital-to-analogue converters, and
+ * every one of them is unconnected while an ES8388 sits on I2S.  Compiled the
+ * old way the board comes up reporting `pcm0 ready (dac)` and playing into
+ * pins nothing is soldered to - healthy, plausible, and silent, which is the
+ * expensive kind of wrong.
+ *
+ * So both are built on a part that can do both, and the choice is made once,
+ * at run time, from the only thing that knows: whether BOARD.CFG named the
+ * I2S wires.  A board that named them means them - nobody writes three pin
+ * numbers into a file for a codec that is not there - and a board that named
+ * nothing keeps exactly the behaviour it had, which is what the CYD and every
+ * other converter board depend on.
+ *
+ * The decision is taken before present() and never revisited, because the
+ * device table is built once and a device that changed its mind about what it
+ * is halfway through a session would be worse than either answer.
+ */
+static bool board_wants_i2s(void)
+{
+    return s_pins.bclk >= 0 && s_pins.ws >= 0 && s_pins.dout >= 0;
+}
+
+/*
+ * Each of these four lines reads as "if the chip can and the board asked".
+ * On a part with only one of the two the compiler removes the question
+ * entirely, so an S3 pays nothing for a converter branch it does not have and
+ * a part with no I2S pays nothing for this.
+ */
+#if SOC_DAC_SUPPORTED && SOC_I2S_SUPPORTED
+#define USE_I2S() board_wants_i2s()
+#elif SOC_I2S_SUPPORTED
+#define USE_I2S() true
+#else
+#define USE_I2S() false
+#endif
+
+#if !SOC_I2S_SUPPORTED
+#define i2s_be_name()             "none"
+#define i2s_be_present()          false
+#define i2s_be_open(r, c)         false
+#define i2s_be_close()            ((void)0)
+#define i2s_be_write(p, f)        (-AG_ENOSYS)
+#define i2s_be_space()            0
+#define i2s_be_capture()          false
+#define i2s_be_read(p, f)         (-AG_ENOSYS)
+#endif
+#if !SOC_DAC_SUPPORTED
+uint32_t ag_port_audio_stops(void) { return 0; }
+uint32_t ag_port_audio_rate_mhz(void) { return 0; }
+
+#define dac_be_name()             "none"
+#define dac_be_present()          false
+#define dac_be_open(r, c)         false
+#define dac_be_close()            ((void)0)
+#define dac_be_write(p, f)        (-AG_ENOSYS)
+#define dac_be_space()            0
+#define dac_be_capture()          false
+#define dac_be_read(p, f)         (-AG_ENOSYS)
+#endif
+
+const char *ag_port_audio_name(void)
+{
+    return USE_I2S() ? i2s_be_name() : dac_be_name();
+}
+
+bool ag_port_audio_present(void)
+{
+    return USE_I2S() ? i2s_be_present() : dac_be_present();
+}
+
+bool ag_port_audio_open(uint32_t rate, uint8_t channels)
+{
+    return USE_I2S() ? i2s_be_open(rate, channels) : dac_be_open(rate, channels);
+}
+
+void ag_port_audio_close(void)
+{
+    if (USE_I2S()) { i2s_be_close(); } else { dac_be_close(); }
+}
+
+int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
+{
+    return USE_I2S() ? i2s_be_write(pcm, frames) : dac_be_write(pcm, frames);
+}
+
+int32_t ag_port_audio_space(void)
+{
+    return USE_I2S() ? i2s_be_space() : dac_be_space();
+}
+
+bool ag_port_audio_capture(void)
+{
+    return USE_I2S() ? i2s_be_capture() : dac_be_capture();
+}
+
+int32_t ag_port_audio_read(int16_t *pcm, int32_t frames)
+{
+    return USE_I2S() ? i2s_be_read(pcm, frames) : dac_be_read(pcm, frames);
+}
+
+#endif /* SOC_DAC_SUPPORTED || SOC_I2S_SUPPORTED */
+
+
 
 #else /* !CONFIG_ARGON_ENABLE_AUDIO */
 
@@ -649,12 +1014,26 @@ int32_t ag_port_audio_write(const int16_t *pcm, int32_t frames)
     return 0;
 }
 
-uint32_t ag_port_audio_stops(void) { return 0; }
-uint32_t ag_port_audio_rate_mhz(void) { return 0; }
-
 int32_t ag_port_audio_space(void)
 {
     return 0;
+}
+
+bool ag_port_audio_capture(void) { return false; }
+
+/*
+ * The ring that stops and the clock that counts it are the built-in
+ * converter's; a part without one has neither, and says so rather than
+ * leaving the question unanswered at link time.
+ */
+uint32_t ag_port_audio_stops(void) { return 0; }
+uint32_t ag_port_audio_rate_mhz(void) { return 0; }
+
+int32_t ag_port_audio_read(int16_t *pcm, int32_t frames)
+{
+    (void)pcm;
+    (void)frames;
+    return -AG_ENOSYS;
 }
 
 #endif /* CONFIG_ARGON_ENABLE_AUDIO */

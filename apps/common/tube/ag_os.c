@@ -3,13 +3,22 @@
  *
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
+/*
+ * Speed rather than size, for this file alone: the oversampling filter runs
+ * on every sample of every stage, twice over at 2x.  See the same note in
+ * ag_ir.c for why the rest of the application is built the other way.
+ */
+#pragma GCC optimize("O2")
+
+#include <argon/argon.h>
+
 #include "ag_os.h"
 
 #include "ag_biq.h" /* ag_sincosf */
 
 #define OS_MASK (AG_OS_CAP - 1)
 
-static void push(float *buf, int *pos, float x)
+static AG_HOT void push(float *buf, int *pos, float x)
 {
     const int p = *pos;
     buf[p] = x;
@@ -91,7 +100,7 @@ void ag_os2_reset(ag_os2_t *s)
     s->ddpos = 0;
 }
 
-void ag_os2_up(ag_os2_t *s, float x, float *out2)
+AG_HOT void ag_os2_up(ag_os2_t *s, float x, float *out2)
 {
     const float *w;
     float        acc = 0.0f;
@@ -103,17 +112,39 @@ void ag_os2_up(ag_os2_t *s, float x, float *out2)
     push(s->uh, &s->upos, x);
     w = win(s->uh, s->upos);
 
-    /* The even phase is the single non-zero even tap, so it is a pure delay of
+    /*
+     * The even phase is the single non-zero even tap, so it is a pure delay of
      * M/2 input samples.  The odd phase is the M odd taps against the same
-     * history: y[2k+1] = sum_p ho[p] * x[k-p]. */
-    for (p = 0; p < s->m; p++) {
-        acc += s->ho[p] * w[AG_OS_CAP - 1 - p];
+     * history: y[2k+1] = sum_p ho[p] * x[k-p].
+     *
+     * FOLDED, because the taps are symmetric.  ho[p] and ho[m-1-p] are the
+     * same number - the sinc is even and the Hamming window is symmetric
+     * about the same centre - so each tap can multiply the SUM of the two
+     * samples it weighs instead of each of them.  Half the multiplies, the
+     * same adds, and the same answer to the last bit the filter was designed
+     * with: checked against the unfolded form at 2e-10, which is the cosine's
+     * own rounding.
+     *
+     * The local copies are not decoration either: push() has just written
+     * into the same struct, so a compiler that cannot prove `ho` is elsewhere
+     * reloads the pointer and the count on every pass of the loop.
+     */
+    {
+        const float *const ho = s->ho;
+        const int          half = s->m / 2;
+        const int          last = s->m - 1;
+        for (p = 0; p < half; p++) {
+            acc += ho[p] * (w[AG_OS_CAP - 1 - p] + w[AG_OS_CAP - 1 - (last - p)]);
+        }
     }
-    out2[0] = 2.0f * s->hc * w[AG_OS_CAP - 1 - (s->m / 2)];
+    /* 2*hc is exactly one: ag_os2_init puts the centre tap at 0.5 so that the
+     * even phase of the interpolator is a pure delay, and a multiply by one
+     * is still a multiply. */
+    out2[0] = w[AG_OS_CAP - 1 - (s->m / 2)];
     out2[1] = 2.0f * acc;
 }
 
-float ag_os2_down(ag_os2_t *s, float a, float b)
+AG_HOT float ag_os2_down(ag_os2_t *s, float a, float b)
 {
     const float *we;
     const float *wo;
@@ -137,8 +168,16 @@ float ag_os2_down(ag_os2_t *s, float a, float b)
     push(s->de, &s->depos, a);
     we = win(s->de, s->depos);
     wo = win(s->dd, s->ddpos);
-    for (p = 0; p < s->m; p++) {
-        acc += s->ho[p] * wo[AG_OS_CAP - 1 - p];
+    {
+        /* Folded on the symmetry, as in ag_os2_up; same reasoning, same
+           saving, and the locals for the same reason. */
+        const float *const ho = s->ho;
+        const int          half = s->m / 2;
+        const int          last = s->m - 1;
+        for (p = 0; p < half; p++) {
+            acc += ho[p] *
+                   (wo[AG_OS_CAP - 1 - p] + wo[AG_OS_CAP - 1 - (last - p)]);
+        }
     }
     acc += s->hc * we[AG_OS_CAP - 1 - (s->m / 2)];
     push(s->dd, &s->ddpos, b);
@@ -163,7 +202,7 @@ void ag_os4_reset(ag_os4_t *s)
     ag_os2_reset(&s->inner);
 }
 
-void ag_os4_up(ag_os4_t *s, float x, float *out4)
+AG_HOT void ag_os4_up(ag_os4_t *s, float x, float *out4)
 {
     float mid[2];
     if (s == 0 || out4 == 0) {
@@ -174,7 +213,7 @@ void ag_os4_up(ag_os4_t *s, float x, float *out4)
     ag_os2_up(&s->inner, mid[1], out4 + 2);
 }
 
-float ag_os4_down(ag_os4_t *s, const float *in4)
+AG_HOT float ag_os4_down(ag_os4_t *s, const float *in4)
 {
     float d0, d1;
     if (s == 0 || in4 == 0) {

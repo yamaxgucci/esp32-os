@@ -28,6 +28,19 @@
  * back, and on a board without PSRAM it is the same internal memory as before.
  */
 #define AG_JOURNAL_BYTES 4096
+/*
+ * And 64 KB - about three thousand lines - when there is external memory to
+ * put it in.
+ *
+ * 4 KB is two hundred lines, which a board that is being measured overwrites
+ * in half a minute: on 14 Oct 2026 an app's own status line destroyed four
+ * hundred lines of the record of what it was doing wrong, twice, before the
+ * evidence could be read.  The small size was never a judgement about what a
+ * journal needs - it was the price of internal SRAM on a board that had no
+ * other memory.  Where there is PSRAM the journal is already in it, and this
+ * costs that board nothing at all; where there is not, nothing changes.
+ */
+#define AG_JOURNAL_BIG_BYTES (64 * 1024)
 
 static char        *s_storage;
 static ag_journal_t s_journal;
@@ -196,6 +209,54 @@ static int log_vprintf(const char *fmt, va_list ap)
     }
     log_unlock();
     return n;
+}
+
+/*
+ * THE JOURNAL GETS BIGGER ONCE THERE IS SOMEWHERE TO PUT IT.
+ *
+ * It is created at the log stage, which is third: external memory is not
+ * usable yet, so the ring is the small internal one it has always been.  Two
+ * hundred lines is half a minute on a board that is being measured, and
+ * during that half minute it quietly destroys the evidence - on 14 Oct 2026
+ * it threw away the record of what an amplifier was doing wrong four
+ * hundred lines deep, twice, and then the one line that said why a setting
+ * had not been applied.
+ *
+ * So once the system is further up and the external heap is real, the ring
+ * is reallocated bigger and what it already holds is copied across.  A board
+ * without external memory keeps exactly what it had.
+ */
+ag_err_t ag_log_grow(size_t bytes)
+{
+    if (s_storage == NULL || bytes <= AG_JOURNAL_BYTES) {
+        return -AG_EINVAL;
+    }
+    char *bigger = ag_port_alloc(bytes, AG_MEM_SLOW | AG_MEM_BYTE);
+    if (bigger == NULL) {
+        return -AG_ENOMEM;
+    }
+    log_lock();
+    /*
+     * The old ring is read out as text and written into the new one, which
+     * is the only way that does not have to know how the ring is laid out -
+     * and it is a boot-time cost of a few hundred lines.
+     */
+    ag_journal_t old = s_journal;
+    char        *old_storage = s_storage;
+    s_storage = bigger;
+    (void)ag_journal_init(&s_journal, bigger, bytes);
+    {
+        ag_journal_iter_t it;
+        char              line[AG_JOURNAL_LINE_MAX];
+        ag_journal_begin(&old, &it);
+        while (ag_journal_next(&old, &it, line, sizeof(line))) {
+            ag_journal_write(&s_journal, line, strlen(line));
+            ag_journal_write(&s_journal, "\n", 1u);
+        }
+    }
+    log_unlock();
+    ag_port_free(old_storage);
+    return AG_OK;
 }
 
 ag_err_t ag_log_init(void)

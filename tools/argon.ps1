@@ -427,6 +427,8 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                esp32s3-lcd2   Waveshare ESP32-S3-Touch-LCD-2: 16 MB flash, ST7789 panel and TF card on one SPI bus'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
+            Write-Host '                esp32-a1s   ESP32-A1S Audio Kit: ES8388 codec on I2S, external RAM'
+            Write-Host '                esp32-a1s-net  the same, with Wi-Fi for a phone screen (smaller arena)'
             Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
             Write-Host '                esp32c3     hardware: RISC-V, USB console, one core, 400 KB - the C3 SuperMini'
         Write-Host '                esp32c3-qemu  the same in the emulator: console on UART0, no radio'
@@ -448,6 +450,14 @@ switch ($Command.ToLowerInvariant()) {
                             $chip = 'esp32' }
             'esp32-cyd' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.cyd'
                           $chip = 'esp32' }
+            # The Audio Kit: the same chip, an ES8388 on I2S, and the external
+            # RAM the module has - see sdkconfig.esp32.a1s.
+            'esp32-a1s' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.a1s'
+                          $chip = 'esp32' }
+            # The same board with the radio on, so a phone can be its screen.
+            # It costs the code arena; see sdkconfig.esp32.a1s.net.
+            'esp32-a1s-net' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.a1s;sdkconfig.esp32.a1s.net'
+                              $chip = 'esp32' }
             'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
             'esp32s3-board' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board'
                               $chip = 'esp32s3' }

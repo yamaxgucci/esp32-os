@@ -171,6 +171,44 @@ const char *ag_port_wifi_reason(int reason);
  */
 #if AG_PORT_WIFI_HAS_AP
 
+/*
+ * How loudly and how often the point announces itself.
+ *
+ * Both are ordinary radio settings everywhere else and an audio setting here:
+ * on the ESP32-A1S the transmitter's current is measurable in the codec's
+ * analogue input - the loopback reads a noise floor of peak 416 with the
+ * point up at full power against 16 with the radio off, heard as a knock at
+ * the beacon rate and a click on every packet.
+ *
+ * The power is the whole of it: 19.5 dBm reads 416, 14 reads 300, 7 reads
+ * 250 and 2 reads 23, which is the radio-off floor with the point still up
+ * and serving.  The fall is a cliff between 5 dBm and 2 rather than a slope,
+ * and the radio's ladder is coarse - asking 3, 4 or 6 gets 2, 2 and 5 - so
+ * there is one useful setting and it is the lowest.  The numbers belong to
+ * the board, so the board sets them.
+ *
+ * beacon_ms 0 or tx_quarter_dbm 0 means "leave the driver's own default".
+ * Call before ag_port_wifi_ap_start; a port with nothing to tune does
+ * nothing, which is the correct implementation rather than a missing one.
+ */
+void ag_port_wifi_ap_tune(int beacon_ms, int tx_quarter_dbm);
+
+/*
+ * The transmitter's power, on a radio that is already running.
+ *
+ * ap_tune above is read when the point is raised, which means every trial of
+ * a different power costs a radio restart - and on this board a radio restart
+ * is a client dropped and, twice, a board that stopped answering its console.
+ * This sets it where it stands, which is what turning a knob and listening
+ * requires.
+ *
+ * In quarter-dBm, as the radio counts it: 8 is 2 dBm and 80 is 20.  Reads
+ * back what the radio says it is now, which is not always what was asked -
+ * the driver clamps to what the calibration allows.
+ */
+ag_err_t ag_port_wifi_tx_power_set(int quarter_dbm);
+ag_err_t ag_port_wifi_tx_power_get(int *quarter_dbm);
+
 ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
                                uint8_t channel, bool hidden);
 ag_err_t ag_port_wifi_ap_stop(void);

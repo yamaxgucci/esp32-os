@@ -16,6 +16,23 @@ CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
 
+# THE RADIO'S STACK BELONGS ON THE SYSTEM CORE.
+#
+# Core 1 is the application's in ArgonOS, and an application is where real time
+# lives: the amplifier's audio thread runs there at priority 5.  IDF builds the
+# TCP/IP task with no affinity at priority 18, so a page being served lands on
+# whichever core is free - and when that is core 1 it preempts the application
+# outright for as long as the packet takes.
+#
+# Measured on the Audio Kit, 11 Oct 2026, the same chain throughout: with a
+# browser holding the pedal's panel open the audio thread stalled up to 31 ms
+# against a 5.8 ms block and resynchronised 329 times; with nobody connected,
+# 10 ms; with the radio off, 6 ms and two late blocks in twenty-four thousand.
+# Serving the page doubled the valve stage alone, 1179 us to 2040, with the
+# code already in instruction RAM - so it was never the cache.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_NO_AFFINITY=n
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+
 # Speed over size: ArgonOS exists to get out of the application's way.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 

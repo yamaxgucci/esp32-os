@@ -98,6 +98,133 @@ static wifi_mode_t desired_mode(void)
     return WIFI_MODE_STA;
 }
 
+/*
+ * Set by the board before the point goes up; 0 means the driver's default.
+ * See ag_port_wifi_ap_tune in the contract for why an audio board cares.
+ */
+static int s_ap_beacon_ms;
+static int s_ap_tx_qdbm;
+
+void ag_port_wifi_ap_tune(int beacon_ms, int tx_quarter_dbm)
+{
+    s_ap_beacon_ms = (beacon_ms >= 100 && beacon_ms <= 60000) ? beacon_ms : 0;
+    s_ap_tx_qdbm = (tx_quarter_dbm >= 8 && tx_quarter_dbm <= 80)
+                       ? tx_quarter_dbm
+                       : 0;
+}
+
+ag_err_t ag_port_wifi_tx_power_set(int quarter_dbm)
+{
+    if (quarter_dbm < 8 || quarter_dbm > 80) {
+        return -AG_EINVAL;
+    }
+    const esp_err_t e = esp_wifi_set_max_tx_power((int8_t)quarter_dbm);
+    if (e == ESP_ERR_WIFI_NOT_INIT || e == ESP_ERR_WIFI_NOT_STARTED) {
+        return -AG_ENODEV;
+    }
+    return (e == ESP_OK) ? AG_OK : -AG_EIO;
+}
+
+ag_err_t ag_port_wifi_tx_power_get(int *quarter_dbm)
+{
+    if (quarter_dbm == NULL) {
+        return -AG_EINVAL;
+    }
+    int8_t         q = 0;
+    const esp_err_t e = esp_wifi_get_max_tx_power(&q);
+    if (e == ESP_ERR_WIFI_NOT_INIT || e == ESP_ERR_WIFI_NOT_STARTED) {
+        return -AG_ENODEV;
+    }
+    if (e != ESP_OK) {
+        return -AG_EIO;
+    }
+    *quarter_dbm = (int)q;
+    return AG_OK;
+}
+
+#if defined(CONFIG_LWIP_IPV4_NAPT) && CONFIG_LWIP_IPV4_NAPT
+/* True once the point is translating, so it is not set up twice. */
+static bool s_sharing;
+
+/*
+ * What the board reaches as a station, its own clients reach through it.
+ *
+ * A point that hands out addresses and names itself the gateway is promising a
+ * way out.  Without this there is none: a phone checks, finds the promise
+ * empty, and goes back to its mobile data - and the board's own address stops
+ * existing for that phone's browser, which is exactly the fault this was
+ * written for.  A laptop, which does not care about the promise, could fetch
+ * the page from the same point at the same moment.
+ *
+ * Two halves, and both are needed.  The translation is what lets a packet from
+ * 192.168.4.x leave by the station; the name server is what lets the client
+ * ask for a host at all, and a client with a gateway and no resolver looks
+ * exactly as broken as one with neither.  The DHCP server has to be stopped to
+ * be told, so this runs when the station's address arrives rather than on
+ * every packet.
+ */
+static void share_the_way_out(void)
+{
+    if (s_ap_netif == NULL || s_sta_netif == NULL || s_sharing) {
+        return;
+    }
+    esp_netif_ip_info_t sta;
+    if (esp_netif_get_ip_info(s_sta_netif, &sta) != ESP_OK || sta.ip.addr == 0) {
+        return; /* nothing to share yet */
+    }
+
+    esp_netif_dns_info_t dns;
+    memset(&dns, 0, sizeof(dns));
+    if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
+        dns.ip.u_addr.ip4.addr != 0) {
+        /* OFFER_DNS, not 1: 1 is OFFER_ROUTER, and asking for the router
+         * again leaves the clients with a gateway and no resolver - which is
+         * exactly what a phone reads as a network that does not work. */
+        uint8_t offer = 0x02;
+        (void)esp_netif_dhcps_stop(s_ap_netif);
+        (void)esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+        (void)esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
+                                     ESP_NETIF_DOMAIN_NAME_SERVER, &offer,
+                                     sizeof(offer));
+        (void)esp_netif_dhcps_start(s_ap_netif);
+    }
+
+    const esp_err_t err = esp_netif_napt_enable(s_ap_netif);
+    if (err != ESP_OK) {
+        ESP_LOGW("wifi.ap", "no way out for the point's clients (%d)",
+                 (int)err);
+        return;
+    }
+    s_sharing = true;
+    ESP_LOGW("wifi.ap", "the point passes traffic on through %u.%u.%u.%u",
+             (unsigned)(sta.ip.addr & 0xffu),
+             (unsigned)((sta.ip.addr >> 8) & 0xffu),
+             (unsigned)((sta.ip.addr >> 16) & 0xffu),
+             (unsigned)((sta.ip.addr >> 24) & 0xffu));
+}
+
+static void stop_sharing(void)
+{
+    if (s_sharing && s_ap_netif != NULL) {
+        (void)esp_netif_napt_disable(s_ap_netif);
+    }
+    s_sharing = false;
+}
+#else
+static void share_the_way_out(void) {}
+static void stop_sharing(void) {}
+#endif
+
+static void on_sta_got_ip(void *arg, esp_event_base_t base, int32_t id,
+                          void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)id;
+    (void)data;
+    share_the_way_out();
+}
+
 static esp_err_t apply_mode(void) { return esp_wifi_set_mode(desired_mode()); }
 
 /*
@@ -118,6 +245,9 @@ static esp_err_t apply_ap_config(void)
     cfg.ap.channel = (s_ap_channel == 0u) ? 1u : s_ap_channel;
     cfg.ap.ssid_hidden = s_ap_hidden ? 1 : 0;
     cfg.ap.max_connection = 4;
+    if (s_ap_beacon_ms > 0) {
+        cfg.ap.beacon_interval = (uint16_t)s_ap_beacon_ms;
+    }
 
     const size_t pl = strnlen(s_ap_pass, sizeof(cfg.ap.password));
     if (pl > 0u) {
@@ -282,6 +412,12 @@ ag_err_t ag_port_wifi_start(void)
 
     (void)esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                      &on_wifi_event, NULL);
+    /*
+     * The station's address is what the point has to share, so the point's
+     * side of that is set up when it arrives - see share_the_way_out.
+     */
+    (void)esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                     &on_sta_got_ip, NULL);
 
     /*
      * The calibration data and the last network live in NVS by default.  The
@@ -295,6 +431,9 @@ ag_err_t ag_port_wifi_start(void)
     }
     if (esp_wifi_start() != ESP_OK) {
         return -AG_EIO;
+    }
+    if (s_ap_tx_qdbm > 0) {
+        (void)esp_wifi_set_max_tx_power((int8_t)s_ap_tx_qdbm);
     }
 
     /* ESP-IDF narrates association at INFO; the kernel prints its own line. */
@@ -692,6 +831,27 @@ ag_err_t ag_port_wifi_ap_start(const char *ssid, const char *pass,
         return -AG_EIO;
     }
 
+    /*
+     * The transmitter's power, which until now was stored by ap_tune and
+     * never applied on this path: only the station start set it, so
+     * `ap.txpower` in SYSTEM.CFG did nothing at all for a board that only
+     * raises a point.  That is not a small omission here - on the ESP32-A1S
+     * the transmitter is audible in the codec's input, and the measured floor
+     * runs from peak 416 at 19.5 dBm to 23 at 2, against 16 with the radio
+     * off.  The board was being told to be quiet and staying loud.
+     *
+     * After set_config, because the radio applies it to the interface as it
+     * stands.
+     */
+    if (s_ap_tx_qdbm > 0) {
+        (void)esp_wifi_set_max_tx_power((int8_t)s_ap_tx_qdbm);
+    }
+
+    /* If the station was already joined when the point came up, its clients
+     * can be given the way out at once rather than waiting for an address
+     * that has already arrived. */
+    share_the_way_out();
+
     snprintf(s_ap_ssid, sizeof(s_ap_ssid), "%s", ssid);
     snprintf(s_ap_pass, sizeof(s_ap_pass), "%s", secured ? pass : "");
     s_ap_channel = cfg.ap.channel;
@@ -726,6 +886,7 @@ ag_err_t ag_port_wifi_ap_stop(void)
         return AG_OK;
     }
     s_ap_on = false;
+    stop_sharing(); /* before the interface it was translating for goes */
     (void)apply_mode(); /* back to station-only, or station if one is joined */
 
     if (s_ap_netif != NULL) {

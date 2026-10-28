@@ -234,7 +234,74 @@ typedef struct {
      */
     uint32_t icon_offset;
     uint32_t icon_size;
+
+    /*
+     * The cold part: code that runs once and then never again.
+     *
+     * Measured on STOMP, the valve pedal, which is the image this was built
+     * for: of 53 KB of code at -Os, the twenty largest functions are all
+     * setup - the command line, the model build, the curve baking, the
+     * circuit solver, printf.  About 40 KB runs once at start and then sits
+     * in the arena, which is 60 KB, so the loop that actually has to be fast
+     * gets a quarter of a scarce resource and the rest is ballast.
+     *
+     * Splitting them is worth a factor of two, because an image that outgrows
+     * the arena does not fail - it relocates into flash entire and runs at
+     * half speed, silently.  With the cold part in flash where it belongs,
+     * the hot part fits the arena with room to spare.
+     *
+     * An application says which side a function is on with AG_HOT (see
+     * argon/app.h); everything unmarked is cold, because the cold set is the
+     * larger one and the hot one is what somebody has actually measured.
+     *
+     * Absent - size 0 - in every image built before this existed, and in
+     * every image that marks nothing, which is most of them.  Then the code
+     * part is the whole program exactly as it always was.
+     */
+    ag_axe_part_t cold;
+
+    /*
+     * Relocations for the split image.  Two words like ag_axe_ireloc_t rather
+     * than one like the table above, because with three parts the low two bits
+     * of an offset no longer hold both which part a word is in and which part
+     * it points into - that is three values each, and there are four bit
+     * patterns in total.
+     *
+     * So each entry says both explicitly, and says the target as an offset
+     * into its part rather than a bias to add.  That makes applying one
+     * idempotent, which the streamed path needs for the same reason the
+     * instruction table does: a word is patched from both sides of a page
+     * boundary.
+     *
+     * Present only when `cold.size` is non-zero.  When it is zero this table
+     * is empty and `reloc_offset` above describes the whole image.
+     */
+    uint32_t creloc_offset;
+    uint32_t creloc_count;
 } ag_axe_header_t;
+
+/*
+ * Which part an address in a split relocation lives in or points into.
+ * Deliberately not the bit values above: this is a number, not a flag, and
+ * the two tables are read by different code.
+ */
+#define AG_AXE_P_CODE 0u /* the hot part, in the arena       */
+#define AG_AXE_P_DATA 1u /* writable data and bss            */
+#define AG_AXE_P_COLD 2u /* the run-once part, in flash      */
+
+/*
+ * One split relocation: where the word is, and what it should hold.
+ *
+ * The part numbers are in the top four bits of each word, which leaves 256 MB
+ * of offset - four thousand times the largest image that fits this machine.
+ */
+typedef struct {
+    uint32_t site;   /* part << 28 | offset of the word within that part   */
+    uint32_t target; /* part << 28 | offset the address should point at    */
+} ag_axe_creloc_t;
+
+#define AG_AXE_C_PART(w) ((w) >> 28)
+#define AG_AXE_C_OFFSET(w) ((w) & 0x0FFFFFFFu)
 
 /*
  * What icon_offset points at.

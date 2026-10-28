@@ -897,6 +897,111 @@ static void test_a_short_header_still_loads(void)
     free(a.data);
 }
 
+/*
+ * A three-part image: the loop in one place, the setup in another, and words
+ * in each pointing into all three.
+ *
+ * Built by hand rather than from a fixture because what has to be checked is
+ * arithmetic - that each word ends up holding the address of the thing it
+ * names, once the three parts have been put in three unrelated places.  A
+ * fixture would fix those places and prove less.
+ */
+static void test_split_image(void)
+{
+    /* One word per part, each holding an address into one of the parts. */
+    uint32_t hot[4] = {0, 0, 0, 0};
+    uint32_t data[4] = {0, 0, 0, 0};
+    uint32_t cold[4] = {0, 0, 0, 0};
+
+    ag_axe_header_t h = {0};
+    memcpy(h.magic, AG_AXE_MAGIC_STR, 4);
+    h.header_size = sizeof(h);
+    h.arch = AG_ARCH_XTENSA;
+    h.code.base = 0x42000000u;
+    h.code.size = sizeof(hot);
+    h.code.file_size = sizeof(hot);
+    h.data.base = 0x3C000000u;
+    h.data.size = sizeof(data);
+    h.data.file_size = sizeof(data);
+    h.cold.base = 0x46000000u;
+    h.cold.size = sizeof(cold);
+    h.cold.file_size = sizeof(cold);
+    /* Execution starts in the cold part, where ag_main is. */
+    h.entry = h.cold.base + 4u;
+    h.api_slot = h.data.base;
+    h.creloc_offset = sizeof(h);
+    h.creloc_count = 4;
+
+    AG_CHECK_INT(ag_axe_is_split(&h), 1);
+    AG_CHECK_INT(ag_axe_creloc_count(&h), 4);
+
+    const ag_axe_creloc_t crel[4] = {
+        /* hot -> cold: the call out to setup. */
+        {(AG_AXE_P_CODE << 28) | 0u, (AG_AXE_P_COLD << 28) | 8u},
+        /* hot -> data: a table. */
+        {(AG_AXE_P_CODE << 28) | 4u, (AG_AXE_P_DATA << 28) | 12u},
+        /* cold -> hot: the call in to the loop. */
+        {(AG_AXE_P_COLD << 28) | 0u, (AG_AXE_P_CODE << 28) | 4u},
+        /* data -> cold: a function pointer in a table. */
+        {(AG_AXE_P_DATA << 28) | 0u, (AG_AXE_P_COLD << 28) | 0u},
+    };
+
+    ag_axe_place_t place = {0};
+    place.code = hot;
+    place.code_capacity = sizeof(hot);
+    place.data = data;
+    place.data_capacity = sizeof(data);
+    place.cold = cold;
+    place.cold_capacity = sizeof(cold);
+
+    ag_axe_binding_t binding;
+    AG_CHECK_INT(ag_axe_apply_split(&h, &place, NULL, 0, NULL, 0, crel, 4,
+                                    &binding),
+                 AG_OK);
+
+    AG_CHECK_INT(hot[0] == (uint32_t)(uintptr_t)cold + 8u, 1);
+    AG_CHECK_INT(hot[1] == (uint32_t)(uintptr_t)data + 12u, 1);
+    AG_CHECK_INT(cold[0] == (uint32_t)(uintptr_t)hot + 4u, 1);
+    AG_CHECK_INT(data[0] == (uint32_t)(uintptr_t)cold, 1);
+
+    /* The entry is in the cold part, and that is where it must resolve. */
+    AG_CHECK_INT(binding.entry == (void *)((uint8_t *)cold + 4), 1);
+    AG_CHECK_INT(binding.cold_base == (uintptr_t)cold, 1);
+
+    /*
+     * The target is stored, not a bias, so applying an entry twice is applying
+     * it once - which is what the streamed flash path relies on when a word
+     * straddles a page boundary.
+     */
+    AG_CHECK_INT(ag_axe_apply_split(&h, &place, NULL, 0, NULL, 0, crel, 4,
+                                    &binding),
+                 AG_OK);
+    AG_CHECK_INT(hot[0] == (uint32_t)(uintptr_t)cold + 8u, 1);
+
+    /*
+     * The old entry point cannot be handed a split image: its relocations are
+     * all in the other table, and applying none of them would leave an image
+     * that loads and jumps into nothing.
+     */
+    AG_CHECK_INT(ag_axe_apply(&h, &place, NULL, 0, NULL, 0, &binding),
+                 -AG_ENOTSUP);
+
+    /* A part number no image has is a malformed image, not a crash. */
+    const ag_axe_creloc_t bad[1] = {{(3u << 28) | 0u, 0u}};
+    h.creloc_count = 1;
+    AG_CHECK_INT(ag_axe_apply_split(&h, &place, NULL, 0, NULL, 0, bad, 1,
+                                    &binding),
+                 -AG_EFORMAT);
+    h.creloc_count = 4;
+
+    /* And a split image may not also carry the narrow table. */
+    h.reloc_count = 1;
+    AG_CHECK_INT(ag_axe_validate(&h, sizeof(h) + sizeof(crel), AG_ARCH_XTENSA,
+                                 h.abi_major, h.abi_minor),
+                 -AG_EFORMAT);
+    h.reloc_count = 0;
+}
+
 static void test_arch_names(void)
 {
     AG_CHECK_STR(ag_axe_arch_name(AG_ARCH_XTENSA), "xtensa");
@@ -916,5 +1021,6 @@ void run_axeload_tests(void)
     test_apply_rejects_bad_input();
     test_instruction_relocations();
     test_a_short_header_still_loads();
+    test_split_image();
     test_arch_names();
 }

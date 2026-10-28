@@ -27,6 +27,14 @@ extern "C" {
  */
 ag_err_t ag_log_init(void);
 
+/*
+ * Move the journal into a bigger buffer, once there is memory for one.  See
+ * the note on ag_log_grow in log.c: the ring is created before external
+ * memory is usable, and two hundred lines is half a minute on a board that
+ * is being measured.
+ */
+ag_err_t ag_log_grow(size_t bytes);
+
 void ag_log(ag_log_level_t level, const char *tag, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 void ag_vlog(ag_log_level_t level, const char *tag, const char *fmt,

@@ -626,6 +626,9 @@ static float *read_wav(const char *path, uint32_t *frames, uint32_t *rate)
 
 static ag_ckt_t *g_ckt;
 static float    *g_tab;
+/* Points per curve; 0 means AG_AMP_TAB_N, which is what the measurement
+ * settled on.  AG_TAB_N overrides it so a smaller table can be compared. */
+static int       g_tab_n;
 
 /*
  * The signal every axis in this tool is fitted to, two seconds of it.  It comes
@@ -645,6 +648,17 @@ static int alloc_all(void)
         return -1;
     }
     ag_amp_probe_pluck(g_probe, G_PROBE_N, RATE);
+    {
+        const char *e = getenv("AG_TAB_N");
+        if (e != NULL) {
+            const int v = atoi(e);
+            if (v >= 64 && v <= AG_AMP_TAB_N) {
+                g_tab_n = v;
+                printf("  curves at %d points a stage (%d KB for four)\n", v,
+                       (int)((size_t)v * 3u * 4u * 4u / 1024u));
+            }
+        }
+    }
     return 0;
 }
 
@@ -856,7 +870,7 @@ static void mode_resp(void)
         return;
     }
     model_cfg(&cfg, RATE);
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, g_probe, G_PROBE_N) != 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, g_probe, G_PROBE_N) != 0) {
         printf("  build failed\n");
         free(a);
         return;
@@ -1030,7 +1044,7 @@ static void mode_alias(void)
         return;
     }
     model_cfg(&cfg, RATE);
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, g_probe, G_PROBE_N) != 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, g_probe, G_PROBE_N) != 0) {
         printf("  build failed\n");
         free(a);
         free(buf);
@@ -2120,7 +2134,7 @@ static void fit_banks(const float *ref, uint32_t rn, const float *in,
         double err = 0.0, worst = 0.0;
         int    nb = 0;
 
-        if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, in,
+        if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, in,
                          (int)(dn < drate * 10u ? dn : drate * 10u)) != 0) {
             printf("  build failed\n");
             break;
@@ -2426,7 +2440,7 @@ static void mode_attack(int argc, char **argv)
     model_cfg(&cfg, RATE);
     cfg.drive = drive;
     cfg.blocking = 0;
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, in, n) == 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, in, n) == 0) {
         for (i = 0; i < n; i++) {
             off[i] = ag_amp_tick(a, in[i]);
         }
@@ -2609,7 +2623,7 @@ static void mode_noise(int argc, char **argv)
            db(peak_of(in, (int)frames)), db(qr), db(peak_of(in, (int)frames) / qr));
 
     /* Digital silence: anything but zero here is arithmetic. */
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, in, (int)(frames < rate * 10u
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, in, (int)(frames < rate * 10u
                                                              ? frames
                                                              : rate * 10u)) != 0) {
         printf("  build failed\n");
@@ -2737,7 +2751,7 @@ static void mode_imd(void)
     for (d = 0; d < 4; d++) {
         model_cfg(&cfg, RATE);
         cfg.drive = drives[d];
-        if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, g_probe, G_PROBE_N) != 0) {
+        if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, g_probe, G_PROBE_N) != 0) {
             continue;
         }
         for (i = 0; i < 110000; i++) {
@@ -3118,7 +3132,7 @@ static int write_preset(const char *path, float fit_drive)
     print_model();
     model_cfg(&cfg, RATE);
     cfg.drive = fit_drive;
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, g_probe, G_PROBE_N) != 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, g_probe, G_PROBE_N) != 0) {
         printf("  build failed\n");
         free(ir16);
         free(a);
@@ -3910,7 +3924,7 @@ static void mode_tonefilt(int argc, char **argv)
      * The bake it costs is thrown away.
      */
     model_cfg(&cfg, (float)rate);
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, g_probe, G_PROBE_N) != 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, g_probe, G_PROBE_N) != 0) {
         printf("  build failed\n");
         free(x);
         free(a);
@@ -4203,6 +4217,134 @@ done:
     free(in);
 }
 
+/*
+ * A guitar-shaped probe: four plucked notes with harmonics that die faster
+ * the higher they are, which is what decides how far the signal moves between
+ * one sample and the next - and that, not the loudness itself, is what the
+ * antialiasing average is paid by.
+ */
+static void cost_probe(float *x, uint32_t n, float fs, float amp)
+{
+    const float f0[4] = {82.41f, 110.0f, 146.83f, 196.0f};
+    uint32_t    i;
+    int         k, h;
+
+    for (i = 0; i < n; i++) {
+        x[i] = 0.0f;
+    }
+    for (k = 0; k < 4; k++) {
+        const uint32_t start = (uint32_t)((float)k * 0.25f * fs);
+        for (h = 1; h < 40; h++) {
+            const float f = f0[k] * (float)h;
+            const float a = amp / powf((float)h, 1.3f);
+            const float tau = 1.6f / (1.0f + 0.35f * (float)h);
+            const float w = 6.2831853f * f / fs;
+            if (f > fs * 0.45f) {
+                break;
+            }
+            for (i = start; i < n; i++) {
+                const float t = (float)(i - start) / fs;
+                const float e = expf(-t / tau);
+                if (e < 1.0e-5f) {
+                    break;
+                }
+                x[i] += a * e * sinf(w * (float)(i - start));
+            }
+        }
+    }
+}
+
+static void mode_cost(int argc, char **argv)
+{
+    const float  fs = 22050.0f;
+    const uint32_t n = (uint32_t)fs; /* one second */
+    ag_amp_cfg_t cfg;
+    ag_amp_t    *a;
+    float       *x;
+    const float  levels[5] = {0.02f, 0.06f, 0.2f, 0.6f, 1.0f};
+    int          li, st;
+
+    model_cfg(&cfg, fs);
+    if (argc > 2) {
+        cfg.os = atoi(argv[2]);
+    }
+    a = (ag_amp_t *)malloc(sizeof(ag_amp_t));
+    x = (float *)malloc(sizeof(float) * n);
+    if (a == NULL || x == NULL) {
+        free(a);
+        free(x);
+        return;
+    }
+    print_model();
+    printf("  oversampling %dx, %u stages, a block is 256 frames (11609 us "
+           "of audio)\n",
+           cfg.os, cfg.n_stages);
+
+    /* Built on the loudest probe, so the axes cover everything measured. */
+    cost_probe(x, n, fs, 1.0f);
+    if (load_preset(a, g_tab, fs) != 0) {
+        if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, x, (int)n) != 0) {
+            printf("  build failed\n");
+            free(a);
+            free(x);
+            return;
+        }
+    } else {
+        (void)ag_amp_set_voicing(a, &cfg);
+    }
+
+    printf("\n  in      us/block   of 11609   peak out   "
+           "one-cell  walk  (cells)  hat   outside\n");
+    for (li = 0; li < 5; li++) {
+        clock_t  t0, t1;
+        double   us;
+        float    peak = 0.0f;
+        uint32_t i;
+        uint32_t one = 0, walks = 0, cells = 0, hats = 0, out = 0, samp = 0;
+
+        cost_probe(x, n, fs, levels[li]);
+        ag_amp_reset(a);
+        for (st = 0; st < a->n; st++) {
+            a->tube[st].one_cell = 0;
+            a->tube[st].walks = 0;
+            a->tube[st].walked = 0;
+            a->tube[st].hats = 0;
+            a->tube[st].outside = 0;
+            a->tube[st].samples = 0;
+        }
+        t0 = clock();
+        for (i = 0; i < n; i++) {
+            const float y = ag_amp_tick(a, x[i]);
+            const float m = y < 0.0f ? -y : y;
+            if (m > peak) {
+                peak = m;
+            }
+        }
+        t1 = clock();
+        us = (double)(t1 - t0) * 1000000.0 / (double)CLOCKS_PER_SEC;
+        for (st = 0; st < a->n; st++) {
+            one += a->tube[st].one_cell;
+            walks += a->tube[st].walks;
+            cells += a->tube[st].walked;
+            hats += a->tube[st].hats;
+            out += a->tube[st].outside;
+            samp += a->tube[st].samples;
+        }
+        printf("  %5.2f   %8.0f   %6.1f%%   %8.3f   %7u  %6u  %7u  %5u  %6u\n",
+               (double)levels[li], us * 256.0 / (double)n,
+               us * 256.0 / (double)n / 11609.0 * 100.0, (double)peak,
+               (unsigned)(one * 100u / (samp ? samp : 1u)),
+               (unsigned)(walks * 100u / (samp ? samp : 1u)),
+               (unsigned)(walks ? cells / walks : 0u),
+               (unsigned)(hats * 100u / (samp ? samp : 1u)),
+               (unsigned)(out * 100u / (samp ? samp : 1u)));
+    }
+    printf("  (the four counts are per cent of all sample intervals; "
+           "(cells) is the average walk)\n");
+    free(a);
+    free(x);
+}
+
 static void mode_render(int argc, char **argv)
 {
     ag_amp_cfg_t cfg;
@@ -4269,7 +4411,7 @@ static void mode_render(int argc, char **argv)
      */
     if (load_preset(a, g_tab, (float)rate) != 0) {
         const uint32_t pn = frames < rate * 10u ? frames : rate * 10u;
-        if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, in, (int)pn) != 0) {
+        if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, in, (int)pn) != 0) {
             printf("  build failed\n");
             free(in);
             free(a);
@@ -5229,7 +5371,7 @@ static void mode_sens(int argc, char **argv)
         ag_amp_cfg_t cfg;
         model_cfg(&cfg, (float)rate);
         cfg.drive = drive;
-        if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, in,
+        if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, in,
                          (int)(n < rate * 10u ? n : rate * 10u)) != 0) {
             printf("  build failed\n");
             free(in);
@@ -5329,7 +5471,7 @@ static void mode_sens(int argc, char **argv)
             }
             (void)snprintf(label, sizeof(label), "BEHIND, 200 Hz");
         }
-        if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, in,
+        if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, in,
                          (int)(n < rate * 10u ? n : rate * 10u)) != 0) {
             continue;
         }
@@ -6186,7 +6328,7 @@ static void mode_knee(int argc, char **argv)
                     x[j] = (float)((double)levels[li] * env *
                                    sin(2.0 * PI * f0 * t));
                 }
-                if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, x, (int)n) == 0) {
+                if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, x, (int)n) == 0) {
                     for (j = 0; j < n; j++) {
                         y[j] = ag_amp_tick(a, x[j]);
                     }
@@ -7539,7 +7681,7 @@ static void mode_step1(int argc, char **argv)
         int rc = 0;
         st1_probe(x, n, edge, rate,
                   lv[ST1_N - 1] / (double)(drive > 0.0f ? drive : 1.0f), 0.0);
-        if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, x, (int)n) != 0) {
+        if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, x, (int)n) != 0) {
             goto done;
         }
         for (li = 0; li < ST1_N; li++) {
@@ -7843,7 +7985,7 @@ static void mode_onset(int argc, char **argv)
                 st1_probe(x, n, edge, rate,
                           lv[ONS_N - 1] / (double)(drive > 0.0f ? drive : 1.0f),
                           0.0);
-                if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, x, (int)n) != 0) {
+                if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, x, (int)n) != 0) {
                     goto done;
                 }
             }
@@ -8261,7 +8403,7 @@ static void mode_step2(int argc, char **argv)
      * the working level.
      */
     st1_probe(x, n, edge, rate, 0.01 / (double)(drive > 0.0f ? drive : 1.0f), 0.0);
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, x, (int)n) != 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, x, (int)n) != 0) {
         goto done;
     }
     st2_lines(a, NULL, x, n, edge, body, rate,
@@ -8497,7 +8639,7 @@ static void mode_stepn(int argc, char **argv)
     }
     st1_probe(x, n, edge, rate,
               lv[25] / (double)(drive > 0.0f ? drive : 1.0f), 0.0);
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, x, (int)n) != 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, x, (int)n) != 0) {
         goto done;
     }
     printf("     V      amplifier   ours\n");
@@ -8864,7 +9006,7 @@ static void mode_iter(int argc, char **argv)
     }
     st1_probe(x, n, edge, rate,
               lv[ITER_N - 1] / (double)(drive > 0.0f ? drive : 1.0f), 0.0);
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, x, (int)n) != 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, x, (int)n) != 0) {
         goto done;
     }
     /* The amplifier once: it does not move, and it is the expensive side. */
@@ -10871,7 +11013,7 @@ static void mode_iter2(int argc, char **argv)
             iter1[st][b] = (double)cfg.voice[st][b].db;
         }
     }
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, fit, (int)fn) != 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, fit, (int)fn) != 0) {
         goto done;
     }
     s_i2_sw_w = sww;
@@ -11066,7 +11208,7 @@ static void mode_iter2(int argc, char **argv)
                 }
             }
             stale = i2_eval(a, &cfg, fit, fn, rate, 0, NULL, NULL, NULL, NULL, NULL);
-            if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, fit, (int)fn) != 0) {
+            if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, fit, (int)fn) != 0) {
                 goto done;
             }
             fresh = i2_eval(a, &cfg, fit, fn, rate, 0, &f2, &fq, &fh, &fi, &fs);
@@ -11114,7 +11256,7 @@ static void mode_iter2(int argc, char **argv)
             for (k = 0; k < cfg.n_stages; k++) {
                 base[k] = (double)cfg.vtrim[k];
             }
-            if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, fit, (int)fn) != 0) {
+            if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, fit, (int)fn) != 0) {
                 goto done;
             }
             after_a = i2_eval(a, &cfg, fit, fn, rate, 0, NULL, NULL, NULL, NULL, NULL);
@@ -11211,7 +11353,7 @@ static void mode_iter2(int argc, char **argv)
                 printf("    circle B, block %d: %.2f dB\n", blk + 1, e);
             }
             /* Rebaked before it is judged, for the same reason circle A is. */
-            if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, fit, (int)fn) != 0) {
+            if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, fit, (int)fn) != 0) {
                 goto done;
             }
             after_b = i2_eval(a, &cfg, fit, fn, rate, 0, &f2, &fq, &fh, &fi, &fs);
@@ -12135,7 +12277,7 @@ static void mode_shape(int argc, char **argv)
     st1_probe(x, n, edge, rate, lv[ITER_N - 1] / (double)(drive > 0.0f ? drive
                                                                       : 1.0f),
               0.0);
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, x, (int)n) != 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, x, (int)n) != 0) {
         goto done;
     }
     for (li = 0; li < ITER_N; li++) {
@@ -13477,7 +13619,7 @@ static void mode_kneew(int argc, char **argv)
     }
     st1_probe(x, n, edge, rate,
               lv[KNW_N - 1] / (double)(drive > 0.0f ? drive : 1.0f), 0.0);
-    if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, x, (int)n) != 0) {
+    if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, x, (int)n) != 0) {
         goto done;
     }
     for (li = 0; li < KNW_N; li++) {
@@ -13706,7 +13848,7 @@ static void mode_duo(int argc, char **argv)
             st1_probe(x, n, edge, rate,
                       lv[DUO_LVL - 1] / (double)(drive > 0.0f ? drive : 1.0f),
                       0.0);
-            if (ag_amp_build(a, g_ckt, &cfg, g_tab, 0, x, (int)n) != 0) {
+            if (ag_amp_build(a, g_ckt, &cfg, g_tab, g_tab_n, x, (int)n) != 0) {
                 goto done;
             }
         }
@@ -14489,6 +14631,8 @@ int main(int argc, char **argv)
         mode_cabify(argc, argv);
     } else if (strcmp(mode, "buzz") == 0) {
         mode_buzz(argc, argv);
+    } else if (strcmp(mode, "cost") == 0) {
+        mode_cost(argc, argv);
     } else if (strcmp(mode, "render") == 0) {
         mode_render(argc, argv);
     } else if (strcmp(mode, "match") == 0) {

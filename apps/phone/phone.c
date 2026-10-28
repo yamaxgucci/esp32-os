@@ -1629,6 +1629,29 @@ static bool service_client(void)
             s.dy1 = s.frame_h;
         }
         unlock();
+
+        /*
+         * A picture with no frame cannot be re-sent from here, because
+         * nothing here kept it: with `frame = no` the bands go straight to
+         * the wire and are forgotten.  The only copy left is the one the
+         * application can draw again, and the way to ask for it is the event
+         * it already answers when the screen comes back to it.
+         *
+         * Without this, a phone that arrives while a panel is merely sitting
+         * there gets the text rows and a black picture, and fills in only
+         * where something happens to change - the amplifier's knobs appeared
+         * one row at a time as they were turned, and the half nobody touched
+         * stayed black.
+         */
+        if (s.picture_live && s.frame == NULL) {
+            ag_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type = AG_EV_FOCUS_GAINED;
+            (void)ag_inject_event(&ev);
+            ag_log(AG_LOG_INFO, "phone",
+                   "a visitor with no frame to send: asked the screen's owner "
+                   "to draw it again");
+        }
     }
 
     /*
@@ -1868,10 +1891,25 @@ static uint32_t utf8_next(const uint8_t *p, uint32_t len, uint32_t *at)
 #define INLOG_PATH "C:\\PHONELOG.TXT"
 #define INLOG_CAP  (64u * 1024u)
 static uint32_t s_inlog_bytes;
+/*
+ * OFF UNLESS THE BOARD ASKS FOR IT: `[phone] inputlog = yes` in SYSTEM.CFG.
+ *
+ * The rule on this machine is that nothing writes to flash while it plays,
+ * and this was writing AND syncing on every key and every tap.  On the ESP32
+ * a flash write turns the cache off for the whole chip, so a knob turned on
+ * the phone stops both cores for as long as the erase lasts - which is what
+ * Maxim heard, and reported from the first day as "I touch the panel and the
+ * sound goes".
+ *
+ * What it was built for is still right (19 Sep: keep the input that hangs the
+ * board, because the journal dies with the reset).  That is a debugging
+ * session, asked for by name, not something every owner pays for.
+ */
+static int s_inlog_on;
 
 static void input_log(const char *line)
 {
-    if (line == NULL || !AG_HAS(ag_api()->fs, write)) {
+    if (!s_inlog_on || line == NULL || !AG_HAS(ag_api()->fs, write)) {
         return;
     }
     const uint32_t n = (uint32_t)strlen(line);
@@ -2411,9 +2449,123 @@ static void serve_404(ag_handle_t h)
  * not speak gzip - curl without --compressed - gets bytes it cannot read, which
  * is a fair trade for a page written for browsers.
  */
+/*
+ * THE PAGE IS HELD IN MEMORY, BECAUSE READING FLASH STOPS BOTH CORES.
+ *
+ * On the ESP32 a read from SPI flash turns the cache off while it runs - for
+ * the whole chip, not for the core that asked - so every program fetching its
+ * code through that cache stops too.  Serving these seventeen kilobytes a
+ * kilobyte at a time is therefore not a background errand: it is a hole in
+ * whatever else the machine was doing.
+ *
+ * Measured on the Audio Kit, 11 Oct 2026, the amplifier playing the same take
+ * for forty seconds in each case:
+ *
+ *   quiet                     7880 blocks,   0.05% lost
+ *   pinged hard (1400 bytes)  7504 blocks,   0.12% lost
+ *   this page being fetched   3408 blocks,  39.88% lost
+ *
+ * The radio costs almost nothing; the flash reads cost two blocks in five and
+ * half the output.  So the file is read once and kept, and the reason it was a
+ * file rather than a C array still holds (see above): the memory comes from
+ * the process arena, which is PSRAM where there is any, and a board that
+ * cannot spare it keeps streaming from flash as before.
+ */
+static uint8_t *s_page_ram;
+static uint32_t s_page_len;
+
+static const uint8_t *page_in_memory(uint32_t size)
+{
+    if (s_page_ram != NULL && s_page_len == size) {
+        return s_page_ram;
+    }
+    if (s_page_ram != NULL) { /* the file changed under us */
+        ag_free(s_page_ram);
+        s_page_ram = NULL;
+        s_page_len = 0;
+    }
+
+    ag_meminfo_t mem;
+    ag_meminfo(&mem);
+    /* Four times its own size free afterwards, or it is not this driver's
+     * memory to take: on a board without PSRAM the arena is the one everything
+     * else is short of, which is why the page became a file in the first
+     * place. */
+    if (mem.arena_free < (size_t)size * 5u) {
+        return NULL;
+    }
+
+    /*
+     * THE ARENA, NEVER THE INTERNAL SRAM.
+     *
+     * It was taken from internal memory first, on the theory that reading
+     * PSRAM goes through the same cache the processor fetches code through.
+     * That is true and it does not matter: this is read once per request, by
+     * a driver, while nothing is playing.
+     *
+     * What does matter is who else wants those bytes.  The amplifier's valve
+     * curves are 48 KB and must be in internal SRAM - outside it the chain
+     * costs twice as much, measured - and this page is eighteen.  A phone
+     * that had opened the page once left the pedal started afterwards with
+     * too little to put its curves in, and Maxim heard an amplifier that had
+     * been clean the day before.  Eighteen kilobytes of a four-megabyte arena
+     * costs nobody anything.
+     */
+    uint8_t *buf = (uint8_t *)ag_malloc(size);
+    if (buf == NULL) {
+        return NULL;
+    }
+    const ag_handle_t f = ag_open(s.page, AG_O_RDONLY);
+    if (f < 0) {
+        ag_free(buf);
+        return NULL;
+    }
+    uint32_t got = 0;
+    while (got < size) {
+        const int32_t n = ag_read(f, buf + got, (int32_t)(size - got));
+        if (n <= 0) {
+            break;
+        }
+        got += (uint32_t)n;
+    }
+    ag_close(f);
+    if (got != size) {
+        ag_free(buf);
+        return NULL;
+    }
+    s_page_ram = buf;
+    s_page_len = size;
+    ag_log(AG_LOG_INFO, "phone", "page held in memory, %u bytes",
+           (unsigned)size);
+    return s_page_ram;
+}
+
 static void serve_page(ag_handle_t h)
 {
     ag_stat_t st;
+    /*
+     * The size is asked of the filesystem every time, and that is deliberate.
+     *
+     * It was skipped once the page was held in memory - one stat saved per
+     * request - and the cost was a driver that served a stale page for ever:
+     * a new PHONE.GZ went onto the board, and the board kept handing out the
+     * old one, which took an hour to see because every symptom was in the
+     * page.  A cache that cannot notice its file changed is not a cache, it
+     * is a copy.
+     *
+     * It is not free, either: that stat is a walk of littlefs metadata, and
+     * every read of the flash switches the cache off for the whole chip.
+     * Measured 14 Oct 2026 with Maxim playing and the page open: 197 flash
+     * operations in a minute, all from this driver, and blocks of audio past
+     * their deadline went from one a second to fourteen.  The sentence that
+     * used to end this note - "nobody fetches a page while playing anyway" -
+     * was simply false: the page is how the amplifier is driven.
+     *
+     * It is answered from RAM now rather than avoided: the filesystem is
+     * mirrored in external memory at boot (ag_port_flash_mirror), so a stat
+     * reaches no flash at all.  This driver asks the question it has always
+     * asked, the answer is still current, and nothing stops.
+     */
     if (ag_stat(s.page, &st) != AG_OK || st.size == 0u) {
         char msg[192];
         const int k = snprintf(msg, sizeof(msg),
@@ -2429,8 +2581,9 @@ static void serve_page(ag_handle_t h)
         return;
     }
 
-    const ag_handle_t f = ag_open(s.page, AG_O_RDONLY);
-    if (f < 0) {
+    const uint8_t *held = page_in_memory((uint32_t)st.size);
+    const ag_handle_t f = (held != NULL) ? -1 : ag_open(s.page, AG_O_RDONLY);
+    if (held == NULL && f < 0) {
         return;
     }
 
@@ -2454,7 +2607,16 @@ static void serve_page(ag_handle_t h)
         uint8_t  buf[1024];
         uint32_t sent = 0;
         for (;;) {
-            const int32_t got = ag_read(f, buf, sizeof(buf));
+            int32_t got;
+            if (held != NULL) {
+                const uint32_t left = (uint32_t)st.size - sent;
+                got = (int32_t)((left > sizeof(buf)) ? sizeof(buf) : left);
+                if (got > 0) {
+                    memcpy(buf, held + sent, (size_t)got);
+                }
+            } else {
+                got = ag_read(f, buf, sizeof(buf));
+            }
             if (got <= 0) {
                 break;
             }
@@ -2480,7 +2642,9 @@ static void serve_page(ag_handle_t h)
                    (unsigned)sent);
         }
     }
-    (void)ag_close(f);
+    if (f >= 0) {
+        (void)ag_close(f);
+    }
 }
 
 /*
@@ -3684,6 +3848,25 @@ ag_err_t ag_driver_init(void)
     }
 
     /*
+     * THE PAGE INTO MEMORY NOW, not on the first request.
+     *
+     * It was read lazily, which put seventeen kilobytes of flash reads - and
+     * the cache switched off for the whole chip while each one ran - at
+     * whatever moment somebody first opened the page.  That moment is
+     * precisely the one where somebody has picked up a guitar.  Here, nothing
+     * is playing yet: the driver starts during boot.
+     *
+     * A board too short of memory to hold it keeps streaming from flash as
+     * before; see page_in_memory, which decides that.
+     */
+    {
+        ag_stat_t st;
+        if (ag_stat(s.page, &st) == AG_OK && st.size > 0u) {
+            (void)page_in_memory((uint32_t)st.size);
+        }
+    }
+
+    /*
      * The frame, here and not on the first blit.
      *
      * Allocating on the first blit meant dropping it, and an application that
@@ -3715,6 +3898,9 @@ ag_err_t ag_driver_init(void)
         s.want_frame = true;
         if (cfg != NULL && AG_HAS(cfg, get_bool)) {
             s.want_frame = cfg->get_bool("phone.frame", true);
+            /* The write-ahead log of every key and tap: a debugging session,
+               and a flash write per keystroke, so it is asked for by name. */
+            s_inlog_on = cfg->get_bool("phone.inputlog", false) ? 1 : 0;
         }
         /*
          * `[phone] codec = light`: never ask for the thirteen kilobytes of

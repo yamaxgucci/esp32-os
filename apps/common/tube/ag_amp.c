@@ -3,6 +3,8 @@
  *
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
+#include <argon/argon.h>
+
 #include "ag_amp.h"
 
 #include "ag_mathf.h"
@@ -80,6 +82,7 @@ void ag_amp_model(ag_amp_cfg_t *cfg, int model, float fs)
      */
     cfg->os = 4;
     cfg->adaa = 1;
+    cfg->tab_hat = 1;   /* the running sums, unless the caller is short */
     cfg->blocking = 1;
     /* Full, which is the circuit; see ag_amp_cfg_t.block_depth. */
     cfg->block_depth = 1.0f;
@@ -1122,7 +1125,17 @@ const char *ag_amp_model_name(int model)
  */
 static const uint8_t k_pots_jcm800[] = { AG_POT_DRIVE, AG_POT_BASS, AG_POT_MID,
                                          AG_POT_TREBLE, AG_POT_MASTER };
-static const uint8_t k_pots_gainamp[] = { AG_POT_DRIVE, AG_POT_GAIN,
+/*
+ * ONE PREAMP CONTROL, BECAUSE THESE AMPLIFIERS HAVE ONE.
+ *
+ * There were two here, DRIVE and GAIN, and Maxim asked what the first one was
+ * supposed to be: a Soldano SLO and a Bogner have a preamp gain and a master,
+ * and no front panel on either carries both.  GAIN is the real one - the
+ * attenuator between the stages, which is in the circuit - and DRIVE was the
+ * level into the first stage wearing a knob's name.  The fitted level stays
+ * where the match put it; what is not on the amplifier is not on the panel.
+ */
+static const uint8_t k_pots_gainamp[] = { AG_POT_GAIN,
                                           AG_POT_BASS, AG_POT_MID,
                                           AG_POT_TREBLE, AG_POT_MASTER };
 static const uint8_t k_pots_ts9[] = { AG_POT_DRIVE, AG_POT_TONE, AG_POT_MASTER };
@@ -1261,8 +1274,33 @@ void ag_amp_pot_apply(struct ag_amp_cfg *cfg, const struct ag_amp_cfg *fitted,
             cfg->tone_treble = p;
             break;
         case AG_POT_TONE:
-            /* The pedal's one control: its own network, not three of them. */
-            cfg->tone_mid = p;
+            /*
+             * The pedal's one control, and it is the output network - which is
+             * where this model already carries it (cfg.out_top_hz, fitted at
+             * 4 kHz from the pedal's own chirp response).
+             *
+             * It used to write `tone_mid`, and `tone_mid` is read only by a
+             * tone stack: the TS9 has none - ag_amp_tone_spec says so by
+             * returning nothing for it - so the number went nowhere and the
+             * knob turned against a dead stop.  Maxim found it by ear, which
+             * is the only way anything could have: nothing warns when a
+             * setting is written and never read.
+             *
+             * The corner moves either side of the fitted one, a factor of
+             * two and a half each way: 1.6 kHz with the knob down, 10 kHz
+             * with it up, and exactly the fitted 4 kHz at noon so a preset
+             * untouched is still the preset that was measured.  The SHAPE is
+             * the measured one - a resistor into a capacitor, first order -
+             * and the travel is an approximation, stated as one: the
+             * schematic's own values for that network were not in front of
+             * whoever wrote this model, and the capture only ever saw one
+             * position of the pot.
+             */
+            if (fitted->out_top_hz > 0.0f) {
+                cfg->out_top_hz = fitted->out_top_hz *
+                                  (p <= 0.5f ? (0.4f + 1.2f * p)
+                                             : (1.0f + 3.0f * (p - 0.5f)));
+            }
             break;
         case AG_POT_MASTER:
             /*
@@ -1736,7 +1774,8 @@ void ag_amp_spec(int model, int i, ag_tube_spec_t *out)
     }
 }
 
-static int bake_all(ag_amp_t *a, ag_ckt_t *scratch, float *tab, int n,
+static int bake_all(ag_amp_t *a, ag_ckt_t *scratch, float *tab,
+                    float *const *tabs, int n,
                     const float *lo, const float *hi)
 {
     const float fos = a->cfg.fs * (float)(a->cfg.os < 1 ? 1 : a->cfg.os);
@@ -1744,9 +1783,21 @@ static int bake_all(ag_amp_t *a, ag_ckt_t *scratch, float *tab, int n,
     for (i = 0; i < a->n; i++) {
         /* Laid out for a->tab_n whatever n is, so a coarse pass and the final
          * one write the same regions and the last one wins. */
-        float *t = tab + (3 * i) * a->tab_n;
-        float *h = t + n;
-        float *g = t + 2 * a->tab_n;
+        /*
+         * One block for all the stages, or one block each.
+         *
+         * The contiguous form is what every caller has always passed and what
+         * the preset format stores.  The split form exists because on the
+         * Audio Kit the whole table is 96 KB and the largest internal block is
+         * 76: the stages fit one at a time where they do not fit together, and
+         * the difference is whether every curve lookup goes to external
+         * memory.  Nothing about the arithmetic changes - the same floats sit
+         * in the same order, in four places instead of one.
+         */
+        const int parts = a->cfg.tab_hat ? 3 : 2;
+        float    *t = tabs ? tabs[i] : tab + (parts * i) * a->tab_n;
+        float    *h = a->cfg.tab_hat ? t + n : 0;
+        float    *g = t + (a->cfg.tab_hat ? 2 : 1) * a->tab_n;
         ag_tube_init(&a->tube[i]);
         if (a->linear[i]) {
             continue; /* no table: gain and filters only */
@@ -1794,14 +1845,16 @@ static int bake_all(ag_amp_t *a, ag_ckt_t *scratch, float *tab, int n,
     return 0;
 }
 
-int ag_amp_build(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
-                 float *tab, int n, const float *probe, int probe_n)
+static int build_common(ag_amp_t *a, ag_ckt_t *scratch,
+                        const ag_amp_cfg_t *cfg, float *tab,
+                        float *const *tabs, int n, const float *probe,
+                        int probe_n)
 {
     float cap_lo[AG_AMP_STAGES], cap_hi[AG_AMP_STAGES];
     float lo[AG_AMP_STAGES], hi[AG_AMP_STAGES];
     int   i, pass, fit_n;
 
-    if (a == 0 || scratch == 0 || cfg == 0 || tab == 0) {
+    if (a == 0 || scratch == 0 || cfg == 0 || (tab == 0 && tabs == 0)) {
         return -1;
     }
     a->cfg = *cfg;
@@ -1881,7 +1934,7 @@ int ag_amp_build(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
             }
         }
         if (given) {
-            if (bake_all(a, scratch, tab, a->tab_n, a->cfg.axis_lo,
+            if (bake_all(a, scratch, tab, tabs, a->tab_n, a->cfg.axis_lo,
                          a->cfg.axis_hi) != 0) {
                 return -1;
             }
@@ -1893,7 +1946,7 @@ int ag_amp_build(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
 
     /* First bake fitted to the curves, coarse, which is what the chain has to be
      * run with before anything can be measured about the signal. */
-    if (bake_all(a, scratch, tab, fit_n, 0, 0) != 0) {
+    if (bake_all(a, scratch, tab, tabs, fit_n, 0, 0) != 0) {
         return -1;
     }
     design(a);
@@ -1931,7 +1984,7 @@ int ag_amp_build(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
             seed_lo[i] = cap_lo[i] > -6.0f ? cap_lo[i] : -6.0f;
             seed_hi[i] = cap_hi[i] < 6.0f ? cap_hi[i] : 6.0f;
         }
-        if (bake_all(a, scratch, tab, fit_n, seed_lo, seed_hi) != 0) {
+        if (bake_all(a, scratch, tab, tabs, fit_n, seed_lo, seed_hi) != 0) {
             return -1;
         }
     }
@@ -1967,7 +2020,7 @@ int ag_amp_build(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
             }
         }
         /* Coarse while still fitting, full size on the last pass. */
-        if (bake_all(a, scratch, tab,
+        if (bake_all(a, scratch, tab, tabs,
                      pass == AMP_FIT_PASSES - 1 ? a->tab_n : fit_n, lo, hi) != 0) {
             return -1;
         }
@@ -1978,6 +2031,30 @@ int ag_amp_build(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
     }
     return 0;
 }
+
+/*
+ * The two ways in, and they differ only in where the caller put the floats.
+ *
+ * ag_amp_build takes one block laid out stage after stage, which is what every
+ * caller has passed since this existed and what a preset stores.
+ * ag_amp_build_split takes one pointer per stage, for a machine where the
+ * whole table will not fit in one piece of the memory that is worth having:
+ * on the ESP32-A1S the table is 96 KB, the largest internal block is 76, and
+ * the stages fit separately.  Same floats, same order, same result.
+ */
+int ag_amp_build(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
+                 float *tab, int n, const float *probe, int probe_n)
+{
+    return build_common(a, scratch, cfg, tab, 0, n, probe, probe_n);
+}
+
+int ag_amp_build_split(ag_amp_t *a, ag_ckt_t *scratch, const ag_amp_cfg_t *cfg,
+                       float *const *tabs, int n, const float *probe,
+                       int probe_n)
+{
+    return build_common(a, scratch, cfg, 0, tabs, n, probe, probe_n);
+}
+
 
 /* Every filter chain in the amplifier, by index, so that one loop can walk them
  * all rather than four places listing them. */
@@ -2091,7 +2168,7 @@ static int apply_cfg(ag_amp_t *a, const ag_amp_cfg_t *cfg, int keep)
      * costs.
      */
     if (keep) {
-        float z[AMP_CHAINS][AG_BIQ_MAX][4];
+        float z[AMP_CHAINS][AG_BIQ_MAX][2];
         int   was[AMP_CHAINS];
         int   c, j;
 
@@ -2099,10 +2176,8 @@ static int apply_cfg(ag_amp_t *a, const ag_amp_cfg_t *cfg, int keep)
             const ag_biq_chain_t *ch = chain_at(a, c);
             was[c] = ch->n;
             for (j = 0; j < ch->n; j++) {
-                z[c][j][0] = ch->s[j].x1;
-                z[c][j][1] = ch->s[j].x2;
-                z[c][j][2] = ch->s[j].y1;
-                z[c][j][3] = ch->s[j].y2;
+                z[c][j][0] = ch->s[j].z1;
+                z[c][j][1] = ch->s[j].z2;
             }
         }
         design(a);
@@ -2110,10 +2185,8 @@ static int apply_cfg(ag_amp_t *a, const ag_amp_cfg_t *cfg, int keep)
             ag_biq_chain_t *ch = chain_at(a, c);
             const int       lim = ch->n < was[c] ? ch->n : was[c];
             for (j = 0; j < lim; j++) {
-                ch->s[j].x1 = z[c][j][0];
-                ch->s[j].x2 = z[c][j][1];
-                ch->s[j].y1 = z[c][j][2];
-                ch->s[j].y2 = z[c][j][3];
+                ch->s[j].z1 = z[c][j][0];
+                ch->s[j].z2 = z[c][j][1];
             }
         }
     } else {
@@ -2184,25 +2257,46 @@ void ag_amp_reset(ag_amp_t *a)
  * Each valve carries its own coupling capacitor.s charge, so blocking is inside
  * ag_tube_tick rather than here.
  */
-static float run_stages(ag_amp_t *a, float v)
+/*
+ * `flatten`: put everything this calls inside it.
+ *
+ * Only possible because ag_hot.c compiles the valve, the filters and this
+ * file as one unit - a compiler cannot inline what it cannot see.  What it
+ * pulls in is the valve's tick, which at four stages and four times
+ * oversampling was sixteen calls for one sample of audio.
+ */
+#if defined(__GNUC__) && !defined(AG_HOST)
+__attribute__((flatten))
+#endif
+/*
+ * For bisecting a fault on the board, and for nothing else: with this set the
+ * oversampled path runs but the valves and their filters do not.  See the
+ * note on the dear samples in stomp.c.
+ */
+int g_ag_amp_no_stages;
+
+static AG_HOT float run_stages(ag_amp_t *a, float v)
 {
     int i;
+    if (g_ag_amp_no_stages) {
+        return v;
+    }
     if (a->tube[0].t != 0) {
         v = ag_tube_tick(&a->tube[0], v);
     }
-    a->tap[0] = v;
+    AG_AMP_TAP(a, 0, v);
     for (i = 1; i < a->n; i++) {
         v = ag_biq_chain_tick(&a->pre[i], v) * a->gain[i];
         v = ag_biq_chain_tick(&a->voice[i], v) * a->vtrim[i];
         if (a->tube[i].t != 0) {
             v = ag_tube_tick(&a->tube[i], v);
         }
-        a->tap[i] = v;
+        AG_AMP_TAP(a, i, v);
     }
     return v;
 }
 
-float ag_amp_tick(ag_amp_t *a, float x)
+AG_HOT float ag_amp_tick(ag_amp_t *a, float x)
 {
     float v, y, p;
 
@@ -2501,8 +2595,8 @@ const int16_t *ag_amp_preset_ir(const void *buf, uint32_t n, uint32_t *frames,
     return (const int16_t *)(const void *)((const uint8_t *)buf + off);
 }
 
-int ag_amp_preset_load(ag_amp_t *a, const void *buf, uint32_t n, float *tab,
-                       float fs)
+static int preset_load_common(ag_amp_t *a, const void *buf, uint32_t n,
+                              float *tab, float *const *tabs, float fs)
 {
     const amp_preset_head_t *h = (const amp_preset_head_t *)buf;
     const float             *in;
@@ -2542,18 +2636,32 @@ int ag_amp_preset_load(ag_amp_t *a, const void *buf, uint32_t n, float *tab,
     in = (const float *)(const void *)(h + 1);
     for (i = 0; i < a->n; i++) {
         const int nn = a->tab_n;
-        float    *d = tab + (3 * i) * nn;
+        const int parts = a->cfg.tab_hat ? 3 : 2;
+        float    *d = tabs ? tabs[i] : tab + (parts * i) * nn;
         int       k;
-        for (k = 0; k < 3 * nn; k++) {
+        /* The file always carries three arrays; what is attached may be two.
+         * The curve first, then the grid current - the running sums in
+         * between are skipped when this chain is not keeping them. */
+        for (k = 0; k < nn; k++) {
             d[k] = in[(3 * i) * nn + k];
+        }
+        for (k = 0; k < nn; k++) {
+            d[(parts - 1) * nn + k] = in[(3 * i) * nn + 2 * nn + k];
+        }
+        if (parts == 3) {
+            for (k = 0; k < nn; k++) {
+                d[nn + k] = in[(3 * i) * nn + nn + k];
+            }
         }
         ag_tube_init(&a->tube[i]);
         if (!h->has_table[i]) {
             a->linear[i] = 1;
             continue;
         }
-        if (ag_tube_attach(&a->tube[i], d, d + nn, d + 2 * nn, nn, h->axis_lo[i],
-                           h->axis_hi[i]) != 0) {
+        if (ag_tube_attach(&a->tube[i], d,
+                           a->cfg.tab_hat ? d + nn : 0,
+                           d + (a->cfg.tab_hat ? 2 : 1) * nn, nn,
+                           h->axis_lo[i], h->axis_hi[i]) != 0) {
             return -1;
         }
         /* The bake knew these and the tables do not carry them: the operating
@@ -2574,6 +2682,20 @@ int ag_amp_preset_load(ag_amp_t *a, const void *buf, uint32_t n, float *tab,
     ag_amp_reset(a);
     return 0;
 }
+
+int ag_amp_preset_load(ag_amp_t *a, const void *buf, uint32_t n, float *tab,
+                       float fs)
+{
+    return preset_load_common(a, buf, n, tab, 0, fs);
+}
+
+/* The same preset, read into one block per stage; see ag_amp_build_split. */
+int ag_amp_preset_load_split(ag_amp_t *a, const void *buf, uint32_t n,
+                             float *const *tabs, float fs)
+{
+    return preset_load_common(a, buf, n, 0, tabs, fs);
+}
+
 
 int ag_amp_blend_stage(ag_amp_t *a, ag_ckt_t *scratch, int stage, float mix,
                        float *work)

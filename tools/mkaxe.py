@@ -62,6 +62,11 @@ HEADER_FORMAT = HEADER_FORMAT_V1 + " II"
 # without one is written in the shorter layout, and a loader that has never
 # heard of icons reads it exactly as before.
 HEADER_FORMAT_ICON = HEADER_FORMAT + " II"
+# Six more for an image split into a hot part and a cold one: the cold
+# part (base, size, file_size, offset) and its relocation table.  Same
+# rule a third time - an unsplit image is written in the shorter layout
+# and read by an older loader exactly as before.
+HEADER_FORMAT_COLD = HEADER_FORMAT_ICON + " IIII II"
 
 ICON_W = 16
 ICON_H = 16
@@ -175,6 +180,10 @@ R_TO_DATA = 0x2
 # relocates from these.
 DEFAULT_CODE_BASE = 0x42000000
 DEFAULT_DATA_BASE = 0x3C000000
+# Far from both, for the same reason they are far from each other: a
+# relocation is checked against the range of the part it claims to point
+# into, and overlapping ranges would make that check pass by accident.
+DEFAULT_COLD_BASE = 0x46000000
 
 # ELF relocation type numbers for a plain absolute 32-bit word.
 ABS32_RELOC = {"xtensa": 1, "riscv32": 1}
@@ -189,6 +198,25 @@ CXX_SUFFIXES = (".cpp", ".cc", ".cxx")
 
 CODE_SECTION = ".image"
 DATA_SECTION = ".dimage"
+# The run-once part.  Named like the others so the "placed outside the
+# image" check below keeps working: anything not in one of these three is
+# a section somebody forgot, and that is worth a refusal rather than a
+# silently dropped function.
+COLD_SECTION = ".cimage"
+
+# Must match AG_AXE_P_* in sdk/include/argon/axe.h.
+P_CODE = 0
+P_DATA = 1
+P_COLD = 2
+
+# What the compiler calls the sections AG_HOT puts a function in.  The
+# literal pool is the reason both are named: on Xtensa an address is
+# fetched with l32r from a pool that must sit within 256 KB behind the
+# instruction, and the compiler names that pool after the section the
+# function is in - .hot.literal beside .hot.text.  Collecting them
+# together is what keeps the pool in reach once the cold part has been
+# moved a long way off.
+HOT_INPUT = "*(.hot.literal .hot.text .hot.literal.* .hot.text.*)"
 
 # Where the constants go needs nothing from the kernel: code reaches one through a
 # literal holding its absolute address, and that literal is relocated by the data
@@ -235,7 +263,29 @@ def rodata_lines():
             "    __ag_rodata_end = .;"]
 
 
-def code_block(rodata_in_code):
+def cold_block():
+    """Everything that was not marked hot, to be executed from flash.
+
+    This is the ordinary text input specification - the one code_block uses
+    when the image is not split - and that is the point: marking is opt-in, so
+    an unmarked image has its whole program here and an unmarked function in a
+    split image stays where it always was.  Only what somebody measured moves.
+
+    The literals are interleaved with the text for the l32r reason spelled out
+    in code_block, and the reason applies within this part just as it did
+    within one undivided one.
+    """
+    return "\n".join([
+        "  .cimage :", "  {",
+        # The entry point lives on this side; code_block says why.
+        "    KEEP(*(.literal.ag_main .text.ag_main "
+        ".literal.ag_driver_init .text.ag_driver_init))",
+        "    *(.literal .text .literal.* .text.*)",
+        "    . = ALIGN(4);",
+        "  }"]) + "\n"
+
+
+def code_block(rodata_in_code, split=False, hot_objs=()):
     """The part that gets executed.
 
     The literals are interleaved with the code rather than gathered at the
@@ -256,17 +306,44 @@ def code_block(rodata_in_code):
     text; they do, because .literal is named first.  ESP-IDF's own linker
     scripts write the same line for the same reason.
     """
-    lines = ["  .image :", "  {",
-             # The two roots.  Nothing in the image refers to the entry point -
-             # the loader jumps to it from outside - so with --gc-sections the
-             # linker is entitled to throw it away, and does: a large image
-             # built with --gc-sections came out with no ag_main at all.  KEEP
-             # says otherwise.  Harmless when the pattern matches nothing,
-             # which is the case for whichever of the two this image is not.
-             "    KEEP(*(.literal.ag_main .text.ag_main "
-             ".literal.ag_driver_init .text.ag_driver_init))",
-             "    *(.literal .text .literal.* .text.*)",
-             "    " + HOT_RODATA_INPUT]
+    # When the image is split this part collects only what AG_HOT marked, and
+    # cold_block takes the rest.
+    # Unsplit, this part takes everything, the marked functions included: a
+    # mark says which side of a seam a function is on, and without a seam it
+    # says nothing.  It still has to be named, or the linker leaves those
+    # sections out of every output section and mkaxe refuses the image - which
+    # is what marking the first function did to the five other applications
+    # that share these DSP sources.
+    text_input = (HOT_INPUT if split
+                  else "*(.literal .text .literal.* .text.*)\n    " + HOT_INPUT)
+
+    # Whole objects named hot, put before the pattern above so the linker takes
+    # them here rather than letting them fall through to the cold part.  Named
+    # by the object the source was compiled to - this tool's own sN.o - because
+    # a linker input specification matches the file a section came from, and
+    # that is the only handle there is on "everything in this source".
+    for obj in hot_objs:
+        text_input = ("%s(.literal .text .literal.* .text.*)\n    " % obj
+                      + text_input)
+
+    # The two roots.  Nothing in the image refers to the entry point - the
+    # loader jumps to it from outside - so with --gc-sections the linker is
+    # entitled to throw it away, and does: a large image built with
+    # --gc-sections came out with no ag_main at all.  KEEP says otherwise.
+    # Harmless when the pattern matches nothing, which is the case for
+    # whichever of the two this image is not.
+    #
+    # In a split image the entry is kept on the cold side instead, because it
+    # is the setup: ag_main is the command line and the model build, 4396
+    # bytes on STOMP, the largest function in the program and cold by every
+    # measure.  Keeping it here because it happens to be where execution
+    # starts would spend a twelfth of the arena on code that runs once.
+    lines = ["  .image :", "  {"]
+    if not split:
+        lines += ["    KEEP(*(.literal.ag_main .text.ag_main "
+                  ".literal.ag_driver_init .text.ag_driver_init))"]
+    lines += ["    " + text_input,
+              "    " + HOT_RODATA_INPUT]
     if rodata_in_code:
         lines += rodata_lines()
     lines += ["    KEEP(*(.ag_header))",
@@ -338,7 +415,8 @@ def data_block(rodata_in_code):
     return "\n".join(lines) + "\n"
 
 
-def linker_script(code_base, data_base, contiguous, rodata_in_code):
+def linker_script(code_base, data_base, contiguous, rodata_in_code,
+                  split=False, cold_base=DEFAULT_COLD_BASE, hot_objs=()):
     """The script for one layout.
 
     Sections are emitted in address order, so that the ELF's own segments come
@@ -346,10 +424,17 @@ def linker_script(code_base, data_base, contiguous, rodata_in_code):
     than by position, so the ordering costs nothing; ld links them either way,
     which was checked rather than assumed.
     """
-    code = code_block(rodata_in_code)
+    code = code_block(rodata_in_code, split, hot_objs)
     data = data_block(rodata_in_code)
 
     if contiguous:
+        if split:
+            # One block means the parts keep a fixed distance from each other,
+            # which is the whole meaning of the flag; a cold part in flash is
+            # the opposite request.  Refuse rather than quietly produce an
+            # image whose two halves are nowhere near where its code expects.
+            raise SystemExit("mkaxe: --contiguous and --split-hot ask for "
+                             "opposite layouts")
         # The data follows the code.  ALIGN covers whatever alignment the data
         # itself asks for, so the gap the linker inserts is bounded and known;
         # it is then folded into the code part, because the loader is promised
@@ -358,6 +443,8 @@ def linker_script(code_base, data_base, contiguous, rodata_in_code):
                   "  . = ALIGN(16);\n", data]
     else:
         parts = [(code_base, code), (data_base, data)]
+        if split:
+            parts.append((cold_base, cold_block()))
         parts.sort(key=lambda p: p[0])
         blocks = []
         for base, block in parts:
@@ -568,7 +655,7 @@ def read_app_header(image, header_addr, image_addr):
     }
 
 
-def part_of(elf, name, is_data):
+def part_of(elf, name, is_data, part=None):
     """Describes one output section as a part of the image.
 
     Absent sections are still described, as an empty part: an application with
@@ -577,7 +664,7 @@ def part_of(elf, name, is_data):
     sec = elf.section(name)
     if sec is None:
         return {"name": name, "index": -1, "addr": 0, "size": 0, "stored": b"",
-                "is_data": is_data}
+                "is_data": is_data, "part": part}
 
     # A section that is all bss carries nothing in the file, and its file offset
     # points at whatever happens to follow.  Reading it would be reading noise.
@@ -586,7 +673,8 @@ def part_of(elf, name, is_data):
         stored = elf.data[sec["offset"]:sec["offset"] + sec["size"]]
 
     return {"name": name, "index": sec["index"], "addr": sec["addr"],
-            "size": sec["size"], "stored": stored, "is_data": is_data}
+            "size": sec["size"], "stored": stored, "is_data": is_data,
+            "part": part}
 
 
 def main():
@@ -629,6 +717,32 @@ def main():
                     help="one block, data straight after code: the code then "
                          "reaches its data PC-relatively (riscv32) and cannot "
                          "be executed from flash")
+    ap.add_argument("--split-hot", action="store_true",
+                    help="split the code into a hot part and a cold one: the "
+                         "functions marked AG_HOT go to a part the loader puts "
+                         "in the code arena, and everything else - setup, "
+                         "parsing, printing - to a part it executes from "
+                         "flash.  For an image that does not fit the arena and "
+                         "is therefore running entirely from flash at half "
+                         "speed")
+    ap.add_argument("--hot-cflags", default="",
+                    help="compiler flags for the --hot-src files instead of "
+                         "--cflags.  An image is split into a half that must "
+                         "be fast and a half that must be small, and those "
+                         "want opposite flags: the amplifier's inner loop at "
+                         "-O2 against -Os is worth a fifth of its time, and "
+                         "-O2 over the whole image makes it too big to load. "
+                         "Empty means --cflags for everything, as before.")
+    ap.add_argument("--hot-src", action="append", default=[],
+                    help="source file (by basename) whose whole contents go in "
+                         "the hot part, as though every function in it were "
+                         "marked AG_HOT.  For a file that is nothing but the "
+                         "inner loop, where marking each function one at a "
+                         "time only invites the next one to be forgotten")
+    ap.add_argument("--cold-base", type=lambda v: int(v, 0),
+                    default=DEFAULT_COLD_BASE,
+                    help="where the cold part is linked (the loader relocates "
+                         "from it, so any address works)")
     ap.add_argument("--rodata", choices=("data", "code"), default="data",
                     help="which part read-only constants go in; data (the "
                          "default) keeps fonts, images and tables out of the "
@@ -677,6 +791,21 @@ def main():
     # written after paying this once; this makes it the default so the next one
     # does not.)
     args.cflags += " -fno-builtin"
+
+    if args.split_hot and args.arch != "xtensa":
+        # The cold part works on Xtensa because -mlongcalls already routes
+        # every call through a literal holding an absolute address, which is a
+        # plain word in the relocation table and may point anywhere.  On
+        # RISC-V the address is built into a lui/addi pair instead, and the
+        # table that describes those (ag_axe_ireloc_t) has one bit for where
+        # the address points - code or data, which is two parts, not three.
+        # Widening it is a day's work nobody has needed yet, so this refuses
+        # rather than silently building an image whose calls land in the wrong
+        # part.
+        raise SystemExit("mkaxe: --split-hot is implemented for xtensa only; "
+                         "the "
+                         "riscv32 instruction relocations name two parts, not "
+                         "three")
 
     if args.arch == "xtensa":
         # Long calls: the linker cannot shorten a call whose target moves.
@@ -737,6 +866,18 @@ def main():
         # nowhere near each other, which medany cannot express.
         args.cflags += " -mcmodel=medlow"
 
+    if args.hot_cflags:
+        # The architecture flags this tool adds above belong to BOTH halves:
+        # they say what machine the code is for, not how hard to optimise.
+        # Without -mlongcalls on the hot half the link failed with "dangerous
+        # relocation: call target out of range" - the hot code sits in the
+        # arena and the cold in flash, which no short call can span.
+        for flag in ("-fno-builtin", "-mlongcalls", "-mcmodel=medany",
+                     "-mcmodel=medlow", "-march=rv32imc_zicsr_zifencei",
+                     "-mabi=ilp32"):
+            if flag in args.cflags and flag not in args.hot_cflags:
+                args.hot_cflags += " " + flag
+
     workdir = tempfile.mkdtemp(prefix="mkaxe-")
     try:
         objects = []
@@ -747,7 +888,14 @@ def main():
             # Unique names: LVGL (and any multi-dir tree) repeats basenames.
             obj = os.path.join(workdir, "s%d.o" % i)
             is_cxx = src.lower().endswith(CXX_SUFFIXES)
-            cmd = [args.gxx if is_cxx else args.gcc, "-c"] + args.cflags.split()
+            # The hot half gets its own flags where the caller asked for them:
+            # fast for the inner loop, small for everything else.
+            hot_names = {os.path.basename(h) for h in args.hot_src}
+            flags = (args.hot_cflags
+                     if (args.hot_cflags and
+                         os.path.basename(src) in hot_names)
+                     else args.cflags)
+            cmd = [args.gxx if is_cxx else args.gcc, "-c"] + flags.split()
             if is_cxx:
                 cmd += args.cxxflags.split()
             for inc in args.include:
@@ -758,10 +906,29 @@ def main():
 
         rodata_in_code = args.rodata == "code"
 
+        # Which objects --hot-src named.  Worked out here rather than after the
+        # compile because the object names are this tool's own and are decided
+        # by position, and the linker script has to be written first.
+        hot_objs = []
+        wanted = {os.path.basename(h) for h in args.hot_src}
+        for i, src in enumerate(args.sources):
+            if os.path.basename(src) in wanted:
+                # A leading * because the objects are handed to the linker by
+                # absolute path, and an input specification matches the name as
+                # given: a bare "s9.o" is read as a file to open and the link
+                # fails with "cannot find s9.o".
+                hot_objs.append("*" + os.path.basename(src) if src.endswith(".o")
+                                else "*s%d.o" % i)
+        missing = wanted - {os.path.basename(s) for s in args.sources}
+        if missing:
+            raise SystemExit("mkaxe: --hot-src named %s, which this image does "
+                             "not build" % ", ".join(sorted(missing)))
+
         script = os.path.join(workdir, "axe.ld")
         with open(script, "w") as f:
             f.write(linker_script(args.code_base, args.data_base,
-                                  args.contiguous, rodata_in_code))
+                                  args.contiguous, rodata_in_code,
+                                  args.split_hot, args.cold_base, hot_objs))
 
         elf_path = os.path.join(workdir, "image.elf")
         ldflags = args.ldflags.split() if args.ldflags else []
@@ -784,17 +951,18 @@ def main():
         for sec in elf.sections():
             if not (sec["flags"] & SHF_ALLOC) or sec["size"] == 0:
                 continue
-            if sec["name"] not in (CODE_SECTION, DATA_SECTION):
+            if sec["name"] not in (CODE_SECTION, DATA_SECTION, COLD_SECTION):
                 raise SystemExit(
                     "mkaxe: section '%s' (%u bytes) was placed outside the "
                     "image; name it in the linker script in this file, or "
                     "discard it" % (sec["name"], sec["size"]))
 
-        code = part_of(elf, CODE_SECTION, is_data=False)
-        if code["size"] == 0:
+        code = part_of(elf, CODE_SECTION, is_data=False, part=P_CODE)
+        cold = part_of(elf, COLD_SECTION, is_data=False, part=P_COLD)
+        if code["size"] == 0 and cold["size"] == 0:
             raise SystemExit("mkaxe: no code in the image; check the linker "
                              "script")
-        data = part_of(elf, DATA_SECTION, is_data=True)
+        data = part_of(elf, DATA_SECTION, is_data=True, part=P_DATA)
 
         syms = elf.symbols()
 
@@ -822,7 +990,8 @@ def main():
         if api_slot is None:
             raise SystemExit("mkaxe: no g_ag_api; is AG_APP() / AG_DRV() missing?")
 
-        targets = {p["index"]: p for p in (code, data) if p["index"] >= 0}
+        targets = {p["index"]: p for p in (code, data, cold)
+                   if p["index"] >= 0}
 
         if args.dump_relocs:
             # What the linker actually emitted, by type and by which part the
@@ -844,6 +1013,7 @@ def main():
                 print("%-6s type %3d  x%d" % (where, t, n))
             return 0
         relocs = set()
+        crelocs = set()
         for where, offset, points_to in elf.abs32_relocs(
                 ABS32_RELOC[args.arch], targets):
             if offset < 0 or offset + 4 > len(where["stored"]):
@@ -865,6 +1035,18 @@ def main():
                     % (where["name"], offset, value, points_to["name"], low,
                        high))
 
+            if cold["size"] > 0:
+                # A split image writes every relocation in the wider table,
+                # rather than putting the ones that mention the cold part in
+                # one table and the rest in another.  Two formats describing
+                # the same image is two chances to disagree, and the loader
+                # would have to walk both; one table costs four bytes an entry
+                # and is read by one loop.
+                crelocs.add(((where["part"] << 28) | offset,
+                             (points_to["part"] << 28) |
+                             (value - points_to["addr"])))
+                continue
+
             entry_word = offset
             if where["is_data"]:
                 entry_word |= R_IN_DATA
@@ -873,6 +1055,7 @@ def main():
             relocs.add(entry_word)
 
         relocs = sorted(relocs)
+        crelocs = sorted(crelocs)
 
         # Addresses that live inside an instruction rather than in a word.
         #
@@ -961,7 +1144,12 @@ def main():
 
         icon = read_icon(args.icon) if args.icon else b""
 
-        if icon:
+        if cold["size"] > 0:
+            # A split image is written in the longest layout whether or not it
+            # has an icon, because the cold fields come after the icon ones in
+            # the struct and a header is read by length, not by flag.
+            fmt = HEADER_FORMAT_COLD
+        elif icon:
             fmt = HEADER_FORMAT_ICON
         elif irelocs:
             fmt = HEADER_FORMAT
@@ -973,11 +1161,18 @@ def main():
         reloc_offset = data_offset + len(data["stored"])
         ireloc_offset = reloc_offset + len(relocs) * 4
 
+        cold_offset = ireloc_offset + len(irelocs) * 8
+        creloc_offset = cold_offset + len(cold["stored"])
+
         # The icon goes last, after everything the loader reads: nothing
         # seeks past it, and a shell that wants it knows where it is.
-        icon_offset = ireloc_offset + len(irelocs) * 8
+        icon_offset = creloc_offset + len(crelocs) * 8
 
-        if icon:
+        if cold["size"] > 0:
+            tail = (ireloc_offset, len(irelocs), icon_offset, len(icon),
+                    cold["addr"], cold["size"], len(cold["stored"]),
+                    cold_offset, creloc_offset, len(crelocs))
+        elif icon:
             tail = (ireloc_offset, len(irelocs), icon_offset, len(icon))
         elif irelocs:
             tail = (ireloc_offset, len(irelocs))
@@ -1006,6 +1201,9 @@ def main():
                 f.write(struct.pack("<I", r))
             for site, target in irelocs:
                 f.write(struct.pack("<II", site, target))
+            f.write(cold["stored"])
+            for site, target in crelocs:
+                f.write(struct.pack("<II", site, target))
             if icon:
                 f.write(icon)
 
@@ -1025,7 +1223,10 @@ def main():
                   code["size"], data["size"], len(data["stored"]),
                   data["size"] - len(data["stored"]), rodata_bytes,
                   args.rodata, len(relocs)) +
-              ("" if not irelocs else ", %u in instructions" % len(irelocs)))
+              ("" if not irelocs else ", %u in instructions" % len(irelocs)) +
+              ("" if cold["size"] == 0 else
+               ", cold %u bytes, %u split relocations"
+               % (cold["size"], len(crelocs))))
 
         if not args.no_stage:
             stage_image(args.output)

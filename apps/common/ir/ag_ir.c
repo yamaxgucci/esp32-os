@@ -2,6 +2,18 @@
  * Uniform partitioned convolution (overlap-add FFT) for IR FX.
  * SPDX-License-Identifier: Apache-2.0
  */
+/*
+ * Speed rather than size, for this file alone.
+ *
+ * The application is built -Os because it has to fit the code arena - past
+ * 60 KB it relocates into flash and everything gets slower - but the convolution: one multiply-accumulate per tap, 507 of them a sample is the
+ * inner loop of the whole pedal, and -Os there was measured at 8.4 cycles a
+ * tap where the chip should manage two or three.  A pragma keeps the choice
+ * next to the code it is about, and costs a kilobyte rather than the seven
+ * that -O2 over the whole image costs.
+ */
+#pragma GCC optimize("O2")
+
 #include "ag_ir.h"
 
 #include <string.h>
@@ -15,6 +27,16 @@
 #include <stdio.h>
 static uint32_t s_trace;
 #endif
+
+/* How many times the unnormalised inverse multiplies, as a shift. */
+static uint8_t fft_log2_of(uint32_t n)
+{
+    uint8_t k = 0;
+    while ((1u << k) < n && k < 31u) {
+        k++;
+    }
+    return k;
+}
 
 static uint32_t ir_frames_for(uint32_t rate, uint32_t ms)
 {
@@ -44,6 +66,16 @@ static void free_spectra(ag_ir_t *ir)
         ag_free(ir->x_sh);
         ir->x_sh = NULL;
     }
+    if (ir->h_dir != NULL) {
+        ag_free(ir->h_dir);
+        ir->h_dir = NULL;
+    }
+    if (ir->hist != NULL) {
+        ag_free(ir->hist);
+        ir->hist = NULL;
+    }
+    ir->n_dir = 0;
+    ir->hist_pos = 0;
     ir->parts = 0;
     ir->ir_frames = 0;
     ir->ready = 0;
@@ -64,10 +96,11 @@ void ag_ir_reset(ag_ir_t *ir)
         return;
     }
     ir->x_pos = 0;
+    ir->ovl_tail = 0u;
     memset(ir->overlap, 0, sizeof(ir->overlap));
     if (ir->X != NULL && ir->parts > 0u) {
         memset(ir->X, 0,
-               ir->parts * AG_IR_FFT * 2u * (uint32_t)sizeof(int16_t));
+               ir->parts * ir->fft * 2u * (uint32_t)sizeof(int16_t));
     }
     if (ir->x_sh != NULL && ir->parts > 0u) {
         memset(ir->x_sh, AG_IR_EMPTY, ir->parts);
@@ -83,6 +116,46 @@ int ag_ir_init(ag_ir_t *ir, uint32_t rate)
     ir->rate = rate;
     ir->wet = AG_IR_WET_REVERB;
     ir->gain = 64u;
+    ir->blk = AG_IR_BLOCK;
+    ir->fft = AG_IR_FFT;
+    ir->fft_log2 = fft_log2_of(AG_IR_FFT);
+    return 0;
+}
+
+/*
+ * Work in a shorter block, because the stream does.
+ *
+ * Refused rather than rounded: a block that is not a power of two has no
+ * transform, and one larger than AG_IR_BLOCK would walk off the scratch
+ * arrays, which are cut once for the largest.  Saying no and leaving the
+ * block alone is better than a cabinet quietly working in something other
+ * than what the caller believes.
+ *
+ * Whatever was loaded is dropped - the partitioning was cut for the old block
+ * and nothing about it survives - but the voicing is not: rate, mix and gain
+ * are the caller's settings and are none of this call's business.
+ */
+int ag_ir_set_block(ag_ir_t *ir, uint32_t frames)
+{
+    if (ir == NULL || frames < 32u || frames > AG_IR_BLOCK) {
+        return -1;
+    }
+    if ((frames & (frames - 1u)) != 0u) {
+        return -1;
+    }
+    if (frames == ir->blk) {
+        return 0;
+    }
+    free_spectra(ir);
+    ir->ready = 0;
+    ir->parts = 0u;
+    ir->n_dir = 0u;
+    ir->x_pos = 0u;
+    ir->ovl_tail = 0u;
+    memset(ir->overlap, 0, sizeof(ir->overlap));
+    ir->blk = frames;
+    ir->fft = frames * 2u;
+    ir->fft_log2 = fft_log2_of(ir->fft);
     return 0;
 }
 
@@ -176,26 +249,6 @@ static void normalize_peak(int16_t *x, uint32_t n, int32_t target_peak)
     }
 }
 
-static uint32_t isqrt64(uint64_t v)
-{
-    uint64_t rem = v;
-    uint64_t root = 0;
-    uint64_t bit = 1ull << 62;
-    while (bit > rem) {
-        bit >>= 2;
-    }
-    while (bit != 0ull) {
-        if (rem >= root + bit) {
-            rem -= root + bit;
-            root = (root >> 1) + bit;
-        } else {
-            root >>= 1;
-        }
-        bit >>= 2;
-    }
-    return (uint32_t)root;
-}
-
 /*
  * Scale the IR by its energy, not its peak.
  *
@@ -215,7 +268,7 @@ static void normalize_energy(int16_t *x, uint32_t n, int32_t target)
         const int32_t v = x[i];
         e2 += (uint64_t)(v * v);
     }
-    rms = isqrt64(e2);
+    rms = ag_isqrt64(e2);
     if (rms < 1u) {
         return;
     }
@@ -257,21 +310,74 @@ static int fft_headroom(uint32_t asum)
 
 /* Forward FFT of partition p of mono[], lifted by `pre`, into re/im. */
 static int part_fft(const int16_t *mono, uint32_t frames, uint32_t p, int pre,
-                    int32_t *re, int32_t *im)
+                    int32_t *re, int32_t *im, uint32_t blk, uint32_t fft)
 {
-    const uint32_t off = p * AG_IR_BLOCK;
+    const uint32_t off = p * blk;
     uint32_t       i;
 
-    for (i = 0; i < AG_IR_FFT; i++) {
+    for (i = 0; i < fft; i++) {
         re[i] = 0;
         im[i] = 0;
     }
-    for (i = 0; i < AG_IR_BLOCK; i++) {
+    for (i = 0; i < blk; i++) {
         const uint32_t idx = off + i;
         re[i] = (idx < frames) ? ((int32_t)mono[idx] << pre) : 0;
     }
     /* Real input, so half a transform does it; same bins, same scale. */
-    return ag_fft_real_fwd(re, im, (int)AG_IR_FFT);
+    return ag_fft_real_fwd(re, im, (int)fft);
+}
+
+/*
+ * The direct form, built instead of the partitions when the impulse is short.
+ *
+ * Nothing clever: the taps as they arrived, and a history twice as long with
+ * every sample written in two places so the inner loop is two forward walks.
+ *
+ * The only arithmetic decision is the shift.  Accumulating 507 taps of int16
+ * against int16 input can reach 2^39 in theory, so the taps come down by
+ * enough that the worst case still fits int32 - computed from the sum of
+ * their magnitudes, which on a real cabinet is one or two bits rather than
+ * the eight the bound would suggest.  Doing it from the actual impulse rather
+ * than from the bound is the difference between losing two bits and losing
+ * eight.
+ */
+static int build_direct(ag_ir_t *ir, const int16_t *mono, uint32_t frames)
+{
+    uint32_t i;
+    uint64_t sum = 0;
+    uint8_t  shift = 0;
+
+    free_spectra(ir);
+    if (frames < 4u) {
+        return -1;
+    }
+
+    for (i = 0; i < frames; i++) {
+        sum += (uint64_t)(mono[i] < 0 ? -(int32_t)mono[i] : (int32_t)mono[i]);
+    }
+    /* The worst an accumulator can see is sum|h| * 32768; keep it inside
+     * int32 with a bit to spare. */
+    while ((sum * 32768u) >> shift > 0x3fffffffu && shift < 16u) {
+        shift++;
+    }
+
+    ir->h_dir = (int16_t *)ag_malloc(sizeof(int16_t) * frames);
+    ir->hist = (int16_t *)ag_malloc(sizeof(int16_t) * frames * 2u);
+    if (ir->h_dir == NULL || ir->hist == NULL) {
+        free_spectra(ir);
+        return -1;
+    }
+    for (i = 0; i < frames; i++) {
+        ir->h_dir[i] = (int16_t)(mono[i] >> shift);
+    }
+    memset(ir->hist, 0, sizeof(int16_t) * frames * 2u);
+    ir->n_dir = frames;
+    ir->hist_pos = frames - 1u;
+    ir->dir_shift = shift;
+    ir->ir_frames = frames;
+    ir->parts = 0;
+    ir->ready = 1;
+    return 0;
 }
 
 static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
@@ -287,7 +393,7 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
     if (frames < 4u) {
         return -1;
     }
-    parts = (frames + AG_IR_BLOCK - 1u) / AG_IR_BLOCK;
+    parts = (frames + ir->blk - 1u) / ir->blk;
     if (parts < 1u) {
         parts = 1u;
     }
@@ -301,8 +407,8 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
         uint32_t worst = 1;
         for (p = 0; p < parts; p++) {
             uint32_t sum = 0;
-            for (i = 0; i < AG_IR_BLOCK; i++) {
-                const uint32_t idx = p * AG_IR_BLOCK + i;
+            for (i = 0; i < ir->blk; i++) {
+                const uint32_t idx = p * ir->blk + i;
                 if (idx < frames) {
                     sum += (uint32_t)(mono[idx] < 0 ? -(int32_t)mono[idx]
                                                     : (int32_t)mono[idx]);
@@ -317,10 +423,11 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
 
     /* Pass one: how big do the bins actually get for this IR? */
     for (p = 0; p < parts; p++) {
-        if (part_fft(mono, frames, p, (int)ir->h_pre, re, im) != 0) {
+        if (part_fft(mono, frames, p, (int)ir->h_pre, re, im,
+                     ir->blk, ir->fft) != 0) {
             return -1;
         }
-        for (i = 0; i < AG_IR_FFT; i++) {
+        for (i = 0; i < ir->fft; i++) {
             const int32_t a = re[i] < 0 ? -re[i] : re[i];
             const int32_t b = im[i] < 0 ? -im[i] : im[i];
             if (a > biggest) {
@@ -336,10 +443,30 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
         shift++;
     }
 
-    bytes = parts * AG_IR_FFT * 2u * (uint32_t)sizeof(int16_t);
-    ir->H = (int16_t *)ag_malloc(bytes);
-    ir->X = (int16_t *)ag_malloc(bytes);
-    ir->x_sh = (int8_t *)ag_malloc(parts);
+    bytes = parts * ir->fft * 2u * (uint32_t)sizeof(int16_t);
+    /*
+     * In fast memory if there is any.
+     *
+     * These two are read end to end for every partition of every block - the
+     * whole of H against the whole of X - and the block has eleven
+     * milliseconds.  In external memory every pass goes through the cache and
+     * shares the bus with whatever is painting a panel; measured on the Audio
+     * Kit, moving the convolution's working memory into SRAM took a 46 ms
+     * cabinet from 2298 us a block to 1721.  Ordinary memory if there is none
+     * to spare: slower, and still right.
+     */
+    ir->H = (int16_t *)ag_malloc_caps(bytes, AG_MEM_FAST);
+    if (ir->H == NULL) {
+        ir->H = (int16_t *)ag_malloc(bytes);
+    }
+    ir->X = (int16_t *)ag_malloc_caps(bytes, AG_MEM_FAST);
+    if (ir->X == NULL) {
+        ir->X = (int16_t *)ag_malloc(bytes);
+    }
+    ir->x_sh = (int8_t *)ag_malloc_caps(parts, AG_MEM_FAST);
+    if (ir->x_sh == NULL) {
+        ir->x_sh = (int8_t *)ag_malloc(parts);
+    }
     if (ir->H == NULL || ir->X == NULL || ir->x_sh == NULL) {
         free_spectra(ir);
         return -1;
@@ -350,12 +477,13 @@ static int build_partitions(ag_ir_t *ir, int16_t *mono, uint32_t frames)
 
     /* Pass two: store, using the whole of int16. */
     for (p = 0; p < parts; p++) {
-        int16_t *Hp = ir->H + p * AG_IR_FFT * 2u;
-        if (part_fft(mono, frames, p, (int)ir->h_pre, re, im) != 0) {
+        int16_t *Hp = ir->H + p * ir->fft * 2u;
+        if (part_fft(mono, frames, p, (int)ir->h_pre, re, im,
+                     ir->blk, ir->fft) != 0) {
             free_spectra(ir);
             return -1;
         }
-        for (i = 0; i < AG_IR_FFT; i++) {
+        for (i = 0; i < ir->fft; i++) {
             Hp[i * 2u] = ag_sat16(re[i] >> shift);
             Hp[i * 2u + 1u] = ag_sat16(im[i] >> shift);
         }
@@ -396,7 +524,8 @@ int ag_ir_load(ag_ir_t *ir, const int16_t *mono, uint32_t frames, uint32_t src_r
         return -1;
     }
     normalize_energy(tmp, n, AG_IR_ENERGY);
-    rc = build_partitions(ir, tmp, n);
+    rc = (n <= AG_IR_DIRECT_MAX) ? build_direct(ir, tmp, n)
+                                : build_partitions(ir, tmp, n);
     ag_free(tmp);
     if (rc == 0) {
         /*
@@ -479,7 +608,8 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
         }
         n = cab_n;
         normalize_energy(buf, n, AG_IR_ENERGY);
-        rc = build_partitions(ir, buf, n);
+        rc = (n <= AG_IR_DIRECT_MAX) ? build_direct(ir, buf, n)
+                                : build_partitions(ir, buf, n);
         ag_free(buf);
         if (rc == 0) {
             /* A cabinet is fully wet: see ag_ir_load. */
@@ -520,7 +650,8 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
     }
 
     normalize_energy(buf, n, AG_IR_ENERGY);
-    rc = build_partitions(ir, buf, n);
+    rc = (n <= AG_IR_DIRECT_MAX) ? build_direct(ir, buf, n)
+                                : build_partitions(ir, buf, n);
     ag_free(buf);
     if (rc == 0) {
         /*
@@ -553,14 +684,24 @@ int ag_ir_load_preset(ag_ir_t *ir, int preset)
  * The round rather than truncate is not cosmetic: an arithmetic shift floors,
  * and the half-a-bit bias would add up over every partition into a DC step.
  */
+/*
+ * One partition at a time into the accumulator, and that is the faster way.
+ *
+ * Summing a bin's partitions in registers instead - one pass over yre/yim
+ * rather than one per partition, and no zeroing beforehand - was built and
+ * measured: the cabinet went from 1622 us a block to 1778.  The gather it
+ * needs puts the pointers and the shifts behind an index, the inner loop is
+ * only as long as the partition count, and what is saved in memory traffic
+ * is lost in addressing.  Written down so the idea is not had twice.
+ */
 AG_IR_NOINLINE static void mac_part(int32_t *yre, int32_t *yim,
                                     const int16_t *Xp, const int16_t *Hp,
-                                    uint32_t sh)
+                                    uint32_t sh, uint32_t fft)
 {
     const int32_t rnd = (int32_t)1 << (sh - 1u);
     uint32_t      i;
 
-    for (i = 0; i < AG_IR_FFT; i++) {
+    for (i = 0; i < fft; i++) {
         const int32_t xr = Xp[0], xii = Xp[1];
         const int32_t hr = Hp[0], hi = Hp[1];
         *yre += (xr * hr - xii * hi + rnd) >> sh;
@@ -572,7 +713,90 @@ AG_IR_NOINLINE static void mac_part(int32_t *yre, int32_t *yim,
     }
 }
 
-void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out)
+/*
+ * The direct form, sample by sample, with the same gain and wet the
+ * partitioned path applies so that one can be swapped for the other without
+ * anything else moving.
+ *
+ * The inner loop is unrolled by four because the tap count is what this costs
+ * and the chip has no instruction fusing the two loads with the multiply:
+ * four at a time is what stops the loop counter being a third of the work.
+ */
+static AG_HOT void process_direct(ag_ir_t *ir, const int16_t *in, int16_t *out,
+                           uint32_t frames)
+{
+    const int16_t *h = ir->h_dir;
+    const uint32_t n = ir->n_dir;
+    /*
+     * The taps are Q15 gains scaled down by dir_shift, so undoing both leaves
+     * the convolution at the input's own scale.
+     */
+    const uint32_t rsh = (ir->dir_shift < 15u) ? (15u - ir->dir_shift) : 0u;
+    const int32_t  half = (rsh > 0u) ? ((int32_t)1 << (rsh - 1u)) : 0;
+    const uint32_t tail = n & 3u;
+    uint32_t       i, k, pos = ir->hist_pos;
+
+    for (i = 0; i < frames; i++) {
+        const int32_t  dry = in[i];
+        const int16_t *x;
+        int32_t        acc = 0, y, m;
+
+        pos = (pos == 0u) ? (n - 1u) : (pos - 1u);
+        ir->hist[pos] = in[i];
+        ir->hist[pos + n] = in[i]; /* the second copy is what removes the wrap */
+        x = ir->hist + pos;
+
+        for (k = 0; k + 4u <= n; k += 4u) {
+            acc += (int32_t)h[k] * (int32_t)x[k];
+            acc += (int32_t)h[k + 1u] * (int32_t)x[k + 1u];
+            acc += (int32_t)h[k + 2u] * (int32_t)x[k + 2u];
+            acc += (int32_t)h[k + 3u] * (int32_t)x[k + 3u];
+        }
+        for (k = n - tail; k < n; k++) {
+            acc += (int32_t)h[k] * (int32_t)x[k];
+        }
+
+        y = (acc + half) >> rsh;
+        y = (y * (int32_t)ir->gain + 32) >> 6;
+        y = ag_sat16(y);
+        m = dry + (((y - dry) * (int32_t)ir->wet + 64) >> 7);
+        m = ag_sat16(m);
+        out[i * 2u] = (int16_t)m;
+        out[i * 2u + 1u] = (int16_t)m;
+    }
+    ir->hist_pos = pos;
+}
+
+/*
+ * Any number of frames, which the direct form allows and the partitioned one
+ * does not: a transform answers in whole blocks or not at all.
+ */
+AG_HOT void ag_ir_process_n(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out,
+                     uint32_t frames)
+{
+    uint32_t i;
+
+    if (ir == NULL || mono_in == NULL || stereo_out == NULL) {
+        return;
+    }
+    if (!ir->ready || ir->bypass) {
+        for (i = 0; i < frames; i++) {
+            stereo_out[i * 2u] = mono_in[i];
+            stereo_out[i * 2u + 1u] = mono_in[i];
+        }
+        return;
+    }
+    if (ir->n_dir > 0u) {
+        process_direct(ir, mono_in, stereo_out, frames);
+        return;
+    }
+    /* Partitioned: whole blocks only, and the caller is expected to know. */
+    for (i = 0; i + ir->blk <= frames; i += ir->blk) {
+        ag_ir_process_block(ir, mono_in + i, stereo_out + i * 2u);
+    }
+}
+
+AG_HOT void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_out)
 {
     uint32_t i, p, parts;
     int      xref, ygain, pre;
@@ -587,8 +811,12 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
         return;
     }
 
+    if (ir->n_dir > 0u && ir->ready && !ir->bypass) {
+        process_direct(ir, mono_in, stereo_out, ir->blk);
+        return;
+    }
     if (!ir->ready || ir->bypass || ir->parts == 0u) {
-        for (i = 0; i < AG_IR_BLOCK; i++) {
+        for (i = 0; i < ir->blk; i++) {
             stereo_out[i * 2u] = mono_in[i];
             stereo_out[i * 2u + 1u] = mono_in[i];
         }
@@ -610,16 +838,16 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
     memset(re, 0, sizeof(re));
     {
         uint32_t asum = 0;
-        for (i = 0; i < AG_IR_BLOCK; i++) {
+        for (i = 0; i < ir->blk; i++) {
             asum += (uint32_t)(mono_in[i] < 0 ? -(int32_t)mono_in[i]
                                               : (int32_t)mono_in[i]);
         }
         pre = fft_headroom(asum);
-        for (i = 0; i < AG_IR_BLOCK; i++) {
+        for (i = 0; i < ir->blk; i++) {
             re[i] = (int32_t)mono_in[i] << pre;
         }
     }
-    (void)ag_fft_real_fwd(re, im, (int)AG_IR_FFT);
+    (void)ag_fft_real_fwd(re, im, (int)ir->fft);
 
     /*
      * Store this block's spectrum with a shift of its own, picked from what
@@ -642,7 +870,7 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
         int32_t xmax = 1;
         int     xs = 0;
         int32_t half;
-        for (i = 0; i < AG_IR_FFT; i++) {
+        for (i = 0; i < ir->fft; i++) {
             const int32_t a = re[i] < 0 ? -re[i] : re[i];
             const int32_t b = im[i] < 0 ? -im[i] : im[i];
             if (a > xmax) {
@@ -657,8 +885,8 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
             xs++;
         }
         half = xs > 0 ? ((int32_t)1 << (xs - 1)) : 0;
-        slot = ir->X + ir->x_pos * AG_IR_FFT * 2u;
-        for (i = 0; i < AG_IR_FFT; i++) {
+        slot = ir->X + ir->x_pos * ir->fft * 2u;
+        for (i = 0; i < ir->fft; i++) {
             slot[i * 2u] = ag_sat16((re[i] + half) >> xs);
             slot[i * 2u + 1u] = ag_sat16((im[i] + half) >> xs);
         }
@@ -694,8 +922,8 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
     memset(yim, 0, sizeof(yim));
     for (p = 0; p < parts; p++) {
         uint32_t xi = (ir->x_pos + parts - p) % parts;
-        const int16_t *Hp = ir->H + p * AG_IR_FFT * 2u;
-        const int16_t *Xp = ir->X + xi * AG_IR_FFT * 2u;
+        const int16_t *Hp = ir->H + p * ir->fft * 2u;
+        const int16_t *Xp = ir->X + xi * ir->fft * 2u;
         uint32_t sh;
         if (ir->x_sh[xi] == AG_IR_EMPTY) {
             continue;
@@ -704,7 +932,7 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
         if (sh > 31u) {
             continue; /* older than the scale can express: it is inaudible */
         }
-        mac_part(yre, yim, Xp, Hp, sh);
+        mac_part(yre, yim, Xp, Hp, sh, ir->fft);
     }
 
     /*
@@ -726,7 +954,7 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
          * back in the output shift, which is written in terms of ygain.
          */
         uint64_t ysum = 0;
-        for (i = 0; i < AG_IR_FFT; i++) {
+        for (i = 0; i < ir->fft; i++) {
             const int32_t a = yre[i] < 0 ? -yre[i] : yre[i];
             const int32_t b = yim[i] < 0 ? -yim[i] : yim[i];
             ysum += (uint64_t)a + (uint64_t)b;
@@ -747,25 +975,25 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
          * works them out for itself rather than reading them. */
         if (ygain > 0) {
             const uint32_t g = (uint32_t)ygain;
-            for (i = 0; i <= AG_IR_FFT / 2u; i++) {
+            for (i = 0; i <= ir->fft / 2u; i++) {
                 re[i] = yre[i] << g;
                 im[i] = yim[i] << g;
             }
         } else if (ygain < 0) {
             const uint32_t g = (uint32_t)(-ygain);
             const int32_t  r = (int32_t)1 << (g - 1u);
-            for (i = 0; i <= AG_IR_FFT / 2u; i++) {
+            for (i = 0; i <= ir->fft / 2u; i++) {
                 re[i] = (yre[i] + r) >> g;
                 im[i] = (yim[i] + r) >> g;
             }
         } else {
-            for (i = 0; i <= AG_IR_FFT / 2u; i++) {
+            for (i = 0; i <= ir->fft / 2u; i++) {
                 re[i] = yre[i];
                 im[i] = yim[i];
             }
         }
     }
-    (void)ag_fft_real_inv(re, im, (int)AG_IR_FFT);
+    (void)ag_fft_real_inv(re, im, (int)ir->fft);
 
     /*
      * X is scaled by 2^xref, H by 2^h_shift and the product by 2^p_shift; the
@@ -785,8 +1013,18 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
      * end, instead of once here and once again on the way back in.
      */
     {
+        /*
+         * ...and 24 was log2(512) + 15, with the transform's size written
+         * into it as a number.  At any other block that is wrong by the
+         * difference of the logs, and wrong by four bits is not a worse
+         * cabinet, it is a different signal: measured against an honest
+         * convolution, the engine went from -75 dB of error at 256 frames to
+         * -6 dB at 128 and -2.5 dB at 64, which is an error the size of the
+         * music.  The size of the transform belongs in a variable.
+         */
         const int base = (int)ir->h_shift - (int)ir->h_pre + xref +
-                         (int)ir->p_shift - ygain - 24;
+                         (int)ir->p_shift - ygain -
+                         ((int)ir->fft_log2 + 15);
         /*
          * As many tail bits as the scale has room for, which in practice is
          * all of them: `base` runs about -13 to -26 on real material.  Taking
@@ -815,11 +1053,56 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
         rsh = osh < 0 ? (uint32_t)(-osh) : 0u;
         rnd = rsh > 0u ? ((int32_t)1 << (rsh - 1u)) : 0;
         thalf = tail > 0u ? ((int32_t)1 << (tail - 1u)) : 0;
-        for (i = 0; i < AG_IR_BLOCK; i++) {
+        /*
+         * The tail comes from the block before, written at that block's
+         * scale; bring it to this one before adding it.  The two agree on
+         * steady material and differ exactly when the level moves, which is
+         * why this was inaudible until somebody hit a string hard.
+         */
+        /*
+         * The tail comes from the block before, written at that block's
+         * scale; bring it to this one before the loop rather than inside it.
+         *
+         * It agrees with this block's scale on steady material - the
+         * diagnostic counts one block in 172 where it does not - so the
+         * common case has to cost nothing, and the rare one can afford a pass
+         * over the tail.  Done per sample instead, it put the cabinet up by a
+         * third of its cost, measured on the board.
+         */
+        if ((int)ir->ovl_tail != (int)tail) {
+            const int     dn = (int)ir->ovl_tail - (int)tail;
+            const uint8_t mag = (uint8_t)(dn < 0 ? -dn : dn);
+            ir->ovl_moves++;
+            if (mag > ir->ovl_worst) {
+                ir->ovl_worst = mag;
+            }
+            if (dn > 0) {
+                const uint32_t r = (uint32_t)dn;
+                const int32_t  half = (int32_t)1 << (r - 1u);
+                for (i = 0; i < ir->blk; i++) {
+                    ir->overlap[i] = (ir->overlap[i] + half) >> r;
+                }
+            } else {
+                /* Clamped first: the tail is bounded by the inverse, but a
+                 * left shift of an unbounded value would not stay in int32. */
+                const uint32_t l = (uint32_t)(-dn);
+                const int32_t  cap = AG_IR_FINE_MAX >> l;
+                for (i = 0; i < ir->blk; i++) {
+                    int32_t v = ir->overlap[i];
+                    if (v > cap) {
+                        v = cap;
+                    } else if (v < -cap) {
+                        v = -cap;
+                    }
+                    ir->overlap[i] = v << l;
+                }
+            }
+        }
+        for (i = 0; i < ir->blk; i++) {
             int32_t fine = (((re[i] << lsh) + rnd) >> rsh) + ir->overlap[i];
             int32_t dry = (int32_t)mono_in[i];
             int32_t wet, m;
-            ir->overlap[i] = ((re[i + AG_IR_BLOCK] << lsh) + rnd) >> rsh;
+            ir->overlap[i] = ((re[i + ir->blk] << lsh) + rnd) >> rsh;
             /*
              * The gain applied before the rounding, and the whole of it
              * rounded once.  Written the other way round - round to the output
@@ -847,13 +1130,14 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
             stereo_out[i * 2u] = (int16_t)m;
             stereo_out[i * 2u + 1u] = (int16_t)m;
         }
+        ir->ovl_tail = (uint8_t)tail;
     }
 
 #ifdef AG_IR_TRACE
     if ((s_trace++ % 900u) == 5u) {
         int32_t  ymax = 0, omax = 0;
         uint32_t j;
-        for (j = 0; j < AG_IR_FFT; j++) {
+        for (j = 0; j < ir->fft; j++) {
             const int32_t a = yre[j] < 0 ? -yre[j] : yre[j];
             const int32_t b = re[j] < 0 ? -re[j] : re[j];
             if (a > ymax) {
@@ -871,7 +1155,7 @@ void ag_ir_process_block(ag_ir_t *ir, const int16_t *mono_in, int16_t *stereo_ou
                pre, (int)ir->x_sh[ir->x_pos], xref, ir->h_pre, ir->h_shift,
                ir->p_shift, ymax, ygain, omax,
                (int)ir->h_shift - (int)ir->h_pre + xref + (int)ir->p_shift -
-                   ygain - 24);
+                   ygain - ((int)ir->fft_log2 + 15));
     }
 #endif
 

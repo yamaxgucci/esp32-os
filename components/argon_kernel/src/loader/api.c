@@ -171,6 +171,13 @@ static bool api_module_task(void (*fn)(void *), void *arg, const char *name,
 /* Defined below, next to the other session-facing calls. */
 static int32_t api_prompt_in_slot(int slot, const char *cwd);
 
+/*
+ * ABI 0.69.  See the note on audio_live in abi.h: a converter that is
+ * clocking frames is a reason for everything else to leave the flash alone.
+ */
+static bool api_audio_live(void) { return ag_port_flash_guarded(); }
+
+
 static const ag_sys_api_t k_sys = {
     .size = sizeof(ag_sys_api_t),
     .info = api_info,
@@ -184,6 +191,7 @@ static const ag_sys_api_t k_sys = {
     .module_on_unload = api_module_on_unload,
     .prompt_in_slot = api_prompt_in_slot,
     .module_task = api_module_task,
+    .audio_live = api_audio_live,
 };
 
 /* ---------------------------------------------------------------------- */

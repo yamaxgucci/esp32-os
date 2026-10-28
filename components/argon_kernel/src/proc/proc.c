@@ -1472,14 +1472,34 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
     }
 
     /*
-     * App core for interactive starts; system core for background.  Priority
-     * comes from sched_class (applied inside proc_task); create uses normal.
+     * The application core unless the caller asked for the other one.
+     *
+     * This used to read `background ? 0 : app_core`, and background means
+     * only that the caller is not waiting - which the shell's `run` sets so
+     * that it is not blocked while the image loads.  The result was that
+     * every application started from a prompt ran on the system core, beside
+     * the console and the shells, and one that never yielded took all of them
+     * with it: the board answered nothing and had to be reset.  It was the
+     * first thing looked for and the last thing found, because the system
+     * says "app core 1" and meant it about everything except applications.
+     *
+     * Priority comes from sched_class (applied inside proc_task); create uses
+     * normal.
      */
-    const int      core = background ? 0 : (int)ag_sysinfo()->app_core;
+    const int      core = ((flags & (uint32_t)AG_SPAWN_SYSTEM_CORE) != 0)
+                              ? 0
+                              : (int)ag_sysinfo()->app_core;
     const unsigned prio = prio_for(p->sched_class);
 
+    /*
+     * The handle, kept here rather than left to the task to fill in: the task
+     * sets p->task itself once it runs, and a task that spins from its first
+     * instruction never gets that far - which is precisely the one whose core
+     * needs reporting.
+     */
+    ag_port_task_t started = NULL;
     if (!ag_proc_task_create_app(proc_task, p->name, p->stack_bytes, p, prio,
-                                 core, NULL)) {
+                                 core, &started)) {
         /*
          * Tried internal SRAM, then PSRAM (when enabled).  Failure here means
          * both are exhausted or the TCB (always internal) could not be taken.
@@ -1502,6 +1522,20 @@ static ag_err_t spawn_common(proc_t *p, uint32_t flags, ag_pid_t *out_pid)
 
     /* On the core this task was pinned to, before it has run an instruction. */
     guard_watch_take(p, core);
+
+    /*
+     * Which core it actually went to, asked of the scheduler rather than
+     * assumed from the number handed in.  An application is meant to run on
+     * the application core and a shell on the other one, so that a busy
+     * application cannot starve the prompt that started it - and the day that
+     * stopped being true, this line was what the journal was missing.  It
+     * reaches the console even when every shell is starved, which is exactly
+     * the day it is wanted.
+     */
+    ag_log(AG_LOG_INFO, "proc",
+           "pid %u (%s) on core %d (asked %d, app core %d), priority %u",
+           (unsigned)p->pid, p->name, ag_port_task_core(started), core,
+           (int)ag_sysinfo()->app_core, (unsigned)prio);
 
     const ag_pid_t bound_pid = p->pid;
     char           bound_name[32];
@@ -2217,10 +2251,14 @@ void *ag_proc_alloc(size_t bytes, uint32_t caps)
          * arriving devices (see ag_proc_keep_internal) */
         if (p != NULL && (want & AG_MEM_SLOW) == 0u &&
             (want & AG_MEM_EXEC) == 0u && !app_internal_room(bytes)) {
+            /* With what was free at the time: "refused, 0 kept" over a
+             * hundred kilobytes of free SRAM is a question nobody can answer
+             * without this number. */
             ag_log(AG_LOG_INFO, "proc",
-                   "%s: %u bytes of internal memory refused - %u are kept for "
-                   "devices",
+                   "%s: %u bytes of internal memory refused - %u free, %u are "
+                   "kept for devices",
                    p->name, (unsigned)bytes,
+                   (unsigned)ag_port_mem_free(AG_MEM_FAST),
                    (unsigned)ag_proc_kept_internal());
             return NULL;
         }

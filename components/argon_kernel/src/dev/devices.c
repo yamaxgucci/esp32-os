@@ -717,6 +717,17 @@ ag_err_t ag_devices_init(void)
         }
         const bool hidden = (ap_hid != NULL && ap_hid[0] == '1');
 
+        /*
+         * How loudly and how often, before it goes up.
+         *
+         * On a board whose audio input can hear the transmitter these are not
+         * radio settings but audio ones; see ag_port_wifi_ap_tune.  Absent,
+         * they are zero and the driver keeps its own defaults, so no board
+         * that works today changes.
+         */
+        ag_port_wifi_ap_tune(ag_cfg_get_int(ag_sysconfig(), "ap.beacon_ms", 0),
+                             ag_cfg_get_int(ag_sysconfig(), "ap.txpower", 0));
+
         const ag_err_t aerr = ag_port_wifi_ap_start(
             ap_ssid, ap_pass, (uint8_t)(channel > 13u ? 0u : channel), hidden);
         if (aerr == AG_OK) {

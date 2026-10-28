@@ -16,6 +16,7 @@ Exit code is non-zero if any image fails to build, which is the point.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -132,6 +133,23 @@ def command_for(app, defaults, extra_cflags, target_pair, forced_gcc,
     # decision, not a default.
     for lib in app.get("libs", []):
         cmd += ["--libs", lib]
+    if app.get("split_hot"):
+        # The image is built in three parts, with the functions marked AG_HOT
+        # in one the loader puts in the code arena and everything else in one
+        # it executes from flash.  Worth it only for an image that does not fit
+        # the arena whole; mkaxe prints both sizes and the arena check below
+        # measures the hot half, which is the half that has to fit.
+        cmd += ["--split-hot"]
+        for src in app.get("hot_src", []):
+            cmd += ["--hot-src", src]
+        # And the hot half may be compiled differently from the cold one,
+        # because they want opposite things: the inner loop wants speed and
+        # the rest wants to be small.  `hot_cflags` in apps.json.
+        hot_cflags = app.get("hot_cflags", "")
+        if hot_cflags:
+            if extra_cflags:
+                hot_cflags = (hot_cflags + " " + extra_cflags).strip()
+            cmd += ["--hot-cflags", hot_cflags]
     if app.get("icon"):
         # A program's own face, carried in its file (mkaxe --icon).  Kept in
         # apps.json beside its sources because that is where everything else
@@ -140,6 +158,37 @@ def command_for(app, defaults, extra_cflags, target_pair, forced_gcc,
     cmd += ["-o", "build/apps/" + app["out"]]
     cmd += app["src"]
     return cmd
+
+
+def arena_bytes():
+    """How much code arena this target has, from the configured sdkconfig.
+
+    The loader puts an .AXE in the arena when it fits and relocates it into
+    flash when it does not, and the difference was measured on the ESP32-A1S
+    at a factor of two - 168% of an audio block against 79%.  It says so in one
+    line at load time, and that line is easy not to read: an application that
+    grows past the arena keeps working and quietly stops being fast.
+
+    So an image that declares `"arena": true` in the manifest is checked here
+    instead, where somebody is already looking.
+
+    What this cannot know: the arena is shared.  A driver loaded before the
+    application takes its share first, which is why the A1S sends drivers to
+    flash (`[modules] xip`).  This is a guard against the plain case, not a
+    model of the machine.
+    """
+    cfg = os.path.join(ROOT, "sdkconfig")
+    if not os.path.exists(cfg):
+        return 0
+    with open(cfg, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    for line in text.split("\n"):
+        if line.startswith("CONFIG_ARGON_APP_ARENA_KB="):
+            try:
+                return int(line.split("=", 1)[1]) * 1024
+            except ValueError:
+                return 0
+    return 0
 
 
 def main():
@@ -197,6 +246,7 @@ def main():
 
     extra = "-Wall -Wextra" if args.warnings else ""
     failed = []
+    over_arena = []
     started = time.time()
     for i, app in enumerate(apps, 1):
         name = app["out"]
@@ -221,11 +271,39 @@ def main():
 
         proc = subprocess.run(
             command_for(app, defaults, extra, target_pair, args.gcc,
-                        target in FPU_TARGETS), cwd=ROOT)
+                        target in FPU_TARGETS), cwd=ROOT,
+            capture_output=True, text=True)
+        if proc.stdout:
+            sys.stdout.write(proc.stdout)
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
         if proc.returncode != 0:
             failed.append(name)
+            continue
+
+        if app.get("arena"):
+            # The size mkaxe just printed, rather than one read back out of the
+            # header: the two would have to agree, and only one of them is what
+            # the tool actually believes.
+            m = re.search(r"code (\d+) bytes", proc.stdout or "")
+            arena = arena_bytes()
+            size = int(m.group(1)) if m else 0
+            if arena > 0 and size > 0:
+                if size > arena:
+                    print(f"{name}: {size} bytes of code will not fit the "
+                          f"{arena}-byte arena - it will run from flash, "
+                          f"which on the A1S was twice as slow",
+                          file=sys.stderr)
+                    over_arena.append(name)
+                elif size > arena - 2048:
+                    print(f"{name}: {arena - size} bytes of arena left "
+                          f"({size} of {arena})")
 
     took = time.time() - started
+    if over_arena and args.warnings:
+        print(f"\napps: {', '.join(over_arena)} outgrew the code arena",
+              file=sys.stderr)
+        return 1
     if failed:
         print(f"\napps: {len(failed)} of {len(apps)} FAILED "
               f"({', '.join(failed)}) for {target or 'no target'} "

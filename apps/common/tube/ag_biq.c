@@ -3,6 +3,14 @@
  *
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
+/*
+ * Speed rather than size, for this file alone: every stage has filters and
+ * they run on every sample.  See ag_ir.c for why the rest is built -Os.
+ */
+#pragma GCC optimize("O2")
+
+#include <argon/argon.h>
+
 #include "ag_biq.h"
 
 #include "ag_mathf.h"
@@ -85,10 +93,8 @@ void ag_biq_reset(ag_biq_t *s)
     if (s == 0) {
         return;
     }
-    s->x1 = 0.0f;
-    s->x2 = 0.0f;
-    s->y1 = 0.0f;
-    s->y2 = 0.0f;
+    s->z1 = 0.0f;
+    s->z2 = 0.0f;
 }
 
 float ag_biq_hp1(ag_biq_t *s, float fs, float f0)
@@ -229,20 +235,7 @@ float ag_biq_bandpass(ag_biq_t *s, float fs, float f0, float bw)
     return f;
 }
 
-float ag_biq_tick(ag_biq_t *s, float x)
-{
-    float y;
-    if (s == 0) {
-        return x;
-    }
-    y = s->b0 * x + s->b1 * s->x1 + s->b2 * s->x2 - s->a1 * s->y1 -
-        s->a2 * s->y2;
-    s->x2 = s->x1;
-    s->x1 = x;
-    s->y2 = s->y1;
-    s->y1 = y;
-    return y;
-}
+/* ag_biq_tick is in the header; see the note there. */
 
 void ag_biq_chain_init(ag_biq_chain_t *c)
 {
@@ -287,25 +280,7 @@ ag_biq_t *ag_biq_chain_push(ag_biq_chain_t *c)
  * percent of a core.  Bit for bit identical output - this is a call being
  * removed, not a formula being changed.
  */
-float ag_biq_chain_tick(ag_biq_chain_t *c, float x)
-{
-    int i, n;
-    if (c == 0) {
-        return x;
-    }
-    n = c->n;
-    for (i = 0; i < n; i++) {
-        ag_biq_t   *s = &c->s[i];
-        const float y = s->b0 * x + s->b1 * s->x1 + s->b2 * s->x2 -
-                        s->a1 * s->y1 - s->a2 * s->y2;
-        s->x2 = s->x1;
-        s->x1 = x;
-        s->y2 = s->y1;
-        s->y1 = y;
-        x = y;
-    }
-    return x;
-}
+/* ag_biq_chain_tick is in the header, for the same reason. */
 
 float ag_biq_mag_db(const ag_biq_t *s, float f, float fs)
 {

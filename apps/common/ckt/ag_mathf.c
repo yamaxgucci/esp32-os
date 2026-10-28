@@ -2,6 +2,8 @@
  * ag_mathf - single-precision transcendentals, no libm, no tables.
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <argon/argon.h>
+
 #include "ag_mathf.h"
 
 #include <stdint.h>
@@ -20,7 +22,7 @@ typedef union {
  * by writing the exponent field directly - the only place this file needs to
  * know what a float looks like.
  */
-float ag_expf(float x)
+AG_HOT float ag_expf(float x)
 {
     fbits_t two_k;
     float   t, f, p;
@@ -56,7 +58,7 @@ float ag_expf(float x)
  * 0.1716, so five odd terms are worth ~1e-8.  The one divide is the price of
  * that fast convergence and is still cheaper than a longer polynomial in m.
  */
-float ag_logf(float x)
+AG_HOT float ag_logf(float x)
 {
     fbits_t v;
     float   m, s, s2, p;
@@ -86,7 +88,7 @@ float ag_logf(float x)
     return 2.0f * s * p + (float)e * 6.93147181e-1f;
 }
 
-float ag_powf(float x, float y)
+AG_HOT float ag_powf(float x, float y)
 {
     if (x <= 0.0f) {
         return 0.0f;
@@ -103,7 +105,7 @@ float ag_powf(float x, float y)
  * multiplies and a subtract per step.  Two steps from the bit-hack seed land
  * within about 1e-7 relative, and the whole thing costs less than one divide.
  */
-float ag_sqrtf(float x)
+AG_HOT float ag_sqrtf(float x)
 {
     fbits_t v;
     float   y, hx;
@@ -126,7 +128,7 @@ float ag_sqrtf(float x)
  * tanh(x) = 1 - 2/(e^2x + 1), with the series near zero where that form loses
  * precision to cancellation, and saturation past +-9 where it is 1.0 in float.
  */
-float ag_tanhf(float x)
+AG_HOT float ag_tanhf(float x)
 {
     float ax = x < 0.0f ? -x : x;
     float y;

@@ -1144,6 +1144,29 @@ const BY_CODE = {
 };
 for (let i = 1; i <= 12; i++) BY_CODE["F" + i] = K["f" + i];
 
+/*
+ * The keys that are not letters and not digits, by the key itself: its usage
+ * id and what it prints on a US layout, unshifted and shifted.
+ *
+ * Same reason as the letters above, and found the same way - a full stop that
+ * would not type.  On a Russian layout the key marked `.` prints a Cyrillic
+ * character, and a path or a decimal point cannot be typed at all, which on a
+ * machine driven from a command line is most of what a keyboard is for.
+ */
+const BY_PUNCT = {
+  Minus:        [K.minus,     "-",  "_"],
+  Equal:        [K.equal,     "=",  "+"],
+  BracketLeft:  [K.lbracket,  "[",  "{"],
+  BracketRight: [K.rbracket,  "]",  "}"],
+  Backslash:    [K.backslash, "\\", "|"],
+  Semicolon:    [K.semicolon, ";",  ":"],
+  Quote:        [K.quote,     "'",  "\""],
+  Backquote:    [K.grave,     "`",  "~"],
+  Comma:        [K.comma,     ",",  "<"],
+  Period:       [K.period,    ".",  ">"],
+  Slash:        [K.slash,     "/",  "?"],
+};
+
 window.addEventListener("keydown", (e) => {
   /*
    * Not while the person is typing into a field of this page's own.  This
@@ -1167,10 +1190,78 @@ window.addEventListener("keydown", (e) => {
   mods |= st.sticky;
 
   let hid = BY_CODE[e.code] || 0;
-  if (!hid && /^Key[A-Z]$/.test(e.code)) hid = K[e.code[3].toLowerCase()];
-  if (!hid && /^Digit[0-9]$/.test(e.code)) hid = K[e.code[5]];
+  let plain = "", shifted = "", letter = false;
+  if (!hid && /^Key[A-Z]$/.test(e.code)) {
+    hid = K[e.code[3].toLowerCase()];
+    plain = e.code[3].toLowerCase();
+    shifted = e.code[3];
+    letter = true;
+  }
+  if (!hid && /^Digit[0-9]$/.test(e.code)) {
+    hid = K[e.code[5]];
+    plain = e.code[5];
+    shifted = ")!@#$%^&*("[+e.code[5]];
+  }
+  if (!hid && BY_PUNCT[e.code]) {
+    hid = BY_PUNCT[e.code][0];
+    plain = BY_PUNCT[e.code][1];
+    shifted = BY_PUNCT[e.code][2];
+  }
 
-  const uni = (e.key && e.key.length === 1) ? e.key.codePointAt(0) : 0;
+  let uni = (e.key && e.key.length === 1) ? e.key.codePointAt(0) : 0;
+  /*
+   * The letter of the key that was pressed, not the letter the layout prints.
+   *
+   * On a Russian layout `e.key` for the key marked A is a Cyrillic character,
+   * which goes on the wire as its own codepoint and arrives at a console that
+   * cannot take it - so the digits worked and the letters did nothing, which
+   * is exactly how it was reported.  `e.code` names the physical key and is
+   * layout independent, so a letter key always sends its Latin letter and the
+   * shell can be typed at from any layout.  Anything a layout composes that is
+   * NOT on a letter key - accents, punctuation, a phone's own keyboard - still
+   * goes through as what it composed.
+   */
+  /*
+   * Once a letter key has been seen to print something that is not ASCII, the
+   * layout is not a Latin one and every marked key sends what is painted on
+   * it from then on.
+   *
+   * Without that second half, a Russian layout can type `.` (its own key is
+   * Cyrillic, so the override applies) but not `$`: shift and the 4 key
+   * compose `;` there, which IS ASCII, so the character the layout made would
+   * be trusted and a dollar could not be typed at all.  On a machine driven
+   * from a command line that is not a detail.  A German or French layout
+   * keeps its own characters, because its letter keys are Latin and nothing
+   * here ever fires.
+   */
+  /*
+   * A LETTER key, and only a letter key, says what alphabet this layout is.
+   *
+   * Taking any non-ASCII character as the sign was wrong and would have
+   * broken the layouts it was supposed to leave alone: German puts `ß` on the
+   * minus key, French `é` on a digit, and neither makes the alphabet
+   * Cyrillic.  Their letter keys print Latin letters, so nothing here fires
+   * and they keep every character their layout composes.
+   */
+  if (letter && uni && (uni < 32 || uni > 126)) st.nonlatin = 1;
+  /*
+   * Two cases, and only two.
+   *
+   * A letter key that printed something not ASCII: send its Latin letter,
+   * because that is what the key is marked with and what a command line is
+   * made of.  And once such a key has been seen - the alphabet is not Latin -
+   * every marked key sends what is painted on it, including the ones whose
+   * character IS ASCII: on a Russian layout shift and 4 compose `;`, and
+   * without this a dollar could not be typed at all.
+   *
+   * Everything else keeps what the layout composed: German's `ß` on the minus
+   * key and `ö` on the semicolon are that layout's own characters, not a
+   * failure to be corrected.
+   */
+  if (plain && (st.nonlatin || (letter && (!uni || uni < 32 || uni > 126)))) {
+    const ch = e.shiftKey ? shifted : plain;
+    uni = ch ? ch.codePointAt(0) : uni;
+  }
   if (!hid && !uni) return;
 
   e.preventDefault();

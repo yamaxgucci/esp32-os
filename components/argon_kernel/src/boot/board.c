@@ -128,9 +128,13 @@ static void apply_generic_defaults(void)
     s_board.uart[2].rx = 20;
 
     strcpy(s_board.audio.driver, "auto");
+    s_board.audio.i2c = AG_PIN_NONE;
+    s_board.audio.ingain = 0; /* line level; a guitar says so in BOARD.CFG */
+    s_board.audio.dma_frames = 0; /* the port's default unless a board asks */
     s_board.audio.bclk = AG_PIN_NONE;
     s_board.audio.ws = AG_PIN_NONE;
     s_board.audio.dout = AG_PIN_NONE;
+    s_board.audio.din = AG_PIN_NONE;
     s_board.audio.mclk = AG_PIN_NONE;
     s_board.audio.rate = 22050;
 
@@ -395,8 +399,33 @@ ag_err_t ag_board_apply_config(const ag_cfg_t *cfg)
             s_board.audio.ws = cfg_pin(cfg, "audio.ws", s_board.audio.ws);
             s_board.audio.dout =
                 cfg_pin(cfg, "audio.dout", s_board.audio.dout);
+            s_board.audio.din = cfg_pin(cfg, "audio.din", s_board.audio.din);
             s_board.audio.mclk =
                 cfg_pin(cfg, "audio.mclk", s_board.audio.mclk);
+            /*
+             * Not a pin, which is why it does not go through cfg_pin:
+             * `audio.i2c` is a bus number, and 0 is a perfectly good one.  A
+             * board with a codec says which bus programs it; a board with a
+             * bare converter leaves it out and nothing is opened on its
+             * behalf.
+             */
+            const int32_t again = ag_cfg_get_int(cfg, "audio.ingain", -1);
+            if (again >= 0 && again <= 24) {
+                s_board.audio.ingain = (int16_t)again;
+            }
+            /*
+             * The ceiling on the converter's ring, not the ring itself: it is
+             * cut to twice the block an application declares, and this only
+             * says how far that may go on this board.
+             */
+            const int32_t adma = ag_cfg_get_int(cfg, "audio.dma_frames", 0);
+            if (adma >= 64 && adma <= 4096) {
+                s_board.audio.dma_frames = (uint16_t)adma;
+            }
+            const int32_t ai2c = ag_cfg_get_int(cfg, "audio.i2c", -1);
+            if (ai2c >= 0 && ai2c < AG_I2C_BUSES) {
+                s_board.audio.i2c = (int16_t)ai2c;
+            }
         }
         const int32_t ar = ag_cfg_get_int(cfg, "audio.rate",
                                           (int32_t)s_board.audio.rate);

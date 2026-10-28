@@ -186,6 +186,55 @@ void ag_pcm_set_chunk(ag_pcm_t *o, uint32_t frames)
     }
     o->chunk = frames ? frames : AG_PCM_CHUNK_DEFAULT;
     set_chunk_us(o);
+    /*
+     * And tell the device, because the converter cuts its ring to fit.
+     *
+     * Before this the block was a private number in this struct and the ring
+     * was a number in BOARD.CFG, and the two had to agree by hand.  They did
+     * not: a 256-frame block against a 128-frame ring stalled every read 7.4
+     * ms past its own deadline, and the stall was counted as processing.
+     *
+     * A driver with nothing to cut answers -AG_ENOTSUP, which is the answer
+     * and not an error, so the result is not checked.
+     */
+    if (o->fd >= 0 && o->sink == AG_PCM_SINK_DEV) {
+        uint32_t want = o->chunk;
+        if (ag_dev_ioctl(o->fd, AG_IOC_AUDIO_SETPERIOD, &want,
+                         sizeof(want)) == AG_OK) {
+            /*
+             * A device that cuts a ring to a block is a device that will hold
+             * the loop to its own clock - it cannot take the next block until
+             * it has played one.  That is true whichever way the sound is
+             * going, so a take played out of a file through a converter is
+             * paced by the converter too, and the wall clock below would be a
+             * second one.  A sink that discards (pcmnull) answers -ENOTSUP
+             * and keeps the pacing, because nothing else would hold it.
+             */
+            o->clocked_by_in = 1;
+        }
+    }
+}
+
+int32_t ag_pcm_read(ag_pcm_t *o, int16_t *pcm, int32_t frames)
+{
+    if (o == 0 || pcm == 0 || frames <= 0 || o->fd < 0) {
+        return -AG_EINVAL;
+    }
+    if (o->sink == AG_PCM_SINK_WAV) {
+        /* A file is not a microphone. */
+        return -AG_ENOSYS;
+    }
+    {
+        const size_t  bytes = (size_t)frames * (size_t)o->channels * 2u;
+        const int32_t got = ag_read(o->fd, pcm, bytes);
+        if (got < 0) {
+            return got;
+        }
+        /* From here the converter is this stream's clock, and the wall-clock
+         * pacing stands down - see clocked_by_in in the header. */
+        o->clocked_by_in = 1;
+        return (int32_t)((size_t)got / ((size_t)o->channels * 2u));
+    }
 }
 
 int32_t ag_pcm_write(ag_pcm_t *o, const int16_t *pcm, int32_t frames)
@@ -257,6 +306,46 @@ void ag_pcm_pace_wait(ag_pcm_t *o)
     if (o->sink == AG_PCM_SINK_WAV) {
         return;
     }
+    /*
+     * A live input already paced this block, and two clocks are worse than
+     * one: the deadline below is kept in ag_micros() while the frames arrive
+     * on the codec's crystal, so the two walk apart and every block looks
+     * late against a schedule that was never the real one.
+     *
+     * The deadline is carried forward rather than abandoned, so a stream that
+     * stops being read - the guitar unplugged, the take taking over - picks
+     * the pacing back up from now instead of from a stale mark and bursting
+     * a second of audio to catch up.
+     */
+    if (o->clocked_by_in) {
+        /*
+         * Measured against the previous turn rather than against a deadline.
+         *
+         * An absolute deadline kept here drifts against the codec's crystal
+         * and marks every block late for no reason - which it did, 37870
+         * resyncs in one run.  The relative measure has no clock of its own:
+         * it only asks whether a turn of the loop took appreciably longer
+         * than a block, which is the thing that empties a converter's ring.
+         * Half a block of slop, because a turn that is a little long is
+         * absorbed by the ring and is not a fault.
+         */
+        const ag_time_t now = ag_micros();
+        if (o->paced_at != 0) {
+            const uint32_t took = (uint32_t)(now - o->paced_at);
+            if (took > o->worst_us) {
+                o->worst_us = took;
+            }
+            if (took > o->chunk_us + o->chunk_us / 2u) {
+                o->late++;
+                if (took > o->chunk_us * 2u) {
+                    o->resync++;
+                }
+            }
+        }
+        o->paced_at = now;
+        o->next_due = now + (ag_time_t)o->chunk_us;
+        return;
+    }
     now = ag_micros();
     if (now <= o->next_due) {
         for (;;) {
@@ -297,6 +386,20 @@ int32_t ag_pcm_slack_us(const ag_pcm_t *o)
         return 0;
     }
     return (int32_t)(o->next_due - now);
+}
+
+int32_t ag_pcm_period(const ag_pcm_t *o)
+{
+    uint32_t frames = 0;
+
+    if (o == 0 || o->fd < 0 || o->sink != AG_PCM_SINK_DEV) {
+        return 0;
+    }
+    if (ag_dev_ioctl(o->fd, AG_IOC_AUDIO_GETPERIOD, &frames,
+                     sizeof(frames)) != AG_OK) {
+        return 0; /* a driver that does not answer has nothing to declare */
+    }
+    return (int32_t)frames;
 }
 
 void ag_pcm_poll_stats(ag_pcm_t *o)

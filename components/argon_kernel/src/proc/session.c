@@ -567,6 +567,17 @@ ag_err_t ag_session_focus(int slot)
     const ag_pid_t next_pid = slot_pid(slot);
 
     /*
+     * What is in the slot being asked for, before anything is done about it.
+     * A slot whose process has gone shows pid 0 here, and that alone is the
+     * difference between "it will not come back" and "there is nothing to
+     * come back to".
+     */
+    ag_log(AG_LOG_INFO, "session", "focus asked: slot %d holds pid %u (from "
+           "slot %d, pid %u)",
+           ag_session_display_number(slot), (unsigned)next_pid,
+           ag_session_display_number(prev_slot), (unsigned)prev_pid);
+
+    /*
      * Same user slot after bind_to(app): index unchanged but the occupant went
      * from shell → process.  Still need foreground + FOCUS_GAINED.
      */
@@ -611,14 +622,28 @@ ag_err_t ag_session_focus(int slot)
         ag_console_flush_input();
     }
 
+    /*
+     * The screen first, and the news afterwards.
+     *
+     * An application that paints on its own thread redraws the moment it
+     * hears FOCUS_GAINED - on the other core, immediately - and if the screen
+     * is still nobody's at that moment every one of those flushes is dropped.
+     * Nothing is dirty afterwards, so nothing is drawn again: the application
+     * runs on, believing it has painted, into a panel that never changes.  A
+     * framebuffer panel hides it, because the kernel restores its own
+     * snapshot; a surfaceless one has no snapshot, and the slot simply cannot
+     * be returned to.
+     */
+    if (next_pid != AG_PID_KERNEL && !proc_is_loading(next_pid)) {
+        ag_display_focus_back(next_pid); /* its screen, if it was taken */
+    }
+
     notify_focus(prev_pid, next_pid);
 
     if (next_pid == AG_PID_KERNEL) {
         enter_shell_view(slot);
     } else if (proc_is_loading(next_pid)) {
         enter_loading_view(slot, next_pid);
-    } else {
-        ag_display_focus_back(next_pid); /* its screen, if it was taken */
     }
     /* Ready apps own the screen — no console banner over them. */
 

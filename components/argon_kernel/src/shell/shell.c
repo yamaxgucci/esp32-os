@@ -486,6 +486,98 @@ static int mem_tasks(void)
  * The question "is it the wire or the board" needs this answer first: a
  * board whose link tasks never get to run looks exactly like a slow wire.
  */
+#include <argon/port/flash.h>
+
+extern uint32_t g_ag_tick_max[2];
+extern uint32_t g_ag_tick_over[2];
+extern uint32_t g_ag_tick_n[2];
+extern uint64_t g_ag_tick_cycles[2];
+
+/*
+ * What the system tick costs, per core, since the last time this was asked.
+ *
+ * It is here rather than in a report of its own because it answers the same
+ * question as `cpu`: where the core went.  `cpu` counts whole ticks and so
+ * cannot see the tick itself, which is the one piece of work every task on
+ * the board pays for and none of them can refuse.
+ */
+static int cmd_tick(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    for (int core = 0; core < 2; core++) {
+        const uint32_t n = g_ag_tick_n[core];
+        if (n == 0u) {
+            continue;
+        }
+        ag_console_printf("core %d: %u ticks, mean %u us, worst %u us, "
+                          "%u over 30 us\n",
+                          core, (unsigned)n,
+                          (unsigned)((g_ag_tick_cycles[core] / n) / 240u),
+                          (unsigned)(g_ag_tick_max[core] / 240u),
+                          (unsigned)g_ag_tick_over[core]);
+        g_ag_tick_max[core] = 0;
+        g_ag_tick_over[core] = 0;
+        g_ag_tick_n[core] = 0;
+        g_ag_tick_cycles[core] = 0;
+    }
+    return 0;
+}
+
+/*
+ * WHAT THE FLASH HAS BEEN ASKED TO DO WHILE SOUND WAS PLAYING.
+ *
+ * Reading or writing this flash switches the cache off for the whole chip,
+ * so an audio application loses frames over somebody else's file.  The
+ * converter raises a guard while it is clocking frames (see the port's
+ * flash.h); this reports what that guard has seen, and switches refusal on.
+ */
+static int cmd_flash(int argc, char **argv)
+{
+    if (argc > 1 && ag_path_icmp(argv[1], "strict") == 0) {
+        const bool on = (argc <= 2) || ag_path_icmp(argv[2], "off") != 0;
+        ag_port_flash_strict(on);
+        ag_console_printf("flash: %s while sound plays\n",
+                          on ? "refused" : "allowed, and counted");
+        return 0;
+    }
+    if (argc > 1) {
+        ag_console_puts("usage: flash [strict|hold [on|off]] | sync\n");
+        return 1;
+    }
+    {
+        uint32_t       mb = 0;
+        const uint32_t mr = ag_port_flash_mirror_reads(&mb);
+        ag_console_printf("flash: C: %s; %u reads answered from RAM, "
+                          "%u KB\n",
+                          (mr > 0u || ag_port_flash_mirrored())
+                              ? "mirrored in RAM"
+                              : "NOT mirrored - reads go to the chip",
+                          (unsigned)mr, (unsigned)(mb / 1024u));
+    }
+    {
+        const char    *who = NULL;
+        const uint32_t n = ag_port_flash_violations(&who);
+        ag_console_printf("flash: sound %s, %s\n",
+                          ag_port_flash_guarded() ? "playing" : "stopped",
+                          ag_port_flash_is_strict() ? "strict"
+                                                    : "watching only");
+        if (ag_port_flash_dirty() > 0u) {
+            ag_console_printf("  %u sectors are in memory and not yet "
+                              "on the chip; they go when the sound "
+                              "stops\n",
+                              (unsigned)ag_port_flash_dirty());
+        }
+        if (n == 0u) {
+            ag_console_puts("  nothing has touched it while sound played\n");
+        } else {
+            ag_console_printf("  %u operations while sound played, last "
+                              "from '%s'\n", (unsigned)n, who);
+        }
+    }
+    return 0;
+}
+
 static int cmd_cpu(int argc, char **argv)
 {
     enum { MAX_TASKS = 48 };
@@ -1385,7 +1477,7 @@ static const char *shell_path_env(void)
  * should be that path (or the name the user typed — loader uses `path`).
  */
 static int spawn_in_slot(const char *path, int argc, char **argv,
-                         bool detach_only)
+                         bool detach_only, bool system_core)
 {
     if (ag_session_is_system()) {
         ag_console_puts("run: use a user slot (Alt+1..4)\n");
@@ -1402,7 +1494,9 @@ static int spawn_in_slot(const char *path, int argc, char **argv,
     ag_pid_t       pid = 0;
     const ag_err_t err = ag_proc_spawn(
         path, argc, argv,
-        (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION, &pid);
+        (uint32_t)AG_SPAWN_BACKGROUND | (uint32_t)AG_SPAWN_NO_SESSION |
+            (system_core ? (uint32_t)AG_SPAWN_SYSTEM_CORE : 0u),
+        &pid);
     if (err != AG_OK) {
         print_load_error(path, err);
         return 1;
@@ -1485,7 +1579,7 @@ static int spawn_in_slot(const char *path, int argc, char **argv,
 }
 
 static int launch_resolved(const char *path, int argc, char **argv,
-                           bool detach_only)
+                           bool detach_only, bool system_core)
 {
     if (ag_shell_is_script(path)) {
         if (argc > 1) {
@@ -1493,22 +1587,49 @@ static int launch_resolved(const char *path, int argc, char **argv,
         }
         return ag_shell_run_script(path);
     }
-    return spawn_in_slot(path, argc, argv, detach_only);
+    return spawn_in_slot(path, argc, argv, detach_only, system_core);
 }
 
 static int cmd_run(int argc, char **argv)
 {
     bool detach_only = false;
+    bool system_core = false;
     int  first = 1;
 
-    if (argc > 1 && ag_path_icmp(argv[1], "/b") == 0) {
-        detach_only = true;
-        first = 2;
+    /*
+     * Switches, in any order, before the file.
+     *
+     * An application runs on the application core, away from the console and
+     * the shells, so that one which never yields cannot take the prompt with
+     * it.  /s puts it on the system core instead, which is an escape hatch
+     * rather than an optimisation: measured on the ESP32-A1S, the same take
+     * through the valve emulator runs 1756 us a block on the application core
+     * and 1832 on the system core, so the safe side is also the fast one.
+     * (A first measurement said the opposite, loudly.  It was taken in a slot
+     * still carrying the wreckage of a wedged application, and repeating it
+     * from a fresh boot each time reversed it.  Measure twice here.)
+     *
+     * What /s costs is the thing this default was introduced for: a program
+     * on the system core that stops yielding takes every shell with it, and
+     * the board has to be reset.
+     */
+    while (argc > first) {
+        if (ag_path_icmp(argv[first], "/b") == 0) {
+            detach_only = true;
+            first++;
+        } else if (ag_path_icmp(argv[first], "/s") == 0) {
+            system_core = true;
+            first++;
+        } else {
+            break;
+        }
     }
     if (argc <= first) {
         ag_console_puts("usage: run [/b] <file> [arguments]\n");
         ag_console_puts("  starts in the current user slot (or a free one)\n");
         ag_console_puts("  /b  same, without switching focus to the app\n");
+        ag_console_puts("  /s  on the system core: faster on this board, but\n");
+        ag_console_puts("      a program that stops yielding takes the shell\n");
         ag_console_puts("  .bat/.cmd run as shell scripts (line by line)\n");
         ag_console_puts("  Alt+1..4 / fg <slot|pid>; Ctrl+\\ = system shell\n");
         return 1;
@@ -1740,7 +1861,8 @@ static int cmd_run(int argc, char **argv)
     }
 
     argv[first] = resolved;
-    return launch_resolved(resolved, argc - first, &argv[first], detach_only);
+    return launch_resolved(resolved, argc - first, &argv[first], detach_only,
+                           system_core);
 }
 
 static int cmd_call(int argc, char **argv)
@@ -1850,7 +1972,8 @@ static int cmd_log(int argc, char **argv)
     }
 
     const uint32_t lost = ag_journal_lost(j);
-    ag_console_printf("\n%u lines held", (unsigned)held);
+    ag_console_printf("\n%u lines held in %u KB",
+                      (unsigned)held, (unsigned)(j->size / 1024u));
     if (lost > 0) {
         ag_console_printf(", %u older lines already overwritten",
                           (unsigned)lost);
@@ -3753,6 +3876,140 @@ static int cmd_wifi(int argc, char **argv)
         return 0;
 #endif /* AG_PORT_WIFI_HAS_AP */
     }
+
+#if AG_PORT_WIFI_HAS_AP
+    /*
+     * QUIET FOR A WHILE, THEN BACK BY ITSELF.
+     *
+     * On the ESP32-A1S the point costs the audio input more than twenty
+     * decibels of noise floor and is heard as a knock at the beacon rate, so a
+     * board that is both controlled from a phone and played through wants the
+     * radio off exactly while somebody is playing - and nobody can turn it
+     * back on from a phone that has just been disconnected.
+     *
+     * So the command does both halves.  It runs on the shell's own task, which
+     * keeps running when the console it was typed on goes away with the
+     * network, and it puts the point back from SYSTEM.CFG afterwards.  A reset
+     * does the same thing if it goes wrong.
+     */
+    /*
+     * The transmitter's power, in dBm, on the radio as it stands.
+     *
+     * This is an audio command on this board.  The transmitter's current is
+     * measurable in the codec's analogue input - the loopback reads a floor of
+     * peak 455 with the point up against 16 with the radio off - and it is
+     * heard as a click on every packet, one per key pressed on the phone that
+     * is driving the pedal.  Turning it down is the one thing that can be
+     * tried without a soldering iron and without taking the radio away, and
+     * trying it used to mean raising the point again, which drops the client
+     * and twice left the board not answering its console at all.
+     */
+    if (ag_path_icmp(argv[1], "power") == 0) {
+        int now = 0;
+        if (argc < 3) {
+            const ag_err_t rerr = ag_port_wifi_tx_power_get(&now);
+            if (rerr != AG_OK) {
+                ag_console_printf("wifi power: %s\n",
+                                  ag_loader_api()->sys->strerror(rerr));
+                return 1;
+            }
+            ag_console_printf("transmitter at %d.%d dBm (%d quarter-dBm)\n",
+                              now / 4, (now % 4) * 25, now);
+            return 0;
+        }
+
+        int want = 0;
+        for (const char *c = argv[2]; *c >= '0' && *c <= '9'; c++) {
+            want = want * 10 + (*c - '0');
+        }
+        /* Given in dBm, because that is how a radio is spoken about; the
+         * driver counts in quarters. */
+        if (want < 2 || want > 20) {
+            ag_console_puts("wifi power: 2 to 20 dBm\n");
+            return 1;
+        }
+        const ag_err_t serr = ag_port_wifi_tx_power_set(want * 4);
+        if (serr != AG_OK) {
+            ag_console_printf("wifi power: %s\n",
+                              ag_loader_api()->sys->strerror(serr));
+            return 1;
+        }
+        if (ag_port_wifi_tx_power_get(&now) == AG_OK) {
+            ag_console_printf("transmitter at %d.%d dBm (asked %d)\n",
+                              now / 4, (now % 4) * 25, want);
+        }
+
+        /*
+         * And keep it, because a setting that has to be typed again after
+         * every boot is a setting that will be forgotten on the boot that
+         * matters.  The whole [ap] section is rewritten from what is in
+         * effect now - the six keys below are all of them.
+         */
+        char body[256];
+        const char *p_ssid = ag_cfg_get(ag_sysconfig(), "ap.ssid", "");
+        const char *p_pass = ag_cfg_get(ag_sysconfig(), "ap.pass", "");
+        const int   p_chan = ag_cfg_get_int(ag_sysconfig(), "ap.channel", 0);
+        const int   p_hide = ag_cfg_get_int(ag_sysconfig(), "ap.hidden", 0);
+        const int   p_beac = ag_cfg_get_int(ag_sysconfig(), "ap.beacon_ms", 0);
+        int         n = snprintf(body, sizeof(body), "ssid = %s\n", p_ssid);
+        if (p_pass[0] != '\0') {
+            n += snprintf(body + n, sizeof(body) - (size_t)n,
+                          "pass = %s\n", p_pass);
+        }
+        if (p_chan > 0) {
+            n += snprintf(body + n, sizeof(body) - (size_t)n,
+                          "channel = %d\n", p_chan);
+        }
+        if (p_hide != 0) {
+            n += snprintf(body + n, sizeof(body) - (size_t)n, "hidden = 1\n");
+        }
+        if (p_beac > 0) {
+            n += snprintf(body + n, sizeof(body) - (size_t)n,
+                          "beacon_ms = %d\n", p_beac);
+        }
+        (void)snprintf(body + n, sizeof(body) - (size_t)n,
+                       "txpower = %d\n", want * 4);
+        const ag_err_t cerr = cfg_replace_section("ap", body);
+        if (cerr != AG_OK) {
+            ag_console_printf("set for now, but not saved (%s)\n",
+                              ag_loader_api()->sys->strerror(cerr));
+        }
+        return 0;
+    }
+
+    if (ag_path_icmp(argv[1], "quiet") == 0) {
+        uint32_t secs = 60;
+        if (argc > 2) {
+            uint32_t v = 0;
+            for (const char *c = argv[2]; *c >= '0' && *c <= '9'; c++) {
+                v = v * 10u + (uint32_t)(*c - '0');
+            }
+            if (v >= 1u && v <= 3600u) {
+                secs = v;
+            }
+        }
+        ag_console_printf("radio off for %u s; this console goes with it\n",
+                          (unsigned)secs);
+        (void)ag_port_wifi_stop();
+        ag_port_task_delay(ag_port_ms_to_ticks(secs * 1000u));
+
+        const ag_err_t rerr = ag_net_init();
+        if (rerr != AG_OK) {
+            ag_console_printf("radio back: %d\n", (int)rerr);
+            return 1;
+        }
+        const char *q_ssid = ag_cfg_get(ag_sysconfig(), "ap.ssid", NULL);
+        if (q_ssid != NULL && q_ssid[0] != '\0') {
+            ag_port_wifi_ap_tune(
+                ag_cfg_get_int(ag_sysconfig(), "ap.beacon_ms", 0),
+                ag_cfg_get_int(ag_sysconfig(), "ap.txpower", 0));
+            (void)ag_port_wifi_ap_start(
+                q_ssid, ag_cfg_get(ag_sysconfig(), "ap.pass", ""), 0, false);
+            ag_console_printf("access point %s again\n", q_ssid);
+        }
+        return 0;
+    }
+#endif /* AG_PORT_WIFI_HAS_AP */
 
     if (ag_path_icmp(argv[1], "off") == 0) {
         /* As with `on`: the kilobytes are this chip's, so only count them when
@@ -6075,6 +6332,8 @@ static const ag_command_t k_commands[] = {
     {"ver", "", "version and hardware", cmd_ver},
     {"mem", "[/t|/p|/x]", "memory usage; /t: every task and its stack; /p: [memory] placement; /x: extended memory block by block", cmd_mem},
     {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
+    {"flash", "[strict [on|off]]", "flash traffic while sound plays", cmd_flash},
+    {"tick", "", "what the system tick itself costs", cmd_tick},
     {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
      cmd_boot},
@@ -6107,7 +6366,7 @@ static const ag_command_t k_commands[] = {
     {"power", "[full|eco|doze|screen on|off|auto on|off]",
      "the clock, the screen, and what applications make of it", ag_cmd_power},
 #if ARGON_SHELL_HAS_WIFI
-    {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|ap <ssid> [pass]|forget]",
+    {"wifi", "[on|off|scan|connect <#n|ssid> [pass]|ap <ssid> [pass]|power <dBm>|forget]",
      "the radio", cmd_wifi},
 #endif
 #if AG_PORT_HAS_ESPNOW
@@ -6348,7 +6607,7 @@ int ag_shell_execute(const char *line)
                                  sizeof(resolved));
         if (rerr == AG_OK) {
             argv[0] = resolved;
-            status = launch_resolved(resolved, argc, argv, false);
+            status = launch_resolved(resolved, argc, argv, false, false);
             found = true;
         }
     }
@@ -6414,7 +6673,7 @@ bool ag_shell_open_associated(const char *path)
     }
 
     char *pargv[2] = {prog, abs};
-    (void)spawn_in_slot(prog, 2, pargv, false);
+    (void)spawn_in_slot(prog, 2, pargv, false, false);
     return true;
 }
 
