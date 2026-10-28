@@ -193,13 +193,13 @@
 #ifdef ARGON_MD_SMALL
 /*
  * The CYD: 64 KB in one piece is more than its heap has to give once the image
- * is loaded, so work RAM is two 32 KB halves, chosen by bit 15.  A long access
- * is two word accesses, so one that crosses from one half to the other (or
+ * is loaded, so work RAM is sixteen 4 KB pages, chosen by bits 12-15: what the heap has left after the image is in pieces.  A long access
+ * is two word accesses, so one that crosses from one page to the next (or
  * wraps at the top) is still right.  Words are stored as the core always kept
  * them: a long's high word at the lower address.
  */
-extern unsigned char *md_ram[2];
-#define MD_RAMP(A) (md_ram[((A) >> 15) & 1] + ((A) & 0x7FFF))
+extern unsigned char *md_ram[16];
+#define MD_RAMP(A) (md_ram[((A) >> 12) & 15] + ((A) & 0xFFF))
 #define FETCH8RAM(A) (*MD_RAMP((A) ^ 1))
 #define FETCH16RAM(A) (*(unsigned short *)MD_RAMP(A))
 #define FETCH32RAM(A) ((((unsigned int)FETCH16RAM(A)) << 16) | FETCH16RAM((A) + 2))

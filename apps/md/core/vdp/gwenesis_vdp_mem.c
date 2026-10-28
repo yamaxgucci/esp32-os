@@ -116,7 +116,7 @@ extern bool sprite_collision;
 //static int DMA_RUN=0;
 
 // 16 bits access to VRAM
-#define FETCH16(A) ( ( (*(unsigned short *)&VRAM[(A) & VRAM_MASK]) >> 8 ) | ( (*(unsigned short *)&VRAM[(A) & VRAM_MASK]) << 8 ) )
+#define FETCH16(A) ( VRAM_RD8((A) + 1) | (VRAM_RD8(A) << 8) )
 
 
 /******************************************************************************
@@ -154,7 +154,11 @@ int m68k_irq_acked(int irq) {
 
 
 void gwenesis_vdp_reset() {
+#ifdef ARGON_MD_SMALL
+  for (unsigned int i = 0; i <= VRAM_MASK; i += 4) VRAM_W(i) = 0;
+#else
   memset(VRAM, 0, VRAM_MASK + 1);
+#endif
   memset(SAT_CACHE, 0, sizeof(SAT_CACHE));
   memset(CRAM, 0, sizeof(CRAM));
   memset(CRAM565, 0, sizeof(CRAM565));
@@ -341,7 +345,7 @@ void push_fifo(unsigned int value)
 static inline __attribute__((always_inline))
 void gwenesis_vdp_vram_write(unsigned int address, unsigned int value)
 {
-  VRAM[address & VRAM_MASK] = value;
+  VRAM_WR8(address, value);
 
   // Update internal SAT Cache
   // used in Castlevania Bloodlines
@@ -668,7 +672,7 @@ void gwenesis_vdp_dma_copy()
 
     do
     {
-        unsigned short value = VRAM[(src_addr_low ^ 1) & VRAM_MASK];
+        unsigned short value = VRAM_RD8(src_addr_low ^ 1);
         gwenesis_vdp_vram_write((address_reg ^ 1) & 0xFFFF, value);
 
         address_reg += REG15_DMA_INCREMENT;
@@ -709,8 +713,8 @@ unsigned int gwenesis_vdp_read_data_port_16()
         {
         case 0x0:
             // No byteswapping here
-            value = VRAM[(address_reg) & 0xFFFE & VRAM_MASK] << 8;
-            value |= VRAM[(address_reg | 1) & VRAM_MASK];
+            value = VRAM_RD8((address_reg) & 0xFFFE) << 8;
+            value |= VRAM_RD8(address_reg | 1);
             address_reg += REG15_DMA_INCREMENT;
             address_reg &= 0xFFFF;
             //vdpm_log(__FUNCTION__,"%04x",value);
@@ -736,7 +740,7 @@ unsigned int gwenesis_vdp_read_data_port_16()
 
             return value;
         case 0xC: /* 8-Bit memory access */
-            value = VRAM[(address_reg ^ 1) & VRAM_MASK];
+            value = VRAM_RD8(address_reg ^ 1);
             value = (value & VRAM8_BITMASK) | (fifo[3] & ~VRAM8_BITMASK);
             address_reg += REG15_DMA_INCREMENT;
             address_reg &= 0xFFFF;

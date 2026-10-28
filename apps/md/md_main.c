@@ -27,8 +27,10 @@
  * The CYD (ESP32, no PSRAM): the machine's own memory is asked for at start
  * (md_small_alloc), the cartridge is mapped out of flash, and with no display
  * driver loaded it runs without a picture - which is how it is measured.
+ * 8 KB of stack: a run that stopped at its allocations left 8.5 of 12 unused,
+ * and the 4 KB was the Z80's last page.
  */
-AG_APP_SIZED("MD", "0.1", "argon", 0, 12 * 1024, 4 * 1024);
+AG_APP_SIZED("MD", "0.1", "argon", 0, 8 * 1024, 4 * 1024);
 #else
 AG_APP_SIZED("MD", "0.1", "argon", AG_AXE_NEEDS_GFX, 24 * 1024, 5 * 1024 * 1024);
 #endif
@@ -276,20 +278,28 @@ static void *small_alloc(size_t n, const char *what)
     return p;
 }
 
-/* The machine's memory: biggest first, while the heap still has its big piece. */
+/* The machine's memory: VRAM out of the way first, then RAM in 4 KB pages. */
 static int md_small_alloc(void)
 {
-    extern unsigned char *md_ram[2];
-    md_ram[0] = (unsigned char *)small_alloc(0x8000, "68000 RAM, low half");
-    md_ram[1] = md_ram[0] ? (unsigned char *)small_alloc(0x8000, "68000 RAM, high half") : NULL;
-    M68K_RAM = md_ram[1];
-    VRAM = M68K_RAM ? (unsigned char *)small_alloc(VRAM_MASK + 1u, "VRAM") : NULL;
-    ZRAM = VRAM ? (unsigned char *)small_alloc(0x2000, "Z80 RAM") : NULL;
+    extern unsigned char *md_ram[16];
+    /* VRAM in IRAM, which only takes word accesses - the VDP makes no other
+     * kind (VRAM_W in gwenesis_vdp.h) - and keeps the byte heap for the rest. */
+    VRAM = (unsigned char *)ag_malloc_caps(VRAM_MASK + 1u, AG_MEM_EXEC);
+    if (VRAM == NULL) {
+        VRAM = (unsigned char *)small_alloc(VRAM_MASK + 1u, "VRAM");
+    }
+    for (int i = 0; i < 16; i++)
+        md_ram[i] = (VRAM && (i == 0 || md_ram[i - 1])) ? (unsigned char *)small_alloc(0x1000, "68000 RAM page") : NULL;
+    M68K_RAM = md_ram[15];
+    extern unsigned char *md_zram[2];
+    md_zram[0] = M68K_RAM ? (unsigned char *)small_alloc(0x1000, "Z80 RAM page") : NULL;
+    md_zram[1] = md_zram[0] ? (unsigned char *)small_alloc(0x1000, "Z80 RAM page") : NULL;
+    ZRAM = md_zram[1];
     if (ZRAM == NULL) {
         return 0;
     }
-    ag_printf("md: 68000 RAM 2 x 32 KB, VRAM %u KB, Z80 RAM 8 KB - from the heap\n",
-              (unsigned)((VRAM_MASK + 1u) / 1024u));
+    ag_printf("md: 68000 RAM 16 x 4 KB, VRAM %u KB at %p, Z80 RAM 8 KB\n",
+              (unsigned)((VRAM_MASK + 1u) / 1024u), (void *)VRAM);
     return 1;
 }
 
@@ -634,7 +644,15 @@ int ag_main(int argc, char **argv)
     md_sound_set_path(sound_path);
 
 #ifdef ARGON_MD_SMALL
-    if (!md_small_alloc()) {
+    size_t         rom_size = 0;
+    /*
+     * The cartridge first: staging it into flash takes a little of the kernel's
+     * own memory (the map table, the flash driver), which is gone once the
+     * machine's RAM is allocated.
+     */
+    unsigned char *rom_data = (rom != NULL) ? map_rom(rom, &rom_size)
+                                            : make_tiny_rom(&rom_size);
+    if (rom_data == NULL || !md_small_alloc()) {
         return 1;
     }
     /*
@@ -655,11 +673,8 @@ int ag_main(int argc, char **argv)
     bind_vdp_to_fb(&s_gi);
 #endif
 
+#ifndef ARGON_MD_SMALL
     size_t         rom_size = 0;
-#ifdef ARGON_MD_SMALL
-    unsigned char *rom_data = (rom != NULL) ? map_rom(rom, &rom_size)
-                                            : make_tiny_rom(&rom_size);
-#else
     unsigned char *rom_data = (rom != NULL) ? load_rom_file(rom, &rom_size)
                                             : make_tiny_rom(&rom_size);
 #endif

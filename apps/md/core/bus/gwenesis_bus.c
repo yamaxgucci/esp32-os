@@ -67,7 +67,7 @@ unsigned char *M68K_RAM=(void *)(uint32_t)(0); // 68K RAM
 unsigned char *ROM_DATA = 0;          // points at the loaded cartridge image
 #ifdef ARGON_MD_SMALL
 unsigned char *M68K_RAM;              // unused on the CYD: md_ram[]
-unsigned char *md_ram[2];             // two 32 KB halves (md_main)
+unsigned char *md_ram[16];            // sixteen 4 KB pages (md_main)
 #else
 unsigned char M68K_RAM[MAX_RAM_SIZE]; // 68K RAM
 #endif
@@ -80,7 +80,8 @@ unsigned char M68K_RAM[MAX_RAM_SIZE];    // 68K RAM
 
 // Setup Z80 Memory
 #ifdef ARGON_MD_SMALL
-unsigned char *ZRAM;
+unsigned char *ZRAM;                  // unused on the CYD: md_zram[]
+unsigned char *md_zram[2];            // two 4 KB pages (md_main)
 #else
 unsigned char ZRAM[MAX_Z80_RAM_SIZE]; // Z80 RAM
 #endif
@@ -104,12 +105,16 @@ void load_cartridge()
 {
     // Clear all volatile memory
 #ifdef ARGON_MD_SMALL
-    memset(md_ram[0], 0, 0x8000);
-    memset(md_ram[1], 0, 0x8000);
+    for (int i = 0; i < 16; i++) memset(md_ram[i], 0, 0x1000);
 #else
     memset(M68K_RAM, 0, MAX_RAM_SIZE);
 #endif
+#ifdef ARGON_MD_SMALL
+    memset(md_zram[0], 0, 0x1000);
+    memset(md_zram[1], 0, 0x1000);
+#else
     memset(ZRAM, 0, MAX_Z80_RAM_SIZE);
+#endif
 
     // Set Z80 Memory as Z80_RAM
     z80_set_memory(ZRAM);
@@ -130,12 +135,16 @@ void load_cartridge()
 void load_cartridge(unsigned char *buffer, size_t size)
 {
 #ifdef ARGON_MD_SMALL
-    memset(md_ram[0], 0, 0x8000);
-    memset(md_ram[1], 0, 0x8000);
+    for (int i = 0; i < 16; i++) memset(md_ram[i], 0, 0x1000);
 #else
     memset(M68K_RAM, 0, MAX_RAM_SIZE);
 #endif
+#ifdef ARGON_MD_SMALL
+    memset(md_zram[0], 0, 0x1000);
+    memset(md_zram[1], 0, 0x1000);
+#else
     memset(ZRAM, 0, MAX_Z80_RAM_SIZE);
+#endif
 
     z80_set_memory(ZRAM);
     z80_pulse_reset();
@@ -163,12 +172,16 @@ void load_cartridge(unsigned char *buffer, size_t size)
 {
     // Clear all volatile memory
 #ifdef ARGON_MD_SMALL
-    memset(md_ram[0], 0, 0x8000);
-    memset(md_ram[1], 0, 0x8000);
+    for (int i = 0; i < 16; i++) memset(md_ram[i], 0, 0x1000);
 #else
     memset(M68K_RAM, 0, MAX_RAM_SIZE);
 #endif
+#ifdef ARGON_MD_SMALL
+    memset(md_zram[0], 0, 0x1000);
+    memset(md_zram[1], 0, 0x1000);
+#else
     memset(ZRAM, 0, MAX_Z80_RAM_SIZE);
+#endif
     memset(ROM_DATA, 0, MAX_ROM_SIZE);
 
     // Set Z80 Memory as ZRAM
@@ -458,7 +471,7 @@ static inline unsigned int gwenesis_bus_read_memory_8(unsigned int address) {
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
-    return ZRAM[address & 0x1FFF];
+    return MD_ZRAM(address);
 
   case Z80_YM2612_ADDR:
     return YM2612Read(m68k_cycles_master());
@@ -509,7 +522,7 @@ static inline unsigned int gwenesis_bus_read_memory_16(unsigned int address) {
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
-    return ZRAM[address & 0X1FFF] | (ZRAM[address & 0X1FFF] << 8);
+    return MD_ZRAM(address) | (MD_ZRAM(address) << 8);
 
   case Z80_YM2612_ADDR:
     ret_value = YM2612Read(m68k_cycles_master());
@@ -560,7 +573,7 @@ static inline void gwenesis_bus_write_memory_8(unsigned int address,
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
-    ZRAM[address & 0x1FFF] = value;
+    MD_ZRAM(address) = value;
     return;
 
   case Z80_YM2612_ADDR:
@@ -612,7 +625,7 @@ static inline void gwenesis_bus_write_memory_16(unsigned int address,
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
-    ZRAM[address & 0X1FFF]= value >> 8;
+    MD_ZRAM(address) = value >> 8;
     return;
 
   case IO_CTRL:

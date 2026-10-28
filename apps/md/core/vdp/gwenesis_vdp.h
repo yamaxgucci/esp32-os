@@ -82,6 +82,25 @@ __license__ = "GPLv3"
 #else
 #define VRAM_MASK 0xFFFF
 #endif
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD keeps VRAM in IRAM - the 32 KB its byte-addressable heap does not
+ * have - and the ESP32 reads and writes IRAM only a whole word at a time.  So
+ * every VRAM access goes through an aligned word; the bytes sit in it exactly
+ * as they would in ordinary memory, so word reads elsewhere (the patterns) are
+ * unchanged.
+ */
+/* volatile: GCC otherwise turns "a word, then one byte of it" back into a
+ * byte load or store - l8ui into IRAM, a LoadStoreError on the first frame. */
+#define VRAM_W(A)   (((volatile unsigned int *)(void *)VRAM)[((A) & VRAM_MASK) >> 2])
+#define VRAM_RD8(A) ((unsigned char)(VRAM_W(A) >> (((A) & 3u) << 3)))
+#define VRAM_WR8(A, V) do { unsigned int a_ = (A), s_ = (a_ & 3u) << 3;      \
+    VRAM_W(a_) = (VRAM_W(a_) & ~(0xFFu << s_)) |                              \
+                 ((unsigned int)(unsigned char)(V) << s_); } while (0)
+#else
+#define VRAM_RD8(A) (VRAM[(A) & VRAM_MASK])
+#define VRAM_WR8(A, V) (VRAM[(A) & VRAM_MASK] = (V))
+#endif
 #define CRAM_MAX_SIZE 0x40       // CRAM maximum size
 #define VSRAM_MAX_SIZE 0x40      // VSRAM maximum size
 #define SAT_CACHE_MAX_SIZE 0x400 // SAT CACHE maximum size

@@ -67,7 +67,7 @@ static unsigned int zbank_addr(unsigned int address)
 uint8_t argon_z80_read(uint16_t address)
 {
     if (address < 0x4000u) {
-        return (s_zram != 0) ? s_zram[address & 0x1fffu] : 0xffu;
+        return (s_zram != 0) ? MD_ZRAM(address) : 0xffu;
     }
     if (address < 0x6000u) {
         int tgt = zclk + s_timeslice;
@@ -83,7 +83,7 @@ void argon_z80_write(uint16_t address, uint8_t data)
 {
     if (address < 0x4000u) {
         if (s_zram != 0) {
-            s_zram[address & 0x1fffu] = data;
+            MD_ZRAM(address) = data;
         }
         return;
     }
@@ -207,7 +207,7 @@ void z80_irq_line(unsigned int value)
 void z80_write_memory_8(unsigned int address, unsigned int value)
 {
     if (s_zram != 0) {
-        s_zram[address & (MAX_Z80_RAM_SIZE - 1u)] = (unsigned char)value;
+        MD_ZRAM(address) = (unsigned char)value;
     }
 }
 
@@ -219,7 +219,7 @@ void z80_write_memory_16(unsigned int address, unsigned int value)
 
 unsigned int z80_read_memory_8(unsigned int address)
 {
-    return (s_zram != 0) ? s_zram[address & (MAX_Z80_RAM_SIZE - 1u)] : 0u;
+    return (s_zram != 0) ? MD_ZRAM(address) : 0u;
 }
 
 unsigned int z80_read_memory_16(unsigned int address)

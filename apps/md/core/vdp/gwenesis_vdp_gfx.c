@@ -105,7 +105,7 @@ static int Window_firstcol;
 static int Window_lastcol;
 
 // 16 bits access to VRAM
-#define FETCH16VRAM(A)  ( (VRAM[((A)+1) & VRAM_MASK]) | (VRAM[(A) & VRAM_MASK] << 8) )
+#define FETCH16VRAM(A)  ( VRAM_RD8((A)+1) | (VRAM_RD8(A) << 8) )
 
 #define VDP_GFX_DISABLE_LOGGING 1
 
@@ -146,10 +146,12 @@ void gwenesis_vdp_set_buffer(unsigned short *ptr_screen_buffer)
     screen_buffer = ptr_screen_buffer;
 }
 
-/* ArgonOS addition; see screen_buffer_stride above. */
+/* ArgonOS addition; see screen_buffer_stride above.  0 is a stride too: every
+ * line over the last, in one row (the CYD's headless bench).  Read as "the
+ * default" it drew a whole frame, 150 KB, past the end of that row. */
 void gwenesis_vdp_set_buffer_stride(int pixels)
 {
-    screen_buffer_stride = (pixels > 0) ? pixels : SCREEN_WIDTH;
+    screen_buffer_stride = (pixels >= 0) ? pixels : SCREEN_WIDTH;
 }
 
 /******************************************************************************
@@ -435,9 +437,9 @@ void draw_pattern_sprite(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
+    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
   else
-    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
+    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
 
   // Horizontal flip ?
   if (name & 0x0800)
@@ -469,9 +471,9 @@ void draw_pattern_sprite_over_planes(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
+    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
   else
-    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
+    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
 
   // Horizontal flip ?
   if (name & 0x0800)
@@ -493,9 +495,9 @@ void draw_pattern_planeB(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
+    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
   else
-    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
+    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
 
 //  if ((*(unsigned int *)pattern) == 0 ) return;
  // uint8_t *pattern = VRAM + ((name << 5) & 0xFFFF); //) pat_addr;
@@ -532,9 +534,9 @@ void draw_pattern_planeA(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
+    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
   else
-    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
+    pattern = *(const volatile unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
 
   // Horizontal flip ?
   if (name & 0x0800)
@@ -749,7 +751,14 @@ void draw_sprites_over_planes(int line)
     int sidx = 0, num_sprites = 0, num_pixels = 0;
     for (int i = 0; (i < SPRITE_TABLE_SIZE) && sidx < (SPRITE_TABLE_SIZE); ++i)
     {
+#ifdef ARGON_MD_SMALL
+        unsigned int ent_[2];   /* the entry by words: VRAM is in IRAM */
+        { unsigned int o_ = (unsigned int)(start_table - VRAM) + sidx * 8;
+          ent_[0] = VRAM_W(o_); ent_[1] = VRAM_W(o_ + 4); }
+        uint8_t *table = (uint8_t *)ent_;
+#else
         uint8_t *table = start_table + sidx*8;
+#endif
         uint8_t *cache = SAT_CACHE + sidx*8;
         //uint8_t *cache = start_table + sidx*8;
         
@@ -856,8 +865,15 @@ void draw_sprites(int line)
   bool masking = false, one_sprite_nonzero = false; // overdraw = false;
   int sidx = 0, num_sprites = 0, num_pixels = 0;
   for (int i = 0; i < SPRITE_TABLE_SIZE && sidx < SPRITE_TABLE_SIZE; ++i) {
+#ifdef ARGON_MD_SMALL
+    unsigned int ent_[2];   /* the entry by words: VRAM is in IRAM */
+    { unsigned int o_ = (unsigned int)(start_table - VRAM) + sidx * 8;
+      ent_[0] = VRAM_W(o_); ent_[1] = VRAM_W(o_ + 4); }
+    uint8_t *table = (uint8_t *)ent_;
+#else
     uint8_t *table = start_table + sidx * 8;
-    uint8_t *cache = start_table + sidx * 8;
+#endif
+    uint8_t *cache = table;
 
     //uint8_t *cache = SAT_CACHE + sidx * 8;
 

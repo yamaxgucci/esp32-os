@@ -32,6 +32,15 @@ void gwenesis_z80inst_load_state();
 
 void z80_set_memory(unsigned char *buffer);
 
+#ifdef ARGON_MD_SMALL
+/* The CYD: the Z80's 8 KB as two 4 KB pages, out of what the heap has left. */
+extern unsigned char *md_zram[2];
+#define MD_ZRAM(A) (md_zram[((A) >> 12) & 1][(A) & 0xFFF])
+#else
+extern unsigned char ZRAM[];
+#define MD_ZRAM(A) (ZRAM[(A) & 0x1FFF])
+#endif
+
 void z80_write_memory_8(unsigned int address, unsigned int value);
 void z80_write_memory_16(unsigned int address, unsigned int value);
 unsigned int z80_read_memory_16(unsigned int address);
