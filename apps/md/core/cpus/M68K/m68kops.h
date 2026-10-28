@@ -23675,7 +23675,8 @@ static void m68k_op_unlk_32(void)
   #ifndef TABLES_FULL
     #ifdef ARGON_MD_SMALL
     #include "m68ki_jump_small.h"
-    #define MD_DISPATCH(op) (MD_HANDLER(op)())
+    #define MD_DISPATCH(op) (MD_OP(op)->fn())
+    static unsigned int md_cyc_of(unsigned int op) { return MD_OP(op)->cyc; }
 #else
     #include "m68ki_instruction_jump_table.h"
     #define MD_DISPATCH(op) (m68ki_instruction_jump_table[(op)]())

@@ -13,7 +13,9 @@ extern int vdp_68k_irq_ack(int int_level);
 
 #ifndef BUILD_TABLES
   #ifndef TABLES_FULL
+    #ifndef ARGON_MD_SMALL /* the small build's cycles are in m68ki_jump_small.h */
     #include "m68ki_cycles.h"
+    #endif
   #else
     #include "m68ki_cycles_full.h"
   #endif
@@ -309,8 +311,20 @@ void m68k_run(unsigned int cycles)
 //    printf("PC=%x IR=%x CYCLES=%d \n",m68k.pc,REG_IR,CYC_OF(REG_IR));
 
     /* Execute instruction */
+#ifdef ARGON_MD_SMALL
+    {
+      /* One lookup for the handler and its cycles.  A handler that ran the next
+       * instruction itself (m68k_set_irq_delay) left that one in REG_IR, and
+       * the cycles counted here are its, as they always were. */
+      const unsigned int ir = REG_IR;
+      const md_op_t *op = MD_OP(ir);
+      op->fn();
+      USE_CYCLES(REG_IR == ir ? op->cyc : CYC_OF(REG_IR));
+    }
+#else
     MD_DISPATCH(REG_IR);
     USE_CYCLES(CYC_OF(REG_IR));
+#endif
 
     /* Trace m68k_exception, if necessary */
     m68ki_exception_if_trace(); /* auto-disable (see m68kcpu.h) */

@@ -215,10 +215,10 @@
 
 #define CYC_INSTRUCTION   m68ki_cycles
 #ifdef ARGON_MD_SMALL
-/* The cycle table is in the code part, in flash, which the ESP32 reads only a
- * word at a time: a byte load there is an exception, so the byte is cut out of
- * its word. */
-#define CYC_OF(i) ((((const unsigned int *)(const void *)m68ki_cycles)[(i) >> 2] >> (((i) & 3) << 3)) & 0xFF)
+/* The cycles are carried by the handler's own entry (m68ki_jump_small.h,
+ * which comes after the handlers that use this; m68kops.h defines it). */
+static unsigned int md_cyc_of(unsigned int op);
+#define CYC_OF(i) md_cyc_of(i)
 #else
 #define CYC_OF(i) (CYC_INSTRUCTION[(i)])
 #endif
