@@ -195,7 +195,16 @@ static void window_for(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
         y1 <= s_win_y1) {
         return;
     }
-    window(x0, y0, x1, y1);
+    /*
+     * Opened down to the bottom of the glass, not to y1: the controller stops
+     * where the data stops, and the next band - which starts at y1 + 1 more
+     * often than not - then finds the window already there.  Sized to the
+     * band, it was full after every band, and a picture sent a row at a time
+     * (the CYD's Mega Drive, which has memory for no more) paid five transfers
+     * of setup for every row: 224 windows a frame.
+     */
+    (void)y1;
+    window(x0, y0, x1, LCD_H - 1);
 }
 
 /* Rows just written, so the next call can tell whether it continues them. */

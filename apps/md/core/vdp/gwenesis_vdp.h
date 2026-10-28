@@ -84,7 +84,7 @@ __license__ = "GPLv3"
 #endif
 #ifdef ARGON_MD_SMALL
 /*
- * The CYD keeps VRAM in 1 KB pages (md_pages.h), as many as fit in IRAM - memory its
+ * The CYD keeps VRAM in pages (md_pages.h), as many as fit in IRAM - memory its
  * byte-addressable heap does not have - and the rest wherever the heap has a
  * piece.  The ESP32 reads and writes IRAM only a whole word at a time, so every
  * VRAM access goes through an aligned word; the bytes sit in it exactly as
@@ -107,7 +107,13 @@ __license__ = "GPLv3"
 #endif
 #define CRAM_MAX_SIZE 0x40       // CRAM maximum size
 #define VSRAM_MAX_SIZE 0x40      // VSRAM maximum size
+#ifdef ARGON_MD_SMALL
+/* the CYD: 80 sprites of 8 bytes are all the table holds - the rest of its
+ * 1 KB in H40 is never read, and the 384 bytes were the glass's */
+#define SAT_CACHE_MAX_SIZE 0x280
+#else
 #define SAT_CACHE_MAX_SIZE 0x400 // SAT CACHE maximum size
+#endif
 #define REG_SIZE 0x20            // REGISTERS total
 #define FIFO_SIZE 0x4            // FIFO maximum size
 

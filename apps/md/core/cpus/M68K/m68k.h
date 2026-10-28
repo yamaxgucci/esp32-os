@@ -193,7 +193,7 @@
 #ifdef ARGON_MD_SMALL
 /*
  * The CYD: 64 KB in one piece is more than its heap has to give once the image
- * is loaded, so work RAM is in 1 KB pages (md_pages.h).  A long access is two
+ * is loaded, so work RAM is in pages (md_pages.h).  A long access is two
  * word accesses, so one that crosses from one page to the next (or wraps at
  * the top) is still right.  Words are stored as the core always kept them: a
  * long's high word at the lower address.

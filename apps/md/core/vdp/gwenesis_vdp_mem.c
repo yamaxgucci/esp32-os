@@ -67,7 +67,7 @@ void vdpm_log(const char *subs, const char *fmt, ...) {
 #else
 #ifdef ARGON_MD_SMALL
   unsigned char *VRAM;            /* = md_vram[0]; every access is paged */
-  unsigned char *md_vram[MD_VRAM_PAGES]; /* 1 KB pages (md_pages.h) */
+  unsigned char *md_vram[MD_VRAM_PAGES]; /* pages (md_pages.h) */
 #else
   unsigned char VRAM[VRAM_MAX_SIZE];
 #endif
@@ -350,7 +350,8 @@ void gwenesis_vdp_vram_write(unsigned int address, unsigned int value)
 
   // Update internal SAT Cache
   // used in Castlevania Bloodlines
-  if (address >= REG5_SAT_ADDRESS && address < REG5_SAT_ADDRESS + REG5_SAT_SIZE)
+  if (address >= REG5_SAT_ADDRESS && address < REG5_SAT_ADDRESS + REG5_SAT_SIZE &&
+      address - REG5_SAT_ADDRESS < SAT_CACHE_MAX_SIZE)
     SAT_CACHE[address - REG5_SAT_ADDRESS] = value;
 }
 

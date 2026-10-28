@@ -67,7 +67,7 @@ unsigned char *M68K_RAM=(void *)(uint32_t)(0); // 68K RAM
 unsigned char *ROM_DATA = 0;          // points at the loaded cartridge image
 #ifdef ARGON_MD_SMALL
 unsigned char *M68K_RAM;              // unused on the CYD: md_ram[]
-unsigned char *md_ram[MD_RAM_PAGES];  // 1 KB pages (md_pages.h, md_main)
+unsigned char *md_ram[MD_RAM_PAGES];  // pages (md_pages.h, md_main)
 #else
 unsigned char M68K_RAM[MAX_RAM_SIZE]; // 68K RAM
 #endif
@@ -81,7 +81,7 @@ unsigned char M68K_RAM[MAX_RAM_SIZE];    // 68K RAM
 // Setup Z80 Memory
 #ifdef ARGON_MD_SMALL
 unsigned char *ZRAM;                  // unused on the CYD: md_zram[]
-unsigned char *md_zram[MD_ZRAM_PAGES]; // 1 KB pages
+unsigned char *md_zram[MD_ZRAM_PAGES]; // pages
 #else
 unsigned char ZRAM[MAX_Z80_RAM_SIZE]; // Z80 RAM
 #endif

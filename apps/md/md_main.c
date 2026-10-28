@@ -29,8 +29,8 @@
  * The CYD (ESP32, no PSRAM): the machine's own memory is asked for at start
  * (md_small_alloc), the cartridge is mapped out of flash, and with no display
  * driver loaded it runs without a picture - which is how it is measured.
- * 6 KB of stack: a run that stopped at its allocations, printf included, left
- * 4.2 of 8 unused, and the Z80's last 2 KB were what it lacked.
+ * 6 KB of stack asked for - though the kernel gives a process at least the 8
+ * KB loading needs (AG_PROC_LOAD_STACK_MIN), so the number is a floor only.
  */
 AG_APP_SIZED("MD", "0.1", "argon", 0, 6 * 1024, 4 * 1024);
 #else
@@ -69,7 +69,7 @@ static int s_ox;
 static int s_oy;
 
 /*
- * Input: prefer the kernel pad layer (HostFS PADPUSH → inp->btnp).  That is
+ * Input: prefer the kernel pad layer (HostFS PADPUSH ??? inp->btnp).  That is
  * real level state, so directions and A+B+C can be held.  `nolivepad` forces
  * the serial sticky path, which has no key-up and is only a degraded reserve.
  */
@@ -80,7 +80,7 @@ static int s_profile_frames = 0; /* print per-frame m68k/z80/vdp split */
 static int s_quit;
 static ag_gfxinfo_t s_gi;
 
-/* Last run_frame phase times (µs), filled when s_profile_frames > 0. */
+/* Last run_frame phase times (??s), filled when s_profile_frames > 0. */
 static uint32_t s_prof_m68k_us;
 static uint32_t s_prof_z80_us;
 static uint32_t s_prof_snd_us;
@@ -170,6 +170,12 @@ static int parse_int(const char *s, int fallback)
  * "% realtime" against one NTSC frame of 16667 us: 100% means keeping up exactly.
  * The pacing sleep is deliberately outside the measured work.
  */
+#ifdef ARGON_MD_SMALL
+static int               s_ring_n;   /* the CYD's picture, below */
+static volatile uint32_t s_ring_got;
+static volatile uint32_t s_glass_us; /* the system core's time sending rows */
+#endif
+
 static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
                          uint64_t emu_sum, uint64_t present_sum,
                          uint64_t work_max)
@@ -185,6 +191,23 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
     ag_printf("md: %u fps, work %u us (emu %u, show %u), max %u us, "
               "%u%% realtime\n",
               fps, avg, emu, pres, (unsigned)work_max, pct);
+#ifdef ARGON_MD_SMALL
+    if (s_ring_n) {
+        /* the glass's own rate: rows sent, as whole pictures a second */
+        static uint32_t s_rows_seen;
+        const uint32_t rows = s_ring_got - s_rows_seen;
+        s_rows_seen += rows;
+        const unsigned x10 = (unsigned)((uint64_t)rows * 10000000u / span_us /
+                                        (uint64_t)(screen_height ? screen_height : 224));
+        static uint32_t s_us_seen;
+        const uint32_t us = s_glass_us - s_us_seen;
+        s_us_seen += us;
+        ag_printf("md: glass %u rows, %u.%u pictures a second, %u us a row, "
+                  "the system core %u%% busy\n", (unsigned)rows,
+                  x10 / 10u, x10 % 10u, rows ? (unsigned)(us / rows) : 0u,
+                  (unsigned)((uint64_t)us * 100u / span_us));
+    }
+#endif
 }
 
 /*
@@ -266,83 +289,193 @@ static int            s_headless;
 static unsigned short s_line[MD_WIDTH];
 
 /*
- * The CYD's picture: the panel has no frame buffer to draw into, so lines are
- * drawn into a band of a few rows and the band goes to the glass when full
- * (ag_gfx_present).  The band is what is left after the machine's memory -
- * eight rows if there is room, down to the one row of s_line if not.
+ * The CYD's picture.  The panel has no frame buffer to draw into, and sending
+ * a frame down its 40 MHz bus is 50 ms - three frames of the game - so the
+ * rows go to the glass from a thread on the system core, through a ring, and
+ * the emulation never waits for it: a line is drawn only if the ring has a
+ * row free (s_cursor).  The picture is refreshed as fast as the bus allows
+ * while the game keeps its own pace.  (The scheme of the CYD's Master System, in rows rather than bands:
+ * after the machine's memory there is room for a few rows and a small stack.)
+ *
+ * Without a thread, or without the memory for a ring, each line is drawn into
+ * s_line and sent from here, as the first version did.
  */
-static unsigned short *s_band = s_line;
-static int             s_band_rows = 1;
-static uint32_t        s_present_us;
-static uint32_t        s_present_bad;
+#define MD_RING_MAX 16
+static unsigned short   *s_ring[MD_RING_MAX];   /* the batch's rows, one block */
+static int               s_ring_n;              /* 0: no batch, synchronous */
+static int               s_batch_rows;          /* rows drawn into the batch */
+static int               s_batch_line;          /* the picture line of its first */
+static int               s_batch_w, s_batch_h;  /* screen_width/height, as drawn */
+static volatile int      s_batch_full;          /* handed to the thread */
+static volatile uint32_t s_ring_got;            /* rows sent */
+static volatile int      s_ring_run;
+static ag_sem_t          s_ring_sem;            /* a batch handed over */
+static ag_thread_t       s_presenter;
+/*
+ * The next line of the picture to draw.  Drawn in order, whenever the batch
+ * has room, whatever line the emulation has got to: drawing a line only as
+ * the beam passes it left the bus idle while the beam went round to the lines
+ * still owed.  A line drawn early or late shows the VDP as it is then - a
+ * mid-frame raster trick can tear.
+ */
+static int               s_cursor;
+static uint32_t          s_present_us;
+static uint32_t          s_present_bad;
 
-static void md_band_alloc(void)
+/* `rows` consecutive lines from `line`, in consecutive rows of memory. */
+static void md_present_rows(const unsigned short *px, int line, int rows, int w,
+                            int h)
 {
-    static const int k_rows[] = {8, 4, 2};
-    for (unsigned i = 0; i < sizeof(k_rows) / sizeof(k_rows[0]); i++) {
-        const size_t bytes = (size_t)k_rows[i] * MD_WIDTH * sizeof(uint16_t);
+    const ag_blit_t b = {
+        .px = px,
+        .stride = MD_WIDTH * sizeof(uint16_t),
+        .surf_w = s_gi.width,
+        .surf_h = s_gi.height,
+        .x = (uint16_t)(((int)s_gi.width - w) / 2),
+        .y = (uint16_t)(((int)s_gi.height - h) / 2 + line),
+        .w = (uint16_t)w,
+        .h = (uint16_t)rows,
+    };
+    if (ag_gfx_present(&b) != AG_OK) {
+        s_present_bad++;
+    }
+}
+
+/*
+ * The system core's half: a whole batch to the glass in one call.  A call
+ * costs some 300 us here whatever it carries and a row some 30 more, so the
+ * rows go in batches; and the thread is woken by the batch, not by the tick -
+ * sleeping a tick let four rows out per three milliseconds.
+ */
+static void md_presenter(void *arg)
+{
+    (void)arg;
+    while (s_ring_run) {
+        (void)ag_sem_take(s_ring_sem, 50);
+        if (!s_batch_full) {
+            continue;
+        }
+        __sync_synchronize();
+        const ag_time_t t0 = ag_micros();
+        md_present_rows(s_ring[0], s_batch_line, s_batch_rows, s_batch_w,
+                        s_batch_h);
+        s_glass_us += (uint32_t)(ag_micros() - t0);
+        s_ring_got += (uint32_t)s_batch_rows;
+        s_batch_rows = 0;
+        __sync_synchronize();
+        s_batch_full = 0;
+    }
+    ag_thread_exit();
+}
+
+/*
+ * The batch and its thread, taken before the machine's memory: they need whole
+ * blocks, which the machine's pages - cut out of anything - leave none of.
+ */
+static void md_ring_start(int rows)
+{
+    s_ring_sem = ag_sem_create(0, 4);
+    if (s_ring_sem == NULL) {
+        return;
+    }
+    s_ring_run = 1;
+    s_presenter = ag_thread_create(md_presenter, NULL, "mdglass", 3072, 4,
+                                   AG_THREAD_SYS_CORE);
+    if (s_presenter == NULL) {
+        s_ring_run = 0;
+        return;
+    }
+    for (int n = rows; n >= 2; n--) {
+        const size_t bytes = (size_t)n * MD_WIDTH * sizeof(uint16_t);
         unsigned short *b = (unsigned short *)ag_malloc_caps(bytes, AG_MEM_FAST);
         if (b == NULL) {
             b = (unsigned short *)ag_malloc(bytes);
         }
         if (b != NULL) {
-            s_band = b;
-            s_band_rows = k_rows[i];
+            for (int i = 0; i < n; i++) {
+                s_ring[i] = b + (size_t)i * MD_WIDTH;
+            }
+            __sync_synchronize();
+            s_ring_n = n;
             return;
         }
+    }
+    /* no batch after all: the thread idles until the end */
+}
+
+static void md_ring_stop(void)
+{
+    if (s_presenter != NULL) {
+        s_ring_run = 0;
+        ag_sem_give(s_ring_sem);
+        (void)ag_thread_join(s_presenter, 1000);
+        s_presenter = NULL;
     }
 }
 
 /* Black over the rows the picture does not cover, once: the console's text. */
 static void md_clear_glass(void)
 {
-    memset(s_band, 0, (size_t)s_band_rows * MD_WIDTH * sizeof(uint16_t));
-    for (int y = 0; y < (int)s_gi.height; y += s_band_rows) {
-        const int rows = ((int)s_gi.height - y < s_band_rows) ? (int)s_gi.height - y
-                                                               : s_band_rows;
-        const ag_blit_t b = {
-            .px = s_band, .stride = MD_WIDTH * sizeof(uint16_t),
-            .surf_w = s_gi.width, .surf_h = s_gi.height,
-            .x = 0, .y = (uint16_t)y, .w = s_gi.width, .h = (uint16_t)rows,
-        };
-        (void)ag_gfx_present(&b);
-    }
+    /* one black row, repeated down the glass by a stride of zero */
+    memset(s_line, 0, sizeof(s_line));
+    const ag_blit_t b = {
+        .px = s_line, .stride = 0,
+        .surf_w = s_gi.width, .surf_h = s_gi.height,
+        .x = 0, .y = 0, .w = s_gi.width, .h = s_gi.height,
+    };
+    (void)ag_gfx_present(&b);
 }
 
-/* Before the VDP draws `line`: its row in the band. */
-static void md_line_begin(int line)
+/*
+ * At each line of the emulation: which line of the picture to draw now, if
+ * any, with the VDP pointed at where it goes.  Without the batch it is the
+ * line the emulation is on; with it, the next the picture needs, while the
+ * batch is not on its way to the glass.
+ */
+static int md_line_begin(int scan)
 {
-    if (!s_headless) {
-        gwenesis_vdp_set_buffer(s_band + (size_t)(line % s_band_rows) * MD_WIDTH);
+    if (s_headless || s_ring_n == 0) {
+        if (scan >= screen_height) {
+            return -1;
+        }
+        gwenesis_vdp_set_buffer(s_line);
+        return scan;
     }
+    if (s_batch_full) {
+        return -1;
+    }
+    if (s_cursor >= screen_height) {
+        s_cursor = 0;
+    }
+    gwenesis_vdp_set_buffer(s_ring[s_batch_rows]);
+    return s_cursor;
 }
 
-/* After: send the band when it is full or the picture ends. */
+/* After: the row goes to the glass - with its batch, or sent from here. */
 static void md_line_end(int line)
 {
     if (s_headless) {
         return;
     }
-    const int row = line % s_band_rows;
-    if (row + 1 < s_band_rows && line + 1 < screen_height) {
+    if (s_ring_n == 0) {
+        const ag_time_t t0 = ag_micros();
+        md_present_rows(s_line, line, 1, screen_width, screen_height);
+        s_present_us += (uint32_t)(ag_micros() - t0);
         return;
     }
-    const int      w = screen_width;
-    const ag_blit_t b = {
-        .px = s_band,
-        .stride = MD_WIDTH * sizeof(uint16_t),
-        .surf_w = s_gi.width,
-        .surf_h = s_gi.height,
-        .x = (uint16_t)(((int)s_gi.width - w) / 2),
-        .y = (uint16_t)(((int)s_gi.height - screen_height) / 2 + line - row),
-        .w = (uint16_t)w,
-        .h = (uint16_t)(row + 1),
-    };
-    const ag_time_t t0 = ag_micros();
-    if (ag_gfx_present(&b) != AG_OK) {
-        s_present_bad++;
+    if (s_batch_rows == 0) {
+        s_batch_line = line;
+        s_batch_w = screen_width;
+        s_batch_h = screen_height;
     }
-    s_present_us += (uint32_t)(ag_micros() - t0);
+    s_batch_rows++;
+    s_cursor = line + 1;
+    if (s_batch_rows == s_ring_n || s_cursor >= screen_height) {
+        __sync_synchronize();
+        s_batch_full = 1;
+        ag_sem_give(s_ring_sem);
+        /* the thread empties the batch (s_batch_rows) before it lets go */
+    }
 }
 
 static int s_blocks; /* blocks the pages were cut from */
@@ -356,7 +489,7 @@ static int s_blocks; /* blocks the pages were cut from */
  */
 static unsigned fill_pages(unsigned char **pages, unsigned count, int iram)
 {
-    static const size_t k_sizes[] = {32768, 16384, 8192, 4096, 2048, 1024};
+    static const size_t k_sizes[] = {32768, 16384, 8192, 4096, 2048, 1024, 512};
     unsigned got = 0;
     unsigned s = 0;
 
@@ -405,7 +538,7 @@ static unsigned fill_pages(unsigned char **pages, unsigned count, int iram)
 }
 
 /*
- * The machine's memory, in 1 KB pages (md_pages.h).  VRAM first into IRAM,
+ * The machine's memory, in pages (md_pages.h).  VRAM first into IRAM,
  * which takes only word accesses - the VDP makes no other kind (VRAM_W in
  * gwenesis_vdp.h) - and which nothing else here could use; the VRAM pages that
  * do not fit there come from the heap last.
@@ -417,7 +550,7 @@ static int md_small_alloc(void)
     /*
      * The Z80's first page is the image's own: allocated with it at load,
      * before the heap is in pieces - by now what is left may not hold one more
-     * 1 KB block.
+     * block.
      */
     static unsigned char s_zram0[MD_PAGE] __attribute__((aligned(4)));
     unsigned zram = 0;
@@ -441,17 +574,20 @@ static int md_small_alloc(void)
     if (ram < MD_RAM_PAGES || zram < MD_ZRAM_PAGES || vram < MD_VRAM_PAGES) {
         ag_meminfo_t mi;
         ag_meminfo(&mi);
+#define MD_PAGES_KB(n) ((unsigned)((n) * MD_PAGE / 1024u))
         ag_printf("md: short of memory - 68000 RAM %u/64 KB, Z80 RAM %u/8 KB, "
                   "VRAM %u/64 KB (%u in IRAM), %d blocks; internal %u free\n",
-                  ram, zram, vram, in_iram, s_blocks, (unsigned)mi.fast_free);
+                  MD_PAGES_KB(ram), MD_PAGES_KB(zram), MD_PAGES_KB(vram),
+                  MD_PAGES_KB(in_iram), s_blocks, (unsigned)mi.fast_free);
         return 0;
     }
     M68K_RAM = md_ram[MD_RAM_PAGES - 1];
     ZRAM = md_zram[MD_ZRAM_PAGES - 1];
     VRAM = md_vram[0];
     ag_printf("md: 68000 RAM 64 KB, Z80 RAM %s, VRAM 64 KB (%u KB in IRAM) - "
-              "1 KB pages from %d blocks\n",
-              s_run_z80_cpu ? "8 KB" : "1 KB (no Z80)", in_iram, s_blocks);
+              "%u-byte pages from %d blocks\n",
+              s_run_z80_cpu ? "8 KB" : "one page (no Z80)", MD_PAGES_KB(in_iram),
+              (unsigned)MD_PAGE, s_blocks);
     return 1;
 }
 
@@ -671,15 +807,19 @@ resume_m68k:
             t0 = t1;
         }
 
-        if (render && scan_line < screen_height) {
 #ifdef ARGON_MD_SMALL
-            md_line_begin(scan_line);
-            gwenesis_vdp_render_line(scan_line);
-            md_line_end(scan_line);
-#else
-            gwenesis_vdp_render_line(scan_line);
-#endif
+        if (render) {
+            const int line = md_line_begin(scan_line);
+            if (line >= 0) {
+                gwenesis_vdp_render_line(line);
+                md_line_end(line);
+            }
         }
+#else
+        if (render && scan_line < screen_height) {
+            gwenesis_vdp_render_line(scan_line);
+        }
+#endif
         if (profile) {
             t1 = ag_micros();
             vdp_us += (uint64_t)(t1 - t0);
@@ -747,13 +887,29 @@ int ag_main(int argc, char **argv)
     int         stats = 0;
     int         want_livepad = 1;
     int         wait_card = 0;
+    /* rows a batch carries to the glass: with the display driver loaded and
+     * the glass's thread at 3 KB of stack, 3 leave the machine 1 KB short of
+     * its 64 KB RAM and 64 KB VRAM; `ringN` asks for N, `noring` for none */
+    int         ring_rows = 2;
 
     for (int i = 1; i < argc; i++) {
         if (arg_eq(argv[i], "waitcard")) {
             wait_card = 1;
             continue;
         }
-        if (arg_eq(argv[i], "headless")) {
+        if ((argv[i][0] == 'r' || argv[i][0] == 'R') &&
+            (argv[i][1] == 'i' || argv[i][1] == 'I') &&
+            (argv[i][2] == 'n' || argv[i][2] == 'N') &&
+            (argv[i][3] == 'g' || argv[i][3] == 'G') &&
+            looks_like_number(argv[i] + 4)) {
+            /* ringN: N rows of ring, 2..16 */
+            ring_rows = parse_int(argv[i] + 4, ring_rows);
+            ring_rows = ring_rows < 2 ? 2 : ring_rows > MD_RING_MAX ? MD_RING_MAX : ring_rows;
+            continue;
+        }
+        if (arg_eq(argv[i], "noring")) {
+            ring_rows = 0;
+        } else if (arg_eq(argv[i], "headless")) {
             s_headless = 1;
         } else if (arg_eq(argv[i], "fps20")) {
             present_div = 3;
@@ -851,24 +1007,41 @@ int ag_main(int argc, char **argv)
             }
         }
     }
-    if (rom_data == NULL || !md_small_alloc()) {
+    if (rom_data == NULL) {
         return 1;
     }
     /*
      * Lines are drawn one row at a time - a stride of zero, and md_line_begin
-     * says which row of the band.  Without a display (or with `headless`) the
-     * VDP's work is the same and the band is s_line, never sent.
+     * says which row.  Without a display (or with `headless`) the VDP's work
+     * is the same and the row is s_line, never sent.
      */
     gwenesis_vdp_set_buffer(s_line);
     gwenesis_vdp_set_buffer_stride(0);
-    if (!s_headless && ag_gfx_acquire(&s_gi) == AG_OK) {
-        md_band_alloc();
-        md_clear_glass();
-        ag_printf("md: picture on the %ux%u glass, a band of %d row(s)\n",
-                  (unsigned)s_gi.width, (unsigned)s_gi.height, s_band_rows);
-    } else {
+    /* The ring before the machine's pages; the glass after them - taking the
+     * display costs internal memory too, and it is the one that can be had
+     * last. */
+    if (!s_headless && ring_rows > 0) {
+        md_ring_start(ring_rows);
+    }
+    if (!md_small_alloc()) {
+        md_ring_stop();
+        return 1;
+    }
+    if (!s_headless && ag_gfx_acquire(&s_gi) != AG_OK) {
+        md_ring_stop();
+        s_ring_n = 0;
         s_headless = 1;
+    }
+    if (s_headless) {
         ag_printf("md: no picture - measuring\n");
+    } else {
+        md_clear_glass();
+        ag_printf("md: picture on the %ux%u glass, %s\n",
+                  (unsigned)s_gi.width, (unsigned)s_gi.height,
+                  s_ring_n ? "rows sent from the system core" : "rows sent from here");
+        if (s_ring_n) {
+            ag_printf("md: a ring of %d rows\n", s_ring_n);
+        }
     }
 #else
     if (ag_gfx_acquire(&s_gi) != AG_OK) {
@@ -921,6 +1094,7 @@ int ag_main(int argc, char **argv)
     uint64_t  work_max = 0;
     uint32_t  window = 0;
     ag_time_t window_t0 = ag_micros();
+    ag_time_t next_frame = window_t0;
     int       ran = 0;
 
     for (; !s_quit && (frames < 0 || ran < frames);) {
@@ -934,7 +1108,6 @@ int ag_main(int argc, char **argv)
             continue;
         }
 
-        const uint32_t  t0 = ag_millis();
         const ag_time_t f0 = ag_micros();
 
         const int show = (present_div <= 1) || ((ran % present_div) == 0);
@@ -987,9 +1160,20 @@ int ag_main(int argc, char **argv)
         }
 
         ag_yield();
-        const uint32_t dt = ag_millis() - t0;
-        if (dt < 16u) {
-            ag_delay(16u - dt);
+        /*
+         * Paced to the console's own frame, 16 683 us (NTSC, 59.94 Hz) - by a
+         * deadline that carries over, not by whole milliseconds from this
+         * frame's start: that ran at 62.5 frames a second wherever a frame
+         * took under 16 ms, which on the CYD is now.  A frame that falls
+         * further than two behind moves the deadline up rather than being
+         * caught up in a rush.
+         */
+        next_frame += 16683u;
+        const ag_time_t now = ag_micros();
+        if ((int64_t)(now - next_frame) > 2 * 16683) {
+            next_frame = now;
+        } else if (next_frame > now + 1000u) {
+            ag_delay((uint32_t)((next_frame - now) / 1000u));
         }
     }
 
@@ -998,6 +1182,13 @@ int ag_main(int argc, char **argv)
                      emu_sum, present_sum, work_max);
     }
     ag_printf("md: %d frames\n", ran);
+#ifdef ARGON_MD_SMALL
+    if (s_ring_n) {
+        ag_printf("md: %u rows to the glass, %u refused\n",
+                  (unsigned)s_ring_got, (unsigned)s_present_bad);
+    }
+    md_ring_stop();
+#endif
     md_sound_close();
     ag_gfx_release();
     return 0;

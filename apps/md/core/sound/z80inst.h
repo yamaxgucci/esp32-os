@@ -33,7 +33,7 @@ void gwenesis_z80inst_load_state();
 void z80_set_memory(unsigned char *buffer);
 
 #ifdef ARGON_MD_SMALL
-/* The CYD: the Z80's 8 KB in 1 KB pages (md_pages.h). */
+/* The CYD: the Z80's 8 KB in pages (md_pages.h). */
 #include "md_pages.h"
 #define MD_ZRAM(A) (md_zram[((A) & 0x1FFFu) >> MD_PAGE_SHIFT][(A) & MD_PAGE_MASK])
 #else
