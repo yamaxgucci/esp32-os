@@ -77,3 +77,17 @@ CONFIG_BT_ENABLED=n
 # The shop's code never fits an arena this board can afford, so it always runs
 # from flash: the eight kilobytes are better spent on the heap.
 CONFIG_ARGON_APP_ARENA_KB=4
+
+# The card's file system at the card's own sector size.  4096 is for a FAT on
+# internal flash (wear levelling), which this board does not have - C: is
+# littlefs.  At 4096 every one of the eight files the mount reserves carries a
+# 4 KB cache, and mounting the card took 44 KB of the 136 the board has free,
+# from the middle of its one 84 KB block (measured 28 Oct 2026, with the Mega
+# Drive needing 64 KB of it in one piece).  At 512, about 5 KB.
+CONFIG_FATFS_SECTOR_512=y
+CONFIG_FATFS_SECTOR_4096=n
+# ...and the wear-levelling layer's too: FatFs sizes every buffer to the larger
+# of the two (FF_MAX_SS = MAX(SD, WL) in ffconf.h), so 512 for the card alone
+# changed nothing - measured, 44 KB both ways.  Nothing here uses wear levelling.
+CONFIG_WL_SECTOR_SIZE_512=y
+CONFIG_WL_SECTOR_SIZE_4096=n
