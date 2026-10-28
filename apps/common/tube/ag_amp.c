@@ -2268,9 +2268,19 @@ void ag_amp_reset(ag_amp_t *a)
 #if defined(__GNUC__) && !defined(AG_HOST)
 __attribute__((flatten))
 #endif
+/*
+ * For bisecting a fault on the board, and for nothing else: with this set the
+ * oversampled path runs but the valves and their filters do not.  See the
+ * note on the dear samples in stomp.c.
+ */
+int g_ag_amp_no_stages;
+
 static AG_HOT float run_stages(ag_amp_t *a, float v)
 {
     int i;
+    if (g_ag_amp_no_stages) {
+        return v;
+    }
     if (a->tube[0].t != 0) {
         v = ag_tube_tick(&a->tube[0], v);
     }

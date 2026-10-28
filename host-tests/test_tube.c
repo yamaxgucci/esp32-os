@@ -2429,9 +2429,78 @@ static void test_couple_mul(void)
     free(probe);
 }
 
+/*
+ * A span too short to divide by.
+ *
+ * The antialiased reading is the integral of the curve over the span the input
+ * crossed, divided by the length of that span.  The span is measured as a
+ * position in a table of 2048 points, so near the top of the table two
+ * neighbouring float values are 1.2e-4 apart - and a span of a few of those is
+ * known to no useful precision at all, while the division by it multiplies
+ * whatever is left by ten thousand.
+ *
+ * The result is a single sample anywhere in the range of the curve: a click at
+ * full scale, with no block late and no frame lost, on a signal that is barely
+ * moving - which is the top of a loud note.  Maxim heard these as "a click
+ * every five to ten seconds" on settings where the converter was taking every
+ * frame it asked for, and the louder the model the more of them.
+ *
+ * The bound is the one an average obeys by definition, and that is the whole
+ * test: the average of a curve over a span cannot leave the range of the curve
+ * at the ends of it.
+ */
+static void test_short_span_does_not_explode(void)
+{
+    ag_ckt_t      *k = (ag_ckt_t *)malloc(sizeof(ag_ckt_t));
+    float         *tab = (float *)malloc(sizeof(float) * 2048 * 3);
+    ag_tube_spec_t sp;
+    ag_tube_t      tb;
+    int            i, step;
+
+    if (k == 0 || tab == 0) {
+        AG_CHECK(0);
+        free(k);
+        free(tab);
+        return;
+    }
+    ag_tube_spec_jcm800(&sp, 1);
+    ag_tube_init(&tb);
+    AG_CHECK_INT(ag_tube_bake(&tb, k, &sp, tab, tab + 2048, tab + 4096, 2048,
+                              1.0f, 0.0f, 0.01f), 0);
+    AG_CHECK(ag_tube_set_adaa(&tb, 1) != 0);
+
+    for (step = 1; step <= 64; step *= 2) {
+        for (i = 0; i <= 2000; i++) {
+            const float base = -3.0f + 6.0f * (float)i / 2000.0f;
+            float       v = base;
+            float       y, lo, hi, a, b;
+            int         u;
+
+            /* Settle on the base, so the span under test is base -> v. */
+            ag_tube_reset(&tb);
+            (void)ag_tube_tick(&tb, base);
+            (void)ag_tube_tick(&tb, base);
+
+            /* A few of the smallest steps this float can take. */
+            for (u = 0; u < step; u++) {
+                v = nextafterf(v, 1.0e9f);
+            }
+            y = ag_tube_tick(&tb, v);
+            a = ag_tube_curve(&tb, base);
+            b = ag_tube_curve(&tb, v);
+            lo = a < b ? a : b;
+            hi = a < b ? b : a;
+            AG_CHECK(y >= lo - 1.0e-3f && y <= hi + 1.0e-3f);
+        }
+    }
+    free(k);
+    free(tab);
+}
+
 void run_tube_tests(void)
 {
     test_spec_matches_bench();
+    test_short_span_does_not_explode();
     test_curve_is_a_valve();
     test_adaa_arithmetic();
     test_blocking();

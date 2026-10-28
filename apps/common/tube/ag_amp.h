@@ -612,6 +612,9 @@ typedef struct ag_amp {
 
 } ag_amp_t;
 
+/* Bisecting switch; see ag_amp.c.  Zero in every build that plays. */
+extern int g_ag_amp_no_stages;
+
 /* fs, two stages of a hot JCM800 front end, 4x with antialiasing, and the two
  * voicing numbers where the design asked for them.  The same as ag_amp_model
  * with AG_AMP_MODEL_JCM800, and it stays the name every tool and note uses. */
