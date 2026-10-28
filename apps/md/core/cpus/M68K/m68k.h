@@ -163,7 +163,11 @@
 	 * array - 64 KB is cheap and it is touched on nearly every instruction.
 	 */
 	extern unsigned char *ROM_DATA;
+#ifdef ARGON_MD_SMALL
+	extern unsigned char *M68K_RAM; /* the CYD: from the heap, md_main */
+#else
 	extern unsigned char M68K_RAM[];
+#endif
 #else
 
 	extern unsigned char ROM_DATA[];

@@ -75,6 +75,13 @@ __license__ = "GPLv3"
 #define STATUS_PAL (1 << 0)
 
 #define VRAM_MAX_SIZE 0x10000    // VRAM maximum size
+#ifdef ARGON_MD_BENCH_VRAM32
+/* MEASUREMENT ONLY: 32 KB of VRAM, addresses folded into it.  The picture is
+ * wrong; the work a frame costs is not.  Not a build anyone plays. */
+#define VRAM_MASK 0x7FFF
+#else
+#define VRAM_MASK 0xFFFF
+#endif
 #define CRAM_MAX_SIZE 0x40       // CRAM maximum size
 #define VSRAM_MAX_SIZE 0x40      // VSRAM maximum size
 #define SAT_CACHE_MAX_SIZE 0x400 // SAT CACHE maximum size

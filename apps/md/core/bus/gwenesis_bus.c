@@ -65,7 +65,11 @@ unsigned char *M68K_RAM=(void *)(uint32_t)(0); // 68K RAM
 #elif ARGON_TARGET != 0
 
 unsigned char *ROM_DATA = 0;          // points at the loaded cartridge image
+#ifdef ARGON_MD_SMALL
+unsigned char *M68K_RAM;              // the CYD: from the heap (md_main)
+#else
 unsigned char M68K_RAM[MAX_RAM_SIZE]; // 68K RAM
+#endif
 #else
 
 unsigned char ROM_DATA[MAX_ROM_SIZE]; // 68K Main Program (uncompressed)
@@ -74,7 +78,11 @@ unsigned char M68K_RAM[MAX_RAM_SIZE];    // 68K RAM
 
 
 // Setup Z80 Memory
+#ifdef ARGON_MD_SMALL
+unsigned char *ZRAM;
+#else
 unsigned char ZRAM[MAX_Z80_RAM_SIZE]; // Z80 RAM
+#endif
 unsigned char TMSS[0x4];
 extern unsigned short gwenesis_vdp_status;
 
@@ -123,11 +131,17 @@ void load_cartridge(unsigned char *buffer, size_t size)
 
     ROM_DATA = buffer;
 
+#ifndef ARGON_MD_SMALL
     for (size_t i = 0; i + 1 < size; i += 2) {
         unsigned char z = ROM_DATA[i];
         ROM_DATA[i] = ROM_DATA[i + 1];
         ROM_DATA[i + 1] = z;
     }
+#else
+    /* the CYD maps the cartridge out of flash, read-only: it was swapped on
+     * the host (tools/mdswap) */
+    (void)size;
+#endif
 
     set_region();
 }

@@ -32,6 +32,7 @@ static int16_t  s_dac;
 static int      s_clock;
 
 /* OPN MUL nibble → ag_fm x2 units (0 → 0.5). */
+#ifndef ARGON_MD_SMALL
 static uint16_t mul_x2(uint8_t opn_mul)
 {
     opn_mul &= 0x0fu;
@@ -268,3 +269,15 @@ void md_ym_render(int16_t *left, int16_t *right, int samples)
 
 void gwenesis_ym2612_save_state(void) {}
 void gwenesis_ym2612_load_state(void) {}
+#else /* ARGON_MD_SMALL: no YM2612 on the CYD yet */
+void YM2612Init(void) {}
+void YM2612Config(unsigned char dac_bits) { (void)dac_bits; }
+void YM2612ResetChip(void) {}
+void YM2612Write(unsigned int a, unsigned int v, int target) { (void)a; (void)v; (void)target; }
+unsigned int YM2612Read(int target) { (void)target; return 0; }
+void md_ym_render(int16_t *left, int16_t *right, int samples) { (void)left; (void)right; (void)samples; }
+void ym2612_run(int target) { (void)target; }
+void md_ym_frame_begin(int lines_per_frame) { (void)lines_per_frame; }
+void gwenesis_ym2612_save_state(void) {}
+void gwenesis_ym2612_load_state(void) {}
+#endif

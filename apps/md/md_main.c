@@ -22,7 +22,16 @@
 #include "z80inst.h"
 
 /* 24 KB stack: with OpenEth/lwIP the largest internal free block is ~31 KB. */
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD (ESP32, no PSRAM): the machine's own memory is asked for at start
+ * (md_small_alloc), the cartridge is mapped out of flash, and with no display
+ * driver loaded it runs without a picture - which is how it is measured.
+ */
+AG_APP_SIZED("MD", "0.1", "argon", 0, 12 * 1024, 4 * 1024);
+#else
 AG_APP_SIZED("MD", "0.1", "argon", AG_AXE_NEEDS_GFX, 24 * 1024, 5 * 1024 * 1024);
+#endif
 
 /*
  * The cores expect these two to live in the platform: every logging site and the
@@ -244,6 +253,60 @@ static unsigned char *load_rom_file(const char *path, size_t *size_out)
     *size_out = got;
     return buf;
 }
+
+#ifdef ARGON_MD_SMALL
+extern unsigned char *M68K_RAM;
+extern unsigned char *ZRAM;
+extern unsigned char *VRAM;
+static int            s_headless;
+static unsigned short s_line[MD_WIDTH];
+
+static void *small_alloc(size_t n, const char *what)
+{
+    void *p = ag_malloc_caps(n, AG_MEM_FAST);
+    if (p == NULL) {
+        p = ag_malloc(n);
+    }
+    if (p == NULL) {
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        ag_printf("md: no %u bytes for %s (internal %u free to this process)\n",
+                  (unsigned)n, what, (unsigned)mi.fast_free);
+    }
+    return p;
+}
+
+/* The machine's memory: biggest first, while the heap still has its big piece. */
+static int md_small_alloc(void)
+{
+    M68K_RAM = (unsigned char *)small_alloc(0x10000, "68000 RAM");
+    VRAM = M68K_RAM ? (unsigned char *)small_alloc(VRAM_MASK + 1u, "VRAM") : NULL;
+    ZRAM = VRAM ? (unsigned char *)small_alloc(0x2000, "Z80 RAM") : NULL;
+    if (ZRAM == NULL) {
+        return 0;
+    }
+    ag_printf("md: 68000 RAM 64 KB, VRAM %u KB, Z80 RAM 8 KB - from the heap\n",
+              (unsigned)((VRAM_MASK + 1u) / 1024u));
+    return 1;
+}
+
+/* Read in place out of flash; the host swapped its bytes (load_cartridge). */
+static unsigned char *map_rom(const char *path, size_t *size_out)
+{
+    const void *ptr = NULL;
+    uint64_t    len = 0;
+    const ag_time_t t0 = ag_micros();
+    const ag_err_t err = ag_map(path, &ptr, &len);
+    if (err != AG_OK) {
+        ag_printf("md: %s: %s\n", path, ag_strerror(err));
+        return NULL;
+    }
+    ag_printf("md: %s, %u KB, staged in flash in %u ms\n", path,
+              (unsigned)(len / 1024u), (unsigned)((ag_micros() - t0) / 1000u));
+    *size_out = (size_t)len;
+    return (unsigned char *)ptr;
+}
+#endif
 
 static void bind_vdp_to_fb(const ag_gfxinfo_t *info)
 {
@@ -567,16 +630,36 @@ int ag_main(int argc, char **argv)
 
     md_sound_set_path(sound_path);
 
+#ifdef ARGON_MD_SMALL
+    if (!md_small_alloc()) {
+        return 1;
+    }
+    /*
+     * Without a display: every line is drawn - the VDP's work is the same -
+     * into one row of 320 pixels, a stride of zero putting each line over the
+     * last.
+     */
+    s_headless = 1;
+    gwenesis_vdp_set_buffer(s_line);
+    gwenesis_vdp_set_buffer_stride(0);
+    ag_printf("md: no picture - measuring\n");
+#else
     if (ag_gfx_acquire(&s_gi) != AG_OK) {
         ag_printf("md: gfx acquire failed\n");
         return 1;
     }
     ag_gfx_clear(0x00000000u);
     bind_vdp_to_fb(&s_gi);
+#endif
 
     size_t         rom_size = 0;
+#ifdef ARGON_MD_SMALL
+    unsigned char *rom_data = (rom != NULL) ? map_rom(rom, &rom_size)
+                                            : make_tiny_rom(&rom_size);
+#else
     unsigned char *rom_data = (rom != NULL) ? load_rom_file(rom, &rom_size)
                                             : make_tiny_rom(&rom_size);
+#endif
     if (rom_data == NULL) {
         ag_gfx_release();
         return 1;
@@ -638,7 +721,11 @@ int ag_main(int argc, char **argv)
         run_frame(show);
 
         const ag_time_t f1 = ag_micros();
+#ifdef ARGON_MD_SMALL
+        if (show && !s_headless) {
+#else
         if (show) {
+#endif
             ag_gfx_flush((uint16_t)s_ox, (uint16_t)s_oy, MD_WIDTH,
                          (uint16_t)screen_height);
         }

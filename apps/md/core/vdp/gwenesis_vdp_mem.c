@@ -65,7 +65,11 @@ void vdpm_log(const char *subs, const char *fmt, ...) {
   extern uint8_t emulator_framebuffer[1024*64];
   unsigned char* VRAM = &emulator_framebuffer[0];
 #else
+#ifdef ARGON_MD_SMALL
+  unsigned char *VRAM;
+#else
   unsigned char VRAM[VRAM_MAX_SIZE];
+#endif
 #endif
 
 unsigned short CRAM[CRAM_MAX_SIZE];           // CRAM - Palettes
@@ -112,7 +116,7 @@ extern bool sprite_collision;
 //static int DMA_RUN=0;
 
 // 16 bits access to VRAM
-#define FETCH16(A) ( ( (*(unsigned short *)&VRAM[(A)]) >> 8 ) | ( (*(unsigned short *)&VRAM[(A)]) << 8 ) )
+#define FETCH16(A) ( ( (*(unsigned short *)&VRAM[(A) & VRAM_MASK]) >> 8 ) | ( (*(unsigned short *)&VRAM[(A) & VRAM_MASK]) << 8 ) )
 
 
 /******************************************************************************
@@ -150,7 +154,7 @@ int m68k_irq_acked(int irq) {
 
 
 void gwenesis_vdp_reset() {
-  memset(VRAM, 0, VRAM_MAX_SIZE);
+  memset(VRAM, 0, VRAM_MASK + 1);
   memset(SAT_CACHE, 0, sizeof(SAT_CACHE));
   memset(CRAM, 0, sizeof(CRAM));
   memset(CRAM565, 0, sizeof(CRAM565));
@@ -337,7 +341,7 @@ void push_fifo(unsigned int value)
 static inline __attribute__((always_inline))
 void gwenesis_vdp_vram_write(unsigned int address, unsigned int value)
 {
-  VRAM[address] = value;
+  VRAM[address & VRAM_MASK] = value;
 
   // Update internal SAT Cache
   // used in Castlevania Bloodlines
@@ -664,7 +668,7 @@ void gwenesis_vdp_dma_copy()
 
     do
     {
-        unsigned short value = VRAM[src_addr_low ^ 1];
+        unsigned short value = VRAM[(src_addr_low ^ 1) & VRAM_MASK];
         gwenesis_vdp_vram_write((address_reg ^ 1) & 0xFFFF, value);
 
         address_reg += REG15_DMA_INCREMENT;
@@ -705,8 +709,8 @@ unsigned int gwenesis_vdp_read_data_port_16()
         {
         case 0x0:
             // No byteswapping here
-            value = VRAM[(address_reg)&0xFFFE] << 8;
-            value |= VRAM[(address_reg | 1) & 0xFFFF];
+            value = VRAM[(address_reg) & 0xFFFE & VRAM_MASK] << 8;
+            value |= VRAM[(address_reg | 1) & VRAM_MASK];
             address_reg += REG15_DMA_INCREMENT;
             address_reg &= 0xFFFF;
             //vdpm_log(__FUNCTION__,"%04x",value);
@@ -732,7 +736,7 @@ unsigned int gwenesis_vdp_read_data_port_16()
 
             return value;
         case 0xC: /* 8-Bit memory access */
-            value = VRAM[(address_reg ^ 1) & 0xFFFF];
+            value = VRAM[(address_reg ^ 1) & VRAM_MASK];
             value = (value & VRAM8_BITMASK) | (fifo[3] & ~VRAM8_BITMASK);
             address_reg += REG15_DMA_INCREMENT;
             address_reg &= 0xFFFF;

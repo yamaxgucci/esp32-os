@@ -43,7 +43,11 @@ extern unsigned char* VRAM;
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
+#ifdef ARGON_MD_SMALL
+extern unsigned char *VRAM;
+#else
 extern unsigned char VRAM[];
+#endif
 
 #endif
 
@@ -101,7 +105,7 @@ static int Window_firstcol;
 static int Window_lastcol;
 
 // 16 bits access to VRAM
-#define FETCH16VRAM(A)  ( (VRAM[(A)+1]) | (VRAM[(A)] << 8) )
+#define FETCH16VRAM(A)  ( (VRAM[((A)+1) & VRAM_MASK]) | (VRAM[(A) & VRAM_MASK] << 8) )
 
 #define VDP_GFX_DISABLE_LOGGING 1
 
@@ -431,9 +435,9 @@ void draw_pattern_sprite(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(unsigned int *)(VRAM + ((name & 0x07FF) << 5) + ((7 - paty) * 4)); //) pat_addr;
+    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
   else
-    pattern = *(unsigned int *)(VRAM + ((name & 0x07FF) << 5) + (paty * 4));
+    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
 
   // Horizontal flip ?
   if (name & 0x0800)
@@ -465,9 +469,9 @@ void draw_pattern_sprite_over_planes(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(unsigned int *)(VRAM + ((name & 0x07FF) << 5) + ((7 - paty) * 4)); //) pat_addr;
+    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
   else
-    pattern = *(unsigned int *)(VRAM + ((name & 0x07FF) << 5) + (paty * 4));
+    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
 
   // Horizontal flip ?
   if (name & 0x0800)
@@ -489,9 +493,9 @@ void draw_pattern_planeB(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(unsigned int *)(VRAM + ((name & 0x07FF) << 5) + ((7 - paty) * 4)); //) pat_addr;
+    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
   else
-    pattern = *(unsigned int *)(VRAM + ((name & 0x07FF) << 5) + (paty * 4));
+    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
 
 //  if ((*(unsigned int *)pattern) == 0 ) return;
  // uint8_t *pattern = VRAM + ((name << 5) & 0xFFFF); //) pat_addr;
@@ -528,9 +532,9 @@ void draw_pattern_planeA(uint8_t *scr, uint16_t name, int paty) {
 
   // Vertical flip ?
   if (name & 0x1000)
-    pattern = *(unsigned int *)(VRAM + ((name & 0x07FF) << 5) + ((7 - paty) * 4)); //) pat_addr;
+    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + ((7 - paty) * 4)) & VRAM_MASK)); //) pat_addr;
   else
-    pattern = *(unsigned int *)(VRAM + ((name & 0x07FF) << 5) + (paty * 4));
+    pattern = *(unsigned int *)(VRAM + ((((name & 0x07FF) << 5) + (paty * 4)) & VRAM_MASK));
 
   // Horizontal flip ?
   if (name & 0x0800)
@@ -732,7 +736,7 @@ void draw_sprites_over_planes(int line)
    // uint8_t mask = mode_h40 ? 0x7E : 0x7F;
    // uint8_t *start_table = VRAM + ((gwenesis_vdp_regs[5] & mask) << 9);
 
-    uint8_t *start_table = VRAM + REG5_SAT_ADDRESS;
+    uint8_t *start_table = VRAM + (REG5_SAT_ADDRESS & VRAM_MASK);
 
     // This is both the size of the table as seen by the VDP
     // *and* the maximum number of sprites that are processed
@@ -840,7 +844,7 @@ void draw_sprites(int line)
   // uint8_t mask = mode_h40 ? 0x7E : 0x7F;
   // uint8_t *start_table = VRAM + ((gwenesis_vdp_regs[5] & mask) << 9);
 
-  uint8_t *start_table = VRAM + REG5_SAT_ADDRESS;
+  uint8_t *start_table = VRAM + (REG5_SAT_ADDRESS & VRAM_MASK);
 
   // This is both the size of the table as seen by the VDP
   // *and* the maximum number of sprites that are processed
