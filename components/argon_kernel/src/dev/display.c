@@ -537,7 +537,29 @@ static uint16_t  s_br_rows;
 static uint32_t  s_br_lost;   /* operations that did not fit, this list  */
 static bool      s_br_moaned;
 
-static bool br_on(void) { return s_surfaceless && s_br_list != NULL; }
+/*
+ * MADE ON THE FIRST PRIMITIVE, NOT AT ACQUIRE (28 Oct 2026).  The strip and the
+ * list are 12 KB, and an application that hands over finished pixels with
+ * gfx->present never draws a primitive: on the CYD that was the Mega Drive,
+ * which needed those 12 KB for the rows it sends.  So acquire only says the
+ * list may be made, and the first primitive makes it - once per acquire, so a
+ * board without the memory says so once and draws nothing, as before.
+ */
+static bool s_br_pending;
+static void br_take(void);
+
+/* The list exists: flush and swap have something to render. */
+static bool br_live(void) { return s_surfaceless && s_br_list != NULL; }
+
+/* A primitive is about to be recorded: the list, made now if it is not yet. */
+static bool br_on(void)
+{
+    if (s_surfaceless && s_br_list == NULL && s_br_pending) {
+        s_br_pending = false;
+        br_take();
+    }
+    return br_live();
+}
 
 static void br_free(void)
 {
@@ -1299,7 +1321,8 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
         s_clip_y = 0;
         s_clip_w = 0;
         s_clip_h = 0;
-        br_take(); /* the primitives draw through a list now; see br_render */
+        br_free();
+        s_br_pending = true; /* the primitives draw through a list, made on the first (br_on) */
         if (out != NULL) {
             out->width = pw;
             out->height = ph;
@@ -1365,6 +1388,7 @@ static void gfx_release(void)
     if (s_surfaceless) {
         shim_kick(); /* whatever was still pending is this app's last frame */
         br_free();   /* nothing is held while nobody has the screen */
+        s_br_pending = false;
         s_acquired = false;
         s_owner = AG_PID_KERNEL;
         drivers_held(false);
@@ -1409,7 +1433,7 @@ static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
      * see shim_kick - but one that does gets its whole frame in one request.
      */
     if (s_surfaceless) {
-        if (br_on()) {
+        if (br_live()) {
             br_flush((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h);
             s_shim_seen = true; /* the primitives did draw, so no warning */
         }
@@ -1447,7 +1471,7 @@ static void gfx_swap(void)
         return;
     }
     if (s_surfaceless) {
-        if (br_on()) {
+        if (br_live()) {
             br_flush(0, 0, 0, 0);
             s_shim_seen = true;
         }
