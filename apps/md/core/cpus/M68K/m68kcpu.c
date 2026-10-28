@@ -242,7 +242,7 @@ void m68k_set_irq_delay(unsigned int int_level)
       m68ki_trace_t1() /* auto-disable (see m68kcpu.h) */
       m68ki_use_data_space() /* auto-disable (see m68kcpu.h) */
       REG_IR = m68ki_read_imm_16();
-      m68ki_instruction_jump_table[REG_IR]();
+      MD_DISPATCH(REG_IR);
       m68ki_exception_if_trace() /* auto-disable (see m68kcpu.h) */
       irq_latency = 0;
     }
@@ -309,7 +309,7 @@ void m68k_run(unsigned int cycles)
 //    printf("PC=%x IR=%x CYCLES=%d \n",m68k.pc,REG_IR,CYC_OF(REG_IR));
 
     /* Execute instruction */
-    m68ki_instruction_jump_table[REG_IR]();
+    MD_DISPATCH(REG_IR);
     USE_CYCLES(CYC_OF(REG_IR));
 
     /* Trace m68k_exception, if necessary */

@@ -279,13 +279,16 @@ static void *small_alloc(size_t n, const char *what)
 /* The machine's memory: biggest first, while the heap still has its big piece. */
 static int md_small_alloc(void)
 {
-    M68K_RAM = (unsigned char *)small_alloc(0x10000, "68000 RAM");
+    extern unsigned char *md_ram[2];
+    md_ram[0] = (unsigned char *)small_alloc(0x8000, "68000 RAM, low half");
+    md_ram[1] = md_ram[0] ? (unsigned char *)small_alloc(0x8000, "68000 RAM, high half") : NULL;
+    M68K_RAM = md_ram[1];
     VRAM = M68K_RAM ? (unsigned char *)small_alloc(VRAM_MASK + 1u, "VRAM") : NULL;
     ZRAM = VRAM ? (unsigned char *)small_alloc(0x2000, "Z80 RAM") : NULL;
     if (ZRAM == NULL) {
         return 0;
     }
-    ag_printf("md: 68000 RAM 64 KB, VRAM %u KB, Z80 RAM 8 KB - from the heap\n",
+    ag_printf("md: 68000 RAM 2 x 32 KB, VRAM %u KB, Z80 RAM 8 KB - from the heap\n",
               (unsigned)((VRAM_MASK + 1u) / 1024u));
     return 1;
 }

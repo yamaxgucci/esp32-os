@@ -66,7 +66,8 @@ unsigned char *M68K_RAM=(void *)(uint32_t)(0); // 68K RAM
 
 unsigned char *ROM_DATA = 0;          // points at the loaded cartridge image
 #ifdef ARGON_MD_SMALL
-unsigned char *M68K_RAM;              // the CYD: from the heap (md_main)
+unsigned char *M68K_RAM;              // unused on the CYD: md_ram[]
+unsigned char *md_ram[2];             // two 32 KB halves (md_main)
 #else
 unsigned char M68K_RAM[MAX_RAM_SIZE]; // 68K RAM
 #endif
@@ -102,7 +103,12 @@ int tmss_count = 0;
 void load_cartridge()
 {
     // Clear all volatile memory
+#ifdef ARGON_MD_SMALL
+    memset(md_ram[0], 0, 0x8000);
+    memset(md_ram[1], 0, 0x8000);
+#else
     memset(M68K_RAM, 0, MAX_RAM_SIZE);
+#endif
     memset(ZRAM, 0, MAX_Z80_RAM_SIZE);
 
     // Set Z80 Memory as Z80_RAM
@@ -123,7 +129,12 @@ void load_cartridge()
  */
 void load_cartridge(unsigned char *buffer, size_t size)
 {
+#ifdef ARGON_MD_SMALL
+    memset(md_ram[0], 0, 0x8000);
+    memset(md_ram[1], 0, 0x8000);
+#else
     memset(M68K_RAM, 0, MAX_RAM_SIZE);
+#endif
     memset(ZRAM, 0, MAX_Z80_RAM_SIZE);
 
     z80_set_memory(ZRAM);
@@ -151,7 +162,12 @@ void load_cartridge(unsigned char *buffer, size_t size)
 void load_cartridge(unsigned char *buffer, size_t size)
 {
     // Clear all volatile memory
+#ifdef ARGON_MD_SMALL
+    memset(md_ram[0], 0, 0x8000);
+    memset(md_ram[1], 0, 0x8000);
+#else
     memset(M68K_RAM, 0, MAX_RAM_SIZE);
+#endif
     memset(ZRAM, 0, MAX_Z80_RAM_SIZE);
     memset(ROM_DATA, 0, MAX_ROM_SIZE);
 

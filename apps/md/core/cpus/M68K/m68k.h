@@ -190,6 +190,24 @@
 #define WRITE32RAM(A, V) ((*(unsigned int   *)( (A)&0XFFFF))      = (((V) << 16) | ((V) >> 16)))
 #else
 
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD: 64 KB in one piece is more than its heap has to give once the image
+ * is loaded, so work RAM is two 32 KB halves, chosen by bit 15.  A long access
+ * is two word accesses, so one that crosses from one half to the other (or
+ * wraps at the top) is still right.  Words are stored as the core always kept
+ * them: a long's high word at the lower address.
+ */
+extern unsigned char *md_ram[2];
+#define MD_RAMP(A) (md_ram[((A) >> 15) & 1] + ((A) & 0x7FFF))
+#define FETCH8RAM(A) (*MD_RAMP((A) ^ 1))
+#define FETCH16RAM(A) (*(unsigned short *)MD_RAMP(A))
+#define FETCH32RAM(A) ((((unsigned int)FETCH16RAM(A)) << 16) | FETCH16RAM((A) + 2))
+#define WRITE8RAM(A, V) (*MD_RAMP((A) ^ 1) = (V))
+#define WRITE16RAM(A, V) (*(unsigned short *)MD_RAMP(A) = (V))
+#define WRITE32RAM(A, V) do { WRITE16RAM((A), (unsigned short)((V) >> 16)); \
+                              WRITE16RAM((A) + 2, (unsigned short)(V)); } while (0)
+#else
 #define FETCH8RAM(A) ((M68K_RAM[(A ^ 1) & 0xFFFF]))
 #define FETCH16RAM(A) ((*(unsigned short *)&M68K_RAM[(A)&0XFFFF]))
 #define FETCH32RAM(A) ( (*(unsigned int *)&M68K_RAM[(A&0XFFFF)] << 16) | (*(unsigned int *)&M68K_RAM[(A&0XFFFF)] >> 16) )
@@ -197,6 +215,7 @@
 #define WRITE8RAM(A, V) (M68K_RAM[(A ^ 1) & 0xFFFF] = (V))
 #define WRITE16RAM(A, V) ((*(unsigned short *)&M68K_RAM[(A)&0XFFFF] = (V)))
 #define WRITE32RAM(A, V) ((*(unsigned int *)&M68K_RAM[(A)&0XFFFF] =( ((V) << 16) | ((V) >> 16) ) ))
+#endif
 
 #endif
 

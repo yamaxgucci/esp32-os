@@ -23673,7 +23673,13 @@ static void m68k_op_unlk_32(void)
 #ifndef BUILD_TABLES
 
   #ifndef TABLES_FULL
+    #ifdef ARGON_MD_SMALL
+    #include "m68ki_jump_small.h"
+    #define MD_DISPATCH(op) (MD_HANDLER(op)())
+#else
     #include "m68ki_instruction_jump_table.h"
+    #define MD_DISPATCH(op) (m68ki_instruction_jump_table[(op)]())
+#endif
   #else
     #include "m68ki_instruction_jump_table_full.h"
   #endif

@@ -9,7 +9,12 @@
 #include "audio_out.h"
 
 #define WAV_HDR 44u
+#ifdef ARGON_MD_SMALL
+/* the CYD build has no YM2612 yet: 8 KB of buffers it does not use (clamped below) */
+#define MD_SOUND_MAX_FRAME 16
+#else
 #define MD_SOUND_MAX_FRAME 512 /* 22050/50 + slack */
+#endif
 
 enum {
     MD_SINK_DEV = 0,
