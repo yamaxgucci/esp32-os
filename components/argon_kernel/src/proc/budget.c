@@ -115,9 +115,28 @@ static uint32_t          s_idle_tick; /* ticks into the idle window, core 0 */
  * memory region accessed".  So it only marks, and somebody in task context
  * comes round to look.
  */
+/*
+ * HOW LONG A TICK TAKES, per core.
+ *
+ * Hunting a click in the amplifier (14 Oct 2026) the measurement came down
+ * to this: with a constant input, where every sample is the same arithmetic
+ * on the same numbers, one sample in a hundred costs five times the rest,
+ * and the rate of those is about the tick rate.  Whether the tick is really
+ * what costs that is not a thing to reason about - the tick can be timed.
+ *
+ * The cycle counter and nothing else: it is a register on this core, it
+ * cannot be wrong about its own core, and it works with the instruction
+ * cache switched off, which the comment at the top of tick_hw.c says this
+ * runs with.
+ */
+uint32_t g_ag_tick_max[2];
+uint32_t g_ag_tick_over[2];
+uint32_t g_ag_tick_n[2];
+uint64_t g_ag_tick_cycles[2];
+
 static void AG_PORT_IRAM budget_tick(int core, ag_port_task_t running)
 {
-    (void)core;
+    const uint32_t t_in = ag_port_cycles();
 
     /*
      * The window is counted on core 0 alone.  Both cores tick, and a window
@@ -173,7 +192,29 @@ static void AG_PORT_IRAM budget_tick(int core, ag_port_task_t running)
     }
 
     if (running == NULL) {
+        if (core >= 0 && core < 2) {
+            const uint32_t took = ag_port_cycles() - t_in;
+            g_ag_tick_n[core]++;
+            g_ag_tick_cycles[core] += took;
+            if (took > g_ag_tick_max[core]) {
+                g_ag_tick_max[core] = took;
+            }
+            if (took > 7200u) {
+                g_ag_tick_over[core]++;
+            }
+        }
         return;
+    }
+    if (core >= 0 && core < 2) {
+        const uint32_t took = ag_port_cycles() - t_in;
+        g_ag_tick_n[core]++;
+        g_ag_tick_cycles[core] += took;
+        if (took > g_ag_tick_max[core]) {
+            g_ag_tick_max[core] = took;
+        }
+        if (took > 7200u) { /* 30 us at 240 MHz */
+            g_ag_tick_over[core]++;
+        }
     }
     for (uint32_t i = 0; i < s_nslots; i++) {
         if (s_slots[i].task != running) {
