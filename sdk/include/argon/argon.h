@@ -193,6 +193,16 @@ static inline bool ag_module_task(void (*fn)(void *), void *arg,
 
 #define ag_log(lvl, tag, ...) (g_ag_api->sys->log((lvl), (tag), __VA_ARGS__))
 
+/*
+ * True while a converter is clocking frames out.  Anything that was about to
+ * touch the flash should ask: reading it stops both cores for as long as the
+ * read takes.  See the note on audio_live in abi.h.
+ */
+static inline bool ag_audio_live(void)
+{
+    return AG_HAS(g_ag_api->sys, audio_live) && g_ag_api->sys->audio_live();
+}
+
 /* ---- memory ------------------------------------------------------------- */
 
 static inline void *ag_malloc(size_t n) { return g_ag_api->mem->alloc(n); }

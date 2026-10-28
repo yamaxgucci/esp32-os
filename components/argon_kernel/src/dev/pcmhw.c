@@ -26,6 +26,7 @@
 #include "argon/log.h"
 
 #include <argon/port/audio.h>
+#include <argon/port/flash.h> /* the guard while frames are moving */
 #include <argon/port/time.h>
 
 #include "io.h" /* ag_io_i2c_up, for a board whose output is a codec */
@@ -80,6 +81,8 @@ static void hw_close(void)
     if (s_hw_open) {
         ag_port_audio_close();
         s_hw_open = false;
+        /* The flash may move again; see ag_port_flash_guard. */
+        ag_port_flash_guard(-1);
     }
 }
 
@@ -135,6 +138,18 @@ static ag_err_t hw_open(void)
     s_retry_us = 0;
     s_backoff_ms = 0;
     s_hw_open = true;
+    /*
+     * FROM HERE UNTIL THE CONVERTER STOPS, THE FLASH MUST STAND STILL.
+     *
+     * Not because this driver reads it - it does not - but because anything
+     * else on the board that does switches the cache off for both cores, and
+     * the frames this converter is clocking out do not wait.  The guard is
+     * raised here rather than by the application because the application is
+     * not who breaks the rule: the radio writing its calibration, a log line
+     * reaching a file and a configuration being read all do, and none of them
+     * can know that something is playing.  See ag_port_flash_guard.
+     */
+    ag_port_flash_guard(1);
     return AG_OK;
 }
 

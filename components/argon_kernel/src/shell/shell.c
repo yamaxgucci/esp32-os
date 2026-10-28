@@ -486,6 +486,98 @@ static int mem_tasks(void)
  * The question "is it the wire or the board" needs this answer first: a
  * board whose link tasks never get to run looks exactly like a slow wire.
  */
+#include <argon/port/flash.h>
+
+extern uint32_t g_ag_tick_max[2];
+extern uint32_t g_ag_tick_over[2];
+extern uint32_t g_ag_tick_n[2];
+extern uint64_t g_ag_tick_cycles[2];
+
+/*
+ * What the system tick costs, per core, since the last time this was asked.
+ *
+ * It is here rather than in a report of its own because it answers the same
+ * question as `cpu`: where the core went.  `cpu` counts whole ticks and so
+ * cannot see the tick itself, which is the one piece of work every task on
+ * the board pays for and none of them can refuse.
+ */
+static int cmd_tick(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    for (int core = 0; core < 2; core++) {
+        const uint32_t n = g_ag_tick_n[core];
+        if (n == 0u) {
+            continue;
+        }
+        ag_console_printf("core %d: %u ticks, mean %u us, worst %u us, "
+                          "%u over 30 us\n",
+                          core, (unsigned)n,
+                          (unsigned)((g_ag_tick_cycles[core] / n) / 240u),
+                          (unsigned)(g_ag_tick_max[core] / 240u),
+                          (unsigned)g_ag_tick_over[core]);
+        g_ag_tick_max[core] = 0;
+        g_ag_tick_over[core] = 0;
+        g_ag_tick_n[core] = 0;
+        g_ag_tick_cycles[core] = 0;
+    }
+    return 0;
+}
+
+/*
+ * WHAT THE FLASH HAS BEEN ASKED TO DO WHILE SOUND WAS PLAYING.
+ *
+ * Reading or writing this flash switches the cache off for the whole chip,
+ * so an audio application loses frames over somebody else's file.  The
+ * converter raises a guard while it is clocking frames (see the port's
+ * flash.h); this reports what that guard has seen, and switches refusal on.
+ */
+static int cmd_flash(int argc, char **argv)
+{
+    if (argc > 1 && ag_path_icmp(argv[1], "strict") == 0) {
+        const bool on = (argc <= 2) || ag_path_icmp(argv[2], "off") != 0;
+        ag_port_flash_strict(on);
+        ag_console_printf("flash: %s while sound plays\n",
+                          on ? "refused" : "allowed, and counted");
+        return 0;
+    }
+    if (argc > 1) {
+        ag_console_puts("usage: flash [strict|hold [on|off]] | sync\n");
+        return 1;
+    }
+    {
+        uint32_t       mb = 0;
+        const uint32_t mr = ag_port_flash_mirror_reads(&mb);
+        ag_console_printf("flash: C: %s; %u reads answered from RAM, "
+                          "%u KB\n",
+                          (mr > 0u || ag_port_flash_mirrored())
+                              ? "mirrored in RAM"
+                              : "NOT mirrored - reads go to the chip",
+                          (unsigned)mr, (unsigned)(mb / 1024u));
+    }
+    {
+        const char    *who = NULL;
+        const uint32_t n = ag_port_flash_violations(&who);
+        ag_console_printf("flash: sound %s, %s\n",
+                          ag_port_flash_guarded() ? "playing" : "stopped",
+                          ag_port_flash_is_strict() ? "strict"
+                                                    : "watching only");
+        if (ag_port_flash_dirty() > 0u) {
+            ag_console_printf("  %u sectors are in memory and not yet "
+                              "on the chip; they go when the sound "
+                              "stops\n",
+                              (unsigned)ag_port_flash_dirty());
+        }
+        if (n == 0u) {
+            ag_console_puts("  nothing has touched it while sound played\n");
+        } else {
+            ag_console_printf("  %u operations while sound played, last "
+                              "from '%s'\n", (unsigned)n, who);
+        }
+    }
+    return 0;
+}
+
 static int cmd_cpu(int argc, char **argv)
 {
     enum { MAX_TASKS = 48 };
@@ -1880,7 +1972,8 @@ static int cmd_log(int argc, char **argv)
     }
 
     const uint32_t lost = ag_journal_lost(j);
-    ag_console_printf("\n%u lines held", (unsigned)held);
+    ag_console_printf("\n%u lines held in %u KB",
+                      (unsigned)held, (unsigned)(j->size / 1024u));
     if (lost > 0) {
         ag_console_printf(", %u older lines already overwritten",
                           (unsigned)lost);
@@ -6239,6 +6332,8 @@ static const ag_command_t k_commands[] = {
     {"ver", "", "version and hardware", cmd_ver},
     {"mem", "[/t|/p|/x]", "memory usage; /t: every task and its stack; /p: [memory] placement; /x: extended memory block by block", cmd_mem},
     {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
+    {"flash", "[strict [on|off]]", "flash traffic while sound plays", cmd_flash},
+    {"tick", "", "what the system tick itself costs", cmd_tick},
     {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",
      cmd_boot},

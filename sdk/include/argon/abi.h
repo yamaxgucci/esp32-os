@@ -461,7 +461,7 @@ extern "C" {
  *      instead of guessing from traffic.  Optional; NULL is the old behaviour.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 68u
+#define AG_ABI_MINOR 69u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -618,6 +618,23 @@ typedef struct ag_sys_api {
      */
     bool (*module_task)(void (*fn)(void *), void *arg, const char *name,
                         uint32_t stack, int priority, uint32_t flags);
+
+    /*
+     * ABI 0.69: is a converter clocking frames right now?
+     *
+     * Asked by anything that was about to touch the flash.  Every read, write
+     * and erase of it switches the cache off for the whole chip - both cores,
+     * instructions and data - so a file opened while sound is playing is
+     * blocks of audio lost, and the program that lost them is never the one
+     * that opened the file.
+     *
+     * It is a question and not a lock: the caller decides what to do about
+     * it.  The page driver answers it by serving what it already has in
+     * memory instead of asking the filesystem whether the file changed; a
+     * logger answers it by keeping the line until later.  The system's own
+     * refusal, when it is switched on, is `[flash] strict`.
+     */
+    bool (*audio_live)(void);
 } ag_sys_api_t;
 
 /* ------------------------------------------------------------------------ */

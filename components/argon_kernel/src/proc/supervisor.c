@@ -22,6 +22,7 @@
 #include <argon/journal.h>
 #include <argon/keys.h>
 #include <argon/log.h>
+#include <argon/port/flash.h>
 #include <argon/power.h>
 #include <argon/place.h>
 #include <argon/proc.h>
@@ -359,6 +360,18 @@ static void supervisor_task(void *arg)
          * application right now, and the tick that noticed cannot fix it.
          */
         (void)ag_budget_service();
+
+        /*
+         * Writes held back while sound was playing go to the chip now.
+         *
+         * Here rather than in the converter's own close: an erase is tens of
+         * milliseconds a sector and the thread that closed the stream has no
+         * business waiting for all of them.  This task has nothing it is
+         * late for.
+         */
+        if (!ag_port_flash_guarded() && ag_port_flash_dirty() > 0u) {
+            (void)ag_port_flash_flush();
+        }
 
         if (s_interrupt_request) {
             s_interrupt_request = false;

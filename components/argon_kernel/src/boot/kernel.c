@@ -16,6 +16,7 @@
 
 #include <argon/board.h>
 #include <argon/cfg.h>
+#include <argon/path.h>
 #include <argon/console.h>
 #include <argon/display.h>
 #include <argon/log.h>
@@ -32,6 +33,7 @@
 #include <argon/port/task.h>
 #include <argon/port/uart.h>
 #include <argon/port/config.h>
+#include <argon/port/flash.h>
 
 #include "boot/platform.h"
 #include "console/uart_console.h"
@@ -256,10 +258,95 @@ static void apply_console_size(void)
     s_rows = rows;
 }
 
+/*
+ * [flash] strict = yes
+ *
+ * Refuse flash operations while sound is playing, rather than only counting
+ * them.  Off by default: the first thing wanted is the list of who turns up,
+ * and a refusal inside the radio's own stack is a new kind of failure.  See
+ * the port's flash.h.
+ */
+static void apply_flash_strict(void)
+{
+    const ag_cfg_t *cfg = ag_sysconfig();
+    if (cfg == NULL) {
+        return;
+    }
+    if (ag_cfg_get_bool(cfg, "flash.strict", false)) {
+        ag_port_flash_strict(true);
+        kout("flash: strict - nothing may touch it while sound plays\n");
+    }
+}
+
+/*
+ * C: IN RAM, AND WHAT THAT COSTS.
+ *
+ *     [flash]
+ *     mirror = yes         ; no by default
+ *     hold   = no          ; no by default
+ *
+ * Reading this flash switches the cache off for the whole chip - both
+ * cores, instructions and data - so every file size, directory entry and
+ * configuration line the system asks for while something is playing is
+ * audio lost.  Measured on the A1S: 4421 reads in the first seconds of a
+ * boot, and 197 of them in one minute of playing, from the page driver
+ * alone, which took blocks past their deadline from one a second to
+ * fourteen.
+ *
+ * The cure is not a rule about when files may be read - all of those
+ * reads are things that have to work - but a copy of the partition in
+ * external RAM, which has no such property: an access to it is an
+ * ordinary cache miss and stops nothing.
+ *
+ * Off unless a board asks: most boards have no external memory at all, and
+ * one that has it may want all of it for something else.  A board that is an
+ * instrument says `mirror = yes` and pays the partition's size in RAM for a
+ * machine that never stops to read a file.
+ *
+ * Here rather than beside the mount: the setting lives in SYSTEM.CFG, which
+ * is a file on the very partition being mirrored, so the configuration has
+ * to have been read first.  Nothing is playing yet either way.  A mirror
+ * that cannot be made is not a boot failure.
+ */
+static ag_err_t stage_config(void)
+{
+    /*
+     * The journal into a bigger ring first of all, because everything this
+     * stage decides is reported into it and two hundred lines is not enough
+     * to still hold the report by the time anybody reads it.  See
+     * ag_log_grow.
+     */
+    (void)ag_log_grow(64u * 1024u);
+    const ag_err_t err = ag_sysconfig_init();
+    if (err != AG_OK) {
+        return err;
+    }
+    const ag_cfg_t *cfg = ag_sysconfig();
+    const char     *want = "no";
+    if (cfg != NULL) {
+        want = ag_cfg_get(cfg, "flash.mirror", "no");
+        /*
+         * Holding a write back until the sound stops is a separate decision
+         * and a riskier one - it is the only thing here that can lose what
+         * was written - so it is off until the plain form has been listened
+         * to.
+         */
+        ag_port_flash_hold(ag_cfg_get_bool(cfg, "flash.hold", false));
+    }
+    if (ag_path_icmp(want, "yes") != 0 && ag_path_icmp(want, "on") != 0) {
+        return AG_OK; /* the ordinary case: nothing to say about it */
+    }
+    if (!ag_port_flash_mirror("sysfs")) {
+        ag_log(AG_LOG_WARN, "flash", "C: could not be mirrored; reads stay on the chip");
+    }
+    return AG_OK;
+}
+
 static ag_err_t stage_devices(void)
 {
     const ag_err_t err = ag_devices_init();
     apply_console_size();
+    apply_flash_strict();
     return err;
 }
 
@@ -313,7 +400,7 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_BOARD]      = {"board",      ag_board_init,  false},
     [AG_STAGE_CONSOLE]    = {"console",    stage_console,  true},
     [AG_STAGE_STORAGE]    = {"storage",    ag_storage_init, false},
-    [AG_STAGE_CONFIG]     = {"config",     ag_sysconfig_init, false},
+    [AG_STAGE_CONFIG]     = {"config",     stage_config,   false},
     /* After the configuration, because [power] lives in it. */
     [AG_STAGE_POWER]      = {"power",      ag_powerctl_init, false},
     /* Also the console size from [console]: `auto` asks the panel. */

@@ -2544,16 +2544,27 @@ static void serve_page(ag_handle_t h)
 {
     ag_stat_t st;
     /*
-     * The size is asked for every time, and that is deliberate.
+     * The size is asked of the filesystem every time, and that is deliberate.
      *
-     * It was skipped once the page was held in memory - one flash read saved
-     * per request - and the cost was a driver that served a stale page for
-     * ever: a new PHONE.GZ went onto the board, and the board kept handing out
-     * the old one, which took an hour to see because every symptom was in the
-     * page.  A cache that cannot notice its file changed is not a cache, it is
-     * a copy.  One stat against seventeen kilobytes read a kilobyte at a time
-     * is the whole of what this costs, and nobody fetches a page while
-     * playing anyway.
+     * It was skipped once the page was held in memory - one stat saved per
+     * request - and the cost was a driver that served a stale page for ever:
+     * a new PHONE.GZ went onto the board, and the board kept handing out the
+     * old one, which took an hour to see because every symptom was in the
+     * page.  A cache that cannot notice its file changed is not a cache, it
+     * is a copy.
+     *
+     * It is not free, either: that stat is a walk of littlefs metadata, and
+     * every read of the flash switches the cache off for the whole chip.
+     * Measured 14 Oct 2026 with Maxim playing and the page open: 197 flash
+     * operations in a minute, all from this driver, and blocks of audio past
+     * their deadline went from one a second to fourteen.  The sentence that
+     * used to end this note - "nobody fetches a page while playing anyway" -
+     * was simply false: the page is how the amplifier is driven.
+     *
+     * It is answered from RAM now rather than avoided: the filesystem is
+     * mirrored in external memory at boot (ag_port_flash_mirror), so a stat
+     * reaches no flash at all.  This driver asks the question it has always
+     * asked, the answer is still current, and nothing stops.
      */
     if (ag_stat(s.page, &st) != AG_OK || st.size == 0u) {
         char msg[192];
@@ -3833,6 +3844,25 @@ ag_err_t ag_driver_init(void)
         if (api->cfg->get_str("phone.page", p, sizeof(p)) == AG_OK &&
             p[0] != '\0') {
             ag_strlcpy(s.page, p, sizeof(s.page));
+        }
+    }
+
+    /*
+     * THE PAGE INTO MEMORY NOW, not on the first request.
+     *
+     * It was read lazily, which put seventeen kilobytes of flash reads - and
+     * the cache switched off for the whole chip while each one ran - at
+     * whatever moment somebody first opened the page.  That moment is
+     * precisely the one where somebody has picked up a guitar.  Here, nothing
+     * is playing yet: the driver starts during boot.
+     *
+     * A board too short of memory to hold it keeps streaming from flash as
+     * before; see page_in_memory, which decides that.
+     */
+    {
+        ag_stat_t st;
+        if (ag_stat(s.page, &st) == AG_OK && st.size > 0u) {
+            (void)page_in_memory((uint32_t)st.size);
         }
     }
 
