@@ -124,6 +124,10 @@
  * gwenesis host API also owns the name z80_execute(target), so this TU's
  * relative-cycle entry is renamed.
  */
+#if defined(ARGON_SMS_SMALL)
+/* The CYD build: this is the hot loop, and -Os costs it more than size buys. */
+#pragma GCC optimize("O2")
+#endif
 #include <stdint.h>
 #include <string.h>
 #include "z80.h"
@@ -232,8 +236,31 @@ static uint8_t SZP[256];      /* zero, sign and parity flags */
 static uint8_t SZHV_inc[256]; /* zero, sign, half carry and overflow flags INC r8 */
 static uint8_t SZHV_dec[256]; /* zero, sign, half carry and overflow flags DEC r8 */
 
+#ifndef ARGON_SMS_SMALL
 static uint8_t SZHVC_add[2*256*256];
 static uint8_t SZHVC_sub[2*256*256];
+#else
+/*
+ * ArgonOS, small build (the CYD, 320 KB of SRAM and no PSRAM): the two tables
+ * above are 256 KB, more than the board has free, so the flags of ADD, ADC,
+ * SUB, SBC and CP are computed instead - the same bits the tables are built
+ * from in z80_init, in a handful of instructions.  a is A before, v the
+ * operand, full the unmasked result.
+ */
+static inline uint8_t flags_add(uint32_t a, uint32_t v, uint32_t full)
+{
+	const uint32_t res = full & 0xff;
+	return (uint8_t)(SZ[res] | ((a ^ v ^ res) & HF) | ((full >> 8) & CF) |
+	                 (((~(a ^ v)) & (a ^ res) & 0x80) >> 5));
+}
+
+static inline uint8_t flags_sub(uint32_t a, uint32_t v, uint32_t full)
+{
+	const uint32_t res = full & 0xff;
+	return (uint8_t)(NF | SZ[res] | ((a ^ v ^ res) & HF) | ((full >> 8) & CF) |
+	                 (((a ^ v) & (a ^ res) & 0x80) >> 5));
+}
+#endif
 
 static const uint8_t cc_op[0x100] = {
 	4,10, 7, 6, 4, 4, 7, 4, 4,11, 7, 6, 4, 4, 7, 4,
@@ -925,7 +952,11 @@ INLINE void add_a(uint8_t value)
 {
 	uint32_t ah = AFD & 0xff00;
 	uint32_t res = (uint8_t)((ah >> 8) + value);
+#ifndef ARGON_SMS_SMALL
 	F = SZHVC_add[ah | res];
+#else
+	F = flags_add(ah >> 8, value, (ah >> 8) + value);
+#endif
 	A = res;
 }
 
@@ -936,7 +967,11 @@ INLINE void adc_a(uint8_t value)
 {
 	uint32_t ah = AFD & 0xff00, c = AFD & 1;
 	uint32_t res = (uint8_t)((ah >> 8) + value + c);
+#ifndef ARGON_SMS_SMALL
 	F = SZHVC_add[(c << 16) | ah | res];
+#else
+	F = flags_add(ah >> 8, value, (ah >> 8) + value + c);
+#endif
 	A = res;
 }
 
@@ -947,7 +982,11 @@ INLINE void sub(uint8_t value)
 {
 	uint32_t ah = AFD & 0xff00;
 	uint32_t res = (uint8_t)((ah >> 8) - value);
+#ifndef ARGON_SMS_SMALL
 	F = SZHVC_sub[ah | res];
+#else
+	F = flags_sub(ah >> 8, value, (ah >> 8) - value);
+#endif
 	A = res;
 }
 
@@ -958,7 +997,11 @@ INLINE void sbc_a(uint8_t value)
 {
 	uint32_t ah = AFD & 0xff00, c = AFD & 1;
 	uint32_t res = (uint8_t)((ah >> 8) - value - c);
+#ifndef ARGON_SMS_SMALL
 	F = SZHVC_sub[(c<<16) | ah | res];
+#else
+	F = flags_sub(ah >> 8, value, (ah >> 8) - value - c);
+#endif
 	A = res;
 }
 
@@ -1026,8 +1069,14 @@ INLINE void cp(uint8_t value)
 	unsigned val = value;
 	uint32_t ah = AFD & 0xff00;
 	uint32_t res = (uint8_t)((ah >> 8) - val);
+#ifndef ARGON_SMS_SMALL
 	F = (SZHVC_sub[ah | res] & ~(YF | XF)) |
 		(val & (YF | XF));
+#else
+	(void)res;
+	F = (flags_sub(ah >> 8, val, (ah >> 8) - val) & ~(YF | XF)) |
+		(val & (YF | XF));
+#endif
 }
 
 /***************************************************************
@@ -3382,6 +3431,7 @@ INLINE void take_nmi()
 void z80_init(int32_t (*irqcallback)(int32_t))
 {
 	int32_t i, p;
+#ifndef ARGON_SMS_SMALL
 	int32_t oldval, newval, val;
 	uint8_t *padd = &SZHVC_add[  0*256];
 	uint8_t *padc = &SZHVC_add[256*256];
@@ -3430,6 +3480,7 @@ void z80_init(int32_t (*irqcallback)(int32_t))
 		}
 	}
 
+#endif
 	for (i = 0; i < 256; i++)
 	{
 		p = 0;

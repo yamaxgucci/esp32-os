@@ -70,7 +70,18 @@ typedef struct
 	uint32_t crc;
 	uint32_t sram_crc;
 	uint8_t mapper;
+#ifdef ARGON_SMS_SMALL
+	/*
+	 * Allocated the first time a game maps it (cart_sram()), not held by every
+	 * game: on the CYD 32 KB is a third of what is free, and most cartridges
+	 * have no RAM at all.  rom_mapped: rom points into flash (ag_map) and is
+	 * not ours to free.
+	 */
+	uint8_t *sram;
+	uint8_t rom_mapped;
+#else
 	uint8_t sram[0x8000];
+#endif
 	uint8_t fcr[4];
 } cart_t;
 

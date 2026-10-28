@@ -6,6 +6,26 @@
     OPLL register protocol and drive apps/common/fm/ag_fm (integer lite synth).
 */
 #include "shared.h"
+
+#ifdef ARGON_SMS_SMALL
+/*
+ * ArgonOS, small build: no FM.  The YM2413 is the Japanese Mark III's optional
+ * sound unit, which a few games use and every game works without; ag_fm's
+ * tables are 30 KB the CYD does not have.  The PSG is untouched.
+ */
+void FM_Init(void) {}
+void FM_Shutdown(void) {}
+void FM_Reset(void) {}
+void FM_Update(int16_t **buffer, int32_t length) { (void)buffer; (void)length; }
+void FM_WriteReg(uint8_t reg, uint8_t data) { (void)reg; (void)data; }
+void FM_Write(uint32_t offset, uint8_t data) { (void)offset; (void)data; }
+void FM_GetContext(uint8_t *data) { (void)data; }
+void FM_SetContext(uint8_t *data) { (void)data; }
+uint32_t FM_GetContextSize(void) { return 0; }
+uint8_t *FM_GetContextPtr(void) { return NULL; }
+uint32_t YM2413_GetContextSize(void) { return 0; }
+uint8_t *YM2413_GetContextPtr(void) { return NULL; }
+#else
 #include "ag_fm.h"
 
 static FM_Context fm_context;
@@ -146,3 +166,4 @@ uint8_t *YM2413_GetContextPtr(void)
 {
 	return NULL;
 }
+#endif /* ARGON_SMS_SMALL */

@@ -512,19 +512,57 @@ uint32_t load_rom (char *filename)
 	return 1;
 }
 
+#ifdef ARGON_SMS_SMALL
+/*
+ * The cartridge read in place, out of flash (ag_map): a Master System game is up
+ * to a megabyte and the CYD has a tenth of that free.  The Z80 only ever reads
+ * ROM pages - mapper writes go to registers - so a read-only pointer is enough.
+ */
+uint32_t load_rom_mapped (const uint8_t *data, size_t size)
+{
+	cart.rom = NULL; /* an earlier one goes back when the process ends */
+	if ((size / 512) & 1)
+	{
+		data += 512;
+		size -= 512;
+	}
+	if (size < 0x4000)
+		return 0;
+	cart.rom = (uint8_t *)data;
+	cart.rom_mapped = 1;
+	cart.size = size;
+	cart.pages = cart.size / 0x4000;
+	cart.crc = crc32 (0, cart.rom, cart.size);
+	cart.loaded = 1;
+	set_config();
+	return 1;
+}
+#endif
+
 uint32_t load_rom_mem (const char *data, size_t size)
 {
 	if(cart.rom)
 	{
-		free(cart.rom);
+#ifndef ARGON_SMS_SMALL
+		free(cart.rom); /* the small build's goes back when the process ends */
+#endif
 		cart.rom = NULL;
 	}
+#ifdef ARGON_SMS_SMALL
+	cart.rom_mapped = 0;
+#endif
 
 	cart.size = size;
 	if (cart.size < 0x4000) cart.size = 0x4000;
+#ifdef ARGON_SMS_SMALL
+	cart.rom = sms_alloc_internal(cart.size);
+#else
 	cart.rom = malloc(cart.size);
+#endif
 	if (!cart.rom)
 		return 0;
+	if (size < cart.size)
+		memset(cart.rom + size, 0, cart.size - size);
 
 	/* Take care of image header, if present */
 	if ((cart.size / 512) & 1)

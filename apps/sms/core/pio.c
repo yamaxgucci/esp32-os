@@ -38,7 +38,42 @@ typedef struct {
   uint8_t th_dir[2];    /* TH pin direction */
 } io_state;
 
+#ifndef ARGON_SMS_SMALL
 static io_state io_lut[2][256];
+#else
+/*
+ * The small build keeps one entry, the one for the value last written to port
+ * $3F, and works it out when it is written: the whole table is 4 KB of the
+ * CYD's memory for a port a game writes a handful of times.
+ */
+static io_state io_slot[2];
+static uint8_t  io_which;
+
+static io_state *io_entry(int32_t j, int32_t i)
+{
+  io_state *e = &io_slot[io_which ^= 1]; /* not the one io_current is on */
+  e->tr_dir[0]   = (i & 0x01) ? PIN_DIR_IN : PIN_DIR_OUT;
+  e->th_dir[0]   = (i & 0x02) ? PIN_DIR_IN : PIN_DIR_OUT;
+  e->tr_dir[1]   = (i & 0x04) ? PIN_DIR_IN : PIN_DIR_OUT;
+  e->th_dir[1]   = (i & 0x08) ? PIN_DIR_IN : PIN_DIR_OUT;
+  if (j == 1)
+  {
+    e->tr_level[0] = (i & 0x01) ? PIN_LVL_HI : (i & 0x10) ? PIN_LVL_HI : PIN_LVL_LO;
+    e->th_level[0] = (i & 0x02) ? PIN_LVL_HI : (i & 0x20) ? PIN_LVL_HI : PIN_LVL_LO;
+    e->tr_level[1] = (i & 0x04) ? PIN_LVL_HI : (i & 0x40) ? PIN_LVL_HI : PIN_LVL_LO;
+    e->th_level[1] = (i & 0x08) ? PIN_LVL_HI : (i & 0x80) ? PIN_LVL_HI : PIN_LVL_LO;
+  }
+  else
+  {
+    e->tr_level[0] = (i & 0x01) ? PIN_LVL_HI : PIN_LVL_LO;
+    e->th_level[0] = (i & 0x02) ? PIN_LVL_HI : PIN_LVL_LO;
+    e->tr_level[1] = (i & 0x04) ? PIN_LVL_HI : PIN_LVL_LO;
+    e->th_level[1] = (i & 0x08) ? PIN_LVL_HI : PIN_LVL_LO;
+  }
+  return e;
+}
+#define IO_LUT(j, i) io_entry((j), (i))
+#endif
 static io_state *io_current;
 
 
@@ -69,6 +104,9 @@ static io_state *io_current;
 
 void pio_init(void)
 {
+#ifdef ARGON_SMS_SMALL
+}
+#else
   int32_t i, j;
 
   /* Make pin state LUT */
@@ -101,6 +139,7 @@ void pio_init(void)
     }
   }
 }
+#endif
 
 void pio_reset(void)
 {
@@ -114,7 +153,11 @@ void pio_reset(void)
   input.analog[0][1] = 96;
 
   /* SMS I/O power-on defaults */
+#ifdef ARGON_SMS_SMALL
+  io_current = IO_LUT(sms.territory, 0xFF);
+#else
   io_current = &io_lut[sms.territory][0xFF];
+#endif
   pio_ctrl_w(0xFF);
 }
 
@@ -134,7 +177,11 @@ void pio_ctrl_w(uint8_t data)
   th_level[1] = io_current->th_level[1];
   
   /* HCounter is latched on TH Low->High transition */
+#ifdef ARGON_SMS_SMALL
+  io_current = IO_LUT(sms.territory, data);
+#else
   io_current = &io_lut[sms.territory][data];
+#endif
   if ((io_current->th_dir[0]   == PIN_DIR_IN) &&
        (io_current->th_level[0] == PIN_LVL_HI) &&
        (th_level[0] == PIN_LVL_LO)

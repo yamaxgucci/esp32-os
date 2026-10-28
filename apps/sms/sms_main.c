@@ -17,10 +17,23 @@
 #include "sms_cfg.h"
 #include "sound_output.h"
 
+#ifdef ARGON_SMS_SMALL
+/*
+ * The CYD build: 10 KB of stack and next to no arena.  What is needed only
+ * sometimes - the cartridge's RAM (32 KB, for the games that have it) and the
+ * built-in ROM when no cartridge is named (16 KB) - comes from the system heap
+ * when it is asked for (sms_alloc_internal) instead of being reserved at start
+ * by every game.  The cartridge itself is read out of flash and costs nothing.
+ */
+AG_APP_SIZED("SMS", "1.0", "argon", AG_AXE_NEEDS_GFX, 10 * 1024, 20 * 1024);
+#else
 AG_APP_SIZED("SMS", "1.0", "argon", AG_AXE_NEEDS_GFX, 32 * 1024, 2 * 1024 * 1024);
+#endif
 
-/* Built-in tiny ROM: clear VRAM-ish loop so a missing cart still draws something. */
-static const uint8_t k_tiny_rom[0x4000] = {
+/* Built-in tiny ROM: clear VRAM-ish loop so a missing cart still draws something.
+ * Six bytes, padded to a 16 KB page by load_rom_mem: on an ESP32 a constant is
+ * in RAM like everything else in the data part. */
+static const uint8_t k_tiny_rom[] = {
     0xF3,                   /* di */
     0x31, 0xF0, 0xDF,       /* ld sp,$DFF0 */
     0x18, 0xFE,             /* jr $ */
@@ -40,6 +53,18 @@ static sms_cfg_t s_cfg;
  */
 #define SMS_MAX_LINES 224
 static int          s_ox;
+#ifdef ARGON_SMS_SMALL
+/*
+ * One band of the picture on its way to the panel (render.h): the CYD has no
+ * frame to draw into.  8 lines are 4 KB and twenty-four presents a frame.
+ */
+static uint16_t     s_band[VIDEO_WIDTH_SMS * ARGON_SMS_BAND];
+static uint32_t     s_present_us;
+/* What each band on the glass was, so an unchanged one is not sent again. */
+static uint32_t     s_band_hash[(SMS_MAX_LINES + ARGON_SMS_BAND - 1) / ARGON_SMS_BAND];
+static int          s_band_valid;
+static uint32_t     s_bands_skipped;
+#endif
 static int          s_oy;
 static ag_gfxinfo_t s_gi;
 static uint16_t    *s_frame; /* offscreen when sms.cfg fullscreen=1 */
@@ -201,6 +226,26 @@ static void report_stats(const char *tag, uint32_t frames, uint64_t span_us,
 
 static int load_cart(const char *path)
 {
+#ifdef ARGON_SMS_SMALL
+    if (path != NULL && path[0] != '\0') {
+        const void *ptr = NULL;
+        uint64_t    len = 0;
+        const ag_time_t t0 = ag_micros();
+        if (!AG_HAS(ag_api()->fs, map)) {
+            ag_printf("sms: this kernel cannot map a file (needs ABI 0.32)\n");
+            return 0;
+        }
+        const ag_err_t err = ag_map(path, &ptr, &len);
+        if (err != AG_OK) {
+            ag_printf("sms: %s: %s\n", path, ag_strerror(err));
+            return 0;
+        }
+        ag_printf("sms: %s, %u KB, staged in flash in %u ms\n", path,
+                  (unsigned)(len / 1024u),
+                  (unsigned)((ag_micros() - t0) / 1000u));
+        return (int)load_rom_mapped((const uint8_t *)ptr, (size_t)len);
+    }
+#endif
     if (path == NULL || path[0] == '\0') {
         return (int)load_rom_mem((const char *)k_tiny_rom, sizeof(k_tiny_rom));
     }
@@ -243,6 +288,21 @@ static int load_cart(const char *path)
 static void bind_frame_to_fb(const ag_gfxinfo_t *info)
 {
     s_gi = *info;
+#ifdef ARGON_SMS_SMALL
+    s_ox = 0;
+    s_oy = 0;
+    sms_bitmap = s_band;
+    memset(&bitmap, 0, sizeof(bitmap));
+    bitmap.data = (uint8_t *)s_band;
+    bitmap.width = VIDEO_WIDTH_SMS;
+    bitmap.height = ARGON_SMS_BAND;
+    bitmap.pitch = VIDEO_WIDTH_SMS * (int)sizeof(uint16_t);
+    bitmap.depth = 16;
+    bitmap.viewport.w = VIDEO_WIDTH_SMS;
+    bitmap.viewport.h = VIDEO_HEIGHT_SMS;
+    s_band_valid = 0; /* the glass may have been drawn over */
+    return;
+#endif
     uint8_t *origin;
     int32_t  pitch;
 
@@ -313,8 +373,97 @@ static void present_fullscreen(void)
     ag_gfx_flush(0, 0, s_gi.width, s_gi.height);
 }
 
+#ifdef ARGON_SMS_SMALL
+/*
+ * A line has gone into the band; send the band when it is full or the picture
+ * ends.  The driver centres a surface of the picture's size on the glass.
+ */
+void sms_line_done(int32_t line)
+{
+    static uint32_t s_acc;
+    const int32_t h = (int32_t)bitmap.viewport.h;
+    const int32_t row = line % ARGON_SMS_BAND;
+
+    /*
+     * A band that is what the glass already shows is not sent again.  The SPI
+     * is the slowest thing in the frame - 98 KB at 40 MHz is 19.6 ms, more than
+     * the whole emulation - and most of a frame is usually unchanged: a score
+     * line, a still background, a menu.  The hash costs nothing extra: render.c
+     * folds each line's into sms_line_hash while converting it.  It is reset
+     * when the glass may have been drawn over (focus regained), so a band is
+     * never skipped against a picture that is no longer there.
+     */
+    s_acc = ((row == 0) ? 0x9e3779b9u : ((s_acc << 7) | (s_acc >> 25))) ^ sms_line_hash;
+    if (row != ARGON_SMS_BAND - 1 && line != h - 1) {
+        return;
+    }
+    {
+        const uint32_t hash = s_acc;
+        const int32_t  band = line / ARGON_SMS_BAND;
+        if (band < (int32_t)(sizeof(s_band_hash) / sizeof(s_band_hash[0]))) {
+            if (s_band_valid && s_band_hash[band] == hash) {
+                s_bands_skipped++;
+                return;
+            }
+            s_band_hash[band] = hash;
+        }
+    }
+    /*
+     * The surface is the whole glass, with the picture placed in its middle
+     * here, rather than a 256x192 surface the driver would scale.  The CYD's
+     * driver fits a surface to the panel by the largest ratio that fits -
+     * five quarters for this one - and 320x240 of scaled pixels is 41 ms of
+     * SPI a frame, measured; one to one is 98 KB instead of 154 and no column
+     * map.  A Master System picture was never meant to fill a 4:3 tube anyway.
+     */
+    const uint16_t sw = (s_gi.width >= VIDEO_WIDTH_SMS) ? s_gi.width
+                                                        : VIDEO_WIDTH_SMS;
+    const uint16_t sh = (s_gi.height >= (uint32_t)h) ? s_gi.height
+                                                     : (uint16_t)h;
+    const ag_blit_t b = {
+        .px = s_band,
+        .stride = VIDEO_WIDTH_SMS * sizeof(uint16_t),
+        .surf_w = sw,
+        .surf_h = sh,
+        .x = (uint16_t)((sw - VIDEO_WIDTH_SMS) / 2u),
+        .y = (uint16_t)((sh - h) / 2u + (uint16_t)(line - row)),
+        .w = VIDEO_WIDTH_SMS,
+        .h = (uint16_t)(row + 1),
+    };
+    const ag_time_t t0 = ag_micros();
+    (void)ag_gfx_present(&b);
+    s_present_us += (uint32_t)(ag_micros() - t0);
+}
+
+void *sms_alloc_internal(size_t bytes)
+{
+    void *p = ag_malloc_caps(bytes, AG_MEM_FAST);
+    if (p == NULL) {
+        p = ag_malloc(bytes); /* the arena, if it happens to have room */
+    }
+    if (p == NULL) {
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        ag_printf("sms: %u bytes refused: internal %u free to this process, "
+                  "arena %u of %u free\n",
+                  (unsigned)bytes, (unsigned)mi.fast_free,
+                  (unsigned)mi.arena_free, (unsigned)mi.arena_total);
+    }
+    return p;
+}
+
+void sms_out_of_memory(const char *what)
+{
+    ag_printf("sms: no memory for %s\n", what);
+    ag_exit(1);
+}
+#endif
+
 static void present_frame(void)
 {
+#ifdef ARGON_SMS_SMALL
+    return; /* the bands went out as the lines were drawn */
+#endif
     if (s_fullscreen) {
         present_fullscreen();
         return;
@@ -657,6 +806,14 @@ int ag_main(int argc, char **argv)
     const char *exe = (argc > 0) ? argv[0] : NULL;
     sms_cfg_load(&s_cfg, rom, exe, cfg_from, sizeof(cfg_from));
     s_fullscreen = s_cfg.fullscreen ? 1 : 0;
+#ifdef ARGON_SMS_SMALL
+    s_fullscreen = 0; /* no frame to stretch from */
+    if (!AG_HAS(ag_api()->gfx, present)) {
+        ag_printf("sms: this kernel cannot show an application's own pixels "
+                  "(needs ABI 0.31)\n");
+        return 1;
+    }
+#endif
     if (s_fullscreen) {
         const size_t nbytes =
             (size_t)VIDEO_WIDTH_SMS * (size_t)SMS_MAX_LINES * sizeof(uint16_t);
@@ -752,7 +909,15 @@ int ag_main(int argc, char **argv)
         const ag_time_t f0 = ag_micros();
 
         const int show = (present_div <= 1) || ((ran % present_div) == 0);
+#ifdef ARGON_SMS_SMALL
+        s_present_us = 0;
+#endif
         system_frame(show ? 0 : 1);
+#ifdef ARGON_SMS_SMALL
+        if (show) {
+            s_band_valid = 1;
+        }
+#endif
 
         const ag_time_t f1 = ag_micros();
         if (show) {
@@ -762,8 +927,14 @@ int ag_main(int argc, char **argv)
 
         const uint64_t work = (uint64_t)(f2 - f0);
         work_sum += work;
+#ifdef ARGON_SMS_SMALL
+        /* the bands are sent from inside the frame, as lines are drawn */
+        emu_sum += (uint64_t)(f1 - f0) - s_present_us;
+        present_sum += (uint64_t)(f2 - f1) + s_present_us;
+#else
         emu_sum += (uint64_t)(f1 - f0);
         present_sum += (uint64_t)(f2 - f1);
+#endif
         if (work > work_max) {
             work_max = work;
         }
@@ -773,6 +944,26 @@ int ag_main(int argc, char **argv)
         if (stats && (uint64_t)(f2 - window_t0) >= 2000000u) {
             report_stats("sms", window, (uint64_t)(f2 - window_t0), work_sum,
                          emu_sum, present_sum, work_max);
+#ifdef ARGON_SMS_SMALL
+            ag_printf("sms: %u bands of %u not sent, unchanged\n",
+                      (unsigned)s_bands_skipped,
+                      (unsigned)(window * ((bitmap.viewport.h + ARGON_SMS_BAND - 1) /
+                                           ARGON_SMS_BAND)));
+            s_bands_skipped = 0;
+#endif
+#ifdef ARGON_SMS_PROF
+            {
+                extern uint32_t sms_prof[5];
+                const uint32_t  per = window ? window : 1u;
+                ag_printf("prof us/frame: bg %u obj %u sat %u remap %u out %u\n",
+                          (unsigned)(sms_prof[0] / 240u / per),
+                          (unsigned)(sms_prof[1] / 240u / per),
+                          (unsigned)(sms_prof[2] / 240u / per),
+                          (unsigned)(sms_prof[3] / 240u / per),
+                          (unsigned)(sms_prof[4] / 240u / per));
+                memset(sms_prof, 0, sizeof(sms_prof));
+            }
+#endif
             work_sum = emu_sum = present_sum = work_max = 0;
             window = 0;
             window_t0 = f2;

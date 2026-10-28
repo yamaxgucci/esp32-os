@@ -33,6 +33,10 @@
  * October 12th 2018 : Whitepacing and minor fixes.
 */
 
+#if defined(ARGON_SMS_SMALL)
+/* The CYD build: this is the hot loop, and -Os costs it more than size buys. */
+#pragma GCC optimize("O2")
+#endif
 #include "shared.h"
 /*** Vertical Counter Tables ***/
 extern uint8_t *vc_table[2][3];
@@ -55,22 +59,65 @@ uint8_t *linebuf;
 uint8_t sms_cram_expand_table[4];
 uint8_t gg_cram_expand_table[16];
 
+#ifndef ARGON_SMS_SMALL
 /* Dirty pattern info */
 uint8_t bg_name_dirty[0x200];     /* 1= This pattern is dirty */
 uint16_t bg_name_list[0x200];     /* List of modified pattern indices */
 uint16_t bg_list_index;           /* # of modified patterns in list */
+#endif
 
 /* Internal buffer for drawing non 8-bit displays */
 #ifndef _8BPP_COLOR
-static uint8_t internal_buffer[0x200];
+static uint8_t internal_buffer[0x200] __attribute__((aligned(4)));
 /* Precalculated pixel table */
 static uint16_t pixel[PALETTE_SIZE];
 #endif
 
+#ifndef ARGON_SMS_SMALL
 static uint8_t bg_pattern_cache[0x20000];/* Cached and flipped patterns */
 
 /* Pixel look-up table */
 static uint8_t lut[0x10000];
+#else
+/*
+ * ArgonOS, small build (the CYD: no PSRAM, ~100 KB free).  The pattern cache
+ * (128 KB), the bitplane table (256 KB) and the pixel table (64 KB) do not fit,
+ * so a row of a tile is expanded from VRAM when it is drawn, and a sprite pixel
+ * meets the background by three comparisons.  esp_8_bit runs this core on the
+ * same chip the same way, with a 32 KB tile cache we do without.
+ *
+ * s_px_lo[b] / s_px_hi[b]: bitplane byte b spread to one bit per pixel, pixel x
+ * in byte x of the pair (x = 0 is the leftmost, bit 7).  s_rev[b] is b with its
+ * bits reversed, which is a horizontal flip.
+ */
+static uint32_t s_px_lo[256];
+static uint32_t s_px_hi[256];
+static uint8_t  s_rev[256];
+
+/* Row y of tile n as eight 4-bit pixels, in two words, byte x = pixel x. */
+static inline void tile_row(int32_t n, int32_t y, int32_t hflip,
+                            uint32_t *lo, uint32_t *hi)
+{
+	const uint8_t *bp = &vdp.vram[(n << 5) | (y << 2)];
+	uint32_t p0 = bp[0], p1 = bp[1], p2 = bp[2], p3 = bp[3];
+	if (hflip)
+	{
+		p0 = s_rev[p0]; p1 = s_rev[p1]; p2 = s_rev[p2]; p3 = s_rev[p3];
+	}
+	*lo = s_px_lo[p0] | (s_px_lo[p1] << 1) | (s_px_lo[p2] << 2) | (s_px_lo[p3] << 3);
+	*hi = s_px_hi[p0] | (s_px_hi[p1] << 1) | (s_px_hi[p2] << 2) | (s_px_hi[p3] << 3);
+}
+
+/* What lut[(bg << 8) | sp] holds, for a sprite pixel sp that is not 0. */
+static inline uint8_t mix_pixel(uint8_t bg, uint8_t sp)
+{
+	if (bg & 0x40)
+		return bg & 0x7F;              /* a sprite is already there */
+	if ((bg & 0x20) && (bg & 0x0F))
+		return (bg & 0x7F) | 0x40;     /* high-priority background wins */
+	return (sp & 0x0F) | 0x50;
+}
+#endif
 
 static uint8_t object_index_count;
 
@@ -162,11 +209,15 @@ static const uint32_t atex[4] =
 	0x30303030,
 };
 
+#ifndef ARGON_SMS_SMALL
 /* Bitplane to packed pixel LUT */
 static uint32_t bp_lut[0x10000];
+#endif
 
 static void parse_satb(int32_t line);
+#ifndef ARGON_SMS_SMALL
 static void update_bg_pattern_cache(void);
+#endif
 #ifndef _8BPP_COLOR
 static void remap_8_to_16(int32_t line);
 #endif
@@ -237,6 +288,23 @@ void render_init(void)
 
 	make_tms_tables();
 
+#ifdef ARGON_SMS_SMALL
+	for (i = 0; i < 0x100; i++)
+	{
+		uint32_t lo = 0, hi = 0, r = 0;
+		for (j = 0; j < 4; j++)
+		{
+			if (i & (0x80 >> j)) lo |= 1u << (j << 3);
+			if (i & (0x08 >> j)) hi |= 1u << (j << 3);
+		}
+		for (j = 0; j < 8; j++)
+			if (i & (1 << j)) r |= 0x80u >> j;
+		s_px_lo[i] = lo;
+		s_px_hi[i] = hi;
+		s_rev[i] = (uint8_t)r;
+	}
+	(void)bx; (void)sx; (void)b; (void)s; (void)bp; (void)bf; (void)sf; (void)c;
+#else
 	/* Generate 64k of data for the look up table */
 	for(bx = 0; bx < 0x100; bx++)
 	{
@@ -310,6 +378,7 @@ void render_init(void)
 #endif
 		}
 	}
+#endif /* ARGON_SMS_SMALL */
 
 	sms_cram_expand_table[0] =  0;
 	sms_cram_expand_table[1] = 0x55;
@@ -337,11 +406,13 @@ void render_reset(void)
 		palette_sync(i);
 	}
 
+#ifndef ARGON_SMS_SMALL
 	/* Invalidate pattern cache */
 	memset(bg_name_dirty, 0, sizeof(bg_name_dirty));
 	memset(bg_name_list, 0, sizeof(bg_name_list));
 	bg_list_index = 0;
 	memset(bg_pattern_cache, 0, sizeof(bg_pattern_cache));
+#endif
 	
 #ifdef _8BPP_COLOR
     /* Mark all colors as dirty */
@@ -364,6 +435,22 @@ void render_reset(void)
 }
 
 static int32_t prev_line = -1;
+
+#ifdef ARGON_SMS_PROF
+/* Cycles spent in each part of render_line, summed until read (sms_main). */
+uint32_t sms_prof[5];
+static inline uint32_t prof_now(void)
+{
+	uint32_t c;
+	__asm__ __volatile__("rsr.ccount %0" : "=a"(c));
+	return c;
+}
+#define PROF_T(v) uint32_t v = prof_now()
+#define PROF_ADD(i, t0) sms_prof[i] += prof_now() - (t0)
+#else
+#define PROF_T(v)
+#define PROF_ADD(i, t0)
+#endif
 
 /* Draw a line of the display */
 void render_line(int32_t line)
@@ -412,14 +499,20 @@ void render_line(int32_t line)
 		/* Display enabled ? */
 		if (vdp.reg[1] & 0x40)
 		{
+#ifndef ARGON_SMS_SMALL
 			/* Update pattern cache */
 			update_bg_pattern_cache();
+#endif
 
 			/* Draw background */
+			PROF_T(t_bg);
 			render_bg(line);
+			PROF_ADD(0, t_bg);
 
 			/* Draw sprites */
+			PROF_T(t_obj);
 			render_obj(line);
+			PROF_ADD(1, t_obj);
 
 			/* This can take some CPU time. Some targets like the Retromini RS-90 code will crop this section
 			 * as to make sure it fits on the screen and to avoid less artifacts from downscaling.
@@ -441,7 +534,11 @@ void render_line(int32_t line)
 
 	/* Parse Sprites for next line */
 	if (vdp.mode > 7)
+	{
+		PROF_T(t_sat);
 		parse_satb(line);
+		PROF_ADD(2, t_sat);
+	}
 	else
 		parse_line(line);
 
@@ -472,11 +569,26 @@ void render_line(int32_t line)
 		/* adjust output line */
 		vline -= top_border;
 		#ifndef _8BPP_COLOR
+#ifdef ARGON_SMS_SMALL
+		/* bitmap.data is a band of ARGON_SMS_BAND lines, not a frame */
+		{
+			PROF_T(t_rm);
+			remap_8_to_16(vline % ARGON_SMS_BAND);
+			PROF_ADD(3, t_rm);
+		}
+		{
+			PROF_T(t_out);
+			sms_line_done(vline);
+			PROF_ADD(4, t_out);
+		}
+#else
 		remap_8_to_16(vline);
+#endif
 		#endif
 	}
 }
 
+#ifndef ARGON_SMS_SMALL
 /* Draw the Master System background */
 void render_bg_sms(int32_t line)
 {
@@ -672,6 +784,167 @@ void render_obj_sms(int32_t line)
 	}
 }
 
+#else /* ARGON_SMS_SMALL */
+/* Draw the Master System background - small build, tiles from VRAM */
+void render_bg_sms(int32_t line)
+{
+	int32_t locked = 0;
+	int32_t yscroll_mask = (vdp.extended) ? 256 : 224;
+	int32_t v_line = (line + vdp.vscroll) % yscroll_mask;
+	int32_t v_row  = v_line & 7;
+	int32_t hscroll = ((vdp.reg[0] & 0x40) && (line < 0x10) && (sms.console != CONSOLE_GG)) ? 0 : (0x100 - vdp.reg[8]);
+	uint16_t SMS_VDP_BUG = (((sms.console == CONSOLE_SMS) && !(vdp.reg[2] & 1)) ? ~0x400 :0xFFFF);
+	uint16_t nt_addr = (vdp.ntab + ((v_line >> 3) << 6)) & SMS_VDP_BUG;
+	uint16_t nt_addr_stop_verticalscroll = (vdp.ntab + ((line >> 3) << 6)) & SMS_VDP_BUG;
+	const uint8_t *nt = &vdp.vram[nt_addr];
+	int32_t nt_scroll = (hscroll >> 3);
+	int32_t shift = (hscroll & 7);
+	int32_t column;
+
+	/*
+	 * Column c of the name table lands at x = c*8 - shift.  Rather than store
+	 * it a byte at a time at an address that is not word aligned whenever the
+	 * line is scrolled (this chip does not forgive an unaligned word store),
+	 * every tile goes to an aligned place - base + c*8, two words - and the
+	 * line itself starts `shift` bytes in: linebuf[x] is then base[x + shift],
+	 * which is where column c's pixels belong.  Sprites and the conversion to
+	 * RGB565 read the line through linebuf and never see the difference.  The
+	 * first column is clipped to backdrop when the line is shifted, as the
+	 * cache version does; the 33rd is written whole and only its first `shift`
+	 * pixels are on the line.
+	 */
+	uint32_t *base = (uint32_t *)(void *)internal_buffer;
+	linebuf = &internal_buffer[shift];
+	if (shift)
+	{
+		int32_t x;
+		for (x = 0; x < 8 - shift; x++)
+			linebuf[x] = 0;
+	}
+
+	for (column = shift ? 1 : 0; column <= 32; column++)
+	{
+		uint32_t lo, hi, a;
+		uint16_t attr;
+		int32_t  row, x0, x;
+		uint8_t *p;
+
+		if (column == 32 && !shift)
+			break;
+
+		/* Stop vertical scrolling for the rightmost eight columns */
+		if((vdp.reg[0] & 0x80) && (!locked) && (column >= 24))
+		{
+			locked = 1;
+			v_row = line & 7;
+			nt = &vdp.vram[nt_addr_stop_verticalscroll];
+		}
+
+		{
+			const uint8_t *e = &nt[((column + nt_scroll) & 0x1F) << 1];
+			attr = (uint16_t)(e[0] | (e[1] << 8));
+		}
+		row = (attr & 0x400) ? (v_row ^ 7) : v_row;
+		tile_row(attr & 0x1FF, row, attr & 0x200, &lo, &hi);
+		a = (uint32_t)((attr >> 7) & 0x30) * 0x01010101u;
+		lo |= a;
+		hi |= a;
+
+		base[column << 1] = lo;
+		base[(column << 1) | 1] = hi;
+		(void)x0; (void)x; (void)p;
+	}
+}
+
+/* Draw sprites - small build, tiles from VRAM */
+void render_obj_sms(int32_t line)
+{
+	int32_t i,x,start,end,xp,yp,n;
+	uint8_t sp,bg;
+	uint8_t *linebuf_ptr;
+	uint8_t px[8];
+
+	int32_t width = 8;
+
+	/* Adjust dimensions for double size sprites */
+	if(vdp.reg[1] & 0x01)
+		width *= 2;
+
+	/* Draw sprites in front-to-back order */
+	for(i = 0; i < object_index_count; i++)
+	{
+		uint32_t lo, hi;
+
+		start = 0;
+		end = width;
+		xp = object_info[i].xpos;
+		yp = object_info[i].yrange;
+		n = object_info[i].attr;
+
+		if(vdp.reg[0] & 0x08) xp -= 8;
+		if(vdp.reg[6] & 0x04) n |= 0x0100;
+		if(vdp.reg[1] & 0x02) n &= 0x01FE;
+
+		linebuf_ptr = (uint8_t *)&linebuf[xp];
+		if(xp < 0)
+		  start = (0 - xp);
+		if((xp + width) > 256)
+		  end = (256 - xp);
+
+		/*
+		 * The cache version indexes bg_pattern_cache[(n << 6) | (yp << 3)], and
+		 * for an 8x16 sprite yp runs to 15 - which walks into tile n+1, the one
+		 * under it.  Same here, said out loud.
+		 */
+		{
+			int32_t r = (vdp.reg[1] & 0x01) ? (yp >> 1) : yp;
+			tile_row((n + (r >> 3)) & 0x1FF, r & 7, 0, &lo, &hi);
+		}
+		px[0] = (uint8_t)lo;         px[1] = (uint8_t)(lo >> 8);
+		px[2] = (uint8_t)(lo >> 16); px[3] = (uint8_t)(lo >> 24);
+		px[4] = (uint8_t)hi;         px[5] = (uint8_t)(hi >> 8);
+		px[6] = (uint8_t)(hi >> 16); px[7] = (uint8_t)(hi >> 24);
+
+		if(vdp.reg[1] & 0x01)
+		{
+			/* Double size sprite, at 1/2 dot rate */
+			for(x = start; x < end; x+=2)
+			{
+				sp = px[x >> 1];
+				if(sp)
+				{
+					bg = linebuf_ptr[x];
+					linebuf_ptr[x] = linebuf_ptr[x+1] = mix_pixel(bg, sp);
+					if ((bg & 0x40) && !(vdp.status & 0x20) && object_index_count != 9)
+					{
+						vdp.status |= 0x20;
+						vdp.spr_col = (line << 8) | ((xp + x + 13) >> 1);
+					}
+				}
+			}
+		}
+		else
+		{
+			for(x = start; x < end; x++)
+			{
+				sp = px[x];
+				if(sp)
+				{
+					bg = linebuf_ptr[x];
+					linebuf_ptr[x] = mix_pixel(bg, sp);
+					if ((bg & 0x40) && !(vdp.status & 0x20) && object_index_count != 9)
+					{
+						vdp.status |= 0x20;
+						vdp.spr_col = (line << 8) | ((xp + x + 13) >> 1);
+					}
+				}
+			}
+		}
+	}
+}
+
+#endif /* ARGON_SMS_SMALL */
+
 /* Update a palette entry */
 void palette_sync(int32_t index)
 {
@@ -813,6 +1086,7 @@ static void parse_satb(int32_t line)
 	}
 }
 
+#ifndef ARGON_SMS_SMALL
 static void update_bg_pattern_cache(void)
 {
 	int32_t i;
@@ -851,7 +1125,40 @@ static void update_bg_pattern_cache(void)
 	bg_list_index = 0;
 }
 
+#endif
+
 #ifndef _8BPP_COLOR
+#ifdef ARGON_SMS_SMALL
+/*
+ * Four pixels a read and two a write, and the band's hash folded in on the way
+ * (sms_line_hash), so the front end does not read the band a second time to
+ * decide whether it changed.  Measured on the CYD before: 2.9 ms a frame for
+ * this loop and 1.1-1.8 for the separate hash.
+ */
+uint32_t sms_line_hash;
+
+static void remap_8_to_16(int32_t line)
+{
+	const uint8_t *in = linebuf;
+	uint32_t *out = (uint32_t *)(void *)&bitmap.data[(line * bitmap.pitch)];
+	const int32_t words = ((bitmap.viewport.w) + 2 * bitmap.viewport.x) >> 2;
+	uint32_t h = 0;
+	int32_t i;
+
+	for (i = 0; i < words; i++)
+	{
+		const uint8_t *q = &in[i << 2];
+		const uint32_t a = pixel[q[0] & PIXEL_MASK] | ((uint32_t)pixel[q[1] & PIXEL_MASK] << 16);
+		const uint32_t b = pixel[q[2] & PIXEL_MASK] | ((uint32_t)pixel[q[3] & PIXEL_MASK] << 16);
+		out[0] = a;
+		out[1] = b;
+		out += 2;
+		h = ((h << 5) | (h >> 27)) ^ a;
+		h = ((h << 5) | (h >> 27)) ^ b;
+	}
+	sms_line_hash = h;
+}
+#else
 static void remap_8_to_16(int32_t line)
 {
 	int32_t i;
@@ -867,4 +1174,5 @@ static void remap_8_to_16(int32_t line)
 	
 	UNLOCK_VIDEO
 }
+#endif /* ARGON_SMS_SMALL */
 #endif
