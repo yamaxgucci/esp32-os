@@ -672,12 +672,178 @@ static int mem_map(void)
     return 0;
 }
 
+/*
+ * mem /i: internal memory in address order - what cuts it into pieces.
+ *
+ * On the CYD 112 KB were free and a 13 KB arena was refused (29 Oct 2026):
+ * the largest block is decided by what sits between the free ones, often a
+ * few bytes someone took and kept.  Every free block of MEM_GAP_MIN or more
+ * gets a line; the used blocks between two of them are one line, with their
+ * count, and the address of the smallest - the cheapest wall to move.  A
+ * jump in the addresses is a new region of the heap, and starts a line too.
+ */
+#define MEM_GAP_MIN    1024u
+#define MEM_IMAP_LINES 96
+
+typedef struct {
+    uintptr_t addr;        /* first block of the line */
+    uintptr_t small;       /* used: its smallest block */
+    uint32_t  bytes;
+    uint32_t  small_bytes;
+    uint16_t  count;
+    uint8_t   used;
+    uint8_t   region;      /* starts a region of the heap */
+} mem_imap_line_t;
+
+typedef struct {
+    mem_imap_line_t line[MEM_IMAP_LINES];
+    unsigned        n;
+    uintptr_t       next;  /* where a block following the last would start */
+    uint32_t        lost;  /* small free blocks, not worth a line */
+    bool            cut;
+} mem_imap_t;
+
+static void mem_imap_block(void *ctx, const void *addr, size_t bytes, int used)
+{
+    mem_imap_t *m = (mem_imap_t *)ctx;
+    const uintptr_t a = (uintptr_t)addr;
+    const bool region = m->n == 0 || a < m->next || a > m->next + 64u;
+    m->next = a + bytes;
+    if (!used && bytes < MEM_GAP_MIN) {
+        m->lost += (uint32_t)bytes;    /* counted, and part of the wall */
+        used = 1;
+    }
+    mem_imap_line_t *last = (m->n > 0) ? &m->line[m->n - 1] : NULL;
+    if (used && !region && last != NULL && last->used) {
+        last->count++;
+        last->bytes += (uint32_t)bytes;
+        if (bytes < last->small_bytes) {
+            last->small = a;
+            last->small_bytes = (uint32_t)bytes;
+        }
+        return;
+    }
+    if (m->n == MEM_IMAP_LINES) {
+        m->cut = true;
+        return;
+    }
+    mem_imap_line_t *l = &m->line[m->n++];
+    l->addr = a;
+    l->small = a;
+    l->bytes = (uint32_t)bytes;
+    l->small_bytes = (uint32_t)bytes;
+    l->count = 1;
+    l->used = (uint8_t)(used != 0);
+    l->region = (uint8_t)region;
+}
+
+#if CONFIG_ARGON_HEAP_WHO
+/*
+ * mem who: who holds each block of the heap, and who held the last ones given
+ * back (diagnostic build only).  One line a record, in hex, for
+ * tools/heapwho.py to lay over `mem /i`:
+ *   L <ptr> <size> <seq> 0 <task> <pc>...       held
+ *   G <ptr> <size> <seq> <gone> <task> <pc>...  given back
+ *   M <seq> <name>                              a mark
+ * `seq` is the order of allocation.  `mem who mark <word>` names the moment,
+ * between the steps of a session.
+ */
+static void mem_who_line(char kind, const ag_port_heap_rec_t *r)
+{
+    ag_console_printf("%c %08x %x %x %x %08x", kind, (unsigned)r->ptr,
+                      (unsigned)r->size, (unsigned)r->seq, (unsigned)r->gone,
+                      (unsigned)r->task);
+    for (int k = 0; k < AG_PORT_HEAP_PCS; k++) {
+        ag_console_printf(" %08x", (unsigned)r->pc[k]);
+    }
+    ag_console_puts("\n");
+}
+
+static int mem_who(int argc, char **argv)
+{
+    if (argc >= 1 && strcmp(argv[0], "mark") == 0) {
+        ag_port_heap_who_mark(argc >= 2 ? argv[1] : "mark");
+        return 0;
+    }
+    ag_port_heap_rec_t r;
+    uint32_t lost = 0;
+    const uint32_t seq = ag_port_heap_who_seq(&lost);
+    ag_console_printf("S %x lost %u\n", (unsigned)seq, (unsigned)lost);
+    for (uint32_t i = 0; ag_port_heap_who_get(2, i, &r); i++) {
+        ag_console_printf("M %x %08x\n", (unsigned)r.seq, (unsigned)r.task);
+    }
+    for (uint32_t i = 0; ag_port_heap_who_get(0, i, &r); i++) {
+        if (r.ptr != 0) {
+            mem_who_line('L', &r);
+        }
+    }
+    for (uint32_t i = 0; ag_port_heap_who_get(1, i, &r); i++) {
+        if (r.ptr != 0) {
+            mem_who_line('G', &r);
+        }
+    }
+    ag_console_puts("E\n");
+    return 0;
+}
+#endif
+
+static int mem_imap(void)
+{
+    /* taken for the walk, not kept: a static would cost the CYD its 2 KB for
+     * good.  It shows in the map as one used block of its size. */
+    mem_imap_t *mp = (mem_imap_t *)ag_port_alloc(sizeof(*mp),
+                                                AG_MEM_FAST | AG_MEM_BYTE);
+    if (mp == NULL) {
+        ag_console_puts("mem: no room for the map\n");
+        return 1;
+    }
+    const mem_imap_t *const mm = mp;
+    memset(mp, 0, sizeof(*mp));
+    ag_port_mem_walk(AG_MEM_FAST, mem_imap_block, mp);
+    ag_console_printf("address  free   used  blocks (map: %u)\n",
+                      (unsigned)sizeof(*mp));
+    for (unsigned i = 0; i < mm->n; i++) {
+        const mem_imap_line_t *l = &mm->line[i];
+        if (l->region) {
+            ag_console_puts("--\n");
+        }
+        if (!l->used) {
+            ag_console_printf("%08x %5uK\n", (unsigned)l->addr,
+                              (unsigned)(l->bytes / 1024u));
+        } else if (l->count == 1) {
+            ag_console_printf("%08x      %6u\n", (unsigned)l->addr,
+                              (unsigned)l->bytes);
+        } else {
+            ag_console_printf("%08x      %6u %u, least %u @%08x\n",
+                              (unsigned)l->addr, (unsigned)l->bytes,
+                              (unsigned)l->count, (unsigned)l->small_bytes,
+                              (unsigned)l->small);
+        }
+    }
+    ag_console_printf("free in pieces under %uK: %u\n",
+                      (unsigned)(MEM_GAP_MIN / 1024u), (unsigned)mm->lost);
+    if (mm->cut) {
+        ag_console_printf("(only the first %u lines)\n",
+                          (unsigned)MEM_IMAP_LINES);
+    }
+    ag_port_free(mp);
+    return 0;
+}
+
 static int cmd_mem(int argc, char **argv)
 {
     if (argc > 1 && (strcmp(argv[1], "/x") == 0 ||
                      strcmp(argv[1], "map") == 0)) {
         return mem_map();
     }
+    if (argc > 1 && strcmp(argv[1], "/i") == 0) {
+        return mem_imap();
+    }
+#if CONFIG_ARGON_HEAP_WHO
+    if (argc > 1 && strcmp(argv[1], "who") == 0) {
+        return mem_who(argc - 2, argv + 2);
+    }
+#endif
     if (argc > 1 && (strcmp(argv[1], "/t") == 0 ||
                      strcmp(argv[1], "tasks") == 0)) {
         return mem_tasks();
@@ -760,6 +926,41 @@ static int cmd_mem(int argc, char **argv)
     }
     ag_console_printf("\n  %u KB used by the system\n",
                       (unsigned)((int_total - int_free) / 1024));
+#if CONFIG_ARGON_HEAP_TWOEND
+    ag_port_twoend_info_t te;
+    if (ag_port_twoend(&te)) {
+        ag_console_printf(narrow_screen()
+                              ? "  two-ended, <=%u B on top:\n"
+                                "  %uK of %uK free (least %uK)\n"
+                              : "  two-ended heap, blocks of %u B or less on top: "
+                                "%u KB of %u KB free (least %u KB)\n",
+                          (unsigned)te.small_max, (unsigned)(te.free / 1024u),
+                          (unsigned)(te.total / 1024u),
+                          (unsigned)(te.low / 1024u));
+        for (uint32_t i = 0; i < te.arenas && i < 8u; i++) {
+            ag_console_printf("  arena %08x-%08x %uK\n", (unsigned)te.lo[i],
+                              (unsigned)te.hi[i],
+                              (unsigned)((te.hi[i] - te.lo[i]) / 1024u));
+        }
+    }
+#endif
+#if CONFIG_ARGON_SMALL_ZONE_KB > 0
+    /* counted as used above: one block of the heap, run as a heap of its own */
+    ag_port_zone_info_t z;
+    if (ag_port_small_zone(&z)) {
+        ag_console_printf(narrow_screen()
+                              ? "  small<=%u: %uK of %uK free\n"
+                                "  (least %uK, %u blocks, %u spilled, "
+                                "%u lent)\n"
+                              : "  blocks of %u B or less: %u KB of %u KB "
+                                "free (least %u KB), %u held, %u spilled, "
+                                "%u lent\n",
+                          (unsigned)z.max, (unsigned)(z.free / 1024u),
+                          (unsigned)(z.total / 1024u),
+                          (unsigned)(z.low / 1024u), (unsigned)z.blocks,
+                          (unsigned)z.spilled, (unsigned)z.lent);
+    }
+#endif
 
     /*
      * The arena is the honest answer to "how much executable memory is there":
@@ -6202,7 +6403,7 @@ static int cmd_guard(int argc, char **argv)
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
-    {"mem", "[/t|/p|/x]", "memory usage; /t: every task and its stack; /p: [memory] placement; /x: extended memory block by block", cmd_mem},
+    {"mem", "[/t|/p|/x|/i]", "memory usage; /t: every task and its stack; /p: [memory] placement; /x: extended memory block by block; /i: what cuts internal memory up", cmd_mem},
     {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
     {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",

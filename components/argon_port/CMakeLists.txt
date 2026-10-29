@@ -98,6 +98,30 @@ if(NOT CMAKE_SCRIPT_MODE_FILE AND ARGON_PORT STREQUAL "idf")
     endforeach()
 endif()
 
+# SMALL BLOCKS APART: every allocation and free in the image goes through these
+# five, and idf/src/smallzone_hw.c serves the small ones from a heap of their
+# own.  Calls inside heap_caps_base.c itself are not rewritten - the realloc
+# and calloc paths there are wrapped whole for that reason.
+if(NOT CMAKE_SCRIPT_MODE_FILE AND ARGON_PORT STREQUAL "idf" AND
+   CONFIG_ARGON_HEAP_TWOEND)
+    # THE TWO-ENDED HEAP: the same entry points, and the questions about the
+    # heap as well - free, largest, a walk - so that `mem` and the loader see
+    # its blocks and not the arenas it took from ESP-IDF (idf/src/twoend_hw.c).
+    foreach(fn heap_caps_malloc_base heap_caps_calloc_base heap_caps_realloc_base
+               heap_caps_aligned_alloc_base heap_caps_free
+               heap_caps_get_allocated_size heap_caps_get_free_size
+               heap_caps_get_largest_free_block heap_caps_get_minimum_free_size
+               heap_caps_walk)
+        idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=${fn}" APPEND)
+    endforeach()
+elseif(NOT CMAKE_SCRIPT_MODE_FILE AND ARGON_PORT STREQUAL "idf" AND
+   CONFIG_ARGON_SMALL_ZONE_KB GREATER 0)
+    foreach(fn heap_caps_malloc_base heap_caps_calloc_base heap_caps_realloc_base
+               heap_caps_free heap_caps_get_allocated_size)
+        idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=${fn}" APPEND)
+    endforeach()
+endif()
+
 set(ARGON_PORT_LDFRAGMENTS "")
 if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/${ARGON_PORT}/linker.lf")
     set(ARGON_PORT_LDFRAGMENTS "${ARGON_PORT}/linker.lf")

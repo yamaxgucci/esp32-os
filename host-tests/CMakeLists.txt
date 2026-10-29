@@ -148,6 +148,7 @@ add_executable(argon_tests
     test_journal.c
     test_reslist.c
     test_arena.c
+    test_twoend.c
     test_axeload.c
     test_axesig.c
     test_licence.c

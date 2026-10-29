@@ -91,3 +91,11 @@ CONFIG_FATFS_SECTOR_4096=n
 # changed nothing - measured, 44 KB both ways.  Nothing here uses wear levelling.
 CONFIG_WL_SECTOR_SIZE_512=y
 CONFIG_WL_SECTOR_SIZE_4096=n
+
+# The two-ended heap in place of ESP-IDF's TLSF: small blocks from the top of
+# the fullest arena, large ones from the bottom (twoend_core.h).  Measured on
+# this board 29 Oct 2026 over one session (boot, radio off, card out and in, an
+# application): largest pieces after `wifi off` 80/11/9 KB with TLSF, 75/20/10
+# with this - and the Master System emulator, refused under TLSF for want of a
+# 13 KB arena, starts, while the Mega Drive still has its 128 KB.
+CONFIG_ARGON_HEAP_TWOEND=y

@@ -732,4 +732,87 @@ menu "ArgonOS"
             PSRAM that is a large fraction of the memory an application was
             going to get, so hardware targets turn it off.
 
+    config ARGON_HEAP_TWOEND
+        bool "Two-ended heap: small blocks from the top, large from the bottom"
+        default n
+        help
+            Replaces ESP-IDF's heap (TLSF) for all byte-addressable internal
+            RAM with one that places small blocks downward from the top of
+            memory and large ones upward from the bottom, so the free space
+            stays one piece between them.
+
+            What fragments a heap with little memory is small long-lived
+            blocks - FreeRTOS's 84-byte mutexes, made when first needed -
+            landing among large short-lived ones and walling in the holes
+            those leave (tools/heapwho.py, the CYD, 29 Oct 2026).  A fixed
+            area for the small ones (ARGON_SMALL_ZONE_KB) gathered them but
+            locked away whatever it had free; here there is no line between
+            the two kinds, only two directions.
+
+            IRAM for code stays with ESP-IDF.
+
+    config ARGON_HEAP_TWOEND_SMALL
+        int "Two-ended heap: largest block placed from the top (bytes)"
+        default 128
+        range 16 4096
+        depends on ARGON_HEAP_TWOEND
+
+    config ARGON_SMALL_ZONE_KB
+        int "A heap of its own for small blocks (KB, 0 = none)"
+        default 0
+        range 0 64
+        depends on !ARGON_HEAP_TWOEND
+        help
+            Blocks of ARGON_SMALL_ZONE_MAX bytes or less - mutexes,
+            semaphores, list nodes, the radio's little records - are served
+            from one area taken at start-up, not from the heap at large.
+
+            They are made when first needed and kept until the next reset,
+            so wherever they land in the ordinary heap they stay as walls
+            between the holes larger blocks leave behind.  On the CYD, after
+            the radio was switched off, the largest free piece of DRAM was
+            11.8 KB with them scattered and would have been 22.3 KB with them
+            apart (tools/heapwho.py, 29 Oct 2026).
+
+            Off by default: it locks away whatever it has free, and an
+            emulator that builds its memory out of 512-byte pages (MD32 on
+            the CYD) came up 2 KB short with it.  ARGON_HEAP_TWOEND does the
+            same gathering without the partition.
+
+            Sized for what is held at once: about 250 such blocks, 13 KB,
+            on an ESP32 with the radio on.  When the zone is full a small
+            block goes to the ordinary heap as before; `mem` says how often.
+
+    config ARGON_SMALL_ZONE_MAX
+        int "Largest block served from the small-block heap (bytes)"
+        default 128
+        range 16 1024
+        depends on ARGON_SMALL_ZONE_KB > 0
+        help
+            A FreeRTOS mutex or semaphore is 84 bytes; nearly every small
+            block that outlives the big ones is one of those or smaller.
+
+    config ARGON_HEAP_WHO
+        bool "Remember who took each block of the heap (diagnostic)"
+        default n
+        select HEAP_USE_HOOKS
+        help
+            A build for finding out what cuts memory into pieces.  Every
+            allocation records the few calls that led to it, and `mem /i`
+            Every block still held is kept with its owner and its age, and
+            the last ones given back with who held them: `mem who` prints
+            both and tools/heapwho.py lays them over the map from `mem /i` -
+            for each hole, who walls it in and who lived in it.
+
+            The record takes 27 KB of IRAM, which no byte-addressed data
+            could have used, so the map it explains is the map an ordinary
+            build has.  But every allocation and every free pays a backtrace
+            and a search, and a module that wanted that IRAM does not get it:
+            not a build anyone keeps.
+
+            Turning it off leaves HEAP_USE_HOOKS on in an existing sdkconfig,
+            and a build with the hooks on and nobody defining them restarts
+            forever on the first allocation (a call through address 0): turn
+            both off.
+
 endmenu

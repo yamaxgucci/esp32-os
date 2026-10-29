@@ -365,6 +365,10 @@ void ag_kernel_main(void)
 {
     AG_TRACE("kernel entry\n");
     const int64_t t0 = ag_port_us();
+#if CONFIG_ARGON_HEAP_TWOEND
+    /* what ESP-IDF added to the heap after the start-up stacks were done */
+    ag_port_twoend_take_rest();
+#endif
 
     memset(&s_report, 0, sizeof(s_report));
     /*

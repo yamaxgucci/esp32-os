@@ -30,6 +30,7 @@ void run_codepage_tests(void);
 void run_hidrep_tests(void);
 void run_reslist_tests(void);
 void run_arena_tests(void);
+void run_twoend_tests(void);
 void run_probe_tests(void);
 void run_cc_tests(void);
 void run_rv32_tests(void);
@@ -82,6 +83,7 @@ int main(void)
     run_hidrep_tests();
     run_reslist_tests();
     run_arena_tests();
+    run_twoend_tests();
     run_probe_tests();
     run_cc_tests();
     run_rv32_tests();
