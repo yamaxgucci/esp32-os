@@ -323,7 +323,27 @@ void m68k_run(unsigned int cycles)
 #ifdef MD_CYCPROF
       const unsigned int cp1 = md_ccount();
 #endif
+#ifdef MD_DECODE_CACHE
+      /*
+       * The handler of a recent opcode, from RAM.  MD_OP reads a 128 KB index
+       * and a 13.6 KB table, both in flash, for every instruction; a busy
+       * scene uses a few hundred opcodes and each lookup that misses the
+       * flash cache costs some 300 cycles.
+       */
+      static unsigned short s_dc_tag[MD_DECODE_CACHE];
+      static const md_op_t *s_dc_op[MD_DECODE_CACHE];
+      const unsigned int dci = (ir ^ (ir >> 7)) & (MD_DECODE_CACHE - 1u);
+      const md_op_t *op;
+      if (s_dc_tag[dci] == ir && s_dc_op[dci] != NULL) {
+        op = s_dc_op[dci];
+      } else {
+        op = MD_OP(ir);
+        s_dc_tag[dci] = (unsigned short)ir;
+        s_dc_op[dci] = op;
+      }
+#else
       const md_op_t *op = MD_OP(ir);
+#endif
 #ifdef MD_CYCPROF
       const unsigned int cp2 = md_ccount();
 #endif
