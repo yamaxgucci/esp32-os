@@ -280,6 +280,11 @@ def cold_block():
         "    KEEP(*(.literal.ag_main .text.ag_main "
         ".literal.ag_driver_init .text.ag_driver_init))",
         "    *(.literal .text .literal.* .text.*)",
+        # Constants too big for the hot part and read too often for the data
+        # part: a 128 KB decode table, say.  Word reads only, as for
+        # .hot_rodata - this is the instruction bus.
+        "    . = ALIGN(16);",
+        "    *(.cold_rodata .cold_rodata.*)",
         "    . = ALIGN(4);",
         "  }"]) + "\n"
 
@@ -325,6 +330,9 @@ def code_block(rodata_in_code, split=False):
     if not split:
         lines += ["    KEEP(*(.literal.ag_main .text.ag_main "
                   ".literal.ag_driver_init .text.ag_driver_init))"]
+    if not split:
+        # unsplit, the cold constants are simply code-part constants
+        text_input += " *(.cold_rodata .cold_rodata.*)"
     lines += ["    " + text_input,
               # A constant that stays in the code part is read a word at a time
               # and nothing smaller: on an S3 the address the image is linked

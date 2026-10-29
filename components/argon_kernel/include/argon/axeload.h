@@ -38,11 +38,26 @@ typedef struct {
      * biases target the eventual mmap address while bytes are still in RAM.
      */
     void *code_writable;
+
+    /*
+     * The cold part, when the image has one: the code that runs once, which
+     * the caller has put somewhere slower and larger - flash - so that the
+     * loop in `code` can have the arena.
+     *
+     * NULL, with a zero capacity, for every image built without --split-hot,
+     * which is most of them.  `cold_writable` plays the same role for it that
+     * `code_writable` does above: for flash the bytes are relocated in RAM
+     * while the biases already point at where the mapping will be.
+     */
+    void  *cold;
+    size_t cold_capacity;
+    void  *cold_writable;
 } ag_axe_place_t;
 
 typedef struct {
     uintptr_t code_base; /* where the code part actually is                */
     uintptr_t data_base; /* where the data part actually is, 0 if absent    */
+    uintptr_t cold_base; /* where the cold part is, 0 if the image has none */
     void     *entry;     /* ag_main, as a function pointer                  */
 
     /*
@@ -82,6 +97,22 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
                       uint32_t ireloc_count, ag_axe_binding_t *out);
 
 /*
+ * The same, for an image with a cold part.
+ *
+ * A separate entry point rather than two more arguments on the one above, so
+ * that a caller written before the cold part existed cannot be handed a split
+ * image and quietly leave half its relocations unapplied: ag_axe_apply refuses
+ * a split header outright.  An unsplit image may be passed to either.
+ */
+ag_err_t ag_axe_apply_split(const ag_axe_header_t *header,
+                            const ag_axe_place_t *place,
+                            const uint32_t *relocs, uint32_t reloc_count,
+                            const ag_axe_ireloc_t *irelocs,
+                            uint32_t ireloc_count,
+                            const ag_axe_creloc_t *crelocs,
+                            uint32_t creloc_count, ag_axe_binding_t *out);
+
+/*
  * The instruction relocation table, as this image really has it.
  *
  * Two words were added to the header after `reserved`, so an image built
@@ -91,6 +122,18 @@ ag_err_t ag_axe_apply(const ag_axe_header_t *header,
  */
 uint32_t ag_axe_ireloc_count(const ag_axe_header_t *header);
 uint32_t ag_axe_ireloc_offset(const ag_axe_header_t *header);
+
+/*
+ * The split relocation table, for the same reason and read the same way: an
+ * image built before the cold part existed has a header too short to hold
+ * these fields, and asking rather than reading is what keeps it loading
+ * unchanged.  Both are zero for an unsplit image, whatever its header length.
+ */
+uint32_t ag_axe_creloc_count(const ag_axe_header_t *header);
+uint32_t ag_axe_creloc_offset(const ag_axe_header_t *header);
+
+/* True when the image has a cold part at all. */
+bool ag_axe_is_split(const ag_axe_header_t *header);
 
 /*
  * One instruction relocation, applied to a window of the code part.

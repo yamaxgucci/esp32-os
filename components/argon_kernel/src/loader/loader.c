@@ -388,6 +388,13 @@ static void release_image(ag_loaded_app_t *app)
         ag_appfs_release((ag_appfs_slot_t *)app->xip_slot);
         app->xip_slot = NULL;
     }
+    if (app->cold_slot != NULL) {
+        ag_appfs_release((ag_appfs_slot_t *)app->cold_slot);
+        app->cold_slot = NULL;
+    }
+    app->place.cold = NULL;
+    app->place.cold_writable = NULL;
+    app->place.cold_capacity = 0;
 #if defined(CONFIG_ARGON_APP_ARENA_PSRAM)
     if (app->code_from_psram) {
         /* The PSRAM arena tracks the writable alias, not the exec one; the
@@ -888,7 +895,7 @@ static ag_err_t xip_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
     return AG_OK;
 }
 
-static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
+static ag_err_t place_parts(const ag_axe_header_t *header, ag_loaded_app_t *out)
 {
     arena_ready();
 
@@ -1053,6 +1060,47 @@ static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
 }
 
 /*
+ * Where the parts of an image go: the code part by the rules of place_parts -
+ * which for a split image is the hot part, small enough for internal memory,
+ * and placed as [memory] app.code in SYSTEM.CFG says - and the cold part
+ * always in flash.
+ *
+ * A hot part that ends up in flash itself has been split for nothing, and is
+ * refused rather than loaded at the speed nobody built it for.
+ */
+static ag_err_t place_image(const ag_axe_header_t *header, ag_loaded_app_t *out)
+{
+    ag_err_t err = place_parts(header, out);
+    if (err != AG_OK || !ag_axe_is_split(header)) {
+        return err;
+    }
+    if (out->code_from_xip) {
+        ag_log(AG_LOG_ERROR, "loader",
+               "%u bytes of hot code found no internal memory; a split image "
+               "is not run with its hot part in flash",
+               (unsigned)header->code.size);
+        release_image(out);
+        memset(out, 0, sizeof(*out));
+        return -AG_ENOMEM;
+    }
+    ag_appfs_slot_t *slot = NULL;
+    void            *exec = NULL;
+    err = ag_appfs_reserve(header->cold.size, &slot, &exec);
+    if (err != AG_OK) {
+        ag_log(AG_LOG_ERROR, "loader", "no flash for %u bytes of cold code (%d)",
+               (unsigned)header->cold.size, (int)err);
+        release_image(out);
+        memset(out, 0, sizeof(*out));
+        return err;
+    }
+    out->place.cold = exec;
+    out->place.cold_capacity = header->cold.size;
+    out->place.cold_writable = NULL;
+    out->cold_slot = slot;
+    return AG_OK;
+}
+
+/*
  * Reads exactly `bytes` from `at` in the file.
  *
  * Short reads are an error rather than something to retry around: the sizes come
@@ -1182,6 +1230,175 @@ static ag_err_t stream_code(ag_handle_t h, const ag_axe_part_t *part, void *dst)
  * different piece of work.  Signing is optional and rare; running out of memory
  * is neither.
  */
+/*
+ * A split image (sdk/include/argon/axe.h, `cold`): the hot part into internal
+ * memory, the data into RAM, and the cold part programmed into its flash slot
+ * a page at a time with each page's relocations applied on the way.
+ *
+ * main's loader relocated the cold part in a scratch buffer its own size, from
+ * PSRAM.  A board without PSRAM has no such buffer - MD32's cold part is
+ * 330 KB on a CYD with 240 KB of RAM in all - so here only the relocation
+ * table is held whole (8 bytes an entry) and the code passes through one
+ * page.  A split relocation names its word's part and offset and its target's,
+ * and Xtensa literals are word aligned, so no word is ever cut by a page.
+ */
+static void put_word(uint8_t *at, uint32_t word, bool word_only)
+{
+    if (word_only) {
+        *(volatile uint32_t *)(void *)at = word;   /* IRAM: words only */
+    } else {
+        memcpy(at, &word, 4);
+    }
+}
+
+static ag_err_t split_load_chunked(ag_handle_t h, const ag_axe_header_t *header,
+                                   ag_loaded_app_t *out)
+{
+    if (ag_axe_ireloc_count(header) != 0 ||
+        !(header->api_slot >= header->data.base &&
+          header->api_slot + 4u <= header->data.base + header->data.size) ||
+        !(header->entry >= header->cold.base &&
+          header->entry < header->cold.base + header->cold.size)) {
+        /* none of these happens on Xtensa with the API slot in bss */
+        return -AG_ENOTSUP;
+    }
+
+    uint8_t *const hot_final = (uint8_t *)out->place.code;
+    uint8_t *const hot_write = (out->place.code_writable != NULL)
+                                   ? (uint8_t *)out->place.code_writable
+                                   : hot_final;
+    const bool hot_words = out->code_heap != NULL || !out->code_from_psram;
+    uint8_t *const cold_final = (uint8_t *)out->place.cold;
+    uint8_t *const data = (uint8_t *)out->place.data;
+
+    ag_err_t err = stream_code(h, &header->code, hot_write);
+    if (err == AG_OK && header->data.file_size > 0) {
+        err = read_at(h, header->data.offset, data, header->data.file_size);
+    }
+    if (err == AG_OK && data != NULL &&
+        header->data.size > header->data.file_size) {
+        memset(data + header->data.file_size, 0,
+               header->data.size - header->data.file_size);
+    }
+
+    const uint32_t   cnum = ag_axe_creloc_count(header);
+    ag_axe_creloc_t *crel = NULL;
+    if (err == AG_OK && cnum > 0) {
+        const size_t cbytes = (size_t)cnum * sizeof(ag_axe_creloc_t);
+        crel = (ag_axe_creloc_t *)scratch_alloc(cbytes);
+        if (crel == NULL) {
+            err = -AG_ENOMEM;
+        } else {
+            err = read_at(h, ag_axe_creloc_offset(header), crel, cbytes);
+        }
+    }
+
+    /* Where a target is, finally. */
+    uint32_t final_base[3];
+    final_base[AG_AXE_P_CODE] = (uint32_t)(uintptr_t)hot_final;
+    final_base[AG_AXE_P_DATA] = (uint32_t)(uintptr_t)data;
+    final_base[AG_AXE_P_COLD] = (uint32_t)(uintptr_t)cold_final;
+
+    /* The words in RAM - the hot part and the data - in one pass. */
+    for (uint32_t i = 0; err == AG_OK && i < cnum; i++) {
+        const uint32_t sp = AG_AXE_C_PART(crel[i].site);
+        const uint32_t at = AG_AXE_C_OFFSET(crel[i].site);
+        const uint32_t tp = AG_AXE_C_PART(crel[i].target);
+        if (tp > AG_AXE_P_COLD || (at & 3u) != 0u) {
+            err = -AG_EFORMAT;
+            break;
+        }
+        const uint32_t word = final_base[tp] + AG_AXE_C_OFFSET(crel[i].target);
+        if (sp == AG_AXE_P_CODE) {
+            if (at + 4u > header->code.file_size) {
+                err = -AG_EFORMAT;
+                break;
+            }
+            put_word(hot_write + at, word, hot_words);
+        } else if (sp == AG_AXE_P_DATA) {
+            if (data == NULL || at + 4u > header->data.file_size) {
+                err = -AG_EFORMAT;
+                break;
+            }
+            put_word(data + at, word, false);
+        } else if (sp != AG_AXE_P_COLD) {
+            err = -AG_EFORMAT;
+        }
+    }
+
+    /* And the cold part, a page at a time, into its flash slot. */
+    uint8_t *buf = NULL;
+    if (err == AG_OK) {
+        buf = (uint8_t *)ag_port_alloc(AG_XIP_CHUNK, AG_MEM_FAST | AG_MEM_BYTE);
+        if (buf == NULL) {
+            err = -AG_ENOMEM;
+        }
+    }
+    for (uint32_t off = 0; err == AG_OK && off < header->cold.size;
+         off += AG_XIP_CHUNK) {
+        uint32_t n = header->cold.size - off;
+        if (n > AG_XIP_CHUNK) {
+            n = AG_XIP_CHUNK;
+        }
+        uint32_t fn = 0;
+        if (off < header->cold.file_size) {
+            fn = header->cold.file_size - off;
+            if (fn > n) {
+                fn = n;
+            }
+            err = read_at(h, header->cold.offset + off, buf, fn);
+        }
+        if (fn < n) {
+            memset(buf + fn, 0, n - fn);
+        }
+        for (uint32_t i = 0; err == AG_OK && i < cnum; i++) {
+            const uint32_t at = AG_AXE_C_OFFSET(crel[i].site);
+            if (AG_AXE_C_PART(crel[i].site) != AG_AXE_P_COLD || at < off ||
+                at >= off + n) {
+                continue;
+            }
+            if (at + 4u > header->cold.file_size) {
+                err = -AG_EFORMAT;
+                break;
+            }
+            const uint32_t tp = AG_AXE_C_PART(crel[i].target);
+            put_word(buf + (at - off),
+                     final_base[tp] + AG_AXE_C_OFFSET(crel[i].target), false);
+        }
+        if (err == AG_OK) {
+            err = ag_appfs_program_at((ag_appfs_slot_t *)out->cold_slot, off,
+                                      buf, n);
+        }
+    }
+    ag_port_free(buf);
+    ag_port_free(crel);
+
+    if (err == AG_OK) {
+        const void *mapped = NULL;
+        err = ag_appfs_mmap((ag_appfs_slot_t *)out->cold_slot, &mapped);
+        if (err == AG_OK && mapped != out->place.cold) {
+            /* every address written into the image assumed this one */
+            ag_log(AG_LOG_ERROR, "loader",
+                   "cold XIP address moved: predicted %p, mapped %p",
+                   out->place.cold, mapped);
+            err = -AG_EIO;
+        }
+    }
+    if (err != AG_OK) {
+        return err;
+    }
+
+    out->binding.entry =
+        (void *)(uintptr_t)((uint32_t)(uintptr_t)cold_final +
+                            (header->entry - header->cold.base));
+    out->binding.api_slot =
+        (uint32_t *)(void *)(data + (header->api_slot - header->data.base));
+    out->binding.data_base = (uintptr_t)data;
+    out->binding.cold_base = (uintptr_t)cold_final;
+    out->binding.relocated = cnum;
+    return AG_OK;
+}
+
 static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
                               ag_loaded_app_t *out)
 {
@@ -1190,6 +1407,20 @@ static ag_err_t load_streamed(ag_handle_t h, const ag_axe_header_t *header,
     ag_err_t err = place_image(header, out);
     if (err != AG_OK) {
         memset(out, 0, sizeof(*out));
+        return err;
+    }
+
+    if (ag_axe_is_split(header)) {
+        err = split_load_chunked(h, header, out);
+        if (err == AG_OK) {
+            ag_log(AG_LOG_INFO, "loader",
+                   "%s: hot %u B at %p, cold %u B in flash at %p",
+                   header->name, (unsigned)header->code.size, out->place.code,
+                   (unsigned)header->cold.size, out->place.cold);
+        } else {
+            release_image(out);
+            memset(out, 0, sizeof(*out));
+        }
         return err;
     }
 
@@ -1268,6 +1499,13 @@ static ag_err_t load_whole(const char *path, const char *cwd,
                            const ag_axe_header_t *header, ag_licence_t *lic,
                            ag_loaded_app_t *out)
 {
+    if (ag_axe_is_split(header)) {
+        /* the whole-file path relocates in one buffer the image's size, which
+         * is what a split image is built to avoid; signed split images can
+         * come the day one exists */
+        ag_log(AG_LOG_ERROR, "loader", "a signed image cannot be split yet");
+        return -AG_ENOTSUP;
+    }
     uint8_t *file = NULL;
     size_t   file_size = 0;
     ag_err_t err = read_whole(path, cwd, &file, &file_size);
