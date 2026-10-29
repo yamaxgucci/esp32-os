@@ -547,24 +547,23 @@ typedef struct {
      */
     uint8_t  *staging;
     /*
-     * The receive half for a LONG DUPLEX transfer.  Separate from the pair
-     * above because that one is the write ping-pong and both halves of it can
-     * be in flight; this is used inside one synchronous call and nowhere else.
+     * The receive half for a LONG DUPLEX transfer.  Separate from the buffer
+     * above because a queued write may still be going out of that one; this
+     * is used inside one synchronous call and nowhere else.
      */
     uint8_t  *staging_rx;
     /*
-     * The other half of the staging pair, and the transaction in flight.
+     * The transaction in flight out of the staging buffer.
      *
-     * A long write is QUEUED rather than polled: the engine clocks it out of
-     * one half while the caller fills the other, so the time on the wire and
-     * the time spent building the next frame overlap instead of adding up.
+     * A long write is QUEUED rather than polled: the engine clocks it out
+     * while the caller builds the next frame, so the time on the wire and the
+     * time spent building overlap instead of adding up.
      * Measured on the screen path at 40 MHz: 1.55 ms of the 2.55 ms a band
      * took was the CPU sitting in spi_device_polling_transmit doing nothing.
      *
      * Anything else that touches the bus reaps this first - see spi_drain.
      */
-    spi_transaction_t   tx_trans[2];
-    int                 tx_which;
+    spi_transaction_t   tx_trans[1];
     bool                tx_busy;
     spi_device_handle_t tx_dev; /* the device the queued write is on */
     /* ag_port_spi_xfer_start/finish: the transfers queued, oldest first */
@@ -988,7 +987,6 @@ void ag_port_spi_shed(int bus)
     s_spi[bus].staging = NULL;
     ag_port_free(s_spi[bus].staging_rx);
     s_spi[bus].staging_rx = NULL;
-    s_spi[bus].tx_which = 0;
     xSemaphoreGiveRecursive(s_spi[bus].lock);
 }
 
@@ -1132,7 +1130,7 @@ static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
             }
             if (s_spi[bus].staging == NULL) {
                 s_spi[bus].staging = ag_port_alloc_aligned(
-                    4, 2u * AG_PORT_SPI_MAX_XFER, AG_MEM_DMA);
+                    4, AG_PORT_SPI_MAX_XFER, AG_MEM_DMA);
             }
             if (s_spi[bus].staging_rx == NULL) {
                 s_spi[bus].staging_rx = ag_port_alloc_aligned(
@@ -1176,36 +1174,37 @@ static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
          */
         if (s_spi[bus].staging == NULL) {
             s_spi[bus].staging =
-                ag_port_alloc_aligned(4, 2u * AG_PORT_SPI_MAX_XFER, AG_MEM_DMA);
+                ag_port_alloc_aligned(4, AG_PORT_SPI_MAX_XFER, AG_MEM_DMA);
         }
         if (s_spi[bus].staging != NULL) {
             /*
-             * Reap the previous one FIRST - it owns the half that is about to
-             * be filled - and only then copy and queue.  The call returns with
-             * the bytes still going out, which is the whole point: the caller
-             * builds the next frame during them.
+             * Reap the previous one FIRST, and only then copy and queue.  The
+             * call returns with the bytes still going out, which is the whole
+             * point: the caller builds the next frame during them.
+             *
+             * One buffer, not a pair.  It was a pair, and the second half was
+             * never in use: the reap above waits for the previous write to be
+             * on the wire and done before anything is copied, so the two
+             * halves only ever took turns.  8 KB of the CYD's memory for
+             * nothing (29 Oct 2026).
              */
             const ag_err_t d = spi_drain(bus, dev);
             if (d != AG_OK) {
                 return d;
             }
-            const int      w = s_spi[bus].tx_which;
-            uint8_t *const half =
-                s_spi[bus].staging + (size_t)w * AG_PORT_SPI_MAX_XFER;
-            memcpy(half, tx, len);
-            s_spi[bus].tx_trans[w] = (spi_transaction_t){
+            memcpy(s_spi[bus].staging, tx, len);
+            s_spi[bus].tx_trans[0] = (spi_transaction_t){
                 .length = len * 8u,
-                .tx_buffer = half,
+                .tx_buffer = s_spi[bus].staging,
                 .rx_buffer = NULL,
             };
             const esp_err_t ae = spi_device_queue_trans(
-                dev, &s_spi[bus].tx_trans[w], portMAX_DELAY);
+                dev, &s_spi[bus].tx_trans[0], portMAX_DELAY);
             if (ae != ESP_OK) {
                 return from_esp(ae);
             }
             s_spi[bus].tx_busy = true;
             s_spi[bus].tx_dev = dev;
-            s_spi[bus].tx_which = w ^ 1;
             return AG_OK;
         }
         /*
