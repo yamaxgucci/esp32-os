@@ -125,6 +125,9 @@ static void release_slot(proc_t *p)
     if (p->out_sink != NULL && s_sinks > 0) {
         s_sinks--;
     }
+    if (p->argv != NULL) {
+        ag_port_free(p->argv);
+    }
     memset(p, 0, sizeof(*p));
 }
 
@@ -1283,27 +1286,42 @@ static ag_err_t proc_finish_load(proc_t *p)
  */
 static ag_err_t copy_args(proc_t *p, int argc, char **argv)
 {
-    size_t at = 0;
+    size_t text = 0;
 
     p->argc = 0;
     /* Refuse rather than truncate: a dropped argument is invisible. */
-    if (argc > AG_PROC_ARGS_MAX) {
+    if (argc < 0 || argc > AG_PROC_ARGS_MAX) {
+        return -AG_ERANGE;
+    }
+    for (int i = 0; i < argc; i++) {
+        const char *src = (argv != NULL) ? argv[i] : NULL;
+        text += ((src != NULL) ? strlen(src) : 0) + 1;
+    }
+    if (text > AG_PROC_ARGBUF) {
         return -AG_ERANGE;
     }
 
+    /* argv[argc] is NULL, as C's own main is promised. */
+    const size_t ptrs  = sizeof(char *) * (size_t)(argc + 1);
+    char       **block = ag_port_alloc(ptrs + text, AG_MEM_BYTE);
+    if (block == NULL) {
+        return -AG_ENOMEM;
+    }
+    char *at = (char *)block + ptrs;
     for (int i = 0; i < argc; i++) {
         const char  *src = (argv != NULL) ? argv[i] : NULL;
         const size_t len = (src != NULL) ? strlen(src) : 0;
-
-        if (at + len + 1 > sizeof(p->argbuf)) {
-            return -AG_ERANGE;
-        }
-        memcpy(&p->argbuf[at], (src != NULL) ? src : "", len);
-        p->argbuf[at + len] = '\0';
-        p->argv[i] = &p->argbuf[at];
+        memcpy(at, (src != NULL) ? src : "", len);
+        at[len] = '\0';
+        block[i] = at;
         at += len + 1;
-        p->argc++;
     }
+    block[argc] = NULL;
+    if (p->argv != NULL) {
+        ag_port_free(p->argv);
+    }
+    p->argv = block;
+    p->argc = argc;
     return AG_OK;
 }
 

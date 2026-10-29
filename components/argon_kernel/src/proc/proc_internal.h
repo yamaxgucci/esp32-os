@@ -74,9 +74,14 @@ typedef struct {
     volatile bool     signalled;
     jmp_buf           exit_jump;
 
-    int   argc;
-    char *argv[AG_PROC_ARGS_MAX];
-    char  argbuf[AG_PROC_ARGBUF];
+    /*
+     * One block from copy_args, the pointers then the strings, freed when the
+     * slot is given back.  It was 704 bytes inside every slot, used or not -
+     * 2.8 KB of a CYD's internal memory for four slots that mostly sit empty
+     * and arguments that are mostly a file name (29 Oct 2026).
+     */
+    int    argc;
+    char **argv;
 
     char cwd[AG_PATH_MAX];
     /* Path for deferred AXE load inside proc_task; empty for builtins. */
