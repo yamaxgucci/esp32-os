@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/memshape.h>
 #include <argon/board.h>
 #include <argon/device.h>
 #include <argon/ioclaim.h>
@@ -574,6 +575,21 @@ static int spi_index(int bus) { return bus - AG_SPI_FIRST; }
  * spi_take_cs), while a slave hands its one select to the driver at init and
  * has no transfer call to carry another.
  */
+/*
+ * A master bus keeps a staging buffer between transfers (16 KB on the ESP32)
+ * and needs none of what is in it: asked to, it lets the buffer go, and the
+ * next long transfer makes it again wherever the heap then has room.
+ */
+static void spi_reshape(void *ctx)
+{
+    (void)ctx;
+    for (int idx = 0; idx < AG_SPI_BUSES; idx++) {
+        if (s_spi[idx].up && !s_spi[idx].slave) {
+            ag_port_spi_shed(idx + AG_SPI_FIRST);
+        }
+    }
+}
+
 static ag_err_t spi_bring_up(int bus, bool slave, int cs)
 {
     const int idx = spi_index(bus);
@@ -646,6 +662,9 @@ static ag_err_t spi_bring_up(int bus, bool slave, int cs)
     s_spi[idx].up = true;
     s_spi[idx].slave = slave;
     s_spi[idx].cs = slave ? cs : AG_PIN_NONE;
+    if (!slave) {
+        (void)ag_mem_reshaper_add("spi staging", spi_reshape, NULL);
+    }
 
     if (cfg->drive >= 0) {
         const ag_err_t drv = ag_port_spi_set_drive(bus, cfg->drive);

@@ -95,7 +95,9 @@ CONFIG_WL_SECTOR_SIZE_4096=n
 # The two-ended heap in place of ESP-IDF's TLSF: small blocks from the top of
 # the fullest arena, large ones from the bottom (twoend_core.h).  Measured on
 # this board 29 Oct 2026 over one session (boot, radio off, card out and in, an
-# application): largest pieces after `wifi off` 80/11/9 KB with TLSF, 75/20/10
-# with this - and the Master System emulator, refused under TLSF for want of a
-# 13 KB arena, starts, while the Mega Drive still has its 128 KB.
+# application): largest pieces after `wifi off` 80/11/10 KB with TLSF, 93/8/7
+# with this - the kernel's boot placed with the long-lived, the radio started
+# last, the SPI staging buffer moved into what the radio left (memshape.h).
+# The Master System emulator, refused under TLSF for want of a 13 KB arena,
+# starts; the Mega Drive still gets its 128 KB.
 CONFIG_ARGON_HEAP_TWOEND=y

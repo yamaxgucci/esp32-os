@@ -30,6 +30,7 @@
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "argon/port/mem.h"
 
@@ -60,6 +61,8 @@ void   __real_heap_caps_walk(uint32_t caps, heap_caps_walker_cb_t fn, void *ud);
 
 static te_heap_t s_heap;
 static bool      s_on;
+/* The task whose allocations stay for good, while it says so (ag_port_mem_keep). */
+static volatile TaskHandle_t s_keep_task;
 static struct { void *mem; size_t bytes; } s_grab[TE_MAX_ARENAS];
 
 static inline bool IRAM_ATTR ours(const void *p)
@@ -112,6 +115,20 @@ void ag_port_twoend_take_rest(void)
     grab();
 }
 
+/*
+ * What the calling task takes from here on stays for good: placed from the top
+ * like the small blocks, out of the way of what comes and goes.  The kernel
+ * says so for its own boot, and not for the radio's part of it: on the CYD the
+ * kernel's large permanent blocks - the SPI bus's 16 KB, the supervisor's
+ * 9 KB, the shell's stack - were laid at the bottom of the largest arena while
+ * the radio held the rest, and stood there after `wifi off` between 33 KB of
+ * holes elsewhere and the free space above them.
+ */
+void ag_port_mem_keep(bool on)
+{
+    s_keep_task = on ? xTaskGetCurrentTaskHandle() : NULL;
+}
+
 static inline IRAM_ATTR void *took(void *p, size_t size, uint32_t caps)
 {
 #if CONFIG_ARGON_HEAP_WHO
@@ -125,10 +142,16 @@ static inline IRAM_ATTR void *took(void *p, size_t size, uint32_t caps)
     return p;
 }
 
+static inline bool IRAM_ATTR keeping(void)
+{
+    const TaskHandle_t k = s_keep_task;
+    return k != NULL && !xPortInIsrContext() && xTaskGetCurrentTaskHandle() == k;
+}
+
 void *IRAM_ATTR __wrap_heap_caps_malloc_base(size_t size, uint32_t caps)
 {
     if (can(caps)) {
-        void *p = te_alloc(&s_heap, size);
+        void *p = te_alloc_as(&s_heap, size, keeping());
         if (p != NULL) {
             return took(p, size, caps);
         }
@@ -156,7 +179,7 @@ void *IRAM_ATTR __wrap_heap_caps_calloc_base(size_t n, size_t size,
         return NULL;
     }
     if (can(caps)) {
-        void *p = te_alloc(&s_heap, bytes);
+        void *p = te_alloc_as(&s_heap, bytes, keeping());
         if (p != NULL) {
             memset(p, 0, bytes);
             return took(p, bytes, caps);

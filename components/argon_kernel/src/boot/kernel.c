@@ -256,6 +256,16 @@ static void apply_console_size(void)
     s_rows = rows;
 }
 
+/* The radios last, where the heap makes that pay (ag_devices_start_radios). */
+static ag_err_t stage_radio(void)
+{
+#if CONFIG_ARGON_HEAP_TWOEND
+    return ag_devices_start_radios();
+#else
+    return AG_OK;
+#endif
+}
+
 static ag_err_t stage_devices(void)
 {
     const ag_err_t err = ag_devices_init();
@@ -321,6 +331,9 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_MEDIA]      = {"media",      ag_storage_mount_media, false},
     [AG_STAGE_MODULES]    = {"modules",    stage_modules,  false},
     [AG_STAGE_SUPERVISOR] = {"supervisor", ag_supervisor_init, false},
+    /* Last before the prompt: what the radio takes it gives back with
+     * `wifi off`, so nothing permanent may be laid down after it. */
+    [AG_STAGE_RADIO]      = {"radio",      stage_radio,    false},
     [AG_STAGE_SHELL]      = {"shell",      stage_shell,    true},
 };
 
@@ -368,6 +381,8 @@ void ag_kernel_main(void)
 #if CONFIG_ARGON_HEAP_TWOEND
     /* what ESP-IDF added to the heap after the start-up stacks were done */
     ag_port_twoend_take_rest();
+    /* what the boot takes stays: placed with the long-lived, until the shell */
+    ag_port_mem_keep(true);
 #endif
 
     memset(&s_report, 0, sizeof(s_report));
@@ -472,9 +487,15 @@ void ag_kernel_main(void)
     if (shell_stack == 0 && ag_place_first("shell.stack") == AG_PLACE_PSRAM) {
         shell_stack = AG_SHELL_STACK; /* where it goes was asked for, not how big */
     }
-    if (shell_stack > 0 &&
+    const bool moved =
+        shell_stack > 0 &&
         ag_place_task("shell.stack", shell_task, "shell", shell_stack, NULL,
-                      AG_SHELL_PRIORITY, 0, NULL, NULL)) {
+                      AG_SHELL_PRIORITY, 0, NULL, NULL);
+#if CONFIG_ARGON_HEAP_TWOEND
+    /* the boot is over: what the prompt takes comes and goes */
+    ag_port_mem_keep(false);
+#endif
+    if (moved) {
         return;
     }
     ag_place_adopt("shell.stack", (void *)ag_port_task_self());

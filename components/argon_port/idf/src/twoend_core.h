@@ -206,13 +206,14 @@ static TE_IRAM void *te_carve(te_heap_t *h, te_free_t *f, uint32_t need,
     return (void *)(u + TE_HDR);
 }
 
-static TE_IRAM void *te_alloc(te_heap_t *h, size_t size)
+/* `keep`: placed like a small block whatever its size - it will stay. */
+static TE_IRAM void *te_alloc_as(te_heap_t *h, size_t size, bool keep)
 {
     if (size == 0 || size > 0x7FFFFFF0u) return NULL;
     const uint32_t need = te_need(size);
     void *p = NULL;
     TE_LOCK();
-    if (size <= h->small_max) {
+    if (keep || size <= h->small_max) {
         /* the fullest arena first, from its top */
         uint32_t tried = 0;
         while (p == NULL) {
@@ -238,6 +239,11 @@ static TE_IRAM void *te_alloc(te_heap_t *h, size_t size)
     }
     TE_UNLOCK();
     return p;
+}
+
+static inline TE_IRAM void *te_alloc(te_heap_t *h, size_t size)
+{
+    return te_alloc_as(h, size, false);
 }
 
 /* Aligned: from the bottom, the first free block with room for an aligned

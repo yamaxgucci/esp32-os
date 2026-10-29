@@ -20,6 +20,7 @@ set(ARGON_KERNEL_SRCS
     "src/core/powerctl.c"
     "src/core/reslist.c"
     "src/core/arena.c"
+    "src/core/memshape.c"
     "src/console/codepage.c"
     "src/console/screen.c"
     "src/console/vtout.c"

@@ -108,6 +108,9 @@ bool ag_port_twoend(ag_port_twoend_info_t *out);
 /* Take what has become free since start-up: the ESP32 gives the heap the
  * memory of its start-up stacks only once the scheduler runs. */
 void ag_port_twoend_take_rest(void);
+/* Allocations by the calling task stay for good until this is turned off:
+ * place them with the long-lived (src/twoend_hw.c). */
+void ag_port_mem_keep(bool on);
 #endif
 
 #if CONFIG_ARGON_SMALL_ZONE_KB > 0

@@ -122,6 +122,12 @@
  *       either before it or after it - answered -AG_EAGAIN if it arrives in the
  *       middle, like a full pool - and a reap that is waiting its turn finds a
  *       fresh interface and nothing of the blocks that were abandoned.
+ *   void ag_port_spi_shed(int bus)
+ *       Let go of the buffers a master bus keeps between transfers - the
+ *       staging for long writes, 16 KB on the ESP32 - once nothing is in
+ *       flight.  They are made again on the next transfer that needs them,
+ *       and the heap puts them where it then sees fit: that is the point
+ *       (argon/memshape.h).  A bus with none, or a slave bus, is left alone.
  *   ag_err_t ag_port_spi_set_drive(int bus, int cap)
  *       Drive strength of the bus's pins, 0..3 = GPIO_DRIVE_CAP_n, -1 = leave
  *       the chip's default alone.  It is a bus setting and not a nicety: on
@@ -283,6 +289,7 @@ ag_err_t ag_port_spi_slave_reap(int bus, int *slot, uint32_t *got, void **rx,
                                 uint32_t timeout_ms);
 ag_err_t ag_port_spi_slave_reset(int bus);
 ag_err_t ag_port_spi_set_drive(int bus, int cap);
+void     ag_port_spi_shed(int bus);
 
 ag_err_t ag_port_pwm_config(int channel, int pin, uint32_t hz, uint8_t bits);
 ag_err_t ag_port_pwm_set(int channel, uint32_t duty);

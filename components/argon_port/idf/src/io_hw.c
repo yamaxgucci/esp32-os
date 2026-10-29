@@ -968,6 +968,30 @@ static void spi_drain_all(void)
     }
 }
 
+/*
+ * The staging pair goes back to the heap, to be made again by the next long
+ * transfer - wherever the heap then puts it.  Made the first time a panel was
+ * drawn, while the radio held the rest of the memory, it sat at the bottom of
+ * the CYD's largest arena for good: 16 KB under 79 KB free, while a 20 KB hole
+ * the radio left was empty (argon/memshape.h, 29 Oct 2026).  Nothing in it
+ * matters between transfers; the queued write is reaped first.
+ */
+void ag_port_spi_shed(int bus)
+{
+    if (!spi_valid(bus) || !s_spi[bus].up || s_spi[bus].slave ||
+        s_spi[bus].lock == NULL) {
+        return;
+    }
+    xSemaphoreTakeRecursive(s_spi[bus].lock, portMAX_DELAY);
+    (void)spi_drain(bus, s_spi[bus].tx_dev);
+    ag_port_free(s_spi[bus].staging);
+    s_spi[bus].staging = NULL;
+    ag_port_free(s_spi[bus].staging_rx);
+    s_spi[bus].staging_rx = NULL;
+    s_spi[bus].tx_which = 0;
+    xSemaphoreGiveRecursive(s_spi[bus].lock);
+}
+
 ag_err_t ag_port_spi_xfer_start(int bus, int cs, const void *tx, void *rx,
                                 size_t len)
 {

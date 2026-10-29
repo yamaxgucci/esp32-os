@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/memshape.h>
 #include <argon/console.h>
 #include <argon/lineedit.h>
 #include <argon/path.h>
@@ -592,6 +593,7 @@ int ag_cmd_eject(int argc, char **argv)
         return 1;
     }
     ag_console_puts("A: released - the card can come out now\n");
+    (void)ag_mem_reshape("card out");
     return 0;
 }
 

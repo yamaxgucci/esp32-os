@@ -36,6 +36,7 @@ typedef enum {
     AG_STAGE_MEDIA,        /* SD card, FAT /sd                           */
     AG_STAGE_MODULES,      /* loadable .SYS drivers listed in the config */
     AG_STAGE_SUPERVISOR,   /* watchdog, hotkeys, crash handling          */
+    AG_STAGE_RADIO,        /* Wi-Fi, mDNS, Bluetooth - last, they go away */
     AG_STAGE_SHELL,        /* hand control to the shell or AUTOEXEC      */
     AG_STAGE_COUNT
 } ag_boot_stage_t;

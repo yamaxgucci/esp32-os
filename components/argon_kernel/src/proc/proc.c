@@ -8,6 +8,7 @@
 #include <setjmp.h>
 #include <string.h>
 
+#include <argon/memshape.h>
 #include <argon/budget.h>
 #include <argon/clu.h>
 #include <argon/console.h>
@@ -1851,6 +1852,8 @@ ag_err_t ag_proc_wait(ag_pid_t pid, int32_t *exit_code, uint32_t timeout_ms)
     const bool was_killed = p->killed;
     reap(p);
     unlock();
+    /* its memory is back: buffers that could sit somewhere better can move */
+    (void)ag_mem_reshape("an application ended");
 
     return was_killed ? -AG_EKILLED : AG_OK;
 }
@@ -2020,12 +2023,16 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
      * Given under the lock, as proc_finished does: once the lock is let go a
      * held zombie is its collector's, and may already be gone.
      */
-    if (held_for_collecting(p)) {
+    const bool reaped = !held_for_collecting(p);
+    if (!reaped) {
         ag_port_sem_give(p->done);
     } else {
         reap(p);
     }
     unlock();
+    if (reaped) {
+        (void)ag_mem_reshape("an application was stopped");
+    }
 
     console_restore();
     return AG_OK;
@@ -2045,6 +2052,9 @@ uint32_t ag_proc_reap_finished(void)
         reaped++;
     }
     unlock();
+    if (reaped > 0) {
+        (void)ag_mem_reshape("an application ended");
+    }
     return reaped;
 }
 

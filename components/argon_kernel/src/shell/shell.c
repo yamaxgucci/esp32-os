@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
+#include <argon/memshape.h>
 #include <argon/shell.h>
 
 #include <stdio.h>
@@ -839,6 +840,15 @@ static int cmd_mem(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "/i") == 0) {
         return mem_imap();
     }
+    /* `mem compact`: every buffer that can be made again elsewhere, now */
+    if (argc > 1 && strcmp(argv[1], "compact") == 0) {
+        const size_t before = ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE);
+        (void)ag_mem_reshape("mem compact");
+        const size_t after = ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE);
+        ag_console_printf("largest free %u -> %u KB\n",
+                          (unsigned)(before / 1024u), (unsigned)(after / 1024u));
+        return 0;
+    }
 #if CONFIG_ARGON_HEAP_WHO
     if (argc > 1 && strcmp(argv[1], "who") == 0) {
         return mem_who(argc - 2, argv + 2);
@@ -1153,6 +1163,7 @@ static int cmd_boot(int argc, char **argv)
         [AG_STAGE_MEDIA]      = "media",
         [AG_STAGE_MODULES]    = "modules",
         [AG_STAGE_SUPERVISOR] = "supervisor",
+        [AG_STAGE_RADIO]      = "radio",
         [AG_STAGE_SHELL]      = "shell",
     };
 
@@ -4098,6 +4109,9 @@ static int cmd_wifi(int argc, char **argv)
             const size_t after = ag_port_mem_free(AG_MEM_FAST);
             ag_console_printf("radio off, %u KB back\n",
                               (unsigned)((after - before) / 1024u));
+            /* the radio's memory is back: buffers made while it held the
+             * rest can move into it (argon/memshape.h) */
+            (void)ag_mem_reshape("wifi off");
         } else {
             ag_console_printf("radio off on %s\n", ag_netprov_active());
         }
@@ -4935,6 +4949,7 @@ static int cmd_bt(int argc, char **argv)
         const size_t after = ag_port_mem_free(AG_MEM_FAST);
         ag_console_printf("radio off, %u KB back\n",
                           (unsigned)((after - before) / 1024u));
+        (void)ag_mem_reshape("bt off");
         return 0;
     }
 
@@ -6403,7 +6418,7 @@ static int cmd_guard(int argc, char **argv)
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
-    {"mem", "[/t|/p|/x|/i]", "memory usage; /t: every task and its stack; /p: [memory] placement; /x: extended memory block by block; /i: what cuts internal memory up", cmd_mem},
+    {"mem", "[/t|/p|/x|/i|compact]", "memory usage; /t: every task and its stack; /p: [memory] placement; /x: extended memory block by block; /i: what cuts internal memory up; compact: buffers that can move, moved", cmd_mem},
     {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
     {"guard", "[watch [off]]", "application data guards", cmd_guard},
     {"boot", "[recovery|normal]", "boot report; set/clear recovery marker",

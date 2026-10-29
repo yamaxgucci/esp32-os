@@ -15,5 +15,7 @@
  * register itself.
  */
 ag_err_t ag_devices_init(void);
+/* Wi-Fi, mDNS and Bluetooth as SYSTEM.CFG asks: the boot's last stage but one. */
+ag_err_t ag_devices_start_radios(void);
 
 #endif /* ARGON_DEV_DEVICES_H */
