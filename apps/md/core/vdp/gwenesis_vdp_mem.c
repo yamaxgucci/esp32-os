@@ -915,7 +915,7 @@ void gwenesis_vdp_write_data_port_16(unsigned int value)
  *   Return current VDP Status
  *
  ******************************************************************************/
-unsigned int gwenesis_vdp_get_status()
+MD_HOT unsigned int gwenesis_vdp_get_status()
 {
     return gwenesis_vdp_status;
 }
@@ -929,7 +929,7 @@ unsigned int gwenesis_vdp_get_status()
  *
  ******************************************************************************/
  //static inline 
-unsigned int gwenesis_vdp_read_memory_8(unsigned int address)
+MD_HOT unsigned int gwenesis_vdp_read_memory_8(unsigned int address)
 {
     unsigned int ret = gwenesis_vdp_read_memory_16(address & ~1);
     if (address & 1)
@@ -948,7 +948,7 @@ unsigned int gwenesis_vdp_read_memory_8(unsigned int address)
  *
  ******************************************************************************/
  //static inline 
-unsigned int gwenesis_vdp_read_memory_16(unsigned int address)
+MD_HOT unsigned int gwenesis_vdp_read_memory_16(unsigned int address)
 {
     
     address &= 0x1F;

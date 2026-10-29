@@ -88,6 +88,9 @@ static uint64_t s_prof_vdp_us;
 static uint32_t s_frame_no;     /* frames run so far, for finding the scene */
 static uint32_t s_lines_same;   /* lines the glass already showed (md_line_end) */
 static uint32_t s_passes;       /* times the cursor went through the glass */
+static int      s_sysdraw = 1;  /* the system core draws the lines (md_drawer) */
+static volatile uint32_t s_frames_done; /* frames the emulating core finished */
+static volatile uint32_t s_last_work_us; /* how long the last one took */
 #define MD_INFRAME_LINES 28     /* lines a frame may draw while it emulates */
 static int      s_inframe_left;
 unsigned int md_idle_skips;     /* lines whose rest was a wait (m68kcpu.h) */
@@ -391,9 +394,113 @@ static void md_present_rows(const unsigned short *px, int line, int rows, int w,
  * rows go in batches; and the thread is woken by the batch, not by the tick -
  * sleeping a tick let four rows out per three milliseconds.
  */
+/* A drawn row against what the glass last got for that line. */
+static uint32_t md_row_hash(const unsigned short *row, int width)
+{
+    const uint32_t *w = (const uint32_t *)(const void *)row;
+    uint32_t h = 2166136261u ^ (uint32_t)width;
+    for (int i = 0; i < width / 2; i++) {
+        h = (h ^ w[i]) * 16777619u;
+    }
+    return h;
+}
+
+/*
+ * The system core draws the picture as well as sending it (`sysdraw`, the
+ * default with a panel): line after line, top to bottom, as fast as the VDP
+ * and the wire allow, whatever the emulation is doing.
+ *
+ * Drawn by the emulating core, the lines came out at the pace that core could
+ * spare - 28 a frame in a busy scene - so one pass over the glass took eight
+ * frames and he could see the picture being redrawn in bands.  Here a pass is
+ * as long as drawing and sending its changed lines take, and the emulating
+ * core does no drawing at all.  The VDP's state is read while the other core
+ * changes it, which shows as what it always did: a line from a frame or so
+ * earlier or later than its neighbour, never a fault.
+ *
+ * Each pass ends with a millisecond's sleep, and a pass that changed nothing
+ * with four: this core also runs the system's own tasks, and a thread that
+ * never sleeps starves them.
+ */
+static void md_draw_flush(int line0, int rows, int w, int h)
+{
+    if (rows <= 0) {
+        return;
+    }
+    const ag_time_t t0 = ag_micros();
+    md_present_rows(s_ring[0], line0, rows, w, h);
+    s_glass_us += (uint32_t)(ag_micros() - t0);
+    s_ring_got += (uint32_t)rows;
+}
+
+static void md_drawer(void)
+{
+    int line = 0, rows = 0, line0 = 0;
+    bool changed = false;
+    while (s_ring_run) {
+        const int w = screen_width, h = screen_height;
+        if (line >= h || line >= MD_HASH_LINES) {
+            md_draw_flush(line0, rows, w, h);
+            rows = 0;
+            line = 0;
+            s_passes++;
+            /*
+             * The next pass starts with the next frame, never sooner.  A pass
+             * more often than the game makes pictures draws the same picture
+             * again, and drawing it is flash traffic both cores queue for: 34
+             * passes a second over a game making 10 frames a second took the
+             * 68000 from 30 ms a frame to 95 (29 Oct 2026).  Starting just
+             * after a frame ends also starts it on one whole picture.
+             */
+            {
+                /* and one frame later than that while the game is behind:
+                 * the drawing is what it is queueing behind */
+                const uint32_t wait = (s_last_work_us > 16683u) ? 2u : 1u;
+                const uint32_t seen = s_frames_done;
+                ag_delay(1);
+                while (s_ring_run && s_frames_done - seen < wait) {
+                    ag_delay(1);
+                }
+            }
+            (void)changed;
+            changed = false;
+            continue;
+        }
+        gwenesis_vdp_set_buffer(s_ring[rows]);
+        gwenesis_vdp_render_line(line);
+        const uint32_t hash = md_row_hash(s_ring[rows], w);
+        if (s_line_hash[line] == hash) {
+            s_lines_same++;
+            md_draw_flush(line0, rows, w, h);
+            rows = 0;
+            line++;
+            continue;
+        }
+        s_line_hash[line] = hash;
+        changed = true;
+        if (rows == 0) {
+            line0 = line;
+        }
+        rows++;
+        line++;
+        if (rows == s_ring_n) {
+            md_draw_flush(line0, rows, w, h);
+            rows = 0;
+        }
+    }
+}
+
 static void md_presenter(void *arg)
 {
     (void)arg;
+    if (s_sysdraw) {
+        while (s_ring_run && s_ring_n == 0) {
+            ag_delay(5);             /* the rows arrive just after the thread */
+        }
+        md_drawer();
+        ag_thread_exit();
+        return;
+    }
     while (s_ring_run) {
         (void)ag_sem_take(s_ring_sem, 50);
         if (!s_batch_full) {
@@ -423,7 +530,7 @@ static void md_ring_start(int rows)
         return;
     }
     s_ring_run = 1;
-    s_presenter = ag_thread_create(md_presenter, NULL, "mdglass", 3072, 4,
+    s_presenter = ag_thread_create(md_presenter, NULL, "mdglass", 4096, 4,
                                    AG_THREAD_SYS_CORE);
     if (s_presenter == NULL) {
         s_ring_run = 0;
@@ -991,7 +1098,9 @@ int ag_main(int argc, char **argv)
             ring_rows = ring_rows < 2 ? 2 : ring_rows > MD_RING_MAX ? MD_RING_MAX : ring_rows;
             continue;
         }
-        if (arg_eq(argv[i], "noring")) {
+        if (arg_eq(argv[i], "nosysdraw")) {
+            s_sysdraw = 0;     /* the emulating core draws, as before */
+        } else if (arg_eq(argv[i], "noring")) {
             ring_rows = 0;
         } else if (arg_eq(argv[i], "headless")) {
             s_headless = 1;
@@ -1197,7 +1306,9 @@ int ag_main(int argc, char **argv)
 
         const int show = (present_div <= 1) || ((ran % present_div) == 0);
         s_inframe_left = MD_INFRAME_LINES;
-        run_frame(show);
+        run_frame(show && !(s_sysdraw && s_ring_n > 0));
+        s_last_work_us = (uint32_t)(ag_micros() - f0);
+        s_frames_done++;
         s_frame_no = (uint32_t)ran + 1u;
 
         const ag_time_t f1 = ag_micros();
@@ -1257,7 +1368,7 @@ int ag_main(int argc, char **argv)
              * had 7.  A line drawn now shows the VDP as the frame left it,
              * which for every line not yet drawn is what it would have shown.
              */
-            while (s_ring_n > 0 && !s_headless &&
+            while (s_ring_n > 0 && !s_headless && !s_sysdraw &&
                    (int64_t)(next_frame - ag_micros()) > 300) {
                 const int line = md_line_begin(-1);
                 if (line < 0) {
