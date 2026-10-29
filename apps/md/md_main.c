@@ -86,6 +86,10 @@ static uint64_t s_prof_z80_us;
 static uint64_t s_prof_snd_us;
 static uint64_t s_prof_vdp_us;
 static uint32_t s_frame_no;     /* frames run so far, for finding the scene */
+static uint32_t s_lines_same;   /* lines the glass already showed (md_line_end) */
+static uint32_t s_passes;       /* times the cursor went through the glass */
+#define MD_INFRAME_LINES 28     /* lines a frame may draw while it emulates */
+static int      s_inframe_left;
 unsigned int md_idle_skips;     /* lines whose rest was a wait (m68kcpu.h) */
 #ifdef MD_CYCPROF
 unsigned int md_cp_fetch, md_cp_decode, md_cp_exec, md_cp_n, md_cp_mem, md_cp_memn;
@@ -232,10 +236,18 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
         static uint32_t s_us_seen;
         const uint32_t us = s_glass_us - s_us_seen;
         s_us_seen += us;
+        static uint32_t s_passes_seen, s_same_seen;
+        const uint32_t passes = s_passes - s_passes_seen;
+        const uint32_t same = s_lines_same - s_same_seen;
+        s_passes_seen += passes;
+        s_same_seen += same;
+        const unsigned p10 = (unsigned)((uint64_t)passes * 10000000u / span_us);
         ag_printf("md: glass %u rows, %u.%u pictures a second, %u us a row, "
-                  "the system core %u%% busy\n", (unsigned)rows,
+                  "the system core %u%% busy; %u.%u whole passes a second, "
+                  "%u lines unchanged\n", (unsigned)rows,
                   x10 / 10u, x10 % 10u, rows ? (unsigned)(us / rows) : 0u,
-                  (unsigned)((uint64_t)us * 100u / span_us));
+                  (unsigned)((uint64_t)us * 100u / span_us),
+                  p10 / 10u, p10 % 10u, (unsigned)same);
     }
 #endif
 }
@@ -349,6 +361,8 @@ static ag_thread_t       s_presenter;
  * mid-frame raster trick can tear.
  */
 static int               s_cursor;
+#define MD_HASH_LINES 240
+static uint32_t          s_line_hash[MD_HASH_LINES]; /* what the glass shows */
 static uint32_t          s_present_us;
 static uint32_t          s_present_bad;
 
@@ -474,8 +488,22 @@ static int md_line_begin(int scan)
     if (s_batch_full) {
         return -1;
     }
+    /*
+     * Inside a frame (any scan at all is the emulation asking; the
+     * spare-time loop asks with -1) only a few
+     * lines: drawing one costs the VDP ~50 us whether or not it turns out
+     * unchanged, and every line of every frame is 11 ms of a 16.7 ms frame.
+     * The time after the frame draws the rest.
+     */
+    if (scan >= 0) {
+        if (s_inframe_left <= 0) {
+            return -1;
+        }
+        s_inframe_left--;
+    }
     if (s_cursor >= screen_height) {
         s_cursor = 0;
+        s_passes++;           /* the whole glass brought up to date once more */
     }
     gwenesis_vdp_set_buffer(s_ring[s_batch_rows]);
     return s_cursor;
@@ -492,6 +520,32 @@ static void md_line_end(int line)
         md_present_rows(s_line, line, 1, screen_width, screen_height);
         s_present_us += (uint32_t)(ag_micros() - t0);
         return;
+    }
+    /*
+     * A line the glass already shows is not sent again.  The wire is the
+     * limit - a row is 640 bytes, 128 us at 40 MHz - and on most screens
+     * much of the picture stands still: the sky, a border, a score.  A batch
+     * holds consecutive lines, so a skipped line sends what was gathered.
+     */
+    {
+        const uint32_t *w = (const uint32_t *)(const void *)s_ring[s_batch_rows];
+        uint32_t h = 2166136261u ^ (uint32_t)screen_width;
+        for (int i = 0; i < screen_width / 2; i++) {
+            h = (h ^ w[i]) * 16777619u;
+        }
+        if (line < MD_HASH_LINES && s_line_hash[line] == h) {
+            s_lines_same++;
+            s_cursor = line + 1;
+            if (s_batch_rows > 0) {
+                __sync_synchronize();
+                s_batch_full = 1;
+                ag_sem_give(s_ring_sem);
+            }
+            return;
+        }
+        if (line < MD_HASH_LINES) {
+            s_line_hash[line] = h;
+        }
     }
     if (s_batch_rows == 0) {
         s_batch_line = line;
@@ -1142,6 +1196,7 @@ int ag_main(int argc, char **argv)
         const ag_time_t f0 = ag_micros();
 
         const int show = (present_div <= 1) || ((ran % present_div) == 0);
+        s_inframe_left = MD_INFRAME_LINES;
         run_frame(show);
         s_frame_no = (uint32_t)ran + 1u;
 
@@ -1204,7 +1259,7 @@ int ag_main(int argc, char **argv)
              */
             while (s_ring_n > 0 && !s_headless &&
                    (int64_t)(next_frame - ag_micros()) > 300) {
-                const int line = md_line_begin(screen_height);
+                const int line = md_line_begin(-1);
                 if (line < 0) {
                     ag_yield();      /* the batch is on its way: let it go */
                     continue;
