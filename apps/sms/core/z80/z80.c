@@ -310,7 +310,11 @@ static inline uint8_t flags_sub(uint32_t a, uint32_t v, uint32_t full)
  * constant index back into a byte load).
  */
 #if defined(ARGON_SMS_SMALL) && !defined(AG_BUILTIN)
+#ifdef MD_TABLE_SECTION   /* the Mega Drive's build says which part (md_cfg.h) */
+#define Z80_CC_PLACE __attribute__((aligned(4), section(MD_TABLE_SECTION)))
+#else
 #define Z80_CC_PLACE __attribute__((aligned(4), section(".hot_rodata")))
+#endif
 #define CC_OF(t, op) ((((const volatile uint32_t *)(const void *)cc[t])[(op) >> 2] >> (((op) & 3) << 3)) & 0xFF)
 #else
 #define Z80_CC_PLACE

@@ -577,7 +577,7 @@ void gwenesis_m68k_load_state();
  * by whole words - so there they are kept as words, whatever their width.
  */
 #if defined(ARGON_MD_SMALL) && !defined(AG_BUILTIN)
-#define MD_FLASH_TABLE __attribute__((aligned(4), section(".hot_rodata")))
+#define MD_FLASH_TABLE __attribute__((aligned(4), section(MD_TABLE_SECTION)))
 typedef uint md_tab8;
 typedef uint md_tab16;
 #else

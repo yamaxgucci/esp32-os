@@ -227,7 +227,7 @@ RODATA_INPUT = "*(.rodata .rodata.* .srodata .srodata.*)"
 HOT_RODATA_INPUT = "*(.hot_rodata .hot_rodata.*)"
 
 
-def code_rodata_renames(names):
+def code_rodata_renames(names, split=False):
     """--code-rodata: objcopy arguments moving these sections to the code part.
 
     For the constants that cannot be marked AG_HOT_RODATA because the compiler
@@ -238,10 +238,13 @@ def code_rodata_renames(names):
     first in the script and its .rodata.* takes the section before the code
     part is reached.  A name an object does not have is ignored.
     """
+    # In a split image they go to the cold part's .cold_rodata instead: flash,
+    # not the hot part's internal memory, which is for what was measured hot.
     out = []
+    to = ".cold_rodata" if split else ".hot_rodata"
     for name in names:
         tail = name[len(".rodata"):] if name.startswith(".rodata") else "." + name
-        out += ["--rename-section", "%s=.hot_rodata%s" % (name, tail)]
+        out += ["--rename-section", "%s=%s%s" % (name, to, tail)]
     return out
 
 LINKER_SCRIPT = """\
@@ -299,6 +302,11 @@ def cold_block():
         "    KEEP(*(.literal.ag_main .text.ag_main "
         ".literal.ag_driver_init .text.ag_driver_init))",
         "    *(.literal .text .literal.* .text.*)",
+        # Constants too big for the hot part and read too often for the data
+        # part: a 128 KB decode table, say.  Word reads only, as for
+        # .hot_rodata - this is the instruction bus.
+        "    . = ALIGN(16);",
+        "    *(.cold_rodata .cold_rodata.*)",
         "    . = ALIGN(4);",
         "  }"]) + "\n"
 
@@ -344,6 +352,9 @@ def code_block(rodata_in_code, split=False):
     if not split:
         lines += ["    KEEP(*(.literal.ag_main .text.ag_main "
                   ".literal.ag_driver_init .text.ag_driver_init))"]
+    if not split:
+        # unsplit, the cold constants are simply code-part constants
+        text_input += " *(.cold_rodata .cold_rodata.*)"
     lines += ["    " + text_input,
               "    " + HOT_RODATA_INPUT]
     if rodata_in_code:
@@ -879,7 +890,7 @@ def main():
             run(cmd)
             if args.code_rodata:
                 objcopy = re.sub(r"g(cc|\+\+)(\.exe)?$", r"objcopy\2", args.gcc)
-                run([objcopy] + code_rodata_renames(args.code_rodata) + [obj])
+                run([objcopy] + code_rodata_renames(args.code_rodata, args.split_hot) + [obj])
             objects.append(obj)
 
         rodata_in_code = args.rodata == "code"

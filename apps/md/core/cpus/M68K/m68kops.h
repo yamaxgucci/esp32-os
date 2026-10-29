@@ -125,6 +125,8 @@ INLINE void UseMulsCycles(sint16 src)
 /* ======================================================================== */
 
 
+#include "md_hot.h"
+
 static void m68k_op_1010(void)
 {
   m68ki_exception_1010();
