@@ -125,7 +125,9 @@ INLINE void UseMulsCycles(sint16 src)
 /* ======================================================================== */
 
 
+#ifndef MD_68K_COLD
 #include "md_hot.h"
+#endif
 
 static void m68k_op_1010(void)
 {

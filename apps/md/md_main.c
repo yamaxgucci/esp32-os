@@ -395,7 +395,7 @@ static void md_present_rows(const unsigned short *px, int line, int rows, int w,
  * sleeping a tick let four rows out per three milliseconds.
  */
 /* A drawn row against what the glass last got for that line. */
-static uint32_t md_row_hash(const unsigned short *row, int width)
+MD_HOT_VDP static uint32_t md_row_hash(const unsigned short *row, int width)
 {
     const uint32_t *w = (const uint32_t *)(const void *)row;
     uint32_t h = 2166136261u ^ (uint32_t)width;

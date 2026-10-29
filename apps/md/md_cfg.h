@@ -40,6 +40,20 @@
 #define MD_TABLE_SECTION ".hot_rodata"
 #endif
 
+/*
+ * -DMD_VDP_HOT puts the VDP's line renderer (9.5 KB with all it inlines) in
+ * the hot part too.  Measured on Sonic, 29 Oct 2026, with the 68000's
+ * handlers moved out to make room (-DMD_68K_COLD): 8.3-9.4 whole passes a
+ * second against 7.9-8.9 with the renderer in flash, the system core 40-50%
+ * busy either way - the wire, not the renderer, sets the pace - and the
+ * emulation fell from 43-51 fps to 34-39.  With both hot VRAM is short.
+ */
+#if defined(MD_SPLIT) && defined(MD_VDP_HOT)
+#define MD_HOT_VDP MD_HOT
+#else
+#define MD_HOT_VDP
+#endif
+
 /* Visible lines: 224 normally, 240 when the VDP is put in 240-line mode. */
 #define VISIBLE_LINES_NTSC 224
 #define VISIBLE_LINES_PAL 240
