@@ -4202,6 +4202,9 @@ static void m68k_op_bne_8(void)
   if(COND_NE())
   {
     m68ki_branch_8(MASK_OUT_ABOVE_8(REG_IR));
+#ifdef ARGON_MD_SMALL
+    md_idle_branch(MASK_OUT_ABOVE_8(REG_IR));
+#endif
     return;
   }
   USE_CYCLES(CYC_BCC_NOTAKE_B);
@@ -4213,6 +4216,9 @@ static void m68k_op_beq_8(void)
   if(COND_EQ())
   {
     m68ki_branch_8(MASK_OUT_ABOVE_8(REG_IR));
+#ifdef ARGON_MD_SMALL
+    md_idle_branch(MASK_OUT_ABOVE_8(REG_IR));
+#endif
     return;
   }
   USE_CYCLES(CYC_BCC_NOTAKE_B);
@@ -5096,6 +5102,9 @@ static void m68k_op_bclr_8_s_al(void)
 static void m68k_op_bra_8(void)
 {
   m68ki_branch_8(MASK_OUT_ABOVE_8(REG_IR));
+#ifdef ARGON_MD_SMALL
+  md_idle_branch(MASK_OUT_ABOVE_8(REG_IR));
+#endif
 }
 
 

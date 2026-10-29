@@ -661,8 +661,15 @@ static inline void gwenesis_bus_write_memory_16(unsigned int address,
  ******************************************************************************/
 unsigned int m68k_read_memory_8(unsigned int address)
 {
-      //  if ((address &  0xFF0000 ) == 0xFF0000) return FETCH8RAM(address);
+#ifdef MD_CYCPROF
+    const unsigned int c0 = md_ccount();
+    const unsigned int v = gwenesis_bus_read_memory_8(address);
+    md_cp_mem += md_ccount() - c0;
+    md_cp_memn++;
+    return v;
+#else
     return gwenesis_bus_read_memory_8(address);
+#endif
 }
 
 /******************************************************************************
@@ -673,8 +680,15 @@ unsigned int m68k_read_memory_8(unsigned int address)
  ******************************************************************************/
  unsigned int m68k_read_memory_16(unsigned int address)
 {
-     //   if ((address &  0xFF0000 ) == 0xFF0000) return FETCH16RAM(address);
+#ifdef MD_CYCPROF
+    const unsigned int c0 = md_ccount();
+    const unsigned int v = gwenesis_bus_read_memory_16(address);
+    md_cp_mem += md_ccount() - c0;
+    md_cp_memn++;
+    return v;
+#else
     return gwenesis_bus_read_memory_16(address);
+#endif
 }
 
 /******************************************************************************
@@ -715,7 +729,14 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
   //   WRITE16RAM(address, value);
   //   return;
   // }
+#ifdef MD_CYCPROF
+  const unsigned int c0 = md_ccount();
   gwenesis_bus_write_memory_16(address, value);
+  md_cp_mem += md_ccount() - c0;
+  md_cp_memn++;
+#else
+  gwenesis_bus_write_memory_16(address, value);
+#endif
   return;
 }
 /******************************************************************************

@@ -421,6 +421,9 @@ void gwenesis_vdp_dma_fill(unsigned short value)
 {
   //vdpm_log(__FUNCTION__,"@%x len:%x val:%x",REG21_DMA_SRCADDR_LOW,REG19_DMA_LENGTH,value);
   int dma_length = REG19_DMA_LENGTH;
+#ifdef MD_HOST_COUNT
+  { extern unsigned md_cnt_fill; md_cnt_fill += dma_length; }
+#endif
 
   // This address is not required for fills,
   // but it's still updated by the DMA engine.
@@ -504,6 +507,9 @@ void gwenesis_vdp_dma_m68k()
 {
 
     int dma_length = REG19_DMA_LENGTH;
+#ifdef MD_HOST_COUNT
+    { extern unsigned md_cnt_dma; md_cnt_dma += dma_length ? dma_length : 0xFFFF; }
+#endif
 
     // This address is not required for fills,
     // but it's still updated by the DMA engine.

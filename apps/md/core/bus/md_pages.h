@@ -23,4 +23,18 @@ extern unsigned char *md_ram[MD_RAM_PAGES];
 extern unsigned char *md_zram[MD_ZRAM_PAGES];
 extern unsigned char *md_vram[MD_VRAM_PAGES];
 
+#ifdef MD_CYCPROF
+/* A profiling build only: where a 68000 instruction's time goes, in CPU
+ * cycles - fetch, finding the handler, running it, and the memory accesses
+ * inside it (part of "exec").  md_main.c prints them with `profile`. */
+static inline unsigned int md_ccount(void)
+{
+    unsigned int c;
+    __asm__ volatile("rsr %0, ccount" : "=a"(c));
+    return c;
+}
+extern unsigned int md_cp_fetch, md_cp_decode, md_cp_exec, md_cp_n;
+extern unsigned int md_cp_mem, md_cp_memn;
+#endif
+
 #endif

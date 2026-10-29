@@ -1252,6 +1252,86 @@ INLINE void m68ki_branch_8(uint offset)
   REG_PC += MAKE_INT_8(offset);
 }
 
+#ifdef ARGON_MD_SMALL
+/*
+ * Waiting, recognised.  A game waits for the next frame by reading one place
+ * in memory until the interrupt changes it:
+ *
+ *     loop: move.b ($F62A).w,d0     tst.w (a0)      btst #0,($C00004)...
+ *           bne.s  loop
+ *
+ * Alex Kidd spends 99% of its instructions in such a loop on a quiet screen
+ * and 55% on a busy one, and each costs the CYD some 200 cycles - 12 ms of a
+ * 16.7 ms frame spent finding out, eleven thousand times, that nothing has
+ * changed.  Nothing can: interrupts are raised between lines, never inside
+ * m68k_run, and a read of ROM or work RAM changes nothing.  So when a short
+ * branch is taken back onto the one read before it, and that read is of ROM
+ * or work RAM - not the VDP, the I/O ports or the Z80's window, where a read
+ * can mean something - the rest of the line is spent at once.  PicoDrive
+ * does the same.  The Z80 could write 68000 RAM through its bank window; no
+ * game is known to poll on that, and with `noz80` it does not run at all.
+ */
+extern unsigned int md_idle_skips;
+
+INLINE int md_quiet_addr(uint a)
+{
+  a &= 0xFFFFFFu;
+  return a < 0x400000u || a >= 0xE00000u;
+}
+
+INLINE void md_idle_branch(uint disp8)
+{
+#ifdef MD_NO_IDLE
+  return;
+#endif
+  const int d = MAKE_INT_8(disp8);
+  if (d != -4 && d != -6 && d != -8) {
+    return;
+  }
+  const uint t = REG_PC;                        /* the branch's target */
+  const uint op = m68k_read_immediate_16(t);
+  uint addr;
+  int  len;
+  if ((op & 0xFF38u) == 0x4A10u || (op & 0xFF38u) == 0x4A50u ||
+      (op & 0xFF38u) == 0x4A90u ||              /* tst (An) */
+      (op & 0xF1F8u) == 0x1010u || (op & 0xF1F8u) == 0x3010u ||
+      (op & 0xF1F8u) == 0x2010u ||              /* move (An),Dn */
+      (op & 0xF1F8u) == 0xB010u || (op & 0xF1F8u) == 0xB050u ||
+      (op & 0xF1F8u) == 0xB090u) {              /* cmp (An),Dn */
+    len = 2;
+    addr = REG_A[op & 7u];
+  } else if (op == 0x4A38u || op == 0x4A78u || op == 0x4AB8u ||
+             (op & 0xF1FFu) == 0x1038u || (op & 0xF1FFu) == 0x3038u ||
+             (op & 0xF1FFu) == 0x2038u ||
+             (op & 0xF1FFu) == 0xB038u || (op & 0xF1FFu) == 0xB078u ||
+             (op & 0xF1FFu) == 0xB0B8u ||
+             (op & 0xF1FFu) == 0x0138u) {       /* tst/move/cmp/btst (xxx).w */
+    len = 4;
+    addr = MAKE_INT_16(m68k_read_immediate_16(t + 2u));
+  } else if (op == 0x4A39u || op == 0x4A79u || op == 0x4AB9u ||
+             (op & 0xF1FFu) == 0x1039u || (op & 0xF1FFu) == 0x3039u ||
+             (op & 0xF1FFu) == 0x2039u ||
+             (op & 0xF1FFu) == 0xB039u || (op & 0xF1FFu) == 0xB079u ||
+             (op & 0xF1FFu) == 0xB0B9u) {       /* the same, (xxx).l */
+    len = 6;
+    addr = (m68k_read_immediate_16(t + 2u) << 16) |
+           m68k_read_immediate_16(t + 4u);
+  } else if (op == 0x0838u) {                   /* btst #n,(xxx).w */
+    len = 6;
+    addr = MAKE_INT_16(m68k_read_immediate_16(t + 4u));
+  } else {
+    return;
+  }
+  if (len + 2 != -d || !md_quiet_addr(addr)) {
+    return;
+  }
+  if (m68ki_cpu.cycles < m68ki_cpu.cycle_end) {
+    m68ki_cpu.cycles = m68ki_cpu.cycle_end;
+    md_idle_skips++;
+  }
+}
+#endif
+
 INLINE void m68ki_branch_16(uint offset)
 {
   REG_PC += MAKE_INT_16(offset);

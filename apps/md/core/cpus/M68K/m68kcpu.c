@@ -306,6 +306,9 @@ void m68k_run(unsigned int cycles)
 #endif
 
     /* Decode next instruction */
+#ifdef MD_CYCPROF
+    const unsigned int cp0 = md_ccount();
+#endif
     REG_IR = m68ki_read_imm_16();
 
 //    printf("PC=%x IR=%x CYCLES=%d \n",m68k.pc,REG_IR,CYC_OF(REG_IR));
@@ -317,8 +320,27 @@ void m68k_run(unsigned int cycles)
        * instruction itself (m68k_set_irq_delay) left that one in REG_IR, and
        * the cycles counted here are its, as they always were. */
       const unsigned int ir = REG_IR;
+#ifdef MD_CYCPROF
+      const unsigned int cp1 = md_ccount();
+#endif
       const md_op_t *op = MD_OP(ir);
+#ifdef MD_CYCPROF
+      const unsigned int cp2 = md_ccount();
+#endif
+#ifdef MD_HOST_COUNT
+      { extern unsigned md_cnt_instr, md_cnt_op[];
+        md_cnt_instr++; md_cnt_op[op - md_ops]++; }
+#endif
       op->fn();
+#ifdef MD_CYCPROF
+      {
+        const unsigned int cp3 = md_ccount();
+        md_cp_fetch += cp1 - cp0;
+        md_cp_decode += cp2 - cp1;
+        md_cp_exec += cp3 - cp2;
+        md_cp_n++;
+      }
+#endif
       USE_CYCLES(REG_IR == ir ? op->cyc : CYC_OF(REG_IR));
     }
 #else

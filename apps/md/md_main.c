@@ -76,15 +76,20 @@ static int s_oy;
 static int s_use_live_pad = 1;
 static int s_run_z80_cpu = 1;   /* 0: advance zclk only, no sms_z80_execute */
 static int s_run_sound = 1;     /* 0: skip sample mix (still accepts reg writes) */
-static int s_profile_frames = 0; /* print per-frame m68k/z80/vdp split */
+static int s_profile_frames = 0; /* m68k/z80/snd/vdp split with the stats */
 static int s_quit;
 static ag_gfxinfo_t s_gi;
 
-/* Last run_frame phase times (??s), filled when s_profile_frames > 0. */
-static uint32_t s_prof_m68k_us;
-static uint32_t s_prof_z80_us;
-static uint32_t s_prof_snd_us;
-static uint32_t s_prof_vdp_us;
+/* run_frame's phases summed over the stats window (us), with `profile`. */
+static uint64_t s_prof_m68k_us;
+static uint64_t s_prof_z80_us;
+static uint64_t s_prof_snd_us;
+static uint64_t s_prof_vdp_us;
+static uint32_t s_frame_no;     /* frames run so far, for finding the scene */
+unsigned int md_idle_skips;     /* lines whose rest was a wait (m68kcpu.h) */
+#ifdef MD_CYCPROF
+unsigned int md_cp_fetch, md_cp_decode, md_cp_exec, md_cp_n, md_cp_mem, md_cp_memn;
+#endif
 
 #define PAD_HOLD_MS 150u /* matches console sticky TTL; serial has no key-up */
 #define MD_BUTTONS 8
@@ -191,6 +196,31 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
     ag_printf("md: %u fps, work %u us (emu %u, show %u), max %u us, "
               "%u%% realtime\n",
               fps, avg, emu, pres, (unsigned)work_max, pct);
+    if (s_profile_frames) {
+        /* where a frame's time went, and which frame: the scene can be found
+         * again by number on the host (scratchpad mdhost, MD_DUMP_EVERY) */
+        ag_printf("md: to f%u: m68k %u z80 %u snd %u vdp %u us a frame, "
+                  "%u waits skipped\n",
+                  (unsigned)s_frame_no,
+                  (unsigned)(s_prof_m68k_us / frames),
+                  (unsigned)(s_prof_z80_us / frames),
+                  (unsigned)(s_prof_snd_us / frames),
+                  (unsigned)(s_prof_vdp_us / frames), md_idle_skips);
+        md_idle_skips = 0;
+        s_prof_m68k_us = s_prof_z80_us = s_prof_snd_us = s_prof_vdp_us = 0;
+#ifdef MD_CYCPROF
+        if (md_cp_n) {
+            ag_printf("md: per instruction (cycles): fetch %u decode %u exec %u "
+                      "(memory %u in %u.%u accesses), %u a frame\n",
+                      md_cp_fetch / md_cp_n, md_cp_decode / md_cp_n,
+                      md_cp_exec / md_cp_n, md_cp_mem / md_cp_n,
+                      md_cp_memn / md_cp_n, (md_cp_memn * 10u / md_cp_n) % 10u,
+                      md_cp_n / frames);
+        }
+        md_cp_fetch = md_cp_decode = md_cp_exec = md_cp_n = 0;
+        md_cp_mem = md_cp_memn = 0;
+#endif
+    }
 #ifdef ARGON_MD_SMALL
     if (s_ring_n) {
         /* the glass's own rate: rows sent, as whole pictures a second */
@@ -870,10 +900,10 @@ resume_m68k:
         zclk = 0;
     }
     if (profile) {
-        s_prof_m68k_us = (uint32_t)m68k_us;
-        s_prof_z80_us = (uint32_t)z80_us;
-        s_prof_snd_us = (uint32_t)snd_us;
-        s_prof_vdp_us = (uint32_t)vdp_us;
+        s_prof_m68k_us += m68k_us;
+        s_prof_z80_us += z80_us;
+        s_prof_snd_us += snd_us;
+        s_prof_vdp_us += vdp_us;
     }
     frame_counter++;
 }
@@ -924,7 +954,8 @@ int ag_main(int argc, char **argv)
         } else if (arg_eq(argv[i], "stats")) {
             stats = 1;
         } else if (arg_eq(argv[i], "profile")) {
-            /* Per-frame m68k/z80/snd/vdp for the run (use with a frame count). */
+            /* m68k/z80/snd/vdp per frame, every stats window: the timing
+             * itself costs four clock reads a line */
             s_profile_frames = 1;
             stats = 1;
         } else if (arg_eq(argv[i], "noz80")) {
@@ -1111,11 +1142,8 @@ int ag_main(int argc, char **argv)
         const ag_time_t f0 = ag_micros();
 
         const int show = (present_div <= 1) || ((ran % present_div) == 0);
-        if (s_profile_frames && ran >= 120) {
-            /* Keep the first two seconds of detail; then normal stats only. */
-            s_profile_frames = 0;
-        }
         run_frame(show);
+        s_frame_no = (uint32_t)ran + 1u;
 
         const ag_time_t f1 = ag_micros();
 #ifndef ARGON_MD_SMALL /* the CYD's bands went out as they were drawn */
@@ -1143,15 +1171,7 @@ int ag_main(int argc, char **argv)
         window++;
         ran++;
 
-        if (s_profile_frames) {
-            const unsigned pct =
-                (work > 0u) ? (unsigned)(1666700u / (unsigned)work) : 0u;
-            ag_printf("md: f%u work %u (m68k %u z80 %u snd %u vdp %u show %u) "
-                      "%u%%\n",
-                      (unsigned)ran, (unsigned)work, (unsigned)s_prof_m68k_us,
-                      (unsigned)s_prof_z80_us, (unsigned)s_prof_snd_us,
-                      (unsigned)s_prof_vdp_us, (unsigned)(f2 - f1), pct);
-        } else if (stats && (uint64_t)(f2 - window_t0) >= 2000000u) {
+        if (stats && (uint64_t)(f2 - window_t0) >= 2000000u) {
             report_stats(window, (uint64_t)(f2 - window_t0), work_sum, emu_sum,
                          present_sum, work_max);
             work_sum = emu_sum = present_sum = work_max = 0;
@@ -1172,8 +1192,31 @@ int ag_main(int argc, char **argv)
         const ag_time_t now = ag_micros();
         if ((int64_t)(now - next_frame) > 2 * 16683) {
             next_frame = now;
-        } else if (next_frame > now + 1000u) {
-            ag_delay((uint32_t)((next_frame - now) / 1000u));
+        } else {
+#ifdef ARGON_MD_SMALL
+            /*
+             * The time left before the next frame goes to the picture, not to
+             * sleep.  Lines are drawn while the emulation runs, and since a
+             * game's waiting is skipped (m68kcpu.h) a quiet frame is done in
+             * 3 ms of its 16.7: the glass got 0.5 pictures a second where it
+             * had 7.  A line drawn now shows the VDP as the frame left it,
+             * which for every line not yet drawn is what it would have shown.
+             */
+            while (s_ring_n > 0 && !s_headless &&
+                   (int64_t)(next_frame - ag_micros()) > 300) {
+                const int line = md_line_begin(screen_height);
+                if (line < 0) {
+                    ag_yield();      /* the batch is on its way: let it go */
+                    continue;
+                }
+                gwenesis_vdp_render_line(line);
+                md_line_end(line);
+            }
+#endif
+            const ag_time_t later = ag_micros();
+            if (next_frame > later + 1000u) {
+                ag_delay((uint32_t)((next_frame - later) / 1000u));
+            }
         }
     }
 
