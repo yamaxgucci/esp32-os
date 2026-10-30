@@ -22,6 +22,9 @@
 #include "md_sound.h"
 #include "ym2612.h"
 #include "z80inst.h"
+#ifdef ARGON_MD_SMALL
+#include "md_snd_async.h"
+#endif
 
 /* 24 KB stack: with OpenEth/lwIP the largest internal free block is ~31 KB. */
 #ifdef ARGON_MD_SMALL
@@ -29,10 +32,12 @@
  * The CYD (ESP32, no PSRAM): the machine's own memory is asked for at start
  * (md_small_alloc), the cartridge is mapped out of flash, and with no display
  * driver loaded it runs without a picture - which is how it is measured.
- * 6 KB of stack asked for - though the kernel gives a process at least the 8
- * KB loading needs (AG_PROC_LOAD_STACK_MIN), so the number is a floor only.
+ * 5 KB of stack asked for: with the Z80 and the chips on this core a whole
+ * run, loading included, touched 4.0 KB of it, and they are on the other
+ * core now (md_snd_async.c).  The kernel gives a process at least the 8 KB
+ * loading needs unless [stacks] load in SYSTEM.CFG says less - the CYD says 5.
  */
-AG_APP_SIZED("MD", "0.1", "argon", 0, 6 * 1024, 4 * 1024);
+AG_APP_SIZED("MD", "0.1", "argon", 0, 5 * 1024, 4 * 1024);
 #else
 AG_APP_SIZED("MD", "0.1", "argon", AG_AXE_NEEDS_GFX, 24 * 1024, 5 * 1024 * 1024);
 #endif
@@ -75,7 +80,8 @@ static int s_oy;
  */
 static int s_use_live_pad = 1;
 static int s_run_z80_cpu = 1;   /* 0: advance zclk only, no sms_z80_execute */
-static int s_run_sound = 1;     /* 0: skip sample mix (still accepts reg writes) */
+static int s_run_sound = 1;
+static int s_snd_here;     /* `sndhere`: the sound side stays on this core */     /* 0: skip sample mix (still accepts reg writes) */
 static int s_profile_frames = 0; /* m68k/z80/snd/vdp split with the stats */
 static int s_quit;
 static ag_gfxinfo_t s_gi;
@@ -190,6 +196,16 @@ static volatile uint32_t s_ring_got;
 static volatile uint32_t s_glass_us; /* the system core's time sending rows */
 #endif
 
+/* the Z80's share of the system core's sound, ms a second */
+static uint32_t md_snd_z80_ms(uint64_t span_us)
+{
+    extern volatile uint32_t md_snd_z80_us;
+    static uint32_t          seen;
+    const uint32_t           z = md_snd_z80_us - seen;
+    seen += z;
+    return (uint32_t)((uint64_t)z * 1000u / span_us);
+}
+
 static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
                          uint64_t emu_sum, uint64_t present_sum,
                          uint64_t work_max)
@@ -254,10 +270,17 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
         const uint32_t draw = s_draw_us - s_draw_seen, gate = s_gate_us - s_gate_seen;
         s_draw_seen += draw;
         s_gate_seen += gate;
-        ag_printf("md: drawer per second: draw %u ms, send %u ms, wait %u ms\n",
+        static uint32_t s_snd_seen;
+        const uint32_t snd = md_snd_core0_us() - s_snd_seen;
+        s_snd_seen += snd;
+        ag_printf("md: drawer per second: draw %u ms, send %u ms, wait %u ms, "
+                  "sound %u ms, z80 %u (%u frames in pieces)\n",
                   (unsigned)((uint64_t)draw * 1000u / span_us),
                   (unsigned)((uint64_t)us * 1000u / span_us),
-                  (unsigned)((uint64_t)gate * 1000u / span_us));
+                  (unsigned)((uint64_t)gate * 1000u / span_us),
+                  (unsigned)((uint64_t)snd * 1000u / span_us),
+                  (unsigned)md_snd_z80_ms(span_us),
+                  (unsigned)md_snd_split());
         ag_printf("md: glass %u rows, %u.%u pictures a second, %u us a row, "
                   "the system core %u%% busy; %u.%u whole passes a second, "
                   "%u lines unchanged\n", (unsigned)rows,
@@ -452,6 +475,9 @@ static void md_drawer(void)
     bool changed = false;
     uint32_t pass_seen = s_frames_done;   /* frames done when this pass began */
     while (s_ring_run) {
+        /* the sound side first: a frame's log played before the next row -
+         * a late picture is a band, late sound is a gap */
+        (void)md_snd_core0_poll();
         const int w = screen_width, h = screen_height;
         if (line >= h || line >= MD_HASH_LINES) {
             md_draw_flush(line0, rows, w, h);
@@ -478,7 +504,9 @@ static void md_drawer(void)
                 const ag_time_t g0 = ag_micros();
                 ag_delay(1);             /* the system core's own tasks */
                 while (s_ring_run && s_frames_done - pass_seen < wait) {
-                    ag_delay(1);
+                    if (!md_snd_core0_poll()) {
+                        ag_delay(1);
+                    }
                 }
                 pass_seen = s_frames_done;
                 s_gate_us += (uint32_t)(ag_micros() - g0);
@@ -973,9 +1001,19 @@ static void run_frame(int render)
     hint_counter = gwenesis_vdp_regs[10];
     system_clock = 0;
     scan_line = 0;
-    if (s_run_sound) {
+#ifdef ARGON_MD_SMALL
+    const int here = !md_snd_async; /* the sound side on this core */
+#else
+    const int here = 1;
+#endif
+    if (s_run_sound && here) {
         md_sound_begin_frame(lines_per_frame);
     }
+#ifdef ARGON_MD_SMALL
+    if (!here) {
+        md_snd_68k_frame_begin(lines_per_frame, screen_height);
+    }
+#endif
 
     if (m68k_arm_address_error_trap() != 0) {
         m68k_on_address_error();
@@ -996,7 +1034,9 @@ resume_m68k:
             t0 = t1;
         }
 
-        if (s_run_z80_cpu) {
+        if (!here) {
+            /* the system core runs the Z80 and the chips (md_snd_async.c) */
+        } else if (s_run_z80_cpu) {
             z80_run(system_clock);
         } else {
             /* Keep the Z80 clock in step so BUSREQ sync does not run away. */
@@ -1010,7 +1050,7 @@ resume_m68k:
             t0 = t1;
         }
 
-        if (s_run_sound) {
+        if (s_run_sound && here && MD_SOUND_LINE_DUE(scan_line, lines_per_frame)) {
             /* Catch YM up to the line clock before draining samples. */
             ym2612_run(system_clock);
             md_sound_line(scan_line, lines_per_frame);
@@ -1061,22 +1101,28 @@ resume_m68k:
                 gwenesis_vdp_status |= STATUS_VIRQPENDING;
                 m68k_set_irq(6);
             }
-            if (s_run_z80_cpu) {
+            if (s_run_z80_cpu && here) {
                 z80_irq_line(1);
             }
         }
         if (scan_line == (screen_height + 1)) {
-            if (s_run_z80_cpu) {
+            if (s_run_z80_cpu && here) {
                 z80_irq_line(0);
             }
         }
     }
 
-    if (s_run_sound) {
+    if (s_run_sound && here) {
         md_sound_end_frame();
     }
     /* Rebase the 68000's counter so next frame starts from zero again. */
     m68k_frame_end(system_clock);
+#ifdef ARGON_MD_SMALL
+    if (!here) {
+        /* the frame's log to the system core, which rebases its own clock */
+        md_snd_68k_frame_end(lines_per_frame, screen_height);
+    } else
+#endif
     /* Z80 clock is absolute within the frame; rebase with the 68k. */
     if (zclk >= system_clock) {
         zclk -= system_clock;
@@ -1156,6 +1202,8 @@ int ag_main(int argc, char **argv)
              * itself costs four clock reads a line */
             s_profile_frames = 1;
             stats = 1;
+        } else if (arg_eq(argv[i], "sndhere")) {
+            s_snd_here = 1; /* the CYD: Z80 and chips on this core, as before */
         } else if (arg_eq(argv[i], "hifi")) {
             md_sound_set_hifi(1); /* the CYD: the chips at the whole rate */
         } else if (arg_eq(argv[i], "noz80")) {
@@ -1298,6 +1346,17 @@ int ag_main(int argc, char **argv)
     power_on();
     reset_emulation();
     md_sound_init();
+#ifdef ARGON_MD_SMALL
+    /* the Z80 and the chips on the system core, in the picture's thread,
+     * when there is a Z80 to run - without one the YM fits beside the 68000
+     * here (Sonic: 68000 11 ms + YM 4 of 16.7) and the picture keeps its core.
+     * `sndhere` keeps them here anyway. */
+    if (s_sysdraw && s_ring_n > 0 && !s_headless && !s_snd_here &&
+        s_run_z80_cpu) {
+        md_snd_async_start(s_run_z80_cpu, s_run_sound);
+        ag_printf("md: the Z80 and the sound chips on the system core\n");
+    }
+#endif
 
     s_use_live_pad = want_livepad;
     if (s_use_live_pad) {
@@ -1433,6 +1492,7 @@ int ag_main(int argc, char **argv)
     }
     ag_printf("md: %d frames\n", ran);
 #ifdef ARGON_MD_SMALL
+    md_snd_async_stop();
     if (s_ring_n) {
         ag_printf("md: %u rows to the glass, %u refused\n",
                   (unsigned)s_ring_got, (unsigned)s_present_bad);

@@ -23,6 +23,9 @@
 #define GWENESIS_YM2612_BUF_LEN 1024
 #endif
 extern int ym2612_base;
+#ifdef ARGON_MD_SMALL
+void ym2612_dac_settle(void);
+#endif
 void YM2612SetSampleDivisor(int div);
 #endif
 

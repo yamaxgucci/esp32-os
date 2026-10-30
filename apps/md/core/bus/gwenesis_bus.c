@@ -32,6 +32,21 @@ __license__ = "GPLv3"
 #include "gwenesis_sn76489.h"
 #include "gwenesis_savestate.h"
 
+#ifdef ARGON_MD_SMALL
+/* The CYD: with the sound side on the other core, the 68000's writes to the
+ * chips are logged for it (md_snd_async.c). */
+#include "md_snd_async.h"
+#define MD_YM_WRITE(a, v, t) \
+  do { if (md_snd_async) md_snd_68k_ym((a), (v)); else YM2612Write((a), (v), (t)); } while (0)
+#define MD_YM_READ(t) (md_snd_async ? md_snd_68k_ym_status() : YM2612Read(t))
+#define MD_PSG_WRITE(v, t) \
+  do { if (md_snd_async) md_snd_68k_psg(v); else gwenesis_SN76489_Write((v), (t)); } while (0)
+#else
+#define MD_YM_WRITE(a, v, t) YM2612Write((a), (v), (t))
+#define MD_YM_READ(t) YM2612Read(t)
+#define MD_PSG_WRITE(v, t) gwenesis_SN76489_Write((v), (t))
+#endif
+
 #if GNW_TARGET_MARIO !=0 || GNW_TARGET_ZELDA!=0
   #pragma GCC optimize("Ofast")
 #endif
@@ -471,7 +486,7 @@ MD_HOT static inline unsigned int gwenesis_bus_read_memory_8(unsigned int addres
     return MD_ZRAM(address);
 
   case Z80_YM2612_ADDR:
-    return YM2612Read(m68k_cycles_master());
+    return MD_YM_READ(m68k_cycles_master());
 
   case Z80_SN76489_ADDR:
     return 0xff;
@@ -522,7 +537,7 @@ MD_HOT static inline unsigned int gwenesis_bus_read_memory_16(unsigned int addre
     return MD_ZRAM(address) | (MD_ZRAM(address) << 8);
 
   case Z80_YM2612_ADDR:
-    ret_value = YM2612Read(m68k_cycles_master());
+    ret_value = MD_YM_READ(m68k_cycles_master());
     return ret_value | ret_value << 8;
 
 
@@ -575,12 +590,12 @@ MD_HOT static inline void gwenesis_bus_write_memory_8(unsigned int address,
 
   case Z80_YM2612_ADDR:
     bus_log(__FUNCTION__,"CPUZ80PSG8 ,m68kclk= %d", m68k_cycles_master());
-    YM2612Write(address & 0x3, value & 0Xff,m68k_cycles_master());
+    MD_YM_WRITE(address & 0x3, value & 0Xff,m68k_cycles_master());
     return;
 
   case Z80_SN76489_ADDR:
     bus_log(__FUNCTION__,"CPUZ80FM8  ,m68kclk= %d", m68k_cycles_master());
-    gwenesis_SN76489_Write( value & 0Xff, m68k_cycles_master());
+    MD_PSG_WRITE( value & 0Xff, m68k_cycles_master());
     return;
 
   case Z80_BANK_ADDR:
@@ -635,12 +650,12 @@ MD_HOT static inline void gwenesis_bus_write_memory_16(unsigned int address,
 
   case Z80_YM2612_ADDR:
     bus_log(__FUNCTION__,"CZYM16 ,mclk=%d",  m68k_cycles_master());
-    YM2612Write(address & 0x3, value >> 8,m68k_cycles_master() );
+    MD_YM_WRITE(address & 0x3, value >> 8,m68k_cycles_master() );
     return;
 
   case Z80_SN76489_ADDR:
     bus_log(__FUNCTION__,"CZSN16 ,mclk=%d", m68k_cycles_master());
-    gwenesis_SN76489_Write(value >> 8,m68k_cycles_master() );
+    MD_PSG_WRITE(value >> 8,m68k_cycles_master() );
     return;
 
   default:

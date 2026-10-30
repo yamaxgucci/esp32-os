@@ -2091,6 +2091,60 @@ void YM2612ResetChip(void)
  * needed more, and at the 11 kHz the CYD runs the chips at the difference is
  * about 0.6 ms (30 Oct 2026).
  */
+#ifdef ARGON_MD_SMALL
+/*
+ * The DAC's samples, queued by the sample they take effect at, and put in
+ * place by the update as it reaches them.
+ *
+ * A drum is the Z80 writing the DAC a few hundred times a frame, and each
+ * write used to catch the chip up to its own time first: an update for one
+ * sample or none, whose start refreshes all six channels - from flash on the
+ * CYD.  That was most of the Z80's 8 ms a frame (Sonic, 30 Oct 2026).  Queued,
+ * the update runs in its batches and each DAC value still lands on the
+ * sample it was written for.
+ */
+#define YM_DACQ 64
+static uint16_t s_dacq_at[YM_DACQ];
+static int16_t  s_dacq_v[YM_DACQ];
+static int      s_dacq_n, s_dacq_head;
+static int      s_upd_at; /* the frame's sample the running update makes */
+
+static void ym_dac_write(unsigned int v, int target)
+{
+  const int at = target / (int)ym2612.divisor;
+  const int out = ((int)v - 0x80) << 6;
+  if (at <= ym2612_index || s_dacq_n == YM_DACQ) {
+    /* already made, or the queue is full: as before */
+    ym2612_run(target);
+    ym2612.dacout = out;
+    return;
+  }
+  const int k = (s_dacq_head + s_dacq_n) % YM_DACQ;
+  s_dacq_at[k] = (uint16_t)at;
+  s_dacq_v[k] = (int16_t)out;
+  s_dacq_n++;
+}
+
+/* A frame's end: what is left in the queue takes effect now. */
+void ym2612_dac_settle(void)
+{
+  while (s_dacq_n > 0) {
+    ym2612.dacout = s_dacq_v[s_dacq_head];
+    s_dacq_head = (s_dacq_head + 1) % YM_DACQ;
+    s_dacq_n--;
+  }
+}
+
+#define YM_DAC_DUE(i)                                                        \
+  while (s_dacq_n > 0 && (int)s_dacq_at[s_dacq_head] <= s_upd_at + (i)) {     \
+    ym2612.dacout = s_dacq_v[s_dacq_head];                                   \
+    s_dacq_head = (s_dacq_head + 1) % YM_DACQ;                               \
+    s_dacq_n--;                                                              \
+  }
+#else
+#define YM_DAC_DUE(i)
+#endif
+
 static void YM2612Update(int16_t *buffer, int length)
 {
   int i;
@@ -2135,6 +2189,7 @@ static void YM2612Update(int16_t *buffer, int length)
     update_ssg_eg_channels(&ym2612.CH[0]);
 
     /* calculate FM */
+    YM_DAC_DUE(i)
     if (!ym2612.dacen)
     {
       chan_calc(&ym2612.CH[0],6);
@@ -2249,6 +2304,9 @@ void ym2612_run( int target) {
   }
 #endif
   if (ym2612_index > ym2612_prev_index) {
+#ifdef ARGON_MD_SMALL
+    s_upd_at = ym2612_prev_index;
+#endif
 #if ARGON_TARGET
     YM2612Update(gwenesis_ym2612_buffer + (ym2612_prev_index - ym2612_base), ym2612_index-ym2612_prev_index);
 #else
@@ -2269,11 +2327,23 @@ void YM2612Write(unsigned int a, unsigned int v,  int target)
 {
   ym_log(__FUNCTION__," %06x : %02x",a,v);
 
+  v &= 0xff;  /* adjust to 8 bit bus */
+
+#ifdef ARGON_MD_SMALL
+  /* an address changes no output: no catching up for it; the DAC's data is
+   * queued for the sample it belongs to (ym_dac_write) */
+  if (a == 0 || a == 2) {
+    ym2612.OPN.ST.address = (a == 2) ? (v | 0x100) : v;
+    return;
+  }
+  if (ym2612.OPN.ST.address == 0x2a) {
+    ym_dac_write(v, target);
+    return;
+  }
+#endif
   //Sync
   if (GWENESIS_AUDIO_ACCURATE == 1)
-    ym2612_run(target); 
-
-  v &= 0xff;  /* adjust to 8 bit bus */
+    ym2612_run(target);
 
   switch( a )
   {

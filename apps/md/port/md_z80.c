@@ -14,6 +14,7 @@
 #include "ym2612.h"
 #include "gwenesis_sn76489.h"
 #include "z80inst.h"
+#include "md_snd_async.h"
 
 /*
  * z80.h also declares z80_execute, but for SMS that means relative cycles.
@@ -249,8 +250,38 @@ static void z80_sync(void)
     z80_run(m68k_cycles_master());
 }
 
+/* The 68000's view of the bus request and the reset while the Z80 runs on
+ * the other core (md_snd_async.c): what it last wrote, which is what it is
+ * answered - the Z80 a frame behind gives the bus up at once. */
+static int s_bus_ack68;
+static int s_reset68 = 1;
+
+void md_z80_ctl_apply(unsigned int address, unsigned int value)
+{
+    if (address == 0x1100u) {
+        s_bus_ack = value ? 1 : 0;
+    } else if (address == 0x1200u) {
+        if (value == 0u) {
+            s_reset = 1;
+        } else {
+            z80_pulse_reset();
+            s_reset = 0;
+            s_reset_once = 1;
+        }
+    }
+}
+
 void z80_write_ctrl(unsigned int address, unsigned int value)
 {
+    if (md_snd_async) {
+        if (address == 0x1100u) {
+            s_bus_ack68 = value ? 1 : 0;
+        } else if (address == 0x1200u) {
+            s_reset68 = (value == 0u) ? 1 : 0;
+        }
+        md_snd_68k_zctl(address, value);
+        return;
+    }
     z80_sync();
     if (address == 0x1100u) {
         s_bus_ack = value ? 1 : 0;
@@ -267,6 +298,12 @@ void z80_write_ctrl(unsigned int address, unsigned int value)
 
 unsigned int z80_read_ctrl(unsigned int address)
 {
+    if (md_snd_async) {
+        if (address == 0x1100u) {
+            return s_bus_ack68 ? 0u : 1u;
+        }
+        return (address == 0x1200u) ? (unsigned int)s_reset68 : 0u;
+    }
     z80_sync();
     if (address == 0x1100u) {
         /* Bit0 set = Z80 still owns the bus (BUSREQ not granted). */

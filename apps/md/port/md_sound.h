@@ -24,6 +24,17 @@ void md_sound_init(void);
 void md_sound_close(void);
 void md_sound_begin_frame(int lines_per_frame);
 void md_sound_line(int line, int lines_per_frame);
+
+/*
+ * The lines a frame's samples are mixed on: every eighth and the last.
+ * The YM2612's update starts by refreshing all six channels, and run once a
+ * line from flash that was most of what sound cost on the CYD - 6-8 ms a
+ * frame for one or two samples a line.  A write to the chip still catches it
+ * up to its own time first, so batching changes nothing that is heard.
+ */
+#define MD_SOUND_LINE_DUE(line, lines) \
+    ((((line) & 7) == 7) || ((line) == (lines) - 1))
+
 void md_sound_end_frame(void);
 
 /* Per-frame YM clock/buffer reset (native YM); no-op-ish for ag_fm. */

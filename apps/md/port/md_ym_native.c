@@ -29,6 +29,9 @@ void md_ym_frame_begin(int lines_per_frame)
     if (samples > 0) {
         YM2612SetSampleDivisor(clocks / samples);
     }
+#ifdef ARGON_MD_SMALL
+    ym2612_dac_settle(); /* the frame's clock starts again */
+#endif
     ym2612_index = 0;
     ym2612_clock = 0;
     ym2612_base = 0;
