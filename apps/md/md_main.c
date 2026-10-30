@@ -1114,6 +1114,7 @@ int ag_main(int argc, char **argv)
             wait_card = 1;
             continue;
         }
+#ifdef ARGON_MD_SMALL
         if ((argv[i][0] == 'r' || argv[i][0] == 'R') &&
             (argv[i][1] == 'i' || argv[i][1] == 'I') &&
             (argv[i][2] == 'n' || argv[i][2] == 'N') &&
@@ -1126,11 +1127,16 @@ int ag_main(int argc, char **argv)
         }
         if (arg_eq(argv[i], "nosysdraw")) {
             s_sysdraw = 0;     /* the emulating core draws, as before */
+            continue;
         } else if (arg_eq(argv[i], "noring")) {
             ring_rows = 0;
+            continue;
         } else if (arg_eq(argv[i], "headless")) {
             s_headless = 1;
-        } else if (arg_eq(argv[i], "fps20")) {
+            continue;
+        }
+#endif
+        if (arg_eq(argv[i], "fps20")) {
             present_div = 3;
         } else if (arg_eq(argv[i], "fps15")) {
             present_div = 4;
@@ -1334,7 +1340,11 @@ int ag_main(int argc, char **argv)
 
         const int show = (present_div <= 1) || ((ran % present_div) == 0);
         s_inframe_left = MD_INFRAME_LINES;
+#ifdef ARGON_MD_SMALL
         run_frame(show && !(s_sysdraw && s_ring_n > 0));
+#else
+        run_frame(show);
+#endif
         s_last_work_us = (uint32_t)(ag_micros() - f0);
         s_frames_done++;
         s_frame_no = (uint32_t)ran + 1u;
