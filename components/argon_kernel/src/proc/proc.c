@@ -35,6 +35,8 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 
+#include "core/sysconfig.h"
+#include <argon/cfg.h>
 #include "dev/io.h"
 #include "fs/storage.h"
 #include "proc/supervisor.h"
@@ -83,6 +85,20 @@ uint32_t ag_proc_unmet_needs(uint32_t axe_flags)
  * be loaded on.
  */
 #define AG_PROC_LOAD_STACK_MIN (8u * 1024u)
+
+/*
+ * That floor, unless [stacks] load in SYSTEM.CFG says otherwise - never
+ * below 4 KB.  The CYD's Mega Drive names 6 KB and was given 8, of which
+ * loading and a whole game together touched 4.0 (30 Oct 2026): the rest was
+ * the 2 KB its Z80 could not find.  A board that sets this has measured its
+ * own images; the default is what it always was.
+ */
+static uint32_t load_stack_min(void)
+{
+    const size_t n = ag_cfg_bytes(ag_sysconfig(), "stacks.load",
+                                  AG_PROC_LOAD_STACK_MIN);
+    return (n < 4096u) ? 4096u : (uint32_t)n;
+}
 #ifndef CONFIG_ARGON_APP_STACK_KB
 #define CONFIG_ARGON_APP_STACK_KB 16
 #endif
@@ -1749,8 +1765,8 @@ ag_err_t ag_proc_spawn_sink(const char *path, int argc, char **argv,
          * task, through the filesystem, and an image that asks for two
          * kilobytes would overflow before its first instruction ran.
          */
-        if (want != 0 && want < AG_PROC_LOAD_STACK_MIN) {
-            want = AG_PROC_LOAD_STACK_MIN;
+        if (want != 0 && want < load_stack_min()) {
+            want = load_stack_min();
         }
         p->stack_bytes = clamp_stack_bytes(want);
     }
