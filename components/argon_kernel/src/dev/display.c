@@ -159,8 +159,26 @@ static unsigned collect_drivers(const ag_display_ops_t *ops[AG_DISPLAY_MAX])
 {
     static const ag_display_ops_t *s_ops[AG_DISPLAY_MAX];
     static unsigned                s_n;
-    static uint32_t                s_gen;
-    static bool                    s_have;
+    static volatile uint32_t       s_gen;
+    static volatile bool           s_have;
+
+    /*
+     * Unchanged since the list was made: the list, without the lock.  The
+     * registry's lock is a recursive mutex and taking and giving it was 3400
+     * cycles of every call - more than the rest of the kernel's part of a
+     * present (30 Oct 2026).  It bought nothing a reader here can use: the
+     * lock is let go before any driver is called, so a registration landing
+     * just after this read is one the locked version would have missed too.
+     * The list is written before s_have and s_gen under the lock below, so a
+     * matching generation here is a whole list.
+     */
+    if (s_have && ag_dev_generation() == s_gen) {
+        const unsigned n = s_n;
+        for (unsigned k = 0; k < n; k++) {
+            ops[k] = s_ops[k];
+        }
+        return n;
+    }
 
     /* Under the registry's lock, which is the lock a registration takes:
      * the generation cannot move between reading it and using the list. */
@@ -168,6 +186,7 @@ static unsigned collect_drivers(const ag_display_ops_t *ops[AG_DISPLAY_MAX])
     const uint32_t gen = ag_dev_generation();
     if (!s_have || gen != s_gen) {
         s_n = collect_drivers_walk(s_ops);
+        __sync_synchronize(); /* the list before what says it is whole */
         s_gen = gen;
         s_have = true;
     }
@@ -1298,7 +1317,6 @@ static bool gfx_may_present(void)
 
     bool           ok = true;
     const ag_pid_t me = ag_proc_self();
-    const ag_pid_t focused = ag_session_focused_pid();
 
     if (!s_acquired) {
         ok = false;
@@ -1308,7 +1326,7 @@ static bool gfx_may_present(void)
         ok = true;
     } else {
         /* Safety net: ignore flush/swap from a background session slot. */
-        ok = (me == focused);
+        ok = (me == ag_session_focused_pid()); /* asked only here: it costs */
     }
 
     if (!ok) {
@@ -1320,7 +1338,7 @@ static bool gfx_may_present(void)
                    "%u flushes dropped: acquired %u, asking pid %u, owner "
                    "pid %u, focused pid %u",
                    (unsigned)dropped, (unsigned)s_acquired, (unsigned)me,
-                   (unsigned)s_owner, (unsigned)focused);
+                   (unsigned)s_owner, (unsigned)ag_session_focused_pid());
             dropped = 0;
         }
     }

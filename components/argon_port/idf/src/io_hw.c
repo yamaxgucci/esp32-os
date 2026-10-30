@@ -582,10 +582,19 @@ typedef struct {
     spi_transaction_t   w_trans[2];
     uint8_t             w_head;
     uint8_t             w_n;
+    bool                w_poll; /* the one out was started polled */
     spi_device_handle_t w_dev;
 } spi_state_t;
 
 static spi_state_t s_spi[AG_PORT_SPI_SLOTS];
+
+/*
+ * Hosts another ESP-IDF driver has a device on - the SD card's, which talks
+ * to the host directly and not through this layer.  Writes on such a host are
+ * queued, never polled (ag_port_spi_write_start).  Marked before the card's
+ * driver is given the host, and whatever is out on it is reaped first.
+ */
+static volatile bool s_host_shared[SPI_HOST_MAX];
 
 static bool spi_valid(int bus)
 {
@@ -956,6 +965,13 @@ ag_err_t ag_port_spi_xfer_dma(int bus, int cs, const void *tx, void *rx,
 static ag_err_t spi_reap_writes(int bus)
 {
     ag_err_t err = AG_OK;
+    if (s_spi[bus].w_poll) {
+        /* one, started polled: done by now, or spun for until it is */
+        err = from_esp(spi_device_polling_end(s_spi[bus].w_dev, portMAX_DELAY));
+        s_spi[bus].w_poll = false;
+        s_spi[bus].w_n = 0;
+        return err;
+    }
     while (s_spi[bus].w_n > 0u) {
         spi_transaction_t *done = NULL;
         const esp_err_t    ae =
@@ -1126,6 +1142,42 @@ ag_err_t ag_port_spi_write_start(int bus, int cs, const void *tx, size_t len)
     if (err == AG_OK && s_spi[bus].tx_busy) {
         err = spi_drain(bus, dev); /* the staging write, and ours with it */
     }
+    if (err == AG_OK && !s_host_shared[AG_PORT_SPI_HOST_OF(bus)]) {
+        /*
+         * Polled: started here, finished by whoever reaps it - the owner's
+         * next write or wait, or the bus's next user (spi_drain).
+         *
+         * Queued, a write was a FreeRTOS queue, an interrupt to start it and
+         * another when it ended: 8800 cycles to start one, the largest single
+         * part of a present on the CYD (30 Oct 2026).  Polled it is the same
+         * DMA started from here; the end is a register read, spun on only if
+         * the bits are still going.  A panel driver that draws between writes
+         * finds them gone.
+         *
+         * Not on a host somebody else's ESP-IDF driver also has a device on
+         * (the SD card, ag_port_spi_host_shared): a polled transaction holds
+         * the host until it is reaped, and that driver waits on the host, not
+         * on this layer's lock.
+         */
+        if (s_spi[bus].w_n > 0u) {
+            err = spi_reap_writes(bus);
+        }
+        if (err == AG_OK) {
+            spi_transaction_t *const t = &s_spi[bus].w_trans[0];
+            memset(t, 0, sizeof(*t));
+            t->length = len * 8u;
+            t->tx_buffer = tx;
+            err = from_esp(spi_device_polling_start(dev, t, portMAX_DELAY));
+            if (err == AG_OK) {
+                s_spi[bus].w_head = 0;
+                s_spi[bus].w_n = 1;
+                s_spi[bus].w_poll = true;
+                s_spi[bus].w_dev = dev;
+            }
+        }
+        xSemaphoreGiveRecursive(s_spi[bus].lock);
+        return err;
+    }
     if (err == AG_OK && s_spi[bus].w_n > 0u &&
         (s_spi[bus].w_dev != dev || s_spi[bus].w_n >= 2u)) {
         /* another chip's writes, or both slots taken: the oldest first */
@@ -1156,6 +1208,20 @@ ag_err_t ag_port_spi_write_start(int bus, int cs, const void *tx, size_t len)
     return err;
 }
 
+void ag_port_spi_host_shared(int host)
+{
+    if (host < 0 || host >= SPI_HOST_MAX) {
+        return;
+    }
+    s_host_shared[host] = true;
+    const int bus = host + 1; /* AG_PORT_SPI_HOST_OF backwards */
+    if (spi_valid(bus) && s_spi[bus].up && s_spi[bus].lock != NULL) {
+        xSemaphoreTakeRecursive(s_spi[bus].lock, portMAX_DELAY);
+        (void)spi_reap_writes(bus);
+        xSemaphoreGiveRecursive(s_spi[bus].lock);
+    }
+}
+
 ag_err_t ag_port_spi_write_wait(int bus)
 {
     if (!spi_valid(bus) || !s_spi[bus].up || s_spi[bus].lock == NULL) {
@@ -1184,6 +1250,12 @@ static ag_err_t spi_xfer_locked(int bus, int cs, const void *tx, void *rx,
                              len <= AG_PORT_SPI_MAX_XFER);
     if (!long_write) {
         const ag_err_t d = spi_drain(bus, dev);
+        if (d != AG_OK) {
+            return d;
+        }
+    } else if (s_spi[bus].w_poll) {
+        /* a polled write holds the host: nothing is queued beside it */
+        const ag_err_t d = spi_reap_writes(bus);
         if (d != AG_OK) {
             return d;
         }
