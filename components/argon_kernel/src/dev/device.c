@@ -223,6 +223,16 @@ static bool name_taken_locked(const char *name)
     return false;
 }
 
+/*
+ * Bumped whenever the set of devices, or what one of them answers to, changes:
+ * a registration, an unregistration, a revoke.  Whoever keeps a list built
+ * from the registry keeps this beside it and builds the list again when the
+ * two differ - see ag_dev_generation.
+ */
+static volatile uint32_t s_generation;
+
+uint32_t ag_dev_generation(void) { return s_generation; }
+
 ag_err_t ag_dev_register(const ag_dev_desc_t *desc, ag_device_t **out)
 {
     if (out != NULL) {
@@ -262,6 +272,7 @@ ag_err_t ag_dev_register(const ag_dev_desc_t *desc, ag_device_t **out)
         d->used = true;
         d->iolock =
             (s_lock.call_open != NULL) ? s_lock.call_open(s_lock.ctx) : NULL;
+        s_generation++;
 
         if (out != NULL) {
             *out = d;
@@ -296,6 +307,7 @@ ag_err_t ag_dev_unregister(ag_device_t *dev)
         s_lock.call_close(s_lock.ctx, dev->iolock);
     }
     memset(dev, 0, sizeof(*dev));
+    s_generation++;
     unlock();
     return AG_OK;
 }
@@ -326,6 +338,7 @@ static uint32_t revoke_locked(ag_device_t *dev)
     if (!dev->used) {
         return 0;
     }
+    s_generation++;
 
     /*
      * Before anything else touches the slot: whoever bound this device has to

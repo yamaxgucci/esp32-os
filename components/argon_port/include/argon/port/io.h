@@ -278,6 +278,15 @@ ag_err_t ag_port_spi_xfer_dma(int bus, int cs, const void *tx, void *rx,
  */
 ag_err_t ag_port_spi_xfer_start(int bus, int cs, const void *tx, void *rx,
                                 size_t len);
+/*
+ * A write of the caller's DMA-capable, word-aligned memory, queued: start
+ * returns with the bytes still going out, and the caller must not touch them
+ * until write_wait returns.  At most two in flight (a third waits for the
+ * oldest); any other call on the bus, and any pin change, waits for them
+ * first.  Unlike xfer_start, the bus can be shared while it is used.
+ */
+ag_err_t ag_port_spi_write_start(int bus, int cs, const void *tx, size_t len);
+ag_err_t ag_port_spi_write_wait(int bus);
 ag_err_t ag_port_spi_xfer_finish(int bus, int cs, uint32_t timeout_ms);
 
 ag_err_t ag_port_spi_slave_open(int bus, int sck, int mosi, int miso, int cs,

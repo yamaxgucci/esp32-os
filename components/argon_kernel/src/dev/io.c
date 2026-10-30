@@ -766,6 +766,41 @@ static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
 }
 
 /*
+ * The same write, queued out of the caller's memory and not waited for (ABI
+ * 0.73).  The checks are spi_xfer's - the bus, and the select as the caller's
+ * - and the wait needs none: it only reaps what this bus already has out.
+ */
+static ag_err_t io_spi_write_start(int bus, int cs, const void *tx, size_t len)
+{
+    if (len == 0 || len > AG_PORT_SPI_MAX_XFER || tx == NULL) {
+        return -AG_EINVAL;
+    }
+
+    lock();
+    ag_err_t err = spi_bring_up(bus, false, AG_PIN_NONE);
+    if (err == AG_OK) {
+        err = spi_take_cs(bus, cs);
+    }
+    if (err == AG_OK) {
+        err = ag_port_spi_write_start(bus, cs, tx, len);
+    }
+    unlock();
+    return err;
+}
+
+static ag_err_t io_spi_write_wait(int bus)
+{
+    const int idx = spi_index(bus);
+    if (idx < 0 || idx >= AG_SPI_BUSES) {
+        return -AG_ERANGE;
+    }
+    if (!s_spi[idx].up) {
+        return AG_OK; /* never brought up: nothing can be out */
+    }
+    return ag_port_spi_write_wait(bus);
+}
+
+/*
  * The bus as a slave.  Same pins out of BOARD.CFG as the master's, same lazy
  * bring-up and the same ownership: the select is claimed here as well, because
  * whoever drives it decides whether this board answers at all.
@@ -1594,6 +1629,8 @@ const ag_io_api_t ag_io_api_table = {
     .spi_link_recv2 = ag_spilink_recv2,
     .uart_link_send2 = ag_uartlink_send2,
     .uart_link_recv2 = ag_uartlink_recv2,
+    .spi_write_start = io_spi_write_start,
+    .spi_write_wait = io_spi_write_wait,
 };
 
 ag_err_t ag_io_init(void)

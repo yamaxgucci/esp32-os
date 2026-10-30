@@ -298,6 +298,13 @@ void ag_dev_call_end(ag_device_t *dev);
 ag_device_t *ag_dev_find(const char *name);
 
 /*
+ * A number that changes whenever a device is registered, unregistered or
+ * revoked.  A list built from the registry is still the registry's while this
+ * has not moved since it was built.
+ */
+uint32_t ag_dev_generation(void);
+
+/*
  * Iterates the registry.  `filter` is AG_DEV_ANY for everything.  Returns
  * -AG_ENOENT past the end, which is how a caller knows to stop.
  */

@@ -61,8 +61,16 @@ AG_DRV("ILI9341", "0.5", "argon");
  * Forty is what the driver's own comments always assumed it was running at,
  * and what these boards are usually driven at.  A driver that shares a bus
  * states its speed - the touch driver always did.
+ *
+ * `spi_khz` in [display] of SYSTEM.CFG overrides it, read when the driver
+ * loads.  A picture that changes every frame (MD32 on this board) is held to
+ * the wire - its drawing core waits on the panel half the time - so 80000 is
+ * there for whoever wants twice the rows and will watch for wrong pixels.
+ * Anything outside 1-80 MHz is refused back to forty: the ESP32's SPI goes no
+ * faster, and a typo should not take the console away.
  */
-#define LCD_KHZ  40000
+#define LCD_KHZ      40000
+#define LCD_KHZ_MAX  80000
 #define LCD_DC       2
 #define LCD_BL      27
 #define LCD_MADCTL 0x40 /* landscape, and no BGR bit: this panel is RGB */
@@ -74,17 +82,67 @@ AG_DRV("ILI9341", "0.5", "argon");
 #define COLS   (LCD_W / CELL_W) /* 40 */
 #define ROWS   (LCD_H / CELL_H) /* 30 */
 
-/* One row of text, as pixels.  The only buffer this driver has. */
-static uint16_t s_row[LCD_W * CELL_H];
+/*
+ * One row of text, as pixels.  The only buffer this driver has.
+ *
+ * A picture uses it as two halves: one goes out on the wire while the next
+ * rows are copied into the other (see send_half).  Word-aligned because the
+ * DMA engine reads it in place.
+ */
+static uint16_t s_row[LCD_W * CELL_H] __attribute__((aligned(4)));
+#define HALF_PX (sizeof(s_row) / sizeof(s_row[0]) / 2u)
 
 static const ag_io_api_t *io;
 static bool               s_up;
+
+/*
+ * Pixels written by queueing rather than waiting (io->spi_write_start, ABI
+ * 0.73), and whether a write out of s_row may still be on the wire.
+ *
+ * On the CYD's Mega Drive the core that draws the picture also sends it, and
+ * sent synchronously half of every second went on sending: of a two-row send
+ * at 80 MHz the bits are 128 us and the call took 200-250, the core spinning
+ * in the port's polling loop for all of the wire (30 Oct 2026).  Queued, the
+ * bits go out while the caller draws the next rows.
+ *
+ * False on a kernel without the call, and after the first refusal - s_row in
+ * memory the DMA engine cannot read, wherever the loader put it.
+ */
+static bool s_async;
+static bool s_out;
+
+/* s_row is ours again: whatever was queued out of it has gone. */
+static void settle(void)
+{
+    if (s_out) {
+        (void)io->spi_write_wait(LCD_BUS);
+        s_out = false;
+    }
+}
+
+/*
+ * The D/C line as last set, -1 before the first.  Every pin change waits for
+ * the bus's queued writes (they are sent with the line as it is), so a toggle
+ * that changes nothing - the line going to data for every band of a picture
+ * that is all data - would undo the queueing; it costs a lock and a pin layer
+ * besides, some 60 us a call on the CYD.
+ */
+static int s_dc = -1;
+
+static void dc(int level)
+{
+    if (s_dc != level) {
+        settle();
+        io->gpio_write(LCD_DC, level);
+        s_dc = level;
+    }
+}
 
 /* ---- the wire ---------------------------------------------------------- */
 
 static void cmd(uint8_t c)
 {
-    io->gpio_write(LCD_DC, 0);
+    dc(0);
     (void)io->spi_xfer(LCD_BUS, LCD_CS, &c, NULL, 1);
 }
 
@@ -108,7 +166,7 @@ static void data(const void *buf, size_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
     unsigned       tries = 0;
-    io->gpio_write(LCD_DC, 1);
+    dc(1);
     while (len > 0) {
         const size_t chunk = (len > s_chunk) ? s_chunk : len;
         const ag_err_t err = io->spi_xfer(LCD_BUS, LCD_CS, p, NULL, chunk);
@@ -195,7 +253,16 @@ static void window_for(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
         y1 <= s_win_y1) {
         return;
     }
-    window(x0, y0, x1, y1);
+    /*
+     * Opened down to the bottom of the glass, not to y1: the controller stops
+     * where the data stops, and the next band - which starts at y1 + 1 more
+     * often than not - then finds the window already there.  Sized to the
+     * band, it was full after every band, and a picture sent a row at a time
+     * (the CYD's Mega Drive, which has memory for no more) paid five transfers
+     * of setup for every row: 224 windows a frame.
+     */
+    (void)y1;
+    window(x0, y0, x1, LCD_H - 1);
 }
 
 /* Rows just written, so the next call can tell whether it continues them. */
@@ -303,6 +370,7 @@ static void lcd_text_row(ag_handle_t h, uint16_t row,
     if (count > COLS) {
         count = COLS;
     }
+    settle();
     for (uint16_t x = 0; x < count; x++) {
         paint_cell_into_row(x, cells[x].ch, cells[x].attr, false);
     }
@@ -332,6 +400,7 @@ static void lcd_text_cursor(ag_handle_t h, uint16_t col, uint16_t row,
      * the caret is standing on.  The character underneath comes with the
      * call, so the caret can invert it instead of covering it.
      */
+    settle();
     paint_cell_into_row(0, under.ch, under.attr, visible);
 
     const uint16_t x0 = (uint16_t)(col * CELL_W);
@@ -397,6 +466,7 @@ static uint16_t s_colmap[LCD_W];
 
 static void clear_panel(void)
 {
+    settle();
     for (size_t i = 0; i < sizeof(s_row) / sizeof(s_row[0]); i++) {
         s_row[i] = 0;
     }
@@ -463,6 +533,63 @@ static void fit_surface(uint16_t w, uint16_t h)
     clear_panel();
 }
 
+/*
+ * Rows in half `half` of s_row out, queued: the previous half's write is
+ * waited for first, so at most one is ever out and the half the caller fills
+ * next is never the one on the wire.  The caller returns with this one still
+ * going - which is the point: the next rows are being drawn meanwhile.
+ */
+static void send_half(unsigned half, size_t bytes)
+{
+    const uint16_t *px = &s_row[half * HALF_PX];
+    dc(1);
+    settle();
+    const ag_err_t err = io->spi_write_start(LCD_BUS, LCD_CS, px, bytes);
+    if (err == AG_OK) {
+        s_out = true;
+        return;
+    }
+    if (err == -AG_EINVAL) {
+        s_async = false; /* not memory the engine can read: never again */
+        ag_log(AG_LOG_WARN, "ILI9341", "row buffer at %p cannot be sent "
+                                       "queued; sending it as before",
+               (const void *)px);
+    }
+    data(px, bytes);
+}
+
+/*
+ * One source row into the row buffer at `out`, scaled and in the panel's byte
+ * order.  At one to one - a picture as wide as the glass, which is what MD is -
+ * the map is the identity and the swap goes two pixels to a word.
+ */
+static void copy_row(uint16_t *out, const uint16_t *in, uint16_t ox0,
+                     uint16_t ow, uint16_t x)
+{
+    if (s_num == s_den && (((uintptr_t)in | (uintptr_t)out) & 3u) == 0u &&
+        (ow & 1u) == 0u) {
+        const uint32_t *src = (const uint32_t *)(const void *)in;
+        uint32_t       *dst = (uint32_t *)(void *)out;
+        /*
+         * The mask in a register the compiler cannot see into.  Spelled with
+         * constants it recognised a byte swap and a rotate, and called
+         * libgcc's __bswapsi2 for every word with six registers spilled round
+         * the call: 6421 cycles a row, 40 a word, measured with interrupts
+         * off (30 Oct 2026) - for what is five instructions.
+         */
+        uint32_t m = 0x00ff00ffu;
+        __asm__("" : "+r"(m));
+        for (uint16_t i = 0; i < ow / 2u; i++) {
+            const uint32_t v = src[i];
+            dst[i] = ((v >> 8) & m) | ((v & m) << 8);
+        }
+        return;
+    }
+    for (uint16_t i = 0; i < ow; i++) {
+        out[i] = swap16(in[s_colmap[ox0 + i] - x]);
+    }
+}
+
 static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
 {
     (void)h;
@@ -517,10 +644,21 @@ static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
     window_for((uint16_t)(s_off_x + ox0), (uint16_t)(s_off_y + oy0),
                (uint16_t)(s_off_x + ox1 - 1), (uint16_t)(s_off_y + oy1 - 1));
 
-    /* Output rows that fit the row buffer at this width; never zero. */
-    uint16_t cap = (uint16_t)((sizeof(s_row) / sizeof(s_row[0])) / ow);
+    /*
+     * Output rows that fit the buffer at this width - half of it when the
+     * writes are queued - and never zero.  Queued, the rows go into the half
+     * that is not on the wire; synchronous, the whole buffer is free once
+     * data() returns.
+     */
+    const bool async = s_async && ow <= HALF_PX;
+    uint16_t   cap = (uint16_t)((async ? HALF_PX
+                                       : sizeof(s_row) / sizeof(s_row[0])) / ow);
     if (cap == 0) {
         cap = 1;
+    }
+    static unsigned s_half;     /* the half the next rows go into */
+    if (!async) {
+        settle();
     }
 
     const uint8_t *const src = (const uint8_t *)b->px;
@@ -540,19 +678,28 @@ static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
             (src + (size_t)(srow - y) * b->stride);
 
         if (held == cap) {
-            data(s_row, (size_t)held * ow * sizeof(uint16_t));
+            if (async) {
+                send_half(s_half, (size_t)held * ow * sizeof(uint16_t));
+                s_half ^= 1u;
+            } else {
+                data(s_row, (size_t)held * ow * sizeof(uint16_t));
+            }
             window_advance(held);
             held = 0;
         }
-        uint16_t *out = &s_row[(size_t)held * ow];
-        for (uint16_t i = 0; i < ow; i++) {
-            out[i] = swap16(in[s_colmap[ox0 + i] - x]);
-        }
+        uint16_t *out = &s_row[(async ? s_half * HALF_PX : 0u) +
+                               (size_t)held * ow];
+        copy_row(out, in, ox0, ow, x);
         held++;
     }
 
     if (held != 0) {
-        data(s_row, (size_t)held * ow * sizeof(uint16_t));
+        if (async) {
+            send_half(s_half, (size_t)held * ow * sizeof(uint16_t));
+            s_half ^= 1u;
+        } else {
+            data(s_row, (size_t)held * ow * sizeof(uint16_t));
+        }
         window_advance(held);
     }
 }
@@ -678,11 +825,22 @@ ag_err_t ag_driver_init(void)
         return -AG_ENOTSUP;
     }
     if (AG_HAS(io, spi_config)) {
-        const ag_err_t clk = io->spi_config(LCD_BUS, LCD_CS, LCD_KHZ);
+        const ag_cfg_api_t *cfg = ag_api()->cfg;
+        int32_t khz = (cfg != NULL) ? cfg->get_int("display.spi_khz", LCD_KHZ)
+                                    : LCD_KHZ;
+        if (khz < 1000 || khz > LCD_KHZ_MAX) {
+            ag_printf("ILI9341: spi_khz %d is not 1000-%d; using %d\n",
+                      (int)khz, LCD_KHZ_MAX, LCD_KHZ);
+            khz = LCD_KHZ;
+        }
+        const ag_err_t clk = io->spi_config(LCD_BUS, LCD_CS, (uint32_t)khz);
         if (clk != AG_OK) {
             ag_printf("ILI9341: spi%d cs %d at %d kHz: %s\n", LCD_BUS,
-                      LCD_CS, LCD_KHZ, ag_strerror(clk));
+                      LCD_CS, (int)khz, ag_strerror(clk));
             return clk;
+        }
+        if (khz != LCD_KHZ) {
+            ag_printf("ILI9341: panel at %d kHz (display.spi_khz)\n", (int)khz);
         }
     }
 
@@ -691,6 +849,7 @@ ag_err_t ag_driver_init(void)
         return -AG_EBUSY;
     }
     s_up = true;
+    s_async = AG_HAS(io, spi_write_start) && AG_HAS(io, spi_write_wait);
 
     const ag_dev_add_t desc = {
         .name = "lcd0",

@@ -142,7 +142,44 @@ static size_t fb_bytes(void)
  */
 /* The display drivers that take rectangles, one entry per table; see the
  * walk in driver_present_blit for why it is locked and the calls are not. */
+static unsigned collect_drivers_walk(const ag_display_ops_t *ops[AG_DISPLAY_MAX]);
+
+/*
+ * The walk below, kept and handed out again while the registry has not
+ * changed.
+ *
+ * Walked on every present, it was the dearest part of one: by index, each
+ * index a scan of the whole table with the names copied out, then the device
+ * found again by name - 90 to 150 us of every call on the CYD while MD's
+ * drawer sent its rows two at a time, more than the panel driver spent on the
+ * bits (30 Oct 2026).  The registry says when it changes (ag_dev_generation),
+ * and nothing but a change can make the answer different.
+ */
 static unsigned collect_drivers(const ag_display_ops_t *ops[AG_DISPLAY_MAX])
+{
+    static const ag_display_ops_t *s_ops[AG_DISPLAY_MAX];
+    static unsigned                s_n;
+    static uint32_t                s_gen;
+    static bool                    s_have;
+
+    /* Under the registry's lock, which is the lock a registration takes:
+     * the generation cannot move between reading it and using the list. */
+    ag_dev_lock_hold();
+    const uint32_t gen = ag_dev_generation();
+    if (!s_have || gen != s_gen) {
+        s_n = collect_drivers_walk(s_ops);
+        s_gen = gen;
+        s_have = true;
+    }
+    const unsigned n = s_n;
+    for (unsigned k = 0; k < n; k++) {
+        ops[k] = s_ops[k];
+    }
+    ag_dev_lock_release();
+    return n;
+}
+
+static unsigned collect_drivers_walk(const ag_display_ops_t *ops[AG_DISPLAY_MAX])
 {
     unsigned n = 0;
 

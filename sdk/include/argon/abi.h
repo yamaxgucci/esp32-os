@@ -505,9 +505,15 @@ extern "C" {
  *      with C:\STORE\OWNER.KEY.  The shop stamps such a copy 0.72, so a kernel
  *      that does not know the flag refuses it by version instead of running
  *      the keystream as code.  Nothing in the api table moves.
+ *
+ * 0.73 io->spi_write_start / spi_write_wait (30 Oct 2026): a write out of the
+ *      caller's buffer that is on the wire while the caller carries on.  The
+ *      CYD's panel driver sends from one half of its row buffer while the
+ *      next rows are copied into the other; synchronous, the core that draws
+ *      MD's picture sat out every bit of it.  APPENDED past uart_link_recv2.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 72u
+#define AG_ABI_MINOR 73u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -2360,6 +2366,19 @@ typedef struct ag_io_api {
     int32_t (*uart_link_recv2)(int port, void *head, size_t hcap, void *buf,
                                size_t cap, ag_spilink_block_t *info,
                                uint32_t timeout_ms);
+    /*
+     * ABI 0.73: spi_xfer's write, queued and not waited for.  `tx` is the
+     * caller's own memory - DMA-capable and word-aligned, or -AG_EINVAL - and
+     * it is the wire's until spi_write_wait returns: write into it before then
+     * and the panel gets whatever is there when the engine reaches it.  Two
+     * can be out at once; a third waits for the oldest.  Anything else on the
+     * bus, and any gpio_write, waits for them first, so a driver that shares
+     * its bus needs no care beyond the buffer - but a driver that toggles a
+     * pin between writes (a panel's D/C line) waits at every toggle, and
+     * should skip the toggles that change nothing.
+     */
+    ag_err_t (*spi_write_start)(int bus, int cs, const void *tx, size_t len);
+    ag_err_t (*spi_write_wait)(int bus);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */
