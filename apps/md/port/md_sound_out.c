@@ -38,7 +38,11 @@ enum {
     MD_SINK_WAV = 1,
 };
 
+#ifdef ARGON_MD_SMALL
+static char        s_path[64]; /* a device or a .wav: the CYD has no 256 B to spare */
+#else
 static char        s_path[AG_PATH_MAX];
+#endif
 static int         s_sink = MD_SINK_DEV;
 static int         s_active;
 static int         s_write_err_reported;

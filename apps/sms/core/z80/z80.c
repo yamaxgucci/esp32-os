@@ -3688,13 +3688,189 @@ INLINE void check_interrupts()
  *    in a slice can change that byte - the 68000 runs between slices, and an
  *    interrupt only arrives at a line's edge - so if the loop goes round once
  *    it goes round for the rest of the slice, 21 (or 22) T-states a pass.
+ *    The same with `ld a,(nn)`, and with `and a` or `cp n` for the test.
+ *  - `jp`/`jr` back to itself or over NOPs, and HALT: a wait for an
+ *    interrupt (md_z80_skip_idle, md_z80_skip_halt) - and whole slices of it
+ *    are counted out without the interpreter (md_z80_idle_pass).
  *
+ * Nothing is skipped while an interrupt is waiting to be taken.
  * R advances as if each instruction had run.  PicoDrive skips the 68000's
  * waits the same way (md_idle_branch is this build's).
  */
-MD_HOT static void md_z80_skip_waits(uint8_t opcode)
+/*
+ * A conditional jump's target and its cycles when taken, for the jumps a
+ * wait loop ends in: jp nz/z/p/m,nn and jr nz/z,e, the jump's opcode at `p`.
+ * 0 if it is none of them.
+ */
+static inline __attribute__((always_inline)) uint32_t
+md_z80_wait_jump(uint32_t p, uint8_t *jp, uint32_t *target)
+{
+	*jp = cpu_readop_arg(p & 0xffffu);
+	if (*jp == 0xc2 || *jp == 0xca || *jp == 0xf2 || *jp == 0xfa)
+	{
+		*target = cpu_readop_arg((p + 1u) & 0xffffu) |
+		          ((uint32_t)cpu_readop_arg((p + 2u) & 0xffffu) << 8);
+		return 10u;
+	}
+	if (*jp == 0x20 || *jp == 0x28)
+	{
+		*target = (p + 2u + (uint32_t)(int8_t)cpu_readop_arg((p + 1u) & 0xffffu)) & 0xffffu;
+		return 12u;
+	}
+	return 0u;
+}
+
+/*
+ * A byte the loop keeps reading, tested by `or a` / `and a` (B7/A7) or by
+ * `cp n` (FE n) at `p`, then a jump back to the loop's start: if the jump is
+ * taken now it is taken for the rest of the slice.  The passes that fit are
+ * skipped; `load` is the load's cycles, `ins` the instructions a pass.
+ */
+static inline __attribute__((always_inline)) void
+md_z80_skip_poll(uint8_t v, uint32_t p, uint32_t load)
+{
+	const uint8_t t = cpu_readop_arg(p & 0xffffu);
+	uint32_t      test;
+	uint8_t       r; /* the result the flags are of */
+	if (t == 0xb7 || t == 0xa7)
+	{
+		test = 4u;
+		r = v;
+		p += 1u;
+	}
+	else if (t == 0xfe)
+	{
+		test = 7u;
+		r = (uint8_t)(v - cpu_readop_arg((p + 1u) & 0xffffu));
+		p += 2u;
+	}
+	else
+		return;
+	uint8_t        jp;
+	uint32_t       target;
+	const uint32_t jcyc = md_z80_wait_jump(p, &jp, &target);
+	if (jcyc == 0u || target != PRVPC)
+		return;
+	const int round = (jp == 0xc2 || jp == 0x20) ? (r != 0)
+	                : (jp == 0xca || jp == 0x28) ? (r == 0)
+	                : (jp == 0xf2)               ? !(r & 0x80)
+	                                             : (r & 0x80) != 0;
+	if (!round)
+		return;
+	const uint32_t pass = load + test + jcyc;
+	const uint32_t n = (uint32_t)Z80.icount / pass;
+	if (n == 0u)
+		return;
+	Z80.icount -= (int32_t)(pass * n);
+	Z80.r = (uint8_t)(Z80.r + 3u * n);
+}
+
+/*
+ * jp nn / jr e back to itself, or over nothing but NOPs: a loop that does
+ * nothing until an interrupt (Alex Kidd's driver sat at `ei / nop / jp $-1`
+ * for nine slices in ten, 30 Oct 2026).  In flash: it is met once a slice,
+ * and the rest of the slice goes with it.
+ */
+/* The idle loop last seen (md_z80_skip_idle): its bytes from lo to the jump
+ * at hi, a pass's T-states and R steps.  s_idle_op 0: none. */
+static uint16_t s_idle_lo, s_idle_hi;
+static uint8_t  s_idle_op, s_idle_pass, s_idle_r;
+
+__attribute__((noinline)) static void md_z80_skip_idle(uint8_t opcode)
+{
+	const uint32_t at = PRVPC;
+	uint32_t       target;
+	uint32_t       jcyc;
+	if (opcode == 0xc3)
+	{
+		target = cpu_readop_arg(PCD) |
+		         ((uint32_t)cpu_readop_arg((PCD + 1u) & 0xffffu) << 8);
+		jcyc = 10u;
+	}
+	else
+	{
+		target = (PCD + 1u + (uint32_t)(int8_t)cpu_readop_arg(PCD)) & 0xffffu;
+		jcyc = 12u;
+	}
+	if (target > at || at - target > 8u)
+		return;
+	for (uint32_t a = target; a < at; a++)
+	{
+		if (cpu_readop_arg(a) != 0x00)
+			return;
+	}
+	const uint32_t pass = 4u * (at - target) + jcyc;
+	s_idle_lo = (uint16_t)target;
+	s_idle_hi = (uint16_t)at;
+	s_idle_op = opcode;
+	s_idle_pass = (uint8_t)pass;
+	s_idle_r = (uint8_t)(at - target + 1u);
+	const uint32_t n = (uint32_t)Z80.icount / pass;
+	if (n == 0u)
+		return;
+	Z80.icount -= (int32_t)(pass * n);
+	Z80.r = (uint8_t)(Z80.r + (at - target + 1u) * n);
+}
+
+/*
+ * Whole slices of waiting, without the interpreter (md_z80.c, z80_run).
+ *
+ * Skipped inside the interpreter, an idle loop still cost a way in and out
+ * of it every line - the NOP and the jump before the skip, from flash: Alex
+ * Kidd's Z80 at 255 ms of the system core's second, its driver in the loop
+ * nearly all of it (30 Oct 2026).  So a slice the Z80 can only spend waiting
+ * - halted, or anywhere in the idle loop last seen, its bytes unchanged, no
+ * interrupt waiting - is counted out here in whole passes; what is less than
+ * a pass is left over for the next slice, a few T-states late at most.
+ *
+ * The T-states a pass, 0 if the slice is not one to count out.
+ */
+int md_z80_idle_pass(void)
+{
+	if (Z80.nmi_pending || (Z80.irq_state != CLEAR_LINE && Z80.iff1) || Z80.after_ei)
+		return 0;
+	if (Z80.halt)
+		return 4;
+	if (s_idle_op == 0)
+		return 0;
+	const uint32_t pc = PCD;
+	if (pc < s_idle_lo || pc > s_idle_hi)
+		return 0;
+	for (uint32_t a = s_idle_lo; a < s_idle_hi; a++)
+	{
+		if (cpu_readop_arg(a) != 0x00)
+			return 0;
+	}
+	const uint32_t at = s_idle_hi;
+	if (cpu_readop_arg(at) != s_idle_op)
+		return 0;
+	const uint32_t target = (s_idle_op == 0xc3)
+		? (cpu_readop_arg((at + 1u) & 0xffffu) | ((uint32_t)cpu_readop_arg((at + 2u) & 0xffffu) << 8))
+		: ((at + 2u + (uint32_t)(int8_t)cpu_readop_arg((at + 1u) & 0xffffu)) & 0xffffu);
+	if (target != s_idle_lo)
+		return 0;
+	return s_idle_pass;
+}
+
+/* T-states run so far in the slice running now (0 outside one). */
+MD_HOT int md_z80_slice_done(void)
+{
+	return z80_exec ? (int)(z80_requested_cycles - Z80.icount) : 0;
+}
+
+/* `n` passes of it gone by: R as if they had run. */
+void md_z80_idle_advance(int n)
+{
+	Z80.r = (uint8_t)(Z80.r + (uint32_t)(Z80.halt ? 1u : s_idle_r) * (uint32_t)n);
+}
+
+/* noinline: one copy, not one in md_z80_fast's flattened body as well */
+MD_HOT __attribute__((noinline)) static void md_z80_skip_waits(uint8_t opcode)
 {
 	if (Z80.icount <= 0)
+		return;
+	/* an interrupt waiting ends any wait at the next instruction */
+	if (Z80.nmi_pending || (Z80.irq_state != CLEAR_LINE && Z80.iff1))
 		return;
 	if (opcode == 0x10)
 	{
@@ -3711,41 +3887,47 @@ MD_HOT static void md_z80_skip_waits(uint8_t opcode)
 		Z80.r = (uint8_t)(Z80.r + n);
 		return;
 	}
-	if (opcode != 0x7e || HL >= 0x4000u)
-		return;
-	if (cpu_readop_arg(PCD) != 0xb7)
-		return;
-	const uint8_t  jp = cpu_readop_arg((PCD + 1u) & 0xffffu);
-	const uint32_t at = PRVPC;
-	uint32_t       pass;
-	uint32_t       target;
-	if (jp == 0xc2 || jp == 0xca || jp == 0xf2 || jp == 0xfa)
+	if (opcode == 0x7e)
 	{
-		target = cpu_readop_arg((PCD + 2u) & 0xffffu) |
-		         ((uint32_t)cpu_readop_arg((PCD + 3u) & 0xffffu) << 8);
-		pass = 7u + 4u + 10u;
+		/* ld a,(hl) in the Z80's own RAM (or its mirror) */
+		if (HL < 0x4000u)
+			md_z80_skip_poll(rm(HL), PCD, 7u);
+		return;
 	}
-	else if (jp == 0x20 || jp == 0x28)
+	if (opcode == 0x3a)
 	{
-		target = (PCD + 3u + (uint32_t)(int8_t)cpu_readop_arg((PCD + 2u) & 0xffffu)) & 0xffffu;
-		pass = 7u + 4u + 12u;
+		/* ld a,(nn) in the Z80's own RAM (or its mirror) */
+		const uint32_t nn = cpu_readop_arg(PCD) |
+		                    ((uint32_t)cpu_readop_arg((PCD + 1u) & 0xffffu) << 8);
+		if (nn < 0x4000u)
+			md_z80_skip_poll(rm(nn), PCD + 2u, 13u);
+		return;
 	}
-	else
+	if (opcode == 0xc3 || opcode == 0x18)
+	{
+		/* only a jump back by at most 8 goes on to flash to be looked at:
+		 * a driver's ordinary jumps are met thousands of times a second */
+		const uint32_t target = (opcode == 0xc3)
+			? (cpu_readop_arg(PCD) | ((uint32_t)cpu_readop_arg((PCD + 1u) & 0xffffu) << 8))
+			: ((PCD + 1u + (uint32_t)(int8_t)cpu_readop_arg(PCD)) & 0xffffu);
+		if (target <= PRVPC && PRVPC - target <= 8u)
+			md_z80_skip_idle(opcode);
+	}
+}
+
+/*
+ * HALT: the core runs a NOP in place until an interrupt, four T-states a
+ * pass, each through the whole loop - from flash, some 400 host cycles for
+ * every four of the Z80's.  The passes but the last are worked out (from
+ * flash too: once a slice).
+ */
+__attribute__((noinline)) static void md_z80_skip_halt(void)
+{
+	if (Z80.icount <= 4)
 		return;
-	if (target != at)
-		return;
-	const uint8_t v = rm(HL);
-	const int round = (jp == 0xc2 || jp == 0x20) ? (v != 0)
-	                : (jp == 0xca || jp == 0x28) ? (v == 0)
-	                : (jp == 0xf2)               ? !(v & 0x80)
-	                                             : (v & 0x80) != 0;
-	if (!round)
-		return;
-	const uint32_t n = (uint32_t)Z80.icount / pass;
-	if (n == 0u)
-		return;
-	Z80.icount -= (int32_t)(pass * n);
-	Z80.r = (uint8_t)(Z80.r + 3u * n);
+	const uint32_t n = ((uint32_t)Z80.icount - 1u) / 4u;
+	Z80.icount -= (int32_t)(4u * n);
+	Z80.r = (uint8_t)(Z80.r + n);
 }
 #endif
 
@@ -3817,7 +3999,10 @@ MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
 		PRVPC = pc;
 		PC++;
 		Z80.r++;
-		if (op == 0x10 || op == 0x7e)
+#ifdef MD_Z80PROF
+		{ extern uint32_t md_zp_fast_n; md_zp_fast_n++; }
+#endif
+		if (op == 0x10 || op == 0x7e || op == 0x3a || op == 0xc3)
 			md_z80_skip_waits(op);
 		switch (op)
 		{
@@ -3881,15 +4066,22 @@ int32_t z80_execute(int32_t cycles)
 
 		PRVPC = PCD;
 		Z80.r++;
+#ifdef MD_Z80PROF
+		{ extern uint32_t md_zp_slow_n; md_zp_slow_n++; }
+#endif
 		uint8_t opcode = rop();
 		/* when in HALT state, the fetched opcode is not dispatched (aka a NOP) */
 		if (Z80.halt)
 		{
 			PC--;
 			opcode = 0;
+#ifdef ARGON_MD_Z80
+			md_z80_skip_halt();
+#endif
 		}
 #ifdef ARGON_MD_Z80
-		else if (opcode == 0x10 || opcode == 0x7e)
+		else if (opcode == 0x10 || opcode == 0x7e || opcode == 0x3a ||
+		         opcode == 0xc3 || opcode == 0x18)
 			md_z80_skip_waits(opcode);
 #endif
 		EXEC(op,opcode);

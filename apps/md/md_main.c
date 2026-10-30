@@ -97,6 +97,10 @@ static uint32_t s_passes;       /* times the cursor went through the glass */
 static uint32_t s_draw_us;      /* the drawer in the VDP and the row hash      */
 static uint32_t s_gate_us;      /* the drawer waiting for the game's frames    */
 static uint32_t s_loop_us;      /* the drawer's passes, start to end           */
+static volatile uint32_t s_help_lines; /* lines the application core drew (md_help_draw) */
+static uint32_t s_help_wait_us; /* the system core waiting for one of them     */
+static volatile uint32_t s_drawer_stack_left; /* bytes of its stack never used */
+static volatile uint32_t s_help_sent;   /* rows the application core sent      */
 static int      s_sysdraw = 1;  /* the system core draws the lines (md_drawer) */
 static volatile uint32_t s_frames_done; /* frames the emulating core finished */
 static volatile uint32_t s_last_work_us; /* how long the last one took */
@@ -304,6 +308,23 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
                   (unsigned)md_snd_z80_ms(span_us),
                   (unsigned)md_snd_split(),
                   (unsigned)((uint64_t)loop * 1000u / span_us));
+        static uint32_t s_help_seen, s_hwait_seen;
+        const uint32_t helped = s_help_lines - s_help_seen;
+        const uint32_t hwait = s_help_wait_us - s_hwait_seen;
+        s_help_seen += helped;
+        s_hwait_seen += hwait;
+        static uint32_t s_hsent_seen;
+        const uint32_t hsent = s_help_sent - s_hsent_seen;
+        s_hsent_seen += hsent;
+        ag_printf("md: a ring of %d rows; the application core drew %u lines a "
+                  "second and sent %u rows; the system core waited %u ms a second "
+                  "for its lines; "
+                  "stacks never used: the drawer's %u bytes, this one's %u\n",
+                  s_ring_n,
+                  (unsigned)((uint64_t)helped * 1000000u / span_us),
+                  (unsigned)((uint64_t)hsent * 1000000u / span_us),
+                  (unsigned)((uint64_t)hwait * 1000u / span_us),
+                  (unsigned)s_drawer_stack_left, (unsigned)ag_stack_left());
         ag_printf("md: glass %u rows, %u.%u pictures a second, %u us a row, "
                   "the system core %u%% busy; %u.%u whole passes a second, "
                   "%u lines unchanged\n", (unsigned)rows,
@@ -390,7 +411,9 @@ extern unsigned char *M68K_RAM;
 extern unsigned char *ZRAM;
 extern unsigned char *VRAM;
 static int            s_headless;
-static unsigned short s_line[MD_WIDTH];
+/* the one row a line is drawn into without a ring - only then, from the heap:
+ * with a ring both cores draw into the ring (md_send) */
+static unsigned short *s_line;
 
 /*
  * The CYD's picture.  The panel has no frame buffer to draw into, and sending
@@ -413,6 +436,8 @@ static int               s_batch_w, s_batch_h;  /* screen_width/height, as drawn
 static volatile int      s_batch_full;          /* handed to the thread */
 static volatile uint32_t s_ring_got;            /* rows sent */
 static volatile int      s_ring_run;
+static volatile int      s_ring_go;             /* the machine's memory is there: draw */
+static unsigned short   *s_ring_end;            /* one past the ring's block */
 static ag_sem_t          s_ring_sem;            /* a batch handed over */
 static ag_thread_t       s_presenter;
 /*
@@ -481,105 +506,237 @@ MD_HOT_VDP static uint32_t md_row_hash(const unsigned short *row, int width)
  * with four: this core also runs the system's own tasks, and a thread that
  * never sleeps starves them.
  */
-static void md_draw_flush(int line0, int rows, int w, int h)
+/*
+ * Both cores draw the picture, and whichever is free sends it.
+ *
+ * The system core alone came to some 25 whole pictures a second of Sonic,
+ * with the sound on its hands as well: drawing ~490 ms of its second, sending
+ * ~140, the sound ~320 (30 Oct 2026) - while the application core slept a
+ * third of its own second between frames.  Handing that core's lines over one
+ * at a time did not help: its spare time comes when its frame ends, which is
+ * when the system core takes the frame's sound - 5 ms in one piece - and each
+ * line it drew waited for that.  It drew 450 lines a second.
+ *
+ * So the ring is shared.  Line L of a pass is drawn into row L % N, by the
+ * core that claims it (s_next, one counter, so each line is drawn once), and
+ * only when that row is free - when line L - N has gone (s_sent).  Rows go to
+ * the glass strictly in order, by whichever core holds the sender's token
+ * (md_send): the panel's window just runs on, as it did with one sender.
+ * The application core, ahead of the system core's sound, draws and sends on
+ * its own.
+ *
+ * A row's line is compared with what the glass last got for that line
+ * (s_line_hash) when it is sent: an unchanged line is passed over.
+ */
+static volatile uint32_t s_next;     /* the pass's next line to draw            */
+static volatile int      s_sent;     /* lines before this one are dealt with    */
+static volatile int      s_pass_h;   /* the pass's lines while one is open, else 0 */
+static volatile uint8_t  s_row_ready[MD_RING_MAX];
+static volatile uint32_t s_row_hash[MD_RING_MAX];
+static volatile uint32_t s_sender;   /* 1 while a core sends                    */
+static int               s_help = 1; /* `nohelp`: the system core alone         */
+
+static int md_core(void)
 {
-    if (rows <= 0) {
-        return;
+    unsigned int id;
+    __asm__ volatile("rsr %0, prid" : "=a"(id));
+    return (int)((id >> 13) & 1u);
+}
+
+/* The pass's next line, if its row is free; -1 if not, or no pass is open. */
+static int claim_line(void)
+{
+    uint32_t c = s_next;
+    for (;;) {
+        if ((int)c >= s_pass_h || (int)c >= s_sent + s_ring_n) {
+            return -1;
+        }
+        if (__atomic_compare_exchange_n((uint32_t *)&s_next, &c, c + 1u, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            return (int)c;
+        }
     }
-    const ag_time_t t0 = ag_micros();
-    md_present_rows(s_ring[0], line0, rows, w, h);
-    s_glass_us += (uint32_t)(ag_micros() - t0);
-    s_ring_got += (uint32_t)rows;
+}
+
+static void draw_line(int line)
+{
+    const int slot = line % s_ring_n;
+    gwenesis_vdp_set_buffer(s_ring[slot]);
+#ifdef MD_VDPPROF
+    if ((line & 31) == 7) {
+        /* the same line twice: the second with the code just run */
+        extern unsigned int md_vp_cold, md_vp_warm, md_vp_wn;
+        unsigned int c0, c1, c2;
+        __asm__ volatile("rsr %0, ccount" : "=a"(c0));
+        gwenesis_vdp_render_line(line);
+        __asm__ volatile("rsr %0, ccount" : "=a"(c1));
+        gwenesis_vdp_render_line(line);
+        __asm__ volatile("rsr %0, ccount" : "=a"(c2));
+        md_vp_cold += c1 - c0;
+        md_vp_warm += c2 - c1;
+        md_vp_wn++;
+    } else
+#endif
+    gwenesis_vdp_render_line(line);
+    s_row_hash[slot] = md_row_hash(s_ring[slot], screen_width);
+    __sync_synchronize();
+    s_row_ready[slot] = 1;
+}
+
+/*
+ * What is ready, in order, to the glass: rows a call, as many as are ready in
+ * a run and changed, up to the end of the ring.  A run shorter than four that
+ * could still grow - its next row not drawn yet - waits for it: a call costs
+ * about the same whatever it carries.  True if anything went.
+ */
+static bool md_send(void)
+{
+    if (__atomic_exchange_n((uint32_t *)&s_sender, 1u, __ATOMIC_ACQUIRE) != 0u) {
+        return false;
+    }
+    const int  n = s_ring_n;
+    const int  w = screen_width, h = screen_height;
+    const bool here = (md_core() == 0);
+    bool       went = false;
+    for (;;) {
+        const int line = s_sent;
+        const int hh = s_pass_h;
+        if (line >= hh) {
+            break;
+        }
+        const int slot = line % n;
+        if (!s_row_ready[slot]) {
+            break;
+        }
+        __sync_synchronize();
+        if (s_row_hash[slot] == s_line_hash[line]) {
+            s_lines_same++;   /* the glass has it */
+            s_row_ready[slot] = 0;
+            __sync_synchronize();
+            s_sent = line + 1;
+            went = true;
+            continue;
+        }
+        int k = 1;
+        while (slot + k < n && line + k < hh && s_row_ready[slot + k] &&
+               s_row_hash[slot + k] != s_line_hash[line + k]) {
+            k++;
+        }
+        if (k < 4 && slot + k < n && line + k < hh && !s_row_ready[slot + k]) {
+            break;            /* its next row is still to come: wait for it */
+        }
+        for (int i = 0; i < k; i++) {
+            s_line_hash[line + i] = s_row_hash[slot + i];
+        }
+        const ag_time_t t0 = ag_micros();
+        md_present_rows(s_ring[slot], line, k, w, h);
+        if (here) {
+            s_glass_us += (uint32_t)(ag_micros() - t0);
+        } else {
+            s_help_sent += (uint32_t)k;
+        }
+        s_ring_got += (uint32_t)k;
+        for (int i = 0; i < k; i++) {
+            s_row_ready[slot + i] = 0;
+        }
+        __sync_synchronize();
+        s_sent = line + k;
+        went = true;
+    }
+    __atomic_store_n((uint32_t *)&s_sender, 0u, __ATOMIC_RELEASE);
+    return went;
+}
+
+/* The application core: lines, and rows to the glass, until `until`. */
+static void md_help_draw(ag_time_t until)
+{
+    while ((int64_t)(until - ag_micros()) > 250) {
+        if (s_pass_h == 0 || MODE_SHI) {
+            return;   /* between passes; shadow/highlight has one sprite buffer */
+        }
+        if (md_send()) {
+            continue;
+        }
+        const int line = claim_line();
+        if (line >= 0) {
+            draw_line(line);
+            s_help_lines++;
+        }
+    }
+}
+
+static void md_open_pass(void)
+{
+    const int h = (screen_height < MD_HASH_LINES) ? screen_height : MD_HASH_LINES;
+    s_next = 0;
+    s_sent = 0;
+    __sync_synchronize();
+    s_pass_h = h;
 }
 
 static void md_drawer(void)
 {
-    int line = 0, rows = 0, line0 = 0;
-    bool changed = false;
     uint32_t pass_seen = s_frames_done;   /* frames done when this pass began */
     ag_time_t pass_t0 = ag_micros();
+    for (int i = 0; i < MD_RING_MAX; i++) {
+        s_row_ready[i] = 0;
+    }
+    md_open_pass();
     while (s_ring_run) {
         /* the sound side first: a frame's log played before the next row -
          * a late picture is a band, late sound is a gap */
         (void)md_snd_core0_poll();
-        const int w = screen_width, h = screen_height;
-        if (line >= h || line >= MD_HASH_LINES) {
-            md_draw_flush(line0, rows, w, h);
-            rows = 0;
-            line = 0;
-            s_passes++;
-            /*
-             * The next pass starts with the next frame, never sooner.  A pass
-             * more often than the game makes pictures draws the same picture
-             * again, and drawing it is flash traffic both cores queue for: 34
-             * passes a second over a game making 10 frames a second took the
-             * 68000 from 30 ms a frame to 95 (29 Oct 2026).  Starting just
-             * after a frame ends also starts it on one whole picture.
-             *
-             * Counted from when the pass BEGAN, not from when it ended: a pass
-             * over a busy scene is itself two or three frames long, and
-             * waiting the frames again after it held Sonic to 9 passes a
-             * second whether the wire ran at 40 MHz or 80 (30 Oct 2026).
-             */
-            {
-                /* and one frame later than that while the game is behind:
-                 * the drawing is what it is queueing behind */
-                const uint32_t wait = (s_last_work_us > 16683u) ? 2u : 1u;
-                const ag_time_t g0 = ag_micros();
-                ag_delay(1);             /* the system core's own tasks */
-                while (s_ring_run && s_frames_done - pass_seen < wait) {
-                    if (!md_snd_core0_poll()) {
-                        ag_delay(1);
-                    }
-                }
-                pass_seen = s_frames_done;
-                const ag_time_t g1 = ag_micros();
-                s_gate_us += (uint32_t)(g1 - g0);
-                s_loop_us += (uint32_t)(g1 - pass_t0);
-                pass_t0 = g1;
+        (void)md_send();
+        const int line = claim_line();
+        if (line >= 0) {
+            const ag_time_t d0 = ag_micros();
+            draw_line(line);
+            s_draw_us += (uint32_t)(ag_micros() - d0);
+            continue;
+        }
+        if (s_sent < s_pass_h) {
+            /* the other core is drawing the line the glass needs next */
+            const ag_time_t t0 = ag_micros();
+            while (s_ring_run && s_sent < s_pass_h && !md_send() &&
+                   !((int)s_next < s_pass_h && (int)s_next < s_sent + s_ring_n)) {
             }
-            (void)changed;
-            changed = false;
+            s_help_wait_us += (uint32_t)(ag_micros() - t0);
             continue;
         }
-        const ag_time_t d0 = ag_micros();
-        gwenesis_vdp_set_buffer(s_ring[rows]);
-#ifdef MD_VDPPROF
-        if ((line & 31) == 7) {
-            /* the same line twice: the second with the code just run */
-            extern unsigned int md_vp_cold, md_vp_warm, md_vp_wn;
-            unsigned int c0, c1, c2;
-            __asm__ volatile("rsr %0, ccount" : "=a"(c0));
-            gwenesis_vdp_render_line(line);
-            __asm__ volatile("rsr %0, ccount" : "=a"(c1));
-            gwenesis_vdp_render_line(line);
-            __asm__ volatile("rsr %0, ccount" : "=a"(c2));
-            md_vp_cold += c1 - c0;
-            md_vp_warm += c2 - c1;
-            md_vp_wn++;
-        } else
-#endif
-        gwenesis_vdp_render_line(line);
-        const uint32_t hash = md_row_hash(s_ring[rows], w);
-        s_draw_us += (uint32_t)(ag_micros() - d0);
-        if (s_line_hash[line] == hash) {
-            s_lines_same++;
-            md_draw_flush(line0, rows, w, h);
-            rows = 0;
-            line++;
-            continue;
+        s_pass_h = 0;             /* closed: the other core stops */
+        s_passes++;
+        /*
+         * The next pass starts with the next frame, never sooner.  A pass
+         * more often than the game makes pictures draws the same picture
+         * again, and drawing it is flash traffic both cores queue for: 34
+         * passes a second over a game making 10 frames a second took the
+         * 68000 from 30 ms a frame to 95 (29 Oct 2026).  Starting just
+         * after a frame ends also starts it on one whole picture.
+         *
+         * Counted from when the pass BEGAN, not from when it ended: a pass
+         * over a busy scene is itself two or three frames long, and
+         * waiting the frames again after it held Sonic to 9 passes a
+         * second whether the wire ran at 40 MHz or 80 (30 Oct 2026).
+         */
+        {
+            /* and one frame later than that while the game is behind:
+             * the drawing is what it is queueing behind */
+            const uint32_t wait = (s_last_work_us > 16683u) ? 2u : 1u;
+            const ag_time_t g0 = ag_micros();
+            ag_delay(1);             /* the system core's own tasks */
+            while (s_ring_run && s_frames_done - pass_seen < wait) {
+                if (!md_snd_core0_poll()) {
+                    ag_delay(1);
+                }
+            }
+            pass_seen = s_frames_done;
+            const ag_time_t g1 = ag_micros();
+            s_gate_us += (uint32_t)(g1 - g0);
+            s_loop_us += (uint32_t)(g1 - pass_t0);
+            pass_t0 = g1;
         }
-        s_line_hash[line] = hash;
-        changed = true;
-        if (rows == 0) {
-            line0 = line;
-        }
-        rows++;
-        line++;
-        if (rows == s_ring_n) {
-            md_draw_flush(line0, rows, w, h);
-            rows = 0;
-        }
+        s_drawer_stack_left = ag_stack_left();
+        md_open_pass();
     }
 }
 
@@ -587,7 +744,7 @@ static void md_presenter(void *arg)
 {
     (void)arg;
     if (s_sysdraw) {
-        while (s_ring_run && s_ring_n == 0) {
+        while (s_ring_run && (s_ring_n == 0 || !s_ring_go)) {
             ag_delay(5);             /* the rows arrive just after the thread */
         }
         md_drawer();
@@ -623,7 +780,9 @@ static void md_ring_start(int rows)
         return;
     }
     s_ring_run = 1;
-    s_presenter = ag_thread_create(md_presenter, NULL, "mdglass", 4096, 4,
+    /* 3 KB: Sonic with the sound left 2 KB of 4 never used, and an H32
+     * line no longer takes 1152 bytes of it (gwenesis_vdp_gfx.c) */
+    s_presenter = ag_thread_create(md_presenter, NULL, "mdglass", 3072, 4,
                                    AG_THREAD_SYS_CORE);
     if (s_presenter == NULL) {
         s_ring_run = 0;
@@ -639,6 +798,7 @@ static void md_ring_start(int rows)
             for (int i = 0; i < n; i++) {
                 s_ring[i] = b + (size_t)i * MD_WIDTH;
             }
+            s_ring_end = b + (size_t)n * MD_WIDTH;
             __sync_synchronize();
             s_ring_n = n;
             return;
@@ -658,12 +818,25 @@ static void md_ring_stop(void)
 }
 
 /* Black over the rows the picture does not cover, once: the console's text. */
+static int md_line_alloc(void)
+{
+    if (s_line == NULL) {
+        s_line = (unsigned short *)ag_malloc(MD_WIDTH * sizeof(uint16_t));
+        if (s_line == NULL) {
+            ag_printf("md: no memory for a line\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void md_clear_glass(void)
 {
     /* one black row, repeated down the glass by a stride of zero */
-    memset(s_line, 0, sizeof(s_line));
+    unsigned short *const row = (s_ring_n > 0) ? s_ring[0] : s_line;
+    memset(row, 0, MD_WIDTH * sizeof(uint16_t));
     const ag_blit_t b = {
-        .px = s_line, .stride = 0,
+        .px = row, .stride = 0,
         .surf_w = s_gi.width, .surf_h = s_gi.height,
         .x = 0, .y = 0, .w = s_gi.width, .h = s_gi.height,
     };
@@ -827,19 +1000,45 @@ static unsigned fill_pages(unsigned char **pages, unsigned count, int iram)
  * gwenesis_vdp.h) - and which nothing else here could use; the VRAM pages that
  * do not fit there come from the heap last.
  */
+/*
+ * Pages out of the ring's last rows, the ring keeping two: a 640-byte row
+ * holds a 512-byte page, four rows five.  A smaller ring draws less ahead and
+ * sends fewer rows a call - a slower picture, not a game that will not start.  The machine's memory comes in
+ * pages cut out of whatever the heap has left, in pieces, and whether the last
+ * page is there depended on how the heap lay - Sonic started and Alex Kidd,
+ * the same build a minute later, was one page of VRAM short with 4 KB free in
+ * pieces too small (30 Oct 2026).
+ */
+static unsigned ring_pages(unsigned char **out, unsigned want)
+{
+    unsigned got = 0;
+    while (got < want && s_ring_n > 2) {
+        s_ring_n--;
+        /* pages off the top: what is left of a row joins the one below */
+        unsigned char *const floor = (unsigned char *)s_ring[s_ring_n];
+        unsigned char *end = (unsigned char *)s_ring_end;
+        while (got < want && end - floor >= (ptrdiff_t)MD_PAGE) {
+            end -= MD_PAGE;
+            out[got++] = end;
+        }
+        s_ring_end = (unsigned short *)(void *)end;
+    }
+    return got;
+}
+
 static int md_small_alloc(void)
 {
     const unsigned in_iram = fill_pages(md_vram, MD_VRAM_PAGES, 1);
-    const unsigned ram = fill_pages(md_ram, MD_RAM_PAGES, 0);
+    unsigned ram = fill_pages(md_ram, MD_RAM_PAGES, 0);
     /*
      * The Z80's first page is the image's own: allocated with it at load,
      * before the heap is in pieces - by now what is left may not hold one more
      * block.
      */
     static unsigned char s_zram0[MD_PAGE] __attribute__((aligned(4)));
-    unsigned zram = 0;
+    unsigned zram = 1;
     md_zram[0] = s_zram0;
-    if (ram == MD_RAM_PAGES && !s_run_z80_cpu) {
+    if (!s_run_z80_cpu) {
         /*
          * `noz80`: nothing runs the Z80's 8 KB, so one page stands for all of
          * them - the 68000 may still write its sound program there and read
@@ -849,12 +1048,14 @@ static int md_small_alloc(void)
             md_zram[i] = md_zram[0];
         }
         zram = MD_ZRAM_PAGES;
-    } else if (ram == MD_RAM_PAGES) {
-        zram = 1u + fill_pages(md_zram + 1, MD_ZRAM_PAGES - 1u, 0);
+    } else {
+        zram += fill_pages(md_zram + 1, MD_ZRAM_PAGES - 1u, 0);
     }
-    const unsigned vram = (zram == MD_ZRAM_PAGES)
-        ? in_iram + fill_pages(md_vram + in_iram, MD_VRAM_PAGES - in_iram, 0)
-        : in_iram;
+    unsigned vram = in_iram + fill_pages(md_vram + in_iram, MD_VRAM_PAGES - in_iram, 0);
+    /* what the heap could not give, out of the ring */
+    ram += ring_pages(md_ram + ram, MD_RAM_PAGES - ram);
+    zram += ring_pages(md_zram + zram, MD_ZRAM_PAGES - zram);
+    vram += ring_pages(md_vram + vram, MD_VRAM_PAGES - vram);
     if (ram < MD_RAM_PAGES || zram < MD_ZRAM_PAGES || vram < MD_VRAM_PAGES) {
         ag_meminfo_t mi;
         ag_meminfo(&mi);
@@ -869,9 +1070,11 @@ static int md_small_alloc(void)
     ZRAM = md_zram[MD_ZRAM_PAGES - 1];
     VRAM = md_vram[0];
     ag_printf("md: 68000 RAM 64 KB, Z80 RAM %s, VRAM 64 KB (%u KB in IRAM) - "
-              "%u-byte pages from %d blocks\n",
+              "%u-byte pages from %d blocks; %d rows of ring\n",
               s_run_z80_cpu ? "8 KB" : "one page (no Z80)", MD_PAGES_KB(in_iram),
-              (unsigned)MD_PAGE, s_blocks);
+              (unsigned)MD_PAGE, s_blocks, s_ring_n);
+    __sync_synchronize();
+    s_ring_go = 1;
     return 1;
 }
 
@@ -1195,13 +1398,13 @@ int ag_main(int argc, char **argv)
     int         stats = 0;
     int         want_livepad = 1;
     int         wait_card = 0;
-    /* rows a batch carries to the glass: 4 is the half of ILI9341.SYS's row
-     * buffer, which it sends while the next four are drawn - a call to the
-     * glass costs the same whatever it carries, and at 2 rows it was half of
-     * every send (Sonic: 17 whole passes a second at 2, 22 at 4, 30 Oct
-     * 2026).  8 left the machine a page short; `ringN` asks for N (2..16),
-     * `noring` for none */
-    int         ring_rows = 4;
+    /* rows of the ring both cores draw into (md_send): a call to the glass
+     * costs about the same whatever it carries, so rows go four at a time or
+     * to the ring's end, and six leave room to draw ahead while four go
+     * (Sonic with sound: 17 whole passes a second at 2 rows and the system
+     * core alone, 22 at 4, 30-34 at 6 with both cores, 30 Oct 2026); `ringN`
+     * asks for N (2..16), `noring` for none */
+    int         ring_rows = 6;
 
     for (int i = 1; i < argc; i++) {
         if (arg_eq(argv[i], "waitcard")) {
@@ -1217,6 +1420,10 @@ int ag_main(int argc, char **argv)
             /* ringN: N rows of ring, 2..16 */
             ring_rows = parse_int(argv[i] + 4, ring_rows);
             ring_rows = ring_rows < 2 ? 2 : ring_rows > MD_RING_MAX ? MD_RING_MAX : ring_rows;
+            continue;
+        }
+        if (arg_eq(argv[i], "nohelp")) {
+            s_help = 0;        /* the system core draws every line alone */
             continue;
         }
         if (arg_eq(argv[i], "nosysdraw")) {
@@ -1339,7 +1546,6 @@ int ag_main(int argc, char **argv)
      * says which row.  Without a display (or with `headless`) the VDP's work
      * is the same and the row is s_line, never sent.
      */
-    gwenesis_vdp_set_buffer(s_line);
     gwenesis_vdp_set_buffer_stride(0);
     /* The ring before the machine's pages; the glass after them - taking the
      * display costs internal memory too, and it is the one that can be had
@@ -1347,6 +1553,11 @@ int ag_main(int argc, char **argv)
     if (!s_headless && ring_rows > 0) {
         md_ring_start(ring_rows);
     }
+    if (s_ring_n == 0 && !md_line_alloc()) {
+        md_ring_stop();
+        return 1;
+    }
+    gwenesis_vdp_set_buffer((s_ring_n > 0) ? s_ring[0] : s_line);
     if (!md_small_alloc()) {
         md_ring_stop();
         return 1;
@@ -1355,6 +1566,10 @@ int ag_main(int argc, char **argv)
         md_ring_stop();
         s_ring_n = 0;
         s_headless = 1;
+        if (!md_line_alloc()) {
+            return 1;
+        }
+        gwenesis_vdp_set_buffer(s_line);
     }
     if (s_headless) {
         ag_printf("md: no picture - measuring\n");
@@ -1522,6 +1737,11 @@ int ag_main(int argc, char **argv)
                 }
                 gwenesis_vdp_render_line(line);
                 md_line_end(line);
+            }
+#endif
+#ifdef ARGON_MD_SMALL
+            if (s_sysdraw && s_ring_n > 0 && !s_headless && s_help) {
+                md_help_draw(next_frame);
             }
 #endif
             const ag_time_t later = ag_micros();

@@ -73,6 +73,28 @@ static inline uint32_t zp_cc(void)
     return c;
 }
 uint32_t md_zp_ym_cyc, md_zp_rom_cyc, md_zp_ym_n, md_zp_rom_n;
+uint32_t md_zp_fast_n, md_zp_slow_n; /* instructions, by which loop ran them */
+#endif
+
+#ifdef ARGON_SMS_SMALL
+int md_z80_slice_done(void); /* z80.c */
+/*
+ * The Z80's own time, for what it writes to the chips and when it reads
+ * them: its slice's start and the T-states run so far.  The end of the slice
+ * stood for all of them, which put every DAC sample of a line at the line's
+ * end - and the system core now runs the Z80 several lines a slice
+ * (md_snd_async.c), where that would have put a drum's samples on top of each
+ * other.
+ */
+static inline int md_z80_now(void)
+{
+    return zclk + md_z80_slice_done() * Z80_FREQ_DIVISOR;
+}
+#else
+static inline int md_z80_now(void)
+{
+    return zclk + s_timeslice;
+}
 #endif
 
 uint8_t argon_z80_read(uint16_t address)
@@ -81,7 +103,7 @@ uint8_t argon_z80_read(uint16_t address)
         return (s_zram != 0) ? MD_ZRAM(address) : 0xffu;
     }
     if (address < 0x6000u) {
-        int tgt = zclk + s_timeslice;
+        int tgt = md_z80_now();
         return (uint8_t)YM2612Read(tgt);
     }
     if (address >= 0x8000u) {
@@ -108,7 +130,7 @@ MD_HOT void argon_z80_write(uint16_t address, uint8_t data)
         return;
     }
     if (address < 0x6000u) {
-        int tgt = zclk + s_timeslice;
+        int tgt = md_z80_now();
 #ifdef MD_Z80PROF
         const uint32_t c0 = zp_cc();
         YM2612Write((unsigned int)address & 3u, data, tgt);
@@ -124,7 +146,7 @@ MD_HOT void argon_z80_write(uint16_t address, uint8_t data)
         return;
     }
     if (address == 0x7f11u) {
-        int tgt = zclk + s_timeslice;
+        int tgt = md_z80_now();
         gwenesis_SN76489_Write((int)data, tgt);
         return;
     }
@@ -173,6 +195,9 @@ void md_z80_prof_report(void)
     ag_printf("md: z80 ym writes %u (%u us), rom reads %u (%u us)\n",
               (unsigned)md_zp_ym_n, (unsigned)(md_zp_ym_cyc / 240u),
               (unsigned)md_zp_rom_n, (unsigned)(md_zp_rom_cyc / 240u));
+    ag_printf("md: z80 instructions %u from the hot part, %u from flash\n",
+              (unsigned)md_zp_fast_n, (unsigned)md_zp_slow_n);
+    md_zp_fast_n = md_zp_slow_n = 0;
     md_zp_ym_cyc = md_zp_rom_cyc = md_zp_ym_n = md_zp_rom_n = 0;
     for (int k = 0; k < 8; k++) {
         int best = -1;
@@ -216,6 +241,11 @@ static void zp_sample(void)
 }
 #endif
 
+#ifdef ARGON_SMS_SMALL
+int  md_z80_idle_pass(void);    /* z80.c */
+void md_z80_idle_advance(int n);
+#endif
+
 void z80_run(int target)
 {
     int rem = 0;
@@ -231,6 +261,16 @@ void z80_run(int target)
 
     if (s_reset_once && !s_bus_ack && !s_reset) {
         int cycles = s_timeslice / Z80_FREQ_DIVISOR;
+#ifdef ARGON_SMS_SMALL
+        /* a slice it can only wait through, counted out (z80.c) */
+        const int idle = (cycles > 0) ? md_z80_idle_pass() : 0;
+        if (idle > 0 && cycles >= idle) {
+            const int n = cycles / idle;
+            md_z80_idle_advance(n);
+            zclk = target - (cycles - n * idle) * Z80_FREQ_DIVISOR;
+            return;
+        }
+#endif
         if (cycles > 0) {
             rem = cycles - (int)sms_z80_execute((int32_t)cycles);
             if (rem < 0) {

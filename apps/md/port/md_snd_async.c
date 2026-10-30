@@ -62,6 +62,9 @@ extern int scan_line;
  */
 #define MD_EV_MAX 256
 
+/* lines the Z80 may run in one slice (play) */
+#define MD_Z80_AHEAD 8
+
 int md_snd_async;
 
 /* A log: the events, and the lines of a frame they cover. */
@@ -223,9 +226,36 @@ static void play(const md_log_t *l)
             i++;
         }
         if (s_z80_on) {
-            const ag_time_t z0 = ag_micros();
-            z80_run(end);
-            md_snd_z80_us += (uint32_t)(ag_micros() - z0);
+            /*
+             * Up to MD_Z80_AHEAD lines in one slice, as long as no event of
+             * the 68000's falls in them and the interrupt does not change.
+             *
+             * A slice a line, the Z80 went in and out of the interpreter 262
+             * times a frame, and the YM's update every eighth line between
+             * them pushed the interpreter out of the flash cache: Alex Kidd's
+             * driver came to ~400 cycles an instruction (30 Oct 2026).  What
+             * the Z80 writes to the chips carries its own time (md_z80_now),
+             * and a read of the YM catches it up to that time first.
+             */
+            if (zclk < end) {
+                int last = line;
+                int next_ev = lines; /* the next line with events of its own */
+                if (i < n && ((uint32_t)ev[i] >> EV_KIND_SHIFT) == EV_LINE) {
+                    next_ev = (int)(ev[i] & 0x3fffu);
+                } else if (i < n) {
+                    next_ev = line + 1;
+                }
+                while (last + 1 < (int)l->to && last + 1 < lines &&
+                       last + 1 - line < MD_Z80_AHEAD && last + 1 < next_ev &&
+                       last != vis - 1 && last != vis) {
+                    /* (the interrupt goes up after line vis-1, down after
+                     * line vis: a slice never runs across either) */
+                    last++;
+                }
+                const ag_time_t z0 = ag_micros();
+                z80_run((last + 1) * VDP_CYCLES_PER_LINE);
+                md_snd_z80_us += (uint32_t)(ag_micros() - z0);
+            }
         } else if (end > zclk) {
             zclk = end;
         }

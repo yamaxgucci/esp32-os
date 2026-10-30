@@ -63,8 +63,27 @@ extern unsigned short VSRAM[];        // VSRAM - Scrolling
 unsigned char *screen, *scaled_screen;
 
 // Define screen buffers for embedded 565 format
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD: both cores draw lines - the system core its passes, the
+ * application core what its frames leave time for (md_main.c, md_help_draw) -
+ * so what a line is drawn in is each core's own.  PRID's bit 13 is the core,
+ * as ESP-IDF reads it; not volatile, so a function reads it once.
+ */
+static inline __attribute__((always_inline)) int md_vdp_core(void)
+{
+  unsigned int id;
+  __asm__("rsr %0, prid" : "=a"(id));
+  return (int)((id >> 13) & 1u);
+}
+static unsigned short *screen_buffer_line_c[2];
+static unsigned short *screen_buffer_c[2];
+#define screen_buffer_line (screen_buffer_line_c[md_vdp_core()])
+#define screen_buffer (screen_buffer_c[md_vdp_core()])
+#else
 static unsigned short *screen_buffer_line=0;
 static unsigned short *screen_buffer=0;
+#endif
 
 /*
  * ArgonOS: pixels between the starts of two consecutive lines.  Upstream steps
@@ -80,8 +99,16 @@ static int screen_buffer_stride = SCREEN_WIDTH;
 
 enum { PIX_OVERFLOW = 32 };
 
+#ifdef ARGON_MD_SMALL
+static uint8_t render_buffer_c[2][SCREEN_WIDTH + PIX_OVERFLOW*2] __attribute__((aligned(4)));
+/* one: only shadow/highlight draws into it, and then the application core
+ * does not help (md_help_draw) - 384 bytes the CYD did not have */
+static uint8_t sprite_buffer[SCREEN_WIDTH + PIX_OVERFLOW*2];
+#define render_buffer (render_buffer_c[md_vdp_core()])
+#else
 static uint8_t render_buffer[SCREEN_WIDTH + PIX_OVERFLOW*2] __attribute__((aligned(4)));
 static uint8_t sprite_buffer[SCREEN_WIDTH + PIX_OVERFLOW*2];
+#endif
 
 // Define VIDEO MODE
 static int mode_h40;
@@ -134,9 +161,9 @@ void vdpg_log(const char *subs, const char *fmt, ...) {
  *
  ******************************************************************************/
 //host
-void gwenesis_vdp_set_buffers(unsigned char *screen_buffer, unsigned char *scaled_buffer)
+void gwenesis_vdp_set_buffers(unsigned char *screen_buf, unsigned char *scaled_buffer)
 {
-    screen = screen_buffer;
+    screen = screen_buf;
     scaled_screen = scaled_buffer;
 }
 //embedded
@@ -1375,7 +1402,17 @@ MD_HOT_VDP void gwenesis_vdp_render_line(int line)
     /* upscale mode H32 to H40 */
   } else {
 
+#ifdef ARGON_MD_SMALL
+    /*
+     * The 256 pixels in the row's own last 256, and upscaled into the row in
+     * place: blit_4to5_line reads four pixels before it writes five and never
+     * writes past what it has read.  On the stack the two lines were 1152
+     * bytes of every thread that draws, which on the CYD is two of them.
+     */
+    uint16_t *const buffer_line_H32 = &screen_buffer_line[320 - 256];
+#else
     uint16_t buffer_line_H32[256];
+#endif
 
     /* Mode Highlight/shadow is enabled */
     if (MODE_SHI) {
@@ -1410,6 +1447,9 @@ MD_HOT_VDP void gwenesis_vdp_render_line(int line)
         buffer_line_H32[x] = CRAM565[pb[x]];
     }
 
+#ifdef ARGON_MD_SMALL
+    blit_4to5_line(buffer_line_H32, screen_buffer_line);
+#else
     uint16_t scaled_buffer_line[320];
     
     blit_4to5_line(buffer_line_H32, scaled_buffer_line);
@@ -1422,6 +1462,7 @@ MD_HOT_VDP void gwenesis_vdp_render_line(int line)
       //  2 pixels : 32 bits write  access is faster
       *video_out++ = scaled_buffer_line[x] | scaled_buffer_line[x + 1] << 16;
     }
+#endif
   }
 #else
   uint16_t rgb565;
