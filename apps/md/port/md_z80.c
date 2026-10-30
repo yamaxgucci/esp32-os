@@ -64,6 +64,16 @@ static unsigned int zbank_addr(unsigned int address)
     return (address & 0x7fffu) | ((unsigned int)s_z80_bank << 15);
 }
 
+#ifdef MD_Z80PROF
+static inline uint32_t zp_cc(void)
+{
+    uint32_t c;
+    __asm__ volatile("rsr %0, ccount" : "=r"(c));
+    return c;
+}
+uint32_t md_zp_ym_cyc, md_zp_rom_cyc, md_zp_ym_n, md_zp_rom_n;
+#endif
+
 uint8_t argon_z80_read(uint16_t address)
 {
     if (address < 0x4000u) {
@@ -74,7 +84,15 @@ uint8_t argon_z80_read(uint16_t address)
         return (uint8_t)YM2612Read(tgt);
     }
     if (address >= 0x8000u) {
+#ifdef MD_Z80PROF
+        const uint32_t c0 = zp_cc();
+        const uint8_t  v = (uint8_t)m68k_read_memory_8(zbank_addr(address));
+        md_zp_rom_cyc += zp_cc() - c0;
+        md_zp_rom_n++;
+        return v;
+#else
         return (uint8_t)m68k_read_memory_8(zbank_addr(address));
+#endif
     }
     return 0xffu;
 }
@@ -89,7 +107,14 @@ void argon_z80_write(uint16_t address, uint8_t data)
     }
     if (address < 0x6000u) {
         int tgt = zclk + s_timeslice;
+#ifdef MD_Z80PROF
+        const uint32_t c0 = zp_cc();
         YM2612Write((unsigned int)address & 3u, data, tgt);
+        md_zp_ym_cyc += zp_cc() - c0;
+        md_zp_ym_n++;
+#else
+        YM2612Write((unsigned int)address & 3u, data, tgt);
+#endif
         return;
     }
     if (address == 0x6000u) {
@@ -143,6 +168,10 @@ static uint16_t s_zp_pc[24];
 static uint32_t s_zp_n[24];
 void md_z80_prof_report(void)
 {
+    ag_printf("md: z80 ym writes %u (%u us), rom reads %u (%u us)\n",
+              (unsigned)md_zp_ym_n, (unsigned)(md_zp_ym_cyc / 240u),
+              (unsigned)md_zp_rom_n, (unsigned)(md_zp_rom_cyc / 240u));
+    md_zp_ym_cyc = md_zp_rom_cyc = md_zp_ym_n = md_zp_rom_n = 0;
     for (int k = 0; k < 8; k++) {
         int best = -1;
         for (int i = 0; i < 24; i++) {
