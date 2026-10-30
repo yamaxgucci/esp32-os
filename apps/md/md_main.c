@@ -96,6 +96,7 @@ static uint32_t s_lines_same;   /* lines the glass already showed (md_line_end) 
 static uint32_t s_passes;       /* times the cursor went through the glass */
 static uint32_t s_draw_us;      /* the drawer in the VDP and the row hash      */
 static uint32_t s_gate_us;      /* the drawer waiting for the game's frames    */
+static uint32_t s_loop_us;      /* the drawer's passes, start to end           */
 static int      s_sysdraw = 1;  /* the system core draws the lines (md_drawer) */
 static volatile uint32_t s_frames_done; /* frames the emulating core finished */
 static volatile uint32_t s_last_work_us; /* how long the last one took */
@@ -236,6 +237,24 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
 #ifdef MD_Z80PROF
         { extern void md_z80_prof_report(void); md_z80_prof_report(); }
 #endif
+#ifdef MD_VDPPROF
+        {
+            extern unsigned int md_vp_b, md_vp_a, md_vp_s, md_vp_c, md_vp_n;
+            extern unsigned int md_vp_cold, md_vp_warm, md_vp_wn;
+            if (md_vp_wn) {
+                ag_printf("md: a line drawn twice (cycles): first %u, again %u\n",
+                          md_vp_cold / md_vp_wn, md_vp_warm / md_vp_wn);
+            }
+            md_vp_cold = md_vp_warm = md_vp_wn = 0;
+            if (md_vp_n) {
+                ag_printf("md: a line (cycles): plane B %u, plane A+window %u, "
+                          "sprites %u, colours %u; %u lines\n",
+                          md_vp_b / md_vp_n, md_vp_a / md_vp_n,
+                          md_vp_s / md_vp_n, md_vp_c / md_vp_n, md_vp_n);
+            }
+            md_vp_b = md_vp_a = md_vp_s = md_vp_c = md_vp_n = 0;
+        }
+#endif
 #ifdef MD_CYCPROF
         if (md_cp_n) {
             ag_printf("md: per instruction (cycles): fetch %u decode %u exec %u "
@@ -270,17 +289,21 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
         const uint32_t draw = s_draw_us - s_draw_seen, gate = s_gate_us - s_gate_seen;
         s_draw_seen += draw;
         s_gate_seen += gate;
+        static uint32_t s_loop_seen;
+        const uint32_t loop = s_loop_us - s_loop_seen;
+        s_loop_seen += loop;
         static uint32_t s_snd_seen;
         const uint32_t snd = md_snd_core0_us() - s_snd_seen;
         s_snd_seen += snd;
         ag_printf("md: drawer per second: draw %u ms, send %u ms, wait %u ms, "
-                  "sound %u ms, z80 %u (%u frames in pieces)\n",
+                  "sound %u ms, z80 %u (%u frames in pieces), passes %u ms\n",
                   (unsigned)((uint64_t)draw * 1000u / span_us),
                   (unsigned)((uint64_t)us * 1000u / span_us),
                   (unsigned)((uint64_t)gate * 1000u / span_us),
                   (unsigned)((uint64_t)snd * 1000u / span_us),
                   (unsigned)md_snd_z80_ms(span_us),
-                  (unsigned)md_snd_split());
+                  (unsigned)md_snd_split(),
+                  (unsigned)((uint64_t)loop * 1000u / span_us));
         ag_printf("md: glass %u rows, %u.%u pictures a second, %u us a row, "
                   "the system core %u%% busy; %u.%u whole passes a second, "
                   "%u lines unchanged\n", (unsigned)rows,
@@ -474,6 +497,7 @@ static void md_drawer(void)
     int line = 0, rows = 0, line0 = 0;
     bool changed = false;
     uint32_t pass_seen = s_frames_done;   /* frames done when this pass began */
+    ag_time_t pass_t0 = ag_micros();
     while (s_ring_run) {
         /* the sound side first: a frame's log played before the next row -
          * a late picture is a band, late sound is a gap */
@@ -509,7 +533,10 @@ static void md_drawer(void)
                     }
                 }
                 pass_seen = s_frames_done;
-                s_gate_us += (uint32_t)(ag_micros() - g0);
+                const ag_time_t g1 = ag_micros();
+                s_gate_us += (uint32_t)(g1 - g0);
+                s_loop_us += (uint32_t)(g1 - pass_t0);
+                pass_t0 = g1;
             }
             (void)changed;
             changed = false;
@@ -517,6 +544,21 @@ static void md_drawer(void)
         }
         const ag_time_t d0 = ag_micros();
         gwenesis_vdp_set_buffer(s_ring[rows]);
+#ifdef MD_VDPPROF
+        if ((line & 31) == 7) {
+            /* the same line twice: the second with the code just run */
+            extern unsigned int md_vp_cold, md_vp_warm, md_vp_wn;
+            unsigned int c0, c1, c2;
+            __asm__ volatile("rsr %0, ccount" : "=a"(c0));
+            gwenesis_vdp_render_line(line);
+            __asm__ volatile("rsr %0, ccount" : "=a"(c1));
+            gwenesis_vdp_render_line(line);
+            __asm__ volatile("rsr %0, ccount" : "=a"(c2));
+            md_vp_cold += c1 - c0;
+            md_vp_warm += c2 - c1;
+            md_vp_wn++;
+        } else
+#endif
         gwenesis_vdp_render_line(line);
         const uint32_t hash = md_row_hash(s_ring[rows], w);
         s_draw_us += (uint32_t)(ag_micros() - d0);
@@ -1153,10 +1195,13 @@ int ag_main(int argc, char **argv)
     int         stats = 0;
     int         want_livepad = 1;
     int         wait_card = 0;
-    /* rows a batch carries to the glass: with the display driver loaded and
-     * the glass's thread at 3 KB of stack, 3 leave the machine 1 KB short of
-     * its 64 KB RAM and 64 KB VRAM; `ringN` asks for N, `noring` for none */
-    int         ring_rows = 2;
+    /* rows a batch carries to the glass: 4 is the half of ILI9341.SYS's row
+     * buffer, which it sends while the next four are drawn - a call to the
+     * glass costs the same whatever it carries, and at 2 rows it was half of
+     * every send (Sonic: 17 whole passes a second at 2, 22 at 4, 30 Oct
+     * 2026).  8 left the machine a page short; `ringN` asks for N (2..16),
+     * `noring` for none */
+    int         ring_rows = 4;
 
     for (int i = 1; i < argc; i++) {
         if (arg_eq(argv[i], "waitcard")) {

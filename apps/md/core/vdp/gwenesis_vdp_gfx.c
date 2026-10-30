@@ -80,7 +80,7 @@ static int screen_buffer_stride = SCREEN_WIDTH;
 
 enum { PIX_OVERFLOW = 32 };
 
-static uint8_t render_buffer[SCREEN_WIDTH + PIX_OVERFLOW*2];
+static uint8_t render_buffer[SCREEN_WIDTH + PIX_OVERFLOW*2] __attribute__((aligned(4)));
 static uint8_t sprite_buffer[SCREEN_WIDTH + PIX_OVERFLOW*2];
 
 // Define VIDEO MODE
@@ -482,8 +482,141 @@ void draw_pattern_sprite_over_planes(uint8_t *scr, uint16_t name, int paty) {
     draw_pattern_nofliph_sprite_over_planes (scr, pattern, attrs);
 }
 
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD: a plane's pattern row as two words, all eight pixels at once.
+ *
+ * Pixel by pixel - a nibble out, a test, a byte stored, eight times - the
+ * planes were 15-16 thousand of the 22 thousand cycles a line took (Sonic,
+ * 30 Oct 2026).  Here a cell is a few dozen operations on words and two
+ * stores when it lands on a word - which bought less than it looks: plane B
+ * went from ~7700 cycles a line to ~7250, and with its name-table row found
+ * once a line (name_row) to ~6800.  The rest is the ESP32 itself, roughly an
+ * instruction a cycle: the renderer measured the same from IRAM as from
+ * flash, and the same drawn a second time with everything in the cache.
+ *
+ * pat_cell: the row's pixels in memory order, pixel 0 in the low byte of lo;
+ * PIX0..PIX7 above say which nibble is which.  nz_mask: 0xFF in each byte
+ * that is not 0 (each byte 0..15).
+ */
+static inline __attribute__((always_inline)) void
+pat_cell(uint32_t p, int fliph, uint32_t *lo, uint32_t *hi)
+{
+  const uint32_t a = (p >> 4) & 0x0F0F0F0Fu; /* byte k: pixel 2k   */
+  const uint32_t b = p & 0x0F0F0F0Fu;        /* byte k: pixel 2k+1 */
+  if (!fliph) {
+    *lo = (a & 0xFFu) | ((b & 0xFFu) << 8) | ((a & 0xFF00u) << 8) |
+          ((b & 0xFF00u) << 16);
+    *hi = ((a >> 16) & 0xFFu) | ((b >> 8) & 0xFF00u) | ((a >> 8) & 0xFF0000u) |
+          (b & 0xFF000000u);
+  } else {
+    *lo = (b >> 24) | ((a >> 16) & 0xFF00u) | (b & 0xFF0000u) |
+          ((a << 8) & 0xFF000000u);
+    *hi = ((b >> 8) & 0xFFu) | (a & 0xFF00u) | ((b << 16) & 0xFF0000u) |
+          (a << 24);
+  }
+}
+
+static inline __attribute__((always_inline)) uint32_t nz_mask(uint32_t v)
+{
+  const uint32_t nz = (v + 0x0F0F0F0Fu) & 0x10101010u;
+  return (nz << 4) - (nz >> 4);
+}
+
+/* Eight bytes at scr, which is on a word or is not - the same for a whole
+ * line, so the branch goes the same way every cell. */
+static inline __attribute__((always_inline)) void
+cell_put(uint8_t *scr, uint32_t lo, uint32_t hi)
+{
+  if (((unsigned long)scr & 3u) == 0u) {
+    ((uint32_t *)(void *)scr)[0] = lo;
+    ((uint32_t *)(void *)scr)[1] = hi;
+    return;
+  }
+  scr[0] = (uint8_t)lo;
+  scr[1] = (uint8_t)(lo >> 8);
+  scr[2] = (uint8_t)(lo >> 16);
+  scr[3] = (uint8_t)(lo >> 24);
+  scr[4] = (uint8_t)hi;
+  scr[5] = (uint8_t)(hi >> 8);
+  scr[6] = (uint8_t)(hi >> 16);
+  scr[7] = (uint8_t)(hi >> 24);
+}
+
+static inline __attribute__((always_inline)) void
+cell_get(const uint8_t *scr, uint32_t *lo, uint32_t *hi)
+{
+  if (((unsigned long)scr & 3u) == 0u) {
+    *lo = ((const uint32_t *)(const void *)scr)[0];
+    *hi = ((const uint32_t *)(const void *)scr)[1];
+    return;
+  }
+  *lo = (uint32_t)scr[0] | ((uint32_t)scr[1] << 8) | ((uint32_t)scr[2] << 16) |
+        ((uint32_t)scr[3] << 24);
+  *hi = (uint32_t)scr[4] | ((uint32_t)scr[5] << 8) | ((uint32_t)scr[6] << 16) |
+        ((uint32_t)scr[7] << 24);
+}
+
+/* A name-table entry: one word read where FETCH16VRAM reads two bytes, each
+ * through the page table.  Entries are two bytes on an even address. */
+static inline __attribute__((always_inline)) unsigned int vram_name(unsigned int a)
+{
+  const uint32_t w = VRAM_W(a);
+  const uint32_t h = (a & 2u) ? (w >> 16) : (w & 0xFFFFu);
+  return ((h & 0xFFu) << 8) | ((h >> 8) & 0xFFu);
+}
+#define FETCH_NAME(A) vram_name(A)
+
+/*
+ * A plane's name-table row as words.  Without column scrolling every cell of
+ * a line is on the same row of the table, so the row is found once a line,
+ * not once a cell: a row is 64, 128 or 256 bytes on a multiple of its own size
+ * and never crosses a page.
+ */
+static inline __attribute__((always_inline)) const volatile unsigned int *
+name_row(unsigned int a)
+{
+  return (const volatile unsigned int *)(void *)md_vram[(a & VRAM_MASK) >> MD_PAGE_SHIFT] +
+         ((a & MD_PAGE_MASK) >> 2);
+}
+
+static inline __attribute__((always_inline)) unsigned int
+row_name(const volatile unsigned int *row, unsigned int col)
+{
+  const uint32_t w = row[col >> 1];
+  const uint32_t h = (col & 1u) ? (w >> 16) : (w & 0xFFFFu);
+  return ((h & 0xFFu) << 8) | ((h >> 8) & 0xFFu);
+}
+
+/* The pattern row of a cell: `name`'s vertical flip and row `paty`. */
+static inline __attribute__((always_inline)) uint32_t
+cell_row(unsigned int name, int paty)
+{
+  return VRAM_W((((name & 0x07FF) << 5) + (((name & 0x1000) ? 7 - paty : paty) * 4)));
+}
+#else
+#define FETCH_NAME(A) FETCH16VRAM(A)
+#endif
+
 static inline __attribute__((always_inline))
 void draw_pattern_planeB(uint8_t *scr, uint16_t name, int paty) {
+#ifdef ARGON_MD_SMALL
+  {
+    const uint32_t bk = gwenesis_vdp_regs[7] * 0x01010101u;
+    const uint32_t p = cell_row(name, paty);
+    if (p == 0) {
+      cell_put(scr, bk, bk);
+      return;
+    }
+    const uint32_t at = (uint32_t)(((name & 0x6000) >> 9) + ((name & 0x8000) >> 8)) *
+                        0x01010101u;
+    uint32_t lo, hi;
+    pat_cell(p, name & 0x0800, &lo, &hi);
+    const uint32_t ml = nz_mask(lo), mh = nz_mask(hi);
+    cell_put(scr, (ml & (lo | at)) | (~ml & bk), (mh & (hi | at)) | (~mh & bk));
+    return;
+  }
+#endif
  // uint16_t pat_addr = name  << 5; // * 32;
  // uint8_t pat_palette = BITS(name, 13, 2);
  // unsigned int is_pat_pri = name & 0x8000;
@@ -514,6 +647,27 @@ void draw_pattern_planeB(uint8_t *scr, uint16_t name, int paty) {
 
 static inline __attribute__((always_inline))
 void draw_pattern_planeA(uint8_t *scr, uint16_t name, int paty) {
+#ifdef ARGON_MD_SMALL
+  {
+    const uint32_t p = cell_row(name, paty);
+    if (p == 0)
+      return;
+    const uint32_t at = (uint32_t)(((name & 0x6000) >> 9) + ((name & 0x8000) >> 8)) *
+                        0x01010101u;
+    uint32_t lo, hi, olo, ohi;
+    pat_cell(p, name & 0x0800, &lo, &hi);
+    uint32_t ml = nz_mask(lo), mh = nz_mask(hi);
+    cell_get(scr, &olo, &ohi);
+    if (!(name & 0x8000)) {
+      /* low priority: not over plane B's high-priority pixels */
+      const uint32_t xl = (olo >> 7) & 0x01010101u, xh = (ohi >> 7) & 0x01010101u;
+      ml &= ~((xl << 8) - xl);
+      mh &= ~((xh << 8) - xh);
+    }
+    cell_put(scr, (ml & (lo | at)) | (~ml & olo), (mh & (hi | at)) | (~mh & ohi));
+    return;
+  }
+#endif
   // uint16_t pat_addr = name << 5; //* 32;
   // uint8_t pat_palette = BITS(name, 13, 2);
   // unsigned int is_pat_pri = name & 0x8000;
@@ -609,6 +763,19 @@ void draw_line_b(int line)
 
   unsigned int numcell = 0;
   scr -= patx;
+#ifdef ARGON_MD_SMALL
+  if (!column_scrolling) {
+    const uint16_t scrolly = *vsram + line;
+    const volatile unsigned int *nrow =
+        name_row(ntaddr + ((scrolly >> 3) & nth_mask) * ntwidth_x2);
+    const int paty = scrolly & 7;
+    for (; scr < end; scr += 8) {
+      draw_pattern_planeB(scr, row_name(nrow, col), paty);
+      col = (col + 1) & ntw_mask;
+    }
+    return;
+  }
+#endif
   while (scr < end) {
     // Calculate vertical scrolling for the current line
     uint16_t scrolly = *vsram + line;
@@ -618,7 +785,7 @@ void draw_line_b(int line)
    // unsigned int nt = ntaddr + row * (2 * ntwidth);
     unsigned int nt = ntaddr + row * ntwidth_x2;
 
-    draw_pattern_planeB(scr, FETCH16VRAM(nt + col * 2), paty);
+    draw_pattern_planeB(scr, FETCH_NAME(nt + col * 2), paty);
     col = (col + 1) & ntw_mask;
     scr += 8;
     numcell++;
@@ -684,6 +851,18 @@ void draw_line_aw(int line) {
 
   unsigned int numcell = 0;
   pos -= patx;
+#ifdef ARGON_MD_SMALL
+  if (!column_scrolling && pos < end) {
+    const uint16_t scrolly = *vsram + line;
+    const volatile unsigned int *nrow =
+        name_row(ntaddr + ((scrolly >> 3) & nth_mask) * ntwidth_x2);
+    const int paty = scrolly & 7;
+    for (; pos < end; pos += 8) {
+      draw_pattern_planeA(pos, row_name(nrow, col), paty);
+      col = (col + 1) & ntw_mask;
+    }
+  }
+#endif
   while (pos < end) {
     // Calculate vertical scrolling for the current line
     uint16_t scrolly = *vsram + line;
@@ -693,7 +872,7 @@ void draw_line_aw(int line) {
    // unsigned int nt = ntaddr + row * (2 * ntwidth);
     unsigned int nt = ntaddr + row * ntwidth_x2;
 
-    draw_pattern_planeA(pos, FETCH16VRAM(nt + col * 2), paty);
+    draw_pattern_planeA(pos, FETCH_NAME(nt + col * 2), paty);
 
     col = (col + 1) & ntw_mask;
     pos += 8;
@@ -715,7 +894,7 @@ void draw_line_aw(int line) {
   unsigned int nt = base_w + row * wdwidth_x2 + Window_first / 4;
 
   for (int i = Window_first / 8; i < Window_last / 8; ++i) {
-    draw_pattern_planeA(end, FETCH16VRAM(nt), paty);
+    draw_pattern_planeA(end, FETCH_NAME(nt), paty);
     nt += 2;
     end += 8;
   }
@@ -1043,6 +1222,22 @@ blit_4to5_line(uint16_t *in, uint16_t *out) {
   }
 }
 
+#ifdef MD_VDPPROF
+static inline unsigned int md_ccount(void)
+{
+    unsigned int c;
+    __asm__ volatile("rsr %0, ccount" : "=a"(c));
+    return c;
+}
+/* -DMD_VDPPROF: a line's cycles by part - plane B, plane A and the window,
+ * the sprites, the colours - and the lines counted */
+unsigned int md_vp_b, md_vp_a, md_vp_s, md_vp_c, md_vp_n;
+unsigned int md_vp_cold, md_vp_warm, md_vp_wn;
+#define VP_MARK(v) do { const unsigned int c_ = md_ccount(); v += c_ - vp_; vp_ = c_; } while (0)
+#else
+#define VP_MARK(v) do { } while (0)
+#endif
+
 MD_HOT_VDP void gwenesis_vdp_render_line(int line)
 {
   mode_h40 = REG12_MODE_H40;
@@ -1106,16 +1301,23 @@ MD_HOT_VDP void gwenesis_vdp_render_line(int line)
   uint8_t *pb = &render_buffer[PIX_OVERFLOW];
   uint8_t *ps = &sprite_buffer[PIX_OVERFLOW];
 
+#ifdef MD_VDPPROF
+  unsigned int vp_ = md_ccount();
+  md_vp_n++;
+#endif
   if (MODE_SHI)
     memset(ps, 0, 320);
 
   draw_line_b(line);
+  VP_MARK(md_vp_b);
   draw_line_aw(line);
+  VP_MARK(md_vp_a);
 
   if (MODE_SHI)
     draw_sprites(line);
   else
     draw_sprites_over_planes(line);
+  VP_MARK(md_vp_s);
 
 #if GNW_TARGET_MARIO != 0 | GNW_TARGET_ZELDA != 0 | ARGON_TARGET != 0
 
@@ -1151,6 +1353,17 @@ MD_HOT_VDP void gwenesis_vdp_render_line(int line)
 
       uint32_t *video_out = (uint32_t *)&screen_buffer_line[0];
 
+#ifdef ARGON_MD_SMALL
+      /* four pixels a word read out of the line, two words out */
+      const uint32_t *in4 = (const uint32_t *)(const void *)pb;
+      for (int x = 0; x < screen_width; x += 4) {
+        const uint32_t w = *in4++;
+        video_out[0] = CRAM565[w & 0xFFu] | (uint32_t)CRAM565[(w >> 8) & 0xFFu] << 16;
+        video_out[1] = CRAM565[(w >> 16) & 0xFFu] | (uint32_t)CRAM565[w >> 24] << 16;
+        video_out += 2;
+      }
+      if (0)
+#endif
       for (int x = 0; x < screen_width; x += 2) {
 
         // screen_buffer_line[x] = CRAM565[pb[x]];
@@ -1158,6 +1371,7 @@ MD_HOT_VDP void gwenesis_vdp_render_line(int line)
         *video_out++ = CRAM565[pb[x]] | CRAM565[pb[x + 1]] << 16;
       }
     }
+    VP_MARK(md_vp_c);
     /* upscale mode H32 to H40 */
   } else {
 
