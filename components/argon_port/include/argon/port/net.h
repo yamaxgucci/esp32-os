@@ -85,6 +85,14 @@ void     ag_port_net_on_ready(ag_port_net_ready_fn fn);
 ag_err_t ag_port_net_mdns(const char *hostname);
 
 /*
+ * The responder stopped with the radio and started again with it (the Wi-Fi
+ * port calls these).  Pause does nothing while another link is up, or if the
+ * responder was never asked for.
+ */
+void ag_port_net_mdns_pause(void);
+void ag_port_net_mdns_resume(void);
+
+/*
  * What the stack is holding, for an operator asking where the memory went.
  *
  * A connection the application has closed is not necessarily a connection the

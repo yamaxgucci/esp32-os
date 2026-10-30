@@ -15,6 +15,7 @@
 
 #if defined(CONFIG_ARGON_NET_WIFI) && CONFIG_ARGON_NET_WIFI
 
+#include <argon/port/net.h>
 #include <argon/port/wifi.h>
 
 #include <string.h>
@@ -303,6 +304,7 @@ ag_err_t ag_port_wifi_start(void)
 
     if (s_state == AG_WIFI_OFF) {
         s_state = AG_WIFI_IDLE;
+        ag_port_net_mdns_resume();
     }
     return AG_OK;
 }
@@ -356,6 +358,7 @@ ag_err_t ag_port_wifi_stop(void)
     s_state = AG_WIFI_OFF;
     s_attempts = 0;
     s_last_reason = 0;
+    ag_port_net_mdns_pause();
     return AG_OK;
 }
 

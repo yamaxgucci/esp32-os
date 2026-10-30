@@ -754,15 +754,9 @@ ag_err_t ag_devices_start_radios(void)
              */
             const char *host =
                 ag_cfg_get(ag_sysconfig(), "net.hostname", "argon");
-#if CONFIG_ARGON_HEAP_TWOEND
-            /* the responder outlives the radio: `wifi off` leaves its task,
-             * so it is placed with what stays, not inside what goes */
-            ag_port_mem_keep(true);
-#endif
+            /* not placed with what stays: it goes with the radio now
+             * (ag_port_net_mdns_pause) */
             const ag_err_t merr = ag_port_net_mdns(host);
-#if CONFIG_ARGON_HEAP_TWOEND
-            ag_port_mem_keep(false);
-#endif
             if (merr == AG_OK) {
                 ag_log(AG_LOG_INFO, "net", "mdns: %s.local", host);
             } else if (merr != -AG_ENOSYS) {
