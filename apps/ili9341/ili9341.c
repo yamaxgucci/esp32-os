@@ -61,8 +61,16 @@ AG_DRV("ILI9341", "0.5", "argon");
  * Forty is what the driver's own comments always assumed it was running at,
  * and what these boards are usually driven at.  A driver that shares a bus
  * states its speed - the touch driver always did.
+ *
+ * `spi_khz` in [display] of SYSTEM.CFG overrides it, read when the driver
+ * loads.  A picture that changes every frame (MD32 on this board) is held to
+ * the wire - its drawing core waits on the panel half the time - so 80000 is
+ * there for whoever wants twice the rows and will watch for wrong pixels.
+ * Anything outside 1-80 MHz is refused back to forty: the ESP32's SPI goes no
+ * faster, and a typo should not take the console away.
  */
-#define LCD_KHZ  40000
+#define LCD_KHZ      40000
+#define LCD_KHZ_MAX  80000
 #define LCD_DC       2
 #define LCD_BL      27
 #define LCD_MADCTL 0x40 /* landscape, and no BGR bit: this panel is RGB */
@@ -687,11 +695,22 @@ ag_err_t ag_driver_init(void)
         return -AG_ENOTSUP;
     }
     if (AG_HAS(io, spi_config)) {
-        const ag_err_t clk = io->spi_config(LCD_BUS, LCD_CS, LCD_KHZ);
+        const ag_cfg_api_t *cfg = ag_api()->cfg;
+        int32_t khz = (cfg != NULL) ? cfg->get_int("display.spi_khz", LCD_KHZ)
+                                    : LCD_KHZ;
+        if (khz < 1000 || khz > LCD_KHZ_MAX) {
+            ag_printf("ILI9341: spi_khz %d is not 1000-%d; using %d\n",
+                      (int)khz, LCD_KHZ_MAX, LCD_KHZ);
+            khz = LCD_KHZ;
+        }
+        const ag_err_t clk = io->spi_config(LCD_BUS, LCD_CS, (uint32_t)khz);
         if (clk != AG_OK) {
             ag_printf("ILI9341: spi%d cs %d at %d kHz: %s\n", LCD_BUS,
-                      LCD_CS, LCD_KHZ, ag_strerror(clk));
+                      LCD_CS, (int)khz, ag_strerror(clk));
             return clk;
+        }
+        if (khz != LCD_KHZ) {
+            ag_printf("ILI9341: panel at %d kHz (display.spi_khz)\n", (int)khz);
         }
     }
 

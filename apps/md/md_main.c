@@ -88,6 +88,8 @@ static uint64_t s_prof_vdp_us;
 static uint32_t s_frame_no;     /* frames run so far, for finding the scene */
 static uint32_t s_lines_same;   /* lines the glass already showed (md_line_end) */
 static uint32_t s_passes;       /* times the cursor went through the glass */
+static uint32_t s_draw_us;      /* the drawer in the VDP and the row hash      */
+static uint32_t s_gate_us;      /* the drawer waiting for the game's frames    */
 static int      s_sysdraw = 1;  /* the system core draws the lines (md_drawer) */
 static volatile uint32_t s_frames_done; /* frames the emulating core finished */
 static volatile uint32_t s_last_work_us; /* how long the last one took */
@@ -245,6 +247,14 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
         s_passes_seen += passes;
         s_same_seen += same;
         const unsigned p10 = (unsigned)((uint64_t)passes * 10000000u / span_us);
+        static uint32_t s_draw_seen, s_gate_seen;
+        const uint32_t draw = s_draw_us - s_draw_seen, gate = s_gate_us - s_gate_seen;
+        s_draw_seen += draw;
+        s_gate_seen += gate;
+        ag_printf("md: drawer per second: draw %u ms, send %u ms, wait %u ms\n",
+                  (unsigned)((uint64_t)draw * 1000u / span_us),
+                  (unsigned)((uint64_t)us * 1000u / span_us),
+                  (unsigned)((uint64_t)gate * 1000u / span_us));
         ag_printf("md: glass %u rows, %u.%u pictures a second, %u us a row, "
                   "the system core %u%% busy; %u.%u whole passes a second, "
                   "%u lines unchanged\n", (unsigned)rows,
@@ -437,6 +447,7 @@ static void md_drawer(void)
 {
     int line = 0, rows = 0, line0 = 0;
     bool changed = false;
+    uint32_t pass_seen = s_frames_done;   /* frames done when this pass began */
     while (s_ring_run) {
         const int w = screen_width, h = screen_height;
         if (line >= h || line >= MD_HASH_LINES) {
@@ -451,24 +462,33 @@ static void md_drawer(void)
              * passes a second over a game making 10 frames a second took the
              * 68000 from 30 ms a frame to 95 (29 Oct 2026).  Starting just
              * after a frame ends also starts it on one whole picture.
+             *
+             * Counted from when the pass BEGAN, not from when it ended: a pass
+             * over a busy scene is itself two or three frames long, and
+             * waiting the frames again after it held Sonic to 9 passes a
+             * second whether the wire ran at 40 MHz or 80 (30 Oct 2026).
              */
             {
                 /* and one frame later than that while the game is behind:
                  * the drawing is what it is queueing behind */
                 const uint32_t wait = (s_last_work_us > 16683u) ? 2u : 1u;
-                const uint32_t seen = s_frames_done;
-                ag_delay(1);
-                while (s_ring_run && s_frames_done - seen < wait) {
+                const ag_time_t g0 = ag_micros();
+                ag_delay(1);             /* the system core's own tasks */
+                while (s_ring_run && s_frames_done - pass_seen < wait) {
                     ag_delay(1);
                 }
+                pass_seen = s_frames_done;
+                s_gate_us += (uint32_t)(ag_micros() - g0);
             }
             (void)changed;
             changed = false;
             continue;
         }
+        const ag_time_t d0 = ag_micros();
         gwenesis_vdp_set_buffer(s_ring[rows]);
         gwenesis_vdp_render_line(line);
         const uint32_t hash = md_row_hash(s_ring[rows], w);
+        s_draw_us += (uint32_t)(ag_micros() - d0);
         if (s_line_hash[line] == hash) {
             s_lines_same++;
             md_draw_flush(line0, rows, w, h);
