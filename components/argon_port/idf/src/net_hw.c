@@ -177,7 +177,10 @@ void ag_port_net_mdns_resume(void)
         return;
     }
     s_mdns_paused = false;
-    (void)ag_port_net_mdns(s_mdns_host);
+    const ag_err_t err = ag_port_net_mdns(s_mdns_host);
+    if (err != AG_OK) {
+        ESP_LOGW("net", "mdns: %s.local not back (%d)", s_mdns_host, (int)err);
+    }
 }
 
 /* Everything both links need before either can be brought up. */

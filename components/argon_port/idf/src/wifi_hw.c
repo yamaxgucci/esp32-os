@@ -304,8 +304,10 @@ ag_err_t ag_port_wifi_start(void)
 
     if (s_state == AG_WIFI_OFF) {
         s_state = AG_WIFI_IDLE;
-        ag_port_net_mdns_resume();
     }
+    /* Not inside the test above: the radio's start event may already have
+     * moved the state on by now, and the responder was then left off. */
+    ag_port_net_mdns_resume();
     return AG_OK;
 }
 
