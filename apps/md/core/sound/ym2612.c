@@ -2109,7 +2109,7 @@ static int16_t  s_dacq_v[YM_DACQ];
 static int      s_dacq_n, s_dacq_head;
 static int      s_upd_at; /* the frame's sample the running update makes */
 
-static void ym_dac_write(unsigned int v, int target)
+MD_HOT static void ym_dac_write(unsigned int v, int target)
 {
   const int at = target / (int)ym2612.divisor;
   const int out = ((int)v - 0x80) << 6;
@@ -2323,7 +2323,31 @@ void ym2612_run( int target) {
 /* n = number  */
 /* a = address */
 /* v = value   */
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD: an address and the DAC's data - what a drum writes - from the hot
+ * part; anything else goes on to the whole write path in flash.
+ */
+__attribute__((noinline)) static void YM2612WriteAll(unsigned int a, unsigned int v, int target);
+
+MD_HOT void YM2612Write(unsigned int a, unsigned int v, int target)
+{
+  v &= 0xff;
+  if (a == 0 || a == 2) {
+    ym2612.OPN.ST.address = (a == 2) ? (v | 0x100) : v;
+    return;
+  }
+  if (ym2612.OPN.ST.address == 0x2a) {
+    ym_dac_write(v, target);
+    return;
+  }
+  YM2612WriteAll(a, v, target);
+}
+
+static void YM2612WriteAll(unsigned int a, unsigned int v,  int target)
+#else
 void YM2612Write(unsigned int a, unsigned int v,  int target)
+#endif
 {
   ym_log(__FUNCTION__," %06x : %02x",a,v);
 

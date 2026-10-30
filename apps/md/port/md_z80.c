@@ -98,7 +98,8 @@ uint8_t argon_z80_read(uint16_t address)
     return 0xffu;
 }
 
-void argon_z80_write(uint16_t address, uint8_t data)
+/* in the hot part: a drum is the Z80 writing the YM through here (md_z80_fast) */
+MD_HOT void argon_z80_write(uint16_t address, uint8_t data)
 {
     if (address < 0x4000u) {
         if (s_zram != 0) {

@@ -3692,7 +3692,7 @@ INLINE void check_interrupts()
  * R advances as if each instruction had run.  PicoDrive skips the 68000's
  * waits the same way (md_idle_branch is this build's).
  */
-static void md_z80_skip_waits(uint8_t opcode)
+MD_HOT static void md_z80_skip_waits(uint8_t opcode)
 {
 	if (Z80.icount <= 0)
 		return;
@@ -3749,6 +3749,107 @@ static void md_z80_skip_waits(uint8_t opcode)
 }
 #endif
 
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+/*
+ * The CYD: the instructions a sound driver's loop is made of, from the hot
+ * part, as many in a row as come - the rest, and anything an interrupt is
+ * waiting on, go back to the loop below.
+ *
+ * The whole interpreter is 16 KB of code and IRAM has none to spare; from
+ * flash it cost Sonic's drums ~7 ms of every frame, some 400 cycles an
+ * instruction (30 Oct 2026).  Its DAC loop is two dozen kinds of instruction
+ * (ld a,(de) / and n / rrca / add a,n / ld l,a / ld a,(hl) / exx / add a,d
+ * / ld d,a / ld (hl),r / ld (ix+d),r / ld b,c / djnz / ld a,(nn) / bit 7,a
+ * / jp nz / inc de / dec bc / ld a,c / or b / jp / or a / jp p), and these
+ * are them: each through the core's own handler, the same flags, the cycles
+ * the core's tables give (checked against cc_op/cc_xy/cc_cb).
+ */
+MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
+{
+	while (Z80.icount > 0)
+	{
+		if (Z80.nmi_pending || Z80.halt ||
+		    (Z80.irq_state != CLEAR_LINE && Z80.iff1 && !Z80.after_ei))
+			return;
+		const uint32_t pc = PCD;
+		const uint8_t  op = md_z80_rd(pc);
+		int            cyc;
+		switch (op)
+		{
+		case 0x1a: case 0xe6: case 0x0f: case 0xc6: case 0x6f: case 0x7e:
+		case 0xd9: case 0x82: case 0x57: case 0x75: case 0x74: case 0x41:
+		case 0x10: case 0x3a: case 0xc2: case 0x13: case 0x0b: case 0x79:
+		case 0xb0: case 0xc3: case 0xb7: case 0xf2:
+			break;
+		case 0xdd:
+		{
+			const uint8_t op2 = md_z80_rd((pc + 1u) & 0xffffu);
+			if (op2 != 0x72 && op2 != 0x73)
+				return;
+			Z80.after_ei = 0;
+			Z80.after_ldair = 0;
+			PRVPC = pc;
+			PC += 2;
+			Z80.r += 2;
+			Z80.icount -= 19;
+			if (op2 == 0x72)
+				dd_72();
+			else
+				dd_73();
+			continue;
+		}
+		case 0xcb:
+			if (md_z80_rd((pc + 1u) & 0xffffu) != 0x7f)
+				return;
+			Z80.after_ei = 0;
+			Z80.after_ldair = 0;
+			PRVPC = pc;
+			PC += 2;
+			Z80.r += 2;
+			Z80.icount -= 8;
+			cb_7f();
+			continue;
+		default:
+			return;
+		}
+		Z80.after_ei = 0;
+		Z80.after_ldair = 0;
+		PRVPC = pc;
+		PC++;
+		Z80.r++;
+		if (op == 0x10 || op == 0x7e)
+			md_z80_skip_waits(op);
+		switch (op)
+		{
+		case 0x1a: cyc = 7;  Z80.icount -= cyc; op_1a(); break;
+		case 0xe6: cyc = 7;  Z80.icount -= cyc; op_e6(); break;
+		case 0x0f: cyc = 4;  Z80.icount -= cyc; op_0f(); break;
+		case 0xc6: cyc = 7;  Z80.icount -= cyc; op_c6(); break;
+		case 0x6f: cyc = 4;  Z80.icount -= cyc; op_6f(); break;
+		case 0x7e: cyc = 7;  Z80.icount -= cyc; op_7e(); break;
+		case 0xd9: cyc = 4;  Z80.icount -= cyc; op_d9(); break;
+		case 0x82: cyc = 4;  Z80.icount -= cyc; op_82(); break;
+		case 0x57: cyc = 4;  Z80.icount -= cyc; op_57(); break;
+		case 0x75: cyc = 7;  Z80.icount -= cyc; op_75(); break;
+		case 0x74: cyc = 7;  Z80.icount -= cyc; op_74(); break;
+		case 0x41: cyc = 4;  Z80.icount -= cyc; op_41(); break;
+		case 0x10: cyc = 8;  Z80.icount -= cyc; op_10(); break;
+		case 0x3a: cyc = 13; Z80.icount -= cyc; op_3a(); break;
+		case 0xc2: cyc = 10; Z80.icount -= cyc; op_c2(); break;
+		case 0x13: cyc = 6;  Z80.icount -= cyc; op_13(); break;
+		case 0x0b: cyc = 6;  Z80.icount -= cyc; op_0b(); break;
+		case 0x79: cyc = 4;  Z80.icount -= cyc; op_79(); break;
+		case 0xb0: cyc = 4;  Z80.icount -= cyc; op_b0(); break;
+		case 0xc3: cyc = 10; Z80.icount -= cyc; op_c3(); break;
+		case 0xb7: cyc = 4;  Z80.icount -= cyc; op_b7(); break;
+		case 0xf2: cyc = 10; Z80.icount -= cyc; op_f2(); break;
+		default: break;
+		}
+		(void)cyc;
+	}
+}
+#endif
+
 /****************************************************************************
  * Execute 'cycles' T-states. Return number of T-states really executed
  ****************************************************************************/
@@ -3759,6 +3860,11 @@ int32_t z80_execute(int32_t cycles)
 	z80_exec = 1;
 	do
 	{
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+		md_z80_fast();
+		if (Z80.icount <= 0)
+			break;
+#endif
 		/*
 		if (Z80.wait_state)
 		{
