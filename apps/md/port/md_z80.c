@@ -135,9 +135,62 @@ void z80_pulse_reset(void)
     z80_reset();
 }
 
+#ifdef MD_Z80PROF
+#include <argon/argon.h>
+/* -DMD_Z80PROF: where the Z80 spends its time - its PC at the start of each
+ * line's slice, the commonest eight in `profile`, with the code around them */
+static uint16_t s_zp_pc[24];
+static uint32_t s_zp_n[24];
+void md_z80_prof_report(void)
+{
+    for (int k = 0; k < 8; k++) {
+        int best = -1;
+        for (int i = 0; i < 24; i++) {
+            if (s_zp_n[i] && (best < 0 || s_zp_n[i] > s_zp_n[best])) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        const uint16_t pc = s_zp_pc[best];
+        ag_printf("md: z80 pc %04x x%u:", (unsigned)pc, (unsigned)s_zp_n[best]);
+        for (int b = -6; b < 10; b++) {
+            ag_printf(" %02x", (unsigned)argon_z80_read((uint16_t)(pc + b)));
+        }
+        ag_printf("\n");
+        s_zp_n[best] = 0;
+    }
+    for (int i = 0; i < 24; i++) {
+        s_zp_n[i] = 0;
+    }
+}
+static void zp_sample(void)
+{
+    const uint16_t pc = (uint16_t)(Z80.pc.d & 0xffffu);
+    int free_i = -1;
+    for (int i = 0; i < 24; i++) {
+        if (s_zp_n[i] && s_zp_pc[i] == pc) {
+            s_zp_n[i]++;
+            return;
+        }
+        if (!s_zp_n[i] && free_i < 0) {
+            free_i = i;
+        }
+    }
+    if (free_i >= 0) {
+        s_zp_pc[free_i] = pc;
+        s_zp_n[free_i] = 1;
+    }
+}
+#endif
+
 void z80_run(int target)
 {
     int rem = 0;
+#ifdef MD_Z80PROF
+    zp_sample();
+#endif
 
     s_timeslice = 0;
     if (zclk >= target) {

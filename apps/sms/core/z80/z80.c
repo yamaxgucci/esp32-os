@@ -162,7 +162,23 @@ uint8_t (*cpu_readport16)(uint16_t port);
    the CMOS Z80, so until knowing (most) Z80 types on hardware, it's disabled */
 #define HAS_LDAIR_QUIRK     0
 
-#ifdef ARGON_MD_Z80
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+/*
+ * The CYD: its own RAM read here, out of the pages, rather than by a call
+ * into md_z80.c for every byte - the opcode fetch is one of those, and a
+ * sound driver's loop is nothing but its own RAM.
+ */
+#include "md_pages.h"
+static inline uint8_t md_z80_rd(uint32_t a)
+{
+	if (a < 0x4000u)
+		return md_zram[(a & 0x1fffu) >> MD_PAGE_SHIFT][a & MD_PAGE_MASK];
+	return argon_z80_read((uint16_t)a);
+}
+#define cpu_readmem16(a) md_z80_rd((uint32_t)(a))
+#define cpu_readop(a) md_z80_rd((uint32_t)(a))
+#define cpu_readop_arg(a) md_z80_rd((uint32_t)(a))
+#elif defined(ARGON_MD_Z80)
 #define cpu_readmem16(a) argon_z80_read((uint16_t)(a))
 #define cpu_readop(a) argon_z80_read((uint16_t)(a))
 #define cpu_readop_arg(a) argon_z80_read((uint16_t)(a))
@@ -3657,6 +3673,82 @@ INLINE void check_interrupts()
 		take_interrupt();
 }
 
+#ifdef ARGON_MD_Z80
+/*
+ * The Mega Drive's sound drivers wait, and the waits are spent here at the
+ * full 3.58 MHz like any other code.  Sonic's driver had the CYD's Z80 at
+ * 11.6 ms of a 16.7 ms frame, sampled by line (30 Oct 2026): seven slices in
+ * ten at `ld a,(hl) / or a / jp p,$-2` on $1FFF, waiting for the 68000 to
+ * post a sound, the rest mostly at `djnz $`, the pause between two DAC
+ * samples of a drum.  Both are worked out instead of run, to the T-state:
+ *
+ *  - `djnz $`: B-1 more passes at 13 each, as many as the slice holds; the
+ *    last one is executed as ever, so B, the cycles and the pitch are the same.
+ *  - `ld a,(hl) / or a / jp|jr cc,$` with HL in the Z80's own RAM: nothing
+ *    in a slice can change that byte - the 68000 runs between slices, and an
+ *    interrupt only arrives at a line's edge - so if the loop goes round once
+ *    it goes round for the rest of the slice, 21 (or 22) T-states a pass.
+ *
+ * R advances as if each instruction had run.  PicoDrive skips the 68000's
+ * waits the same way (md_idle_branch is this build's).
+ */
+static void md_z80_skip_waits(uint8_t opcode)
+{
+	if (Z80.icount <= 0)
+		return;
+	if (opcode == 0x10)
+	{
+		if (cpu_readop_arg(PCD) != 0xfe)
+			return;
+		const uint32_t b = B ? B : 256u;
+		uint32_t n = (uint32_t)Z80.icount / 13u;
+		if (n > b - 1u)
+			n = b - 1u;
+		if (n == 0u)
+			return;
+		B = (uint8_t)(b - n);
+		Z80.icount -= (int32_t)(13u * n);
+		Z80.r = (uint8_t)(Z80.r + n);
+		return;
+	}
+	if (opcode != 0x7e || HL >= 0x4000u)
+		return;
+	if (cpu_readop_arg(PCD) != 0xb7)
+		return;
+	const uint8_t  jp = cpu_readop_arg((PCD + 1u) & 0xffffu);
+	const uint32_t at = PRVPC;
+	uint32_t       pass;
+	uint32_t       target;
+	if (jp == 0xc2 || jp == 0xca || jp == 0xf2 || jp == 0xfa)
+	{
+		target = cpu_readop_arg((PCD + 2u) & 0xffffu) |
+		         ((uint32_t)cpu_readop_arg((PCD + 3u) & 0xffffu) << 8);
+		pass = 7u + 4u + 10u;
+	}
+	else if (jp == 0x20 || jp == 0x28)
+	{
+		target = (PCD + 3u + (uint32_t)(int8_t)cpu_readop_arg((PCD + 2u) & 0xffffu)) & 0xffffu;
+		pass = 7u + 4u + 12u;
+	}
+	else
+		return;
+	if (target != at)
+		return;
+	const uint8_t v = rm(HL);
+	const int round = (jp == 0xc2 || jp == 0x20) ? (v != 0)
+	                : (jp == 0xca || jp == 0x28) ? (v == 0)
+	                : (jp == 0xf2)               ? !(v & 0x80)
+	                                             : (v & 0x80) != 0;
+	if (!round)
+		return;
+	const uint32_t n = (uint32_t)Z80.icount / pass;
+	if (n == 0u)
+		return;
+	Z80.icount -= (int32_t)(pass * n);
+	Z80.r = (uint8_t)(Z80.r + 3u * n);
+}
+#endif
+
 /****************************************************************************
  * Execute 'cycles' T-states. Return number of T-states really executed
  ****************************************************************************/
@@ -3690,6 +3782,10 @@ int32_t z80_execute(int32_t cycles)
 			PC--;
 			opcode = 0;
 		}
+#ifdef ARGON_MD_Z80
+		else if (opcode == 0x10 || opcode == 0x7e)
+			md_z80_skip_waits(opcode);
+#endif
 		EXEC(op,opcode);
 	} while (Z80.icount > 0);
 

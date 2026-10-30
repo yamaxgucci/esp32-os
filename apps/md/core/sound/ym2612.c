@@ -2085,9 +2085,13 @@ void YM2612ResetChip(void)
 }
 
 /* YM2612 execution */
-/* Generate samples for ym2612 - on the CYD, from the hot part: from flash
- * it took 7.3 ms of every frame (30 Oct 2026) */
-MD_HOT static void YM2612Update(int16_t *buffer, int length)
+/*
+ * Generate samples for ym2612.  On the CYD from flash: in the hot part it took
+ * 5.2 ms of a frame against 7.3 at 22 kHz, but 4.4 KB of IRAM the Z80's RAM
+ * needed more, and at the 11 kHz the CYD runs the chips at the difference is
+ * about 0.6 ms (30 Oct 2026).
+ */
+static void YM2612Update(int16_t *buffer, int length)
 {
   int i;
   int lt;

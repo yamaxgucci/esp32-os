@@ -217,6 +217,9 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
                   (unsigned)(s_prof_vdp_us / frames), md_idle_skips);
         md_idle_skips = 0;
         s_prof_m68k_us = s_prof_z80_us = s_prof_snd_us = s_prof_vdp_us = 0;
+#ifdef MD_Z80PROF
+        { extern void md_z80_prof_report(void); md_z80_prof_report(); }
+#endif
 #ifdef MD_CYCPROF
         if (md_cp_n) {
             ag_printf("md: per instruction (cycles): fetch %u decode %u exec %u "
