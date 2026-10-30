@@ -1092,7 +1092,13 @@ resume_m68k:
 int ag_main(int argc, char **argv)
 {
     const char *rom = NULL;
+#ifdef ARGON_MD_SMALL
+    /* the CYD has a speaker, and a game is meant to be heard: `nosound` or
+     * `mock` to measure without one */
+    const char *sound_path = "pcm0";
+#else
     const char *sound_path = "mock";
+#endif
     int         frames = -1; /* <0: until Esc/Q */
     int         present_div = 1;
     int         stats = 0;
@@ -1141,6 +1147,8 @@ int ag_main(int argc, char **argv)
              * itself costs four clock reads a line */
             s_profile_frames = 1;
             stats = 1;
+        } else if (arg_eq(argv[i], "hifi")) {
+            md_sound_set_hifi(1); /* the CYD: the chips at the whole rate */
         } else if (arg_eq(argv[i], "noz80")) {
             s_run_z80_cpu = 0;
         } else if (arg_eq(argv[i], "nosound")) {

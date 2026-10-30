@@ -12,6 +12,14 @@
 
 void md_sound_set_path(const char *path); /* mock/net/pcmvirt/… or WAV path */
 void md_sound_set_net_port(uint16_t port); /* obsolete; virt port is in PCMVIRT.SYS */
+
+/*
+ * The rate the YM2612 and the PSG are run at: MD_SOUND_RATE, or on the CYD
+ * half of it, each sample then given twice (`hifi` asks for the whole rate).
+ * Set before the machine is powered on; the chips take it at reset.
+ */
+uint32_t md_sound_synth_rate(void);
+void     md_sound_set_hifi(int on);
 void md_sound_init(void);
 void md_sound_close(void);
 void md_sound_begin_frame(int lines_per_frame);

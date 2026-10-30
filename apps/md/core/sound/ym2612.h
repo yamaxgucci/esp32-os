@@ -17,7 +17,12 @@
 #define _H_YM2612_
 
 #if ARGON_TARGET
+#ifdef ARGON_MD_SMALL
+#define GWENESIS_YM2612_BUF_LEN 32 /* a line's worth, drained every line */
+#else
 #define GWENESIS_YM2612_BUF_LEN 1024
+#endif
+extern int ym2612_base;
 void YM2612SetSampleDivisor(int div);
 #endif
 

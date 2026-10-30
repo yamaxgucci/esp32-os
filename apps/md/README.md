@@ -139,6 +139,40 @@ The image is **~170 KB of code** (`MD.AXE`) in the 192 KB arena and asks for a
 tables stay in ordinary `.rodata` (PSRAM) so the Z80 fits; put them back in
 `AG_HOT_RODATA` only if the arena grows.
 
+### The CYD (`MD32.AXE`: ESP32, no PSRAM)
+
+`ARGON_MD_SMALL`: the machine's memory in 512-byte pages, VRAM partly in IRAM
+(word access only), the cartridge staged in flash, tables in flash read by
+words, and the image split (`MD_SPLIT`, `--split-hot`): the 68000's loop, the
+handlers a game runs (`md_hot.h`) and the YM2612's synthesis loop in the hot
+part, the rest streamed into flash. Sound is the native YM2612 with its tables
+at 1 KB (`tools/gen_ym2612_tables.py`) and the PSG, mono, to `/dev/pcm0`, the
+chips at 11 025 Hz (`hifi`: 22 050). Run from the card, then give the card back
+so the machine's memory fits: `run a:\md32.axe a:\game.swp noz80 waitcard`,
+Ctrl+\, `eject`, Alt+1.
+
+```
+. .\tools\idf-env.ps1
+python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc --no-stage --keep-elf build/apps/MD32.AXE.elf `
+  --include sdk/include --include apps/common --include apps/common/libc --include apps/md `
+  --include apps/md/port --include apps/md/core/bus --include apps/md/core/cpus/M68K `
+  --include apps/md/core/vdp --include apps/md/core/io `
+  --include apps/md/core/savestate --include apps/md/core/sound `
+  --include apps/sms/core/z80 --include apps/sms/core/sound --include apps/common/fm --include apps/common/dsp `
+  --cflags "-Os -DMD_SPLIT -ffunction-sections -fdata-sections -fno-builtin -include md_cfg.h -DARGON_MD_Z80 -DARGON_MD_SMALL -DARGON_SMS_SMALL -DLSB_FIRST -Wno-unused -Wno-sign-compare" `
+  --code-rodata .rodata.op_cb --code-rodata .rodata.op_dd --code-rodata .rodata.op_ed --code-rodata .rodata.op_fd `
+  --code-rodata .rodata.dd_cb --code-rodata .rodata.fd_cb --code-rodata .rodata.sms_z80_execute `
+  --libs c --split-hot -o build/apps/MD32.AXE `
+  apps/md/md_main.c `
+  apps/md/port/md_z80.c apps/md/port/md_ym_native.c apps/md/core/sound/ym2612.c apps/md/port/md_psg.c `
+  apps/md/port/md_sound_out.c apps/md/port/md_savestate_stub.c `
+  apps/common/libc/libc_shim.c `
+  apps/sms/core/z80/z80.c apps/sms/core/sound/sn76489.c `
+  apps/md/core/bus/gwenesis_bus.c apps/md/core/cpus/M68K/m68kcpu.c `
+  apps/md/core/vdp/gwenesis_vdp_gfx.c apps/md/core/vdp/gwenesis_vdp_mem.c `
+  apps/md/core/io/gwenesis_io.c apps/md/core/savestate/gwenesis_savestate.c
+```
+
 ## Run
 
 ```
