@@ -167,6 +167,25 @@ static void data(const void *buf, size_t len)
     const uint8_t *p = (const uint8_t *)buf;
     unsigned       tries = 0;
     dc(1);
+    /*
+     * Out of the row buffer, queued like a picture's rows - the console's
+     * text as well.  Through spi_xfer a 5 KB row is a long write, and a long
+     * write is the port's 8 KB staging buffer: made by the first line of text
+     * after boot, given back when memory is reshaped, and made again by the
+     * next line printed - the CYD's Mega Drive found it there, taken between
+     * its own start and its machine's memory (30 Oct 2026).  From s_row it
+     * needs no copy and no buffer at all.  Whoever writes s_row next settles
+     * first.
+     */
+    if (s_async && p >= (const uint8_t *)s_row &&
+        p + len <= (const uint8_t *)s_row + sizeof(s_row) &&
+        ((uintptr_t)p & 3u) == 0u) {
+        settle();
+        if (io->spi_write_start(LCD_BUS, LCD_CS, p, len) == AG_OK) {
+            s_out = true;
+            return;
+        }
+    }
     while (len > 0) {
         const size_t chunk = (len > s_chunk) ? s_chunk : len;
         const ag_err_t err = io->spi_xfer(LCD_BUS, LCD_CS, p, NULL, chunk);
@@ -844,12 +863,14 @@ ag_err_t ag_driver_init(void)
         }
     }
 
+    /* before the first wipe: through spi_xfer it would make the port's
+     * staging buffer, and that is then held for good */
+    s_async = AG_HAS(io, spi_write_start) && AG_HAS(io, spi_write_wait);
     if (!panel_init()) {
         /* The usual cause is a pin somebody else holds; say which. */
         return -AG_EBUSY;
     }
     s_up = true;
-    s_async = AG_HAS(io, spi_write_start) && AG_HAS(io, spi_write_wait);
 
     const ag_dev_add_t desc = {
         .name = "lcd0",
