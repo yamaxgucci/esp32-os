@@ -242,14 +242,60 @@ void md_z80_prof_report(void)
         s_zp_n[i] = 0;
     }
 }
+static void md_z80_bench_one(const char *where, const char *what,
+                             const uint8_t *prog, unsigned len)
+{
+    for (unsigned i = 0; i < len; i++) {
+        MD_ZRAM(i) = prog[i];
+    }
+    for (int quiet = 0; quiet < 2; quiet++) {
+        z80_reset();
+        const uint32_t n0 = md_zp_fast_n + md_zp_slow_n;
+        const ag_time_t u0 = ag_micros();
+        uint32_t ps = 0;
+        if (quiet) {
+            __asm__ volatile("rsil %0, 15" : "=r"(ps));
+        }
+        const uint32_t c0 = zp_cc();
+        uint32_t t = 0;
+        for (int k = 0; k < 20; k++) {
+            t += (uint32_t)sms_z80_execute(10000);
+        }
+        const uint32_t c = zp_cc() - c0;
+        if (quiet) {
+            __asm__ volatile("wsr %0, ps; rsync" :: "r"(ps));
+        }
+        const uint32_t us = (uint32_t)(ag_micros() - u0);
+        const uint32_t n = md_zp_fast_n + md_zp_slow_n - n0;
+        ag_printf("md: z80bench %s %s%s: %u instructions, %u cycles an instruction, "
+                  "%u MHz\n", where, what, quiet ? " (no interrupts)" : "",
+                  (unsigned)n, n ? (unsigned)(c / n) : 0u, us ? (unsigned)(c / us) : 0u);
+    }
+}
+
 /*
- * `z80bench` (profile builds): the interpreter alone, on a loop of the kinds
- * a driver is made of, in the Z80's own RAM - cycles an instruction, on the
- * core that calls it.  Run before the machine starts.
+ * `z80bench` (profile builds): the interpreter alone, in the Z80's own RAM -
+ * cycles an instruction, on the core that calls it, for 64 NOPs and a jump,
+ * 60 register loads and a jump, and a loop of the kinds a driver is made of.
+ * Run before the machine starts.
  */
 void md_z80_bench(const char *where)
 {
-    static const uint8_t prog[] = {
+    static uint8_t prog[80];
+    for (unsigned i = 0; i < 64; i++) {
+        prog[i] = 0x00;
+    }
+    prog[63] = 0x23; /* inc hl: no two passes alike (md_z80_spin) */
+    prog[64] = 0xc3; prog[65] = 0x00; prog[66] = 0x00;
+    md_z80_bench_one(where, "nops", prog, 67);
+    static const uint8_t ld[] = { 0x47, 0x48, 0x51, 0x5a, 0x63, 0x6c, 0x7d, 0x78, 0x41, 0x4a };
+    for (unsigned i = 0; i < 60; i++) {
+        prog[i] = ld[i % 10];
+    }
+    prog[59] = 0x23;
+    prog[60] = 0xc3; prog[61] = 0x00; prog[62] = 0x00;
+    md_z80_bench_one(where, "ld r,r", prog, 63);
+    static const uint8_t mix[] = {
         0x21, 0x00, 0x10,       /* 0000 ld hl,1000h   */
         0x11, 0x00, 0x18,       /* 0003 ld de,1800h   */
         0x06, 0x00,             /* 0006 ld b,0        */
@@ -264,21 +310,7 @@ void md_z80_bench(const char *where)
         0x10, 0xf4,             /* 0012 djnz 0008     */
         0xc3, 0x00, 0x00,       /* 0014 jp 0000       */
     };
-    for (unsigned i = 0; i < sizeof(prog); i++) {
-        MD_ZRAM(i) = prog[i];
-    }
-    z80_reset();
-    const uint32_t n0 = md_zp_fast_n + md_zp_slow_n;
-    const uint32_t c0 = zp_cc();
-    uint32_t t = 0;
-    for (int k = 0; k < 100; k++) {
-        t += (uint32_t)sms_z80_execute(10000);
-    }
-    const uint32_t c = zp_cc() - c0;
-    const uint32_t n = md_zp_fast_n + md_zp_slow_n - n0;
-    ag_printf("md: z80bench %s: %u instructions, %u T-states, %u cycles - "
-              "%u cycles an instruction\n", where, (unsigned)n, (unsigned)t,
-              (unsigned)c, n ? (unsigned)(c / n) : 0u);
+    md_z80_bench_one(where, "mix", mix, sizeof(mix));
 }
 
 static void zp_sample(void)

@@ -792,9 +792,10 @@ static void md_ring_start(int rows)
         return;
     }
     s_ring_run = 1;
-    /* 3 KB: Sonic with the sound left 2 KB of 4 never used, and an H32
-     * line no longer takes 1152 bytes of it (gwenesis_vdp_gfx.c) */
-    s_presenter = ag_thread_create(md_presenter, NULL, "mdglass", 3072, 4,
+    /* 2.5 KB: Sonic with the sound left 2 KB of 4 never used, and an H32
+     * line no longer takes 1152 bytes of it (gwenesis_vdp_gfx.c); at 3 KB
+     * 1044 bytes were never used (31 Oct 2026) */
+    s_presenter = ag_thread_create(md_presenter, NULL, "mdglass", 2560, 4,
                                    AG_THREAD_SYS_CORE);
     if (s_presenter == NULL) {
         s_ring_run = 0;
