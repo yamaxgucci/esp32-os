@@ -240,6 +240,7 @@ function Build-HostTools {
 $script:BoardPackOf = @{
     'esp32'         = 'esp32-cyd'
     'esp32-cyd'     = 'esp32-cyd'
+    'esp32-cyd-md'  = 'esp32-cyd'
     'esp32s3-board' = 'esp32s3-cam'
     'esp32s3-cam'   = 'esp32s3-cam'
     'esp32s3-zero'  = 'esp32s3-zero'
@@ -424,6 +425,8 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                               serial pipe and flash drive (KVM.AXE, partitions_kvm.csv)'
             Write-Host '                esp32s3-lcd2   Waveshare ESP32-S3-Touch-LCD-2: 16 MB flash, ST7789 panel and TF card on one SPI bus'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
+            Write-Host '                esp32-cyd   the CYD as the OS wants it (sdkconfig.esp32.cyd)'
+            Write-Host '                esp32-cyd-md   the same, with 9 KB more IRAM for the Mega Drive (sdkconfig.esp32.cydmd)'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             Write-Host '                esp32c6     hardware: RISC-V, USB console, the C6-LCD-1.47'
             Write-Host '                esp32c3     hardware: RISC-V, USB console, one core, 400 KB - the C3 SuperMini'
@@ -445,6 +448,9 @@ switch ($Command.ToLowerInvariant()) {
                             $chip = 'esp32' }
             'esp32-cyd' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.cyd'
                           $chip = 'esp32' }
+            # The CYD with what helps only the Mega Drive, on top of the CYD.
+            'esp32-cyd-md' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.cyd;sdkconfig.esp32.cydmd'
+                             $chip = 'esp32' }
             'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
             'esp32s3-board' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board'
                               $chip = 'esp32s3' }

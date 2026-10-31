@@ -102,13 +102,9 @@ CONFIG_WL_SECTOR_SIZE_4096=n
 # starts; the Mega Drive still gets its 128 KB.
 CONFIG_ARGON_HEAP_TWOEND=y
 
-# The radio's PHY fast paths stay in flash: 9 KB of IRAM back for programs,
-# and on this board the radio is off whenever something wants that memory.
-# Measured 29 Oct 2026 with MD32 on the panel: game speed and pictures a second
-# unchanged.  Tried and refused the same day: FreeRTOS, ring buffers or the
-# heap's functions in flash - each made the panel's present path slower (the
-# heap alone: 155 -> 270 us a row, 6 -> 3.4 pictures a second).
-CONFIG_ESP_PHY_IRAM_OPT=n
+# What helps only the Mega Drive, and could cost the rest, is not here: it is
+# sdkconfig.esp32.cydmd, `argon target esp32-cyd-md`.  The Mega Drive runs on
+# this one too (1 Nov 2026).
 
 # The flash on four lines (QIO), not two (DIO).  Every cache miss on the
 # ESP32 is a 32-byte line read over SPI, ~450 CPU cycles in DIO at 80 MHz;

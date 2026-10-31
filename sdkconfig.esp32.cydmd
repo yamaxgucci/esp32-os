@@ -1,0 +1,27 @@
+# ArgonOS - the CYD for the Mega Drive (MD-NO-PSRAM.AXE), with room to spare.
+#
+#   argon target esp32-cyd-md
+#
+# An overlay on sdkconfig.esp32.cyd.  That file is the CYD as the OS wants it,
+# with what makes the whole system better and is measured to: the two-ended
+# heap, the card's FAT at 512-byte sectors, the flash on four lines.  What is
+# here helps only the one program that needs the board's last kilobytes, and
+# has not been shown to leave the rest as it was, so it is not the default.
+#
+# The radio's PHY fast paths in flash: 9 KB of IRAM back for programs.  On
+# 29 Oct 2026 the Mega Drive did not start without them - its machine is cut
+# into 512-byte pages from what the heap has left, and it came up a page short.
+# On 1 Nov 2026, after the savings since (one SPI staging buffer, a process's
+# arguments in a block of their size, the card's FAT at 512), it starts and
+# runs on the plain CYD at the same speed: five starts in a row, Sonic 41,
+# Gunstar Heroes 50, Sonic Spinball 39, Thunder Force IV 32 whole pictures a
+# second, as with this overlay.  So this is a margin, for a start that comes
+# up a page short, not a requirement.
+#
+# What it may cost: the radio's own speed with those paths in flash was never
+# measured; the Mega Drive runs with the radio off.
+#
+# Tried and refused on 29 Oct 2026, for every CYD: FreeRTOS, ring buffers or
+# the heap's functions in flash - each made the panel's present path slower
+# (the heap alone: 155 -> 270 us a row, 6 -> 3.4 pictures a second).
+CONFIG_ESP_PHY_IRAM_OPT=n
