@@ -77,7 +77,8 @@ uint32_t md_zp_fast_n, md_zp_slow_n; /* instructions, by which loop ran them */
 #endif
 
 #ifdef ARGON_SMS_SMALL
-int md_z80_slice_done(void); /* z80.c */
+int  md_z80_slice_done(void); /* z80.c */
+void md_z80_spin_until(int tstates);
 /*
  * The Z80's own time, for what it writes to the chips and when it reads
  * them: its slice's start and the T-states run so far.  The end of the slice
@@ -104,7 +105,13 @@ uint8_t argon_z80_read(uint16_t address)
     }
     if (address < 0x6000u) {
         int tgt = md_z80_now();
-        return (uint8_t)YM2612Read(tgt);
+        const uint8_t v = (uint8_t)YM2612Read(tgt);
+#ifdef ARGON_SMS_SMALL
+        /* its status is time's: the same until a timer's next overflow */
+        const int until = ym2612_status_until();
+        md_z80_spin_until((until == 0x7fffffff) ? until : (until - tgt) / Z80_FREQ_DIVISOR);
+#endif
+        return v;
     }
     if (address >= 0x8000u) {
 #ifdef MD_Z80PROF
@@ -131,6 +138,12 @@ MD_HOT void argon_z80_write(uint16_t address, uint8_t data)
     }
     if (address < 0x6000u) {
         int tgt = md_z80_now();
+#ifdef MD_HOST_YMHASH
+        {
+            extern uint32_t md_host_ymhash;
+            md_host_ymhash = md_host_ymhash * 31u + ((address & 3u) << 8 | data) * 7u + (uint32_t)tgt;
+        }
+#endif
 #ifdef MD_Z80PROF
         const uint32_t c0 = zp_cc();
         YM2612Write((unsigned int)address & 3u, data, tgt);

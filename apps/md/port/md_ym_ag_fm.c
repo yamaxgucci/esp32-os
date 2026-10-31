@@ -221,6 +221,12 @@ unsigned int YM2612Read(int target)
     return 0u;
 }
 
+/* no timers here: the status never changes (md_z80.c) */
+int ym2612_status_until(void)
+{
+    return 0x7fffffff;
+}
+
 void ym2612_run(int target)
 {
     s_clock = target;
@@ -275,6 +281,7 @@ void YM2612Config(unsigned char dac_bits) { (void)dac_bits; }
 void YM2612ResetChip(void) {}
 void YM2612Write(unsigned int a, unsigned int v, int target) { (void)a; (void)v; (void)target; }
 unsigned int YM2612Read(int target) { (void)target; return 0; }
+int ym2612_status_until(void) { return 0x7fffffff; }
 void md_ym_render(int16_t *left, int16_t *right, int samples) { (void)left; (void)right; (void)samples; }
 void ym2612_run(int target) { (void)target; }
 void md_ym_frame_begin(int lines_per_frame) { (void)lines_per_frame; }

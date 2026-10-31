@@ -144,6 +144,19 @@ void    argon_z80_write(uint16_t address, uint8_t data);
 
 Z80_Regs Z80;
 
+#ifdef ARGON_MD_Z80
+/*
+ * Counts everything the Z80 does that a pass of a wait loop may not do: a
+ * write (memory, a chip, a port, the stack), and a read whose answer is not
+ * fixed for the slice (a port, LD A,R, the YM's status - md_z80.c counts
+ * that one).  md_z80_spin compares it from one pass to the next.
+ */
+uint32_t md_z80_touch;
+#define MD_TOUCH() (md_z80_touch++)
+#else
+#define MD_TOUCH() ((void)0)
+#endif
+
 int32_t z80_cycle_count = 0;        /* running total of cycles executed */
 static int32_t z80_exec = 0;
 static int32_t z80_requested_cycles = 0;
@@ -577,11 +590,29 @@ PROTOTYPES(Z80xycb,xycb);
 #define CC(prefix,opcode) do { Z80.icount -= CC_OF(Z80_TABLE_##prefix, opcode); } while (0)
 
 /***************************************************************
+ * -DMD_HOST_ZCOUNT (host harness): every instruction counted by its
+ * prefix and opcode, md_zcount[prefix * 256 + opcode]
+ ***************************************************************/
+#ifdef MD_HOST_ZCOUNT
+#define MD_ZC_op   0
+#define MD_ZC_cb   1
+#define MD_ZC_dd   2
+#define MD_ZC_ed   3
+#define MD_ZC_fd   4
+#define MD_ZC_xycb 5
+unsigned long long md_zcount[6 * 256];
+#define MD_ZCOUNT(prefix,opcode) (md_zcount[MD_ZC_##prefix * 256 + (opcode)]++)
+#else
+#define MD_ZCOUNT(prefix,opcode) ((void)0)
+#endif
+
+/***************************************************************
  * execute an opcode
  ***************************************************************/
 #define EXEC(prefix,opcode) do { \
 	uint32_t op = opcode; \
 	CC(prefix,op); \
+	MD_ZCOUNT(prefix,op); \
 	switch(op) \
 	{  \
 	case 0x00:prefix##_##00();break; case 0x01:prefix##_##01();break; case 0x02:prefix##_##02();break; case 0x03:prefix##_##03();break; \
@@ -672,6 +703,7 @@ INLINE void leave_halt()
  ***************************************************************/
 INLINE uint8_t in(uint16_t port)
 {
+	MD_TOUCH();
 	return (uint8_t)cpu_readport16(port);
 }
 
@@ -680,6 +712,7 @@ INLINE uint8_t in(uint16_t port)
  ***************************************************************/
 INLINE void out(uint16_t port, uint8_t value)
 {
+	MD_TOUCH();
 	cpu_writeport16(port, value);
 }
 
@@ -703,6 +736,14 @@ INLINE uint8_t rm(uint32_t addr)
  ***************************************************************/
 INLINE void wm(uint32_t addr, uint8_t value)
 {
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+	/* the same value into its own RAM again changes nothing: Road Rash II's
+	 * wait loop stores a 1 on every pass (md_z80_spin) */
+	if (addr >= 0x4000u || md_z80_rd(addr) != value)
+		MD_TOUCH();
+#else
+	MD_TOUCH();
+#endif
 	cpu_writemem16(addr, value);
 }
 
@@ -902,6 +943,7 @@ INLINE void ld_r_a()
  ***************************************************************/
 INLINE void ld_a_r()
 {
+	MD_TOUCH();
 	A = (Z80.r & 0x7f) | Z80.r2;
 	F = (F & CF) | Z80_FLAGS(SZ, md_sz, A) | (Z80.iff2 << 2);
 	Z80.after_ldair = 1;
@@ -3864,6 +3906,91 @@ void md_z80_idle_advance(int n)
 	Z80.r = (uint8_t)(Z80.r + (uint32_t)(Z80.halt ? 1u : s_idle_r) * (uint32_t)n);
 }
 
+/*
+ * Any wait loop, whatever it is made of.
+ *
+ * The drivers wait in loops of their own: GEMS (Comix Zone, Spinball) in
+ * `bit 0,(hl) / jp z`, Streets of Rage in `ld a,(hl) / cp n / jp c`, Sonic 2
+ * in `ld a,d / or e / jr z` - 400-540 thousand instructions a second of the
+ * Z80's ~500 thousand, against Alex Kidd's 114 (host harness, 31 Oct 2026).
+ * Matching them one by one would never end.
+ *
+ * But a pass that wrote nothing, read nothing that time changes, and came
+ * back to where it started with every register as it was, will be the same
+ * pass again - and again, until the slice ends or an interrupt comes, since
+ * nothing else can reach the Z80 inside a slice (the 68000's writes come
+ * between slices, md_snd_async.c).  So at each jump back, the registers are
+ * kept; at the next arrival at the same place with nothing touched and the
+ * same registers, the passes that fit in the slice are counted out.  R moves
+ * as if they had run; what is less than a pass runs.
+ */
+static uint16_t s_spin_pc;
+static uint8_t  s_spin_ok, s_spin_r;
+static uint32_t s_spin_touch;
+static int32_t  s_spin_icount;
+static uint16_t s_spin_reg[12];
+static uint8_t  s_spin_st[5];
+/* A read whose answer holds only for a while - the YM's status, held until a
+ * timer's next overflow (md_z80.c): passes counted out end before it. */
+static uint32_t s_vreads, s_spin_vreads;
+static int32_t  s_spin_floor; /* the icount at which the last one may change */
+
+void md_z80_spin_until(int tstates)
+{
+	if (tstates > (1 << 24))
+		tstates = 1 << 24;
+	s_vreads++;
+	s_spin_floor = Z80.icount - tstates;
+}
+
+static inline __attribute__((always_inline)) void md_spin_regs(uint16_t *r, uint8_t *st)
+{
+	r[0] = Z80.af.w.l;  r[1] = Z80.bc.w.l;  r[2] = Z80.de.w.l;  r[3] = Z80.hl.w.l;
+	r[4] = Z80.ix.w.l;  r[5] = Z80.iy.w.l;  r[6] = Z80.sp.w.l;  r[7] = Z80.wz.w.l;
+	r[8] = Z80.af2.w.l; r[9] = Z80.bc2.w.l; r[10] = Z80.de2.w.l; r[11] = Z80.hl2.w.l;
+	st[0] = Z80.iff1; st[1] = Z80.iff2; st[2] = Z80.im; st[3] = Z80.i; st[4] = Z80.halt;
+}
+
+MD_HOT __attribute__((noinline)) static void md_z80_spin(void)
+{
+	uint16_t r[12];
+	uint8_t  st[5];
+	md_spin_regs(r, st);
+	if (s_spin_ok && s_spin_pc == (uint16_t)PCD && s_spin_touch == md_z80_touch &&
+	    memcmp(r, s_spin_reg, sizeof(r)) == 0 && memcmp(st, s_spin_st, sizeof(st)) == 0 &&
+	    !Z80.nmi_pending && !(Z80.irq_state != CLEAR_LINE && Z80.iff1))
+	{
+		const int32_t pass = s_spin_icount - Z80.icount;
+		int32_t       room = Z80.icount;
+		if (s_vreads != s_spin_vreads && room > Z80.icount - s_spin_floor - 1)
+			room = Z80.icount - s_spin_floor - 1;
+		if (pass > 0 && room > pass)
+		{
+			const int32_t n = room / pass;
+			Z80.icount -= n * pass;
+			Z80.r = (uint8_t)(Z80.r + (uint8_t)(Z80.r - s_spin_r) * (uint32_t)n);
+		}
+	}
+	s_spin_ok = 1;
+	s_spin_pc = (uint16_t)PCD;
+	s_spin_touch = md_z80_touch;
+	s_spin_vreads = s_vreads;
+	s_spin_icount = Z80.icount;
+	s_spin_r = Z80.r;
+	memcpy(s_spin_reg, r, sizeof(r));
+	memcpy(s_spin_st, st, sizeof(st));
+}
+
+/* after an instruction: a jump back by a little (or to itself) - a loop */
+#ifdef MD_NO_SPIN
+#define MD_SPIN_CHECK() ((void)0)
+#else
+#define MD_SPIN_CHECK() do { \
+	if (PCD <= PRVPC && PRVPC - PCD < 64u) \
+		md_z80_spin(); \
+} while (0)
+#endif
+
 /* noinline: one copy, not one in md_z80_fast's flattened body as well */
 MD_HOT __attribute__((noinline)) static void md_z80_skip_waits(uint8_t opcode)
 {
@@ -3978,6 +4105,7 @@ MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
 				dd_72();
 			else
 				dd_73();
+			MD_SPIN_CHECK();
 			continue;
 		}
 		case 0xcb:
@@ -3990,6 +4118,7 @@ MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
 			Z80.r += 2;
 			Z80.icount -= 8;
 			cb_7f();
+			MD_SPIN_CHECK();
 			continue;
 		default:
 			return;
@@ -4031,6 +4160,7 @@ MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
 		default: break;
 		}
 		(void)cyc;
+		MD_SPIN_CHECK();
 	}
 }
 #endif
@@ -4043,9 +4173,12 @@ int32_t z80_execute(int32_t cycles)
 	Z80.icount = cycles;
 	z80_requested_cycles = Z80.icount;
 	z80_exec = 1;
+#ifdef ARGON_MD_Z80
+	s_spin_ok = 0;
+#endif
 	do
 	{
-#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL) && !defined(MD_HOST_ZCOUNT)
 		md_z80_fast();
 		if (Z80.icount <= 0)
 			break;
@@ -4085,6 +4218,9 @@ int32_t z80_execute(int32_t cycles)
 			md_z80_skip_waits(opcode);
 #endif
 		EXEC(op,opcode);
+#ifdef ARGON_MD_Z80
+		MD_SPIN_CHECK();
+#endif
 	} while (Z80.icount > 0);
 
 	z80_exec = 0;

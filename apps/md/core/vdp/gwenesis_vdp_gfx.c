@@ -72,9 +72,13 @@ unsigned char *screen, *scaled_screen;
  */
 static inline __attribute__((always_inline)) int md_vdp_core(void)
 {
+#ifdef __XTENSA__
   unsigned int id;
   __asm__("rsr %0, prid" : "=a"(id));
   return (int)((id >> 13) & 1u);
+#else
+  return 0; /* the host harness: one core */
+#endif
 }
 static unsigned short *screen_buffer_line_c[2];
 static unsigned short *screen_buffer_c[2];

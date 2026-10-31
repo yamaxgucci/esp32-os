@@ -849,19 +849,34 @@ INLINE void CSMKeyControll(FM_CH *CH)
   ym2612.OPN.SL3.key_csm = 1;
 }
 
+/*
+ * The timers count the system clock, not samples.
+ *
+ * A tick of timer A is one of the chip's own samples, 1008 system clocks
+ * (the clock / 7 / 144) - upstream's divisor (AUDIO_FREQ_DIVISOR, 1009) made
+ * one sample one tick, and the counters were decremented by one a sample.
+ * ArgonOS makes 22050 samples a second (11025 on the CYD), and the timers ran
+ * 2.4 (4.8) times slow: the music of every driver timed by them - GEMS, ECCO,
+ * Thunder Force IV - at a fraction of its tempo (31 Oct 2026).  So TAC and
+ * TBC hold system clocks, and each sample takes away its divisor's worth.
+ */
+#define YM_TIMER_CLK AUDIO_FREQ_DIVISOR
+
 INLINE void INTERNAL_TIMER_A()
 {
   if (ym2612.OPN.ST.mode & 0x01)
   {
-    ym2612.OPN.ST.TAC--;
+    ym2612.OPN.ST.TAC -= (INT32)ym2612.divisor;
     if (ym2612.OPN.ST.TAC <= 0)
     {
       /* set status (if enabled) */
       if (ym2612.OPN.ST.mode & 0x04)
         ym2612.OPN.ST.status |= 0x01;
 
-      /* reload the counter */
-      ym2612.OPN.ST.TAC = ym2612.OPN.ST.TAL;
+      /* reload the counter, keeping what the sample went past it by */
+      do
+        ym2612.OPN.ST.TAC += ym2612.OPN.ST.TAL * YM_TIMER_CLK;
+      while (ym2612.OPN.ST.TAC <= 0);
 
       /* CSM mode auto key on */
       if ((ym2612.OPN.ST.mode & 0xC0) == 0x80)
@@ -874,18 +889,17 @@ INLINE void INTERNAL_TIMER_B(int step)
 {
   if (ym2612.OPN.ST.mode & 0x02)
   {
-    ym2612.OPN.ST.TBC-=step;
+    ym2612.OPN.ST.TBC -= step * (INT32)ym2612.divisor;
     if (ym2612.OPN.ST.TBC <= 0)
     {
       /* set status (if enabled) */
       if (ym2612.OPN.ST.mode & 0x08)
         ym2612.OPN.ST.status |= 0x02;
 
-      /* reload the counter */
-      if (ym2612.OPN.ST.TBL)
-        ym2612.OPN.ST.TBC += ym2612.OPN.ST.TBL;
-      else
-        ym2612.OPN.ST.TBC = ym2612.OPN.ST.TBL;
+      /* reload the counter (TBL is never 0: (256 - TB) << 4) */
+      do
+        ym2612.OPN.ST.TBC += ym2612.OPN.ST.TBL * YM_TIMER_CLK;
+      while (ym2612.OPN.ST.TBC <= 0);
     }
   }
 }
@@ -921,9 +935,9 @@ INLINE void set_timers(int v )
 
   /* reload Timers */
   if ((v&1) && !(ym2612.OPN.ST.mode&1))
-    ym2612.OPN.ST.TAC = ym2612.OPN.ST.TAL;
+    ym2612.OPN.ST.TAC = ym2612.OPN.ST.TAL * YM_TIMER_CLK;
   if ((v&2) && !(ym2612.OPN.ST.mode&2))
-    ym2612.OPN.ST.TBC = ym2612.OPN.ST.TBL;
+    ym2612.OPN.ST.TBC = ym2612.OPN.ST.TBL * YM_TIMER_CLK;
 
   /* reset Timers flags */
   ym2612.OPN.ST.status &= (~v >> 4);
@@ -2418,6 +2432,30 @@ unsigned int YM2612Read(int target)
     ym2612_run(target);
   ym_log(__FUNCTION__, "%02x",ym2612.OPN.ST.status & 0xff);
   return ym2612.OPN.ST.status & 0xff;
+}
+
+/*
+ * After a read: when its answer could next be different.  Only a timer's
+ * overflow sets a flag (a write that clears one is the Z80's own, and the
+ * busy flag is not emulated); a timer's counter goes down by the divisor a
+ * sample, so it overflows on the sample that takes it to 0 or below - made
+ * once the chip is run to that sample's clock.
+ */
+int ym2612_status_until(void)
+{
+  const int d = (int)ym2612.divisor;
+  int k = 0x7fffffff;
+  if ((ym2612.OPN.ST.mode & 0x05) == 0x05 && !(ym2612.OPN.ST.status & 0x01)) {
+    const int a = (ym2612.OPN.ST.TAC + d - 1) / d;
+    if (a < k) k = a;
+  }
+  if ((ym2612.OPN.ST.mode & 0x0a) == 0x0a && !(ym2612.OPN.ST.status & 0x02)) {
+    const int b = (ym2612.OPN.ST.TBC + d - 1) / d;
+    if (b < k) k = b;
+  }
+  if (k == 0x7fffffff) return k;
+  if (k < 1) k = 1;
+  return ym2612_clock + k * d;
 }
 
 

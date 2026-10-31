@@ -40,6 +40,9 @@ extern void YM2612ResetChip(void);
 extern void YM2612Write(unsigned int a, unsigned int v, int target);
 extern void ym2612_run(int target);
 extern unsigned int YM2612Read(int target);
+/* The system clock until which the status just read cannot change - the
+ * next overflow of a timer that would set its flag; 0x7fffffff if none. */
+extern int ym2612_status_until(void);
 
 #if 0
 extern int YM2612LoadContext(unsigned char *state);
