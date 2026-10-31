@@ -151,6 +151,20 @@ chips at 11 025 Hz (`hifi`: 22 050). Run from the card, then give the card back
 so the machine's memory fits: `run a:\md-no-psram.axe a:\game.swp waitcard`,
 Ctrl+\, `eject`, Alt+1.
 
+The firmware under it is the CYD's kernel line (branch `cyd-sdfix`) built as
+`argon target esp32-cyd-md`: the CYD plus `sdkconfig.esp32.cydmd`, which puts
+the radio's PHY paths in flash for the 9 KB of IRAM the machine's pages need.
+A plain `esp32-cyd` keeps them in IRAM, and the machine comes up one or more
+pages short there.
+
+Raster effects (`md_raster.c`): the frame's mid-screen writes to the VDP's
+registers, vertical scroll and palette are recorded with their lines, and the
+horizontal scroll table is copied before the vertical blank rewrites it (and
+before any write into it while lines are shown), so a pass drawn afterwards
+by both cores gives each band its own scroll. The record takes what the heap
+leaves after the machine's pages; `stats` says how many writes it holds and
+how many frames had more.
+
 ```
 . .\tools\idf-env.ps1
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc --no-stage --keep-elf build/apps/MD-NO-PSRAM.AXE.elf `

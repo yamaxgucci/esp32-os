@@ -27,6 +27,9 @@ __license__ = "GPLv3"
 #ifdef ARGON_MD_SMALL
 #include "md_raster.h"
 #endif
+#ifndef MD_RAS_VRAM
+#define MD_RAS_VRAM(start, bytes) do { } while (0)
+#endif
 #include "gwenesis_io.h"
 #include "gwenesis_bus.h"
 #include "gwenesis_sn76489.h"
@@ -298,6 +301,13 @@ static inline __attribute__((always_inline)) void gwenesis_vdp_register_w(int re
     if ((BIT(gwenesis_vdp_regs[0x1], 2)==0) && reg > 0xA)
         return;
 
+#ifdef ARGON_MD_SMALL
+    /* the scroll mode or table changing while lines are shown: the lines
+     * above keep the table as they read it (md_raster.c) */
+    if ((reg == 11 || reg == 13) && md_ras_hs_lo != 0x80000000u &&
+        gwenesis_vdp_regs[reg] != value)
+      md_raster_hs_write();
+#endif
     gwenesis_vdp_regs[reg] = value;
 #ifdef ARGON_MD_SMALL
     MD_VDP_NOTE(MD_RAS_REG, reg);
@@ -446,6 +456,7 @@ void gwenesis_vdp_dma_fill(unsigned short value)
         
   switch (code_reg & 0xF) {
   case 0x1:
+    MD_RAS_VRAM(address_reg, dma_length * REG15_DMA_INCREMENT + 2);
     do {
       gwenesis_vdp_vram_write((address_reg ^ 1) & 0xFFFF, value >> 8);
       address_reg += REG15_DMA_INCREMENT;
@@ -552,6 +563,7 @@ void gwenesis_vdp_dma_m68k()
       switch (code_reg & 0xF) {
 
       case 0x1: // dest is VRAM
+        MD_RAS_VRAM(address_reg, dma_length * REG15_DMA_INCREMENT + 2);
         do {
           value = FETCH16RAM( src_addr );
           push_fifo(value);
@@ -619,7 +631,7 @@ MD_VDP_NOTE(MD_RAS_VS, (address_reg & 0x7f) >> 1);
       switch (code_reg & 0xF) {
 
       case 0x1: // dest is VRAM
-
+        MD_RAS_VRAM(address_reg, dma_length * REG15_DMA_INCREMENT + 2);
         do {
           value = FETCH16ROM(src_addr);
           push_fifo(value);
@@ -708,6 +720,7 @@ void gwenesis_vdp_dma_copy()
     unsigned short src_addr_low = REG21_DMA_SRCADDR_LOW;
     //vdpm_log(__FUNCTION__,"length:%x src:%x",dma_length,src_addr_low);
 
+    MD_RAS_VRAM(address_reg, (dma_length ? dma_length : 0xFFFF) * REG15_DMA_INCREMENT + 2);
     do
     {
         unsigned short value = VRAM_RD8(src_addr_low ^ 1);
@@ -880,6 +893,7 @@ void gwenesis_vdp_write_data_port_16(unsigned int value)
         case 0x1: /* VRAM write */
             //vdpm_log(__FUNCTION__,"VRAM write : addr:%x increment:%d value:%04x",
              // address_reg, REG15_DMA_INCREMENT, value);
+            MD_RAS_VRAM(address_reg, 2);
             gwenesis_vdp_vram_write(address_reg& 0xFFFF, (value >> 8) & 0xFF);
             gwenesis_vdp_vram_write((address_reg^1)& 0xFFFF, (value)&0xFF);
             address_reg += REG15_DMA_INCREMENT;

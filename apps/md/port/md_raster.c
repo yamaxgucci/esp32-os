@@ -25,17 +25,35 @@
  * is the live one unless the frame wrote it while lines were shown: it is
  * written in the vertical blank, for the VRAM the pass draws from.
  *
- * Two records: the 68000 writes one while the drawer may be copying the
- * other.  A frame with more writes than a record holds is drawn as before.
+ * A pass is drawn by both cores all the same: a line with writes before it
+ * is drawn only once every line above it has been, and the core that takes
+ * it puts the writes in first (md_main.c, claim_line).  Gunstar Heroes
+ * changes its registers at the status bar every frame, and drawn by one core
+ * those frames gave 20-28 pictures a second (31 Oct 2026).
+ *
+ * Two records: the 68000 writes one while a pass draws from the other.  A
+ * record grows in pieces of 32 writes, as many as the heap's leftovers give
+ * (up to 256), after the scroll and palette copies - on the CYD that is one
+ * piece.  Gunstar Heroes' intro sets the vertical scroll on every line, 223
+ * writes a frame in 669 frames of 3600 (host harness, 31 Oct 2026); a frame
+ * with more writes than the record holds is drawn as before.
  *
  * The horizontal scroll table is in VRAM, which the game rewrites in the
  * vertical blank for the next frame - the pass, drawn after it, gave each
  * band of Road Rash II's road this frame's height and the next frame's curve,
- * and the horizon shook (31 Oct 2026).  So the 68000 copies the table when
- * the last visible line has run (md_raster_visible), before the vertical
- * blank's DMA, and publishes the frame then.  There is one copy: while a pass
- * draws from it the frames that finish are not published, and the drawer
- * waits for the next one rather than draw the same frame again.
+ * and the horizon shook (31 Oct 2026).  So the table is copied when the last
+ * visible line has run (md_raster_visible), before the vertical blank's DMA,
+ * and the frame published then.  Gunstar Heroes also rewrites the table while
+ * the screen is shown, and the bands of its town came out shifted (host
+ * harness, 31 Oct 2026): a write into the table while lines are shown first
+ * copies the lines above it (md_raster_hs_write, from the VDP's VRAM write).
+ * Taking every line's words as its picture started did the same with a call
+ * into flash on every line, and Thunder Force IV's 68000 took 0.45 ms a frame
+ * longer (31 Oct 2026).
+ *
+ * There is one copy: while a pass draws from it the frames that finish are
+ * not published, and the drawer waits for the next one rather than draw the
+ * same frame again.
  *
  * All of it is taken from what the heap has left once the machine's pages
  * are cut (md_raster_init): blocks too small for a 512-byte page, which the
@@ -67,16 +85,25 @@ unsigned char  *md_vr_regs = gwenesis_vdp_regs;
 unsigned short *md_vr_vsram = VSRAM;
 unsigned short *md_vr_cram565 = CRAM565;
 
-#define MD_RAS_EVENTS 32
+/* the writes a record holds, in pieces */
+#define MD_RAS_PIECE  32
+#ifndef MD_RAS_PIECES
+#define MD_RAS_PIECES 8
+#endif
+#define MD_RAS_EVENTS (MD_RAS_PIECE * MD_RAS_PIECES)
 
 typedef struct {
     uint8_t  regs[MD_RAS_REGS];
     uint16_t vsram[MD_RAS_VSRAM];
-    uint16_t n;    /* events; MD_RAS_EVENTS + 1 once it overflowed */
+    uint16_t n;    /* events; cap + 1 once it overflowed */
     uint16_t cram; /* palette writes among them */
     /* line << 20 | kind << 18 | index << 12 | value */
-    uint32_t ev[MD_RAS_EVENTS];
+    uint32_t *ev[MD_RAS_PIECES];
 } md_ras_t;
+
+#define MD_RAS_EV(r, i) ((r)->ev[(i) / MD_RAS_PIECE][(i) % MD_RAS_PIECE])
+
+static unsigned          s_cap; /* events a record holds: whole pieces */
 
 static md_ras_t         *s_rec[2];
 
@@ -86,6 +113,17 @@ static md_ras_t         *s_rec[2];
 #define MD_RAS_HS_PIECE 32
 static uint16_t         *s_hs[MD_RAS_HS_LINES / MD_RAS_HS_PIECE];
 static int               s_hs_ok;
+/* the frame being run's: its lines up to s_hs_upto copied so far; swapped
+ * with s_hs when the frame is published */
+static uint16_t         *s_hs_run[MD_RAS_HS_LINES / MD_RAS_HS_PIECE];
+static int               s_hs_run_ok;
+static int               s_hs_upto;
+static int               s_hs_moved; /* written while lines were shown */
+/* the bytes of the table the scroll mode reads, while the frame's lines are
+ * shown, for the VRAM write path (gwenesis_vdp_mem.c); 0x80000000 when it is
+ * not to be watched */
+unsigned int             md_ras_hs_lo = 0x80000000u;
+unsigned int             md_ras_hs_len;
 static volatile int      s_hs_busy;     /* a pass draws from it */
 static volatile uint32_t s_pub_seq, s_took_seq;
 uint16_t *const *md_vr_hs;              /* the renderer's: s_hs, or NULL */
@@ -93,34 +131,68 @@ static int               s_rec_k;       /* the one the 68000 writes */
 static volatile int      s_pub = -1;    /* the last whole frame's, -1: none */
 static volatile uint32_t s_lock;
 
-/* the drawer's copy */
+/* the drawer's copy of the state a line is drawn with; the writes it reads
+ * from the published record, which nothing writes while a pass draws */
 typedef struct {
     uint8_t  regs[MD_RAS_REGS];
     uint16_t vsram[MD_RAS_VSRAM];
-    uint32_t ev[MD_RAS_EVENTS];
 } md_ras_copy_t;
-static md_ras_copy_t *s_cp;
-static uint16_t      *s_cram565; /* NULL: palette writes are not followed */
-static int            s_ev_n, s_ev_at;
+static md_ras_copy_t   *s_cp;
+static const md_ras_t  *s_cp_rec;
+static uint16_t        *s_cram565; /* NULL: palette writes are not followed */
+static int              s_ev_n, s_ev_at;
 
 int md_raster_on;
 
+/* a record's next piece of writes, for both records at once */
+static int add_piece(void *(*alloc)(size_t), unsigned pieces)
+{
+    uint32_t *const a = (uint32_t *)alloc(MD_RAS_PIECE * sizeof(uint32_t));
+    uint32_t *const b = (a != NULL) ? (uint32_t *)alloc(MD_RAS_PIECE * sizeof(uint32_t)) : NULL;
+    if (b == NULL) {
+        return 0; /* (a, if it came, stays unused: alloc has no free) */
+    }
+    s_rec[0]->ev[pieces] = a;
+    s_rec[1]->ev[pieces] = b;
+    return 1;
+}
+
+/* a 256-line scroll table in 32-line pieces; 0 if a piece did not come */
+static int alloc_hs(void *(*alloc)(size_t), uint16_t **t)
+{
+    for (int i = 0; i < MD_RAS_HS_LINES / MD_RAS_HS_PIECE; i++) {
+        t[i] = (uint16_t *)alloc(MD_RAS_HS_PIECE * 2 * sizeof(uint16_t));
+        if (t[i] == NULL) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * What the heap has left is a few kilobytes at best, so it goes where it
+ * buys most, in order: a piece of each record and the drawer's copy
+ * (without them nothing is followed), the scroll tables, the palette, and
+ * only then more pieces.  Gunstar Heroes' 10 writes a frame need one piece;
+ * the pieces taken first left the scroll and palette copies nothing.
+ */
 int md_raster_init(void *(*alloc)(size_t))
 {
     s_rec[0] = (md_ras_t *)alloc(sizeof(md_ras_t));
     s_rec[1] = (md_ras_t *)alloc(sizeof(md_ras_t));
     s_cp = (md_ras_copy_t *)alloc(sizeof(md_ras_copy_t));
-    s_cram565 = (uint16_t *)alloc(MD_RAS_CRAM * 4 * sizeof(uint16_t));
-    if (s_rec[0] == NULL || s_rec[1] == NULL || s_cp == NULL) {
+    if (s_rec[0] == NULL || s_rec[1] == NULL || s_cp == NULL ||
+        !add_piece(alloc, 0)) {
         return 0;
     }
-    s_hs_ok = 1;
-    for (int i = 0; i < MD_RAS_HS_LINES / MD_RAS_HS_PIECE; i++) {
-        s_hs[i] = (uint16_t *)alloc(MD_RAS_HS_PIECE * 2 * sizeof(uint16_t));
-        if (s_hs[i] == NULL) {
-            s_hs_ok = 0;
-        }
+    unsigned pieces = 1;
+    s_hs_ok = alloc_hs(alloc, s_hs);
+    s_hs_run_ok = s_hs_ok && alloc_hs(alloc, s_hs_run);
+    s_cram565 = (uint16_t *)alloc(MD_RAS_CRAM * 4 * sizeof(uint16_t));
+    while (pieces < MD_RAS_PIECES && add_piece(alloc, pieces)) {
+        pieces++;
     }
+    s_cap = pieces * MD_RAS_PIECE;
     s_rec[0]->n = s_rec[1]->n = 0;
     return 1;
 }
@@ -142,6 +214,18 @@ static inline uint16_t to565(uint16_t v)
     return (uint16_t)(((v & 0xe00u) >> 7) | ((v & 0x0e0u) << 3) | ((v & 0x00eu) << 12));
 }
 
+/*
+ * Watch only the bytes the scroll mode reads: 4 for the whole screen, 32 for
+ * the first eight lines, a line's worth each for cells and lines - not the
+ * writes that land beside a 4-byte table.
+ */
+static void hs_watch(void)
+{
+    const int mode = gwenesis_vdp_regs[11] & 3;
+    md_ras_hs_lo = (unsigned)(gwenesis_vdp_regs[13] & 0x3f) << 10;
+    md_ras_hs_len = (mode == 0) ? 4u : (mode == 1) ? 32u : (unsigned)screen_height * 4u;
+}
+
 void md_raster_begin(void)
 {
     md_ras_t *r = s_rec[s_rec_k];
@@ -149,6 +233,13 @@ void md_raster_begin(void)
     memcpy(r->vsram, VSRAM, sizeof(r->vsram));
     r->n = 0;
     r->cram = 0;
+    s_hs_upto = 0;
+    s_hs_moved = 0;
+    if (s_hs_run_ok) {
+        hs_watch();
+    } else {
+        md_ras_hs_lo = 0x80000000u;
+    }
 }
 
 /*
@@ -156,7 +247,7 @@ void md_raster_begin(void)
  * sprite and scroll tables (2-5, 13), the backdrop (7), the scroll modes (11),
  * the width and shadow (12), the plane size and the window (16-18).  The
  * rest - the line interrupt's counter (10), DMA (15, 19-23) - change nothing
- * drawn, and a pass with writes to note is drawn by one core instead of two.
+ * drawn and are not noted: every noted line is a gate both cores wait at.
  */
 #define MD_RAS_DRAWN 0x000738beu
 
@@ -164,6 +255,9 @@ void md_raster_note(int kind, int index)
 {
     if (kind == MD_RAS_REG && !((MD_RAS_DRAWN >> (index & 31)) & 1u)) {
         return;
+    }
+    if (kind == MD_RAS_REG && (index == 11 || index == 13) && md_ras_hs_lo != 0x80000000u) {
+        hs_watch(); /* the table moved, or the mode reads another part of it */
     }
     /*
      * Its line: the one being shown when it came.  Past the horizontal blank
@@ -180,8 +274,8 @@ void md_raster_note(int kind, int index)
         return; /* between frames: the next one's copy has it */
     }
     md_ras_t *r = s_rec[s_rec_k];
-    if (r->n >= MD_RAS_EVENTS) {
-        r->n = MD_RAS_EVENTS + 1;
+    if (r->n >= s_cap) {
+        r->n = (uint16_t)(s_cap + 1u);
         return;
     }
     uint32_t v;
@@ -197,8 +291,15 @@ void md_raster_note(int kind, int index)
     { extern int m68k_cycles_master(void); extern int md_dbg_off[2][MD_RAS_EVENTS];
       md_dbg_off[s_rec_k][r->n] = m68k_cycles_master() - scan_line * 3420; }
 #endif
-    r->ev[r->n++] = ((uint32_t)line << 20) | ((uint32_t)kind << 18) |
+    MD_RAS_EV(r, r->n) = ((uint32_t)line << 20) | ((uint32_t)kind << 18) |
                     ((uint32_t)(index & 0x3f) << 12) | (v & 0xfffu);
+    r->n++;
+}
+
+/* events a record holds (the stats) */
+unsigned md_raster_cap(void)
+{
+    return s_cap;
 }
 
 /* frames recorded, and frames with too many writes to follow (the stats) */
@@ -210,6 +311,50 @@ void md_raster_end(void)
 
 #define MD_RAS_RD16(A) (VRAM_RD8((A) + 1) | (VRAM_RD8(A) << 8))
 
+/* a line's two horizontal scroll words, as the VDP reads them now, into o */
+static inline void hs_words(int l, uint16_t *o)
+{
+    const int      mode = gwenesis_vdp_regs[11] & 3;
+    const unsigned table = (unsigned)(gwenesis_vdp_regs[13] & 0x3f) << 10;
+    const int idx = (mode == 0) ? 0 : (mode == 1) ? (l & 7) : (mode == 2) ? (l & ~7) : l;
+    const unsigned a = (table + (unsigned)idx * 4u) & 0xffffu;
+    o[0] = (uint16_t)MD_RAS_RD16(a);
+    o[1] = (uint16_t)MD_RAS_RD16((a + 2u) & 0xffffu);
+}
+
+/* the frame's lines from s_hs_upto up to `to`, from the table as it is */
+static void hs_upto(int to)
+{
+    const int h = (screen_height < MD_RAS_HS_LINES) ? screen_height : MD_RAS_HS_LINES;
+    if (to > h) {
+        to = h;
+    }
+    for (int l = s_hs_upto; l < to; l++) {
+        hs_words(l, &s_hs_run[l / MD_RAS_HS_PIECE][(l % MD_RAS_HS_PIECE) * 2]);
+    }
+    if (to > s_hs_upto) {
+        s_hs_upto = to;
+    }
+}
+
+/*
+ * A write into the scroll table is coming while lines are shown: the lines
+ * already shown, and the one being shown if its picture has started, keep
+ * the table as it was.
+ */
+void md_raster_hs_write(void)
+{
+    extern int m68k_cycles_master(void);
+    int line = scan_line;
+    if (m68k_cycles_master() - scan_line * VDP_CYCLES_PER_LINE > MD_RAS_HBLANK) {
+        line++;
+    }
+    if (line > 0) {
+        s_hs_moved = 1; /* the frame has something to draw differently */
+    }
+    hs_upto(line);
+}
+
 /*
  * The last visible line has run: the horizontal scroll table copied before
  * the vertical blank rewrites it, and the frame published - unless a pass is
@@ -218,8 +363,9 @@ void md_raster_end(void)
 void md_raster_visible(void)
 {
     const md_ras_t *r = s_rec[s_rec_k];
+    md_ras_hs_lo = 0x80000000u; /* the vertical blank's writes are the next frame's */
     md_raster_frames++;
-    if (r->n > MD_RAS_EVENTS) {
+    if (r->n > s_cap) {
         md_raster_over++;
     }
     lock();
@@ -227,19 +373,20 @@ void md_raster_visible(void)
         unlock();
         return;
     }
-    if (r->n == 0 || r->n > MD_RAS_EVENTS) {
+    if ((r->n == 0 && !s_hs_moved) || r->n > s_cap) {
         s_pub = -1; /* nothing to draw differently, or too much to */
     } else {
-        if (s_hs_ok) {
-            const int      mode = gwenesis_vdp_regs[11] & 3;
-            const unsigned table = (unsigned)(gwenesis_vdp_regs[13] & 0x3f) << 10;
-            const int      h = (screen_height < MD_RAS_HS_LINES) ? screen_height : MD_RAS_HS_LINES;
+        if (s_hs_run_ok) {
+            hs_upto(MD_RAS_HS_LINES);
+            for (int i = 0; i < MD_RAS_HS_LINES / MD_RAS_HS_PIECE; i++) {
+                uint16_t *const t = s_hs[i];
+                s_hs[i] = s_hs_run[i];
+                s_hs_run[i] = t;
+            }
+        } else if (s_hs_ok) {
+            const int h = (screen_height < MD_RAS_HS_LINES) ? screen_height : MD_RAS_HS_LINES;
             for (int l = 0; l < h; l++) {
-                const int idx = (mode == 0) ? 0 : (mode == 1) ? (l & 7) : (mode == 2) ? (l & ~7) : l;
-                const unsigned a = (table + (unsigned)idx * 4u) & 0xffffu;
-                uint16_t *const o = &s_hs[l / MD_RAS_HS_PIECE][(l % MD_RAS_HS_PIECE) * 2];
-                o[0] = (uint16_t)MD_RAS_RD16(a);
-                o[1] = (uint16_t)MD_RAS_RD16((a + 2u) & 0xffffu);
+                hs_words(l, &s_hs[l / MD_RAS_HS_PIECE][(l % MD_RAS_HS_PIECE) * 2]);
             }
         }
         s_pub = s_rec_k;
@@ -260,11 +407,11 @@ int md_raster_take(void)
     }
     if (k >= 0) {
         s_took_seq = s_pub_seq;
-        s_hs_busy = s_hs_ok;
+        s_hs_busy = 1; /* the record and the scroll copy stay as they are */
         const md_ras_t *r = s_rec[k];
         memcpy(s_cp->regs, r->regs, sizeof(s_cp->regs));
         memcpy(s_cp->vsram, r->vsram, sizeof(s_cp->vsram));
-        memcpy(s_cp->ev, r->ev, (size_t)r->n * sizeof(s_cp->ev[0]));
+        s_cp_rec = r;
         s_ev_n = r->n;
         cram = r->cram;
     }
@@ -287,8 +434,9 @@ int md_raster_take(void)
 
 void md_raster_line(int line)
 {
-    while (s_ev_at < s_ev_n && (int)(s_cp->ev[s_ev_at] >> 20) <= line) {
-        const uint32_t e = s_cp->ev[s_ev_at++];
+    while (s_ev_at < s_ev_n && (int)(MD_RAS_EV(s_cp_rec, s_ev_at) >> 20) <= line) {
+        const uint32_t e = MD_RAS_EV(s_cp_rec, s_ev_at);
+        s_ev_at++;
         const int      kind = (int)((e >> 18) & 3u);
         const int      i = (int)((e >> 12) & 0x3fu);
         const uint16_t v = (uint16_t)(e & 0xfffu);
@@ -305,6 +453,13 @@ void md_raster_line(int line)
             s_cram565[i] = s_cram565[0x40 + i] = s_cram565[0x80 + i] = s_cram565[0xc0 + i] = c;
         }
     }
+}
+
+/* the line of the next write the pass has not put in yet; past the
+ * screen when there is none */
+int md_raster_next(void)
+{
+    return (s_ev_at < s_ev_n) ? (int)(MD_RAS_EV(s_cp_rec, s_ev_at) >> 20) : 0x7fffffff;
 }
 
 void md_raster_done(void)
@@ -324,8 +479,8 @@ void md_raster_dump(int frame)
 {
     const md_ras_t *r = s_rec[s_rec_k ^ 1];
     printf("frame %d: %u writes\n", frame, (unsigned)r->n);
-    for (unsigned i = 0; i < r->n && i < MD_RAS_EVENTS; i++) {
-        const uint32_t e = r->ev[i];
+    for (unsigned i = 0; i < r->n && i < s_cap; i++) {
+        const uint32_t e = MD_RAS_EV(r, i);
         printf("  line %3u +%4d %s %2u = %03x\n", (unsigned)(e >> 20), md_dbg_off[s_rec_k ^ 1][i],
                ((e >> 18) & 3u) == 0 ? "reg  " : ((e >> 18) & 3u) == 1 ? "vsram" : "cram ",
                (unsigned)((e >> 12) & 0x3fu), (unsigned)(e & 0xfffu));

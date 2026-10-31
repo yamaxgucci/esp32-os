@@ -114,6 +114,7 @@ static uint32_t s_draw_us;      /* the drawer in the VDP and the row hash      *
 static uint32_t s_gate_us;      /* the drawer waiting for the game's frames    */
 static uint32_t s_loop_us;      /* the drawer's passes, start to end           */
 static volatile uint32_t s_help_lines; /* lines the application core drew (md_help_draw) */
+static uint32_t          s_ras_passes; /* passes drawn from a raster record (the stats) */
 static uint32_t s_help_wait_us; /* the system core waiting for one of them     */
 static volatile uint32_t s_drawer_stack_left; /* bytes of its stack never used */
 static volatile uint32_t s_help_sent;   /* rows the application core sent      */
@@ -347,6 +348,20 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
                   x10 / 10u, x10 % 10u, rows ? (unsigned)(us / rows) : 0u,
                   (unsigned)((uint64_t)us * 100u / span_us),
                   p10 / 10u, p10 % 10u, (unsigned)same);
+        if (md_raster_on) {
+            extern unsigned md_raster_frames, md_raster_over;
+            static unsigned s_rf_seen, s_ro_seen;
+            const unsigned rf = md_raster_frames - s_rf_seen;
+            const unsigned ro = md_raster_over - s_ro_seen;
+            s_rf_seen += rf;
+            s_ro_seen += ro;
+            static uint32_t s_rp_seen;
+            const uint32_t rp = s_ras_passes - s_rp_seen;
+            s_rp_seen += rp;
+            ag_printf("md: raster record holds %u writes; %u of %u frames had "
+                      "more; %u passes drawn from it\n", md_raster_cap(), ro,
+                      rf, (unsigned)rp);
+        }
     }
 #endif
 }
@@ -551,9 +566,11 @@ static volatile uint8_t  s_row_ready[MD_RING_MAX];
 static volatile uint32_t s_row_hash[MD_RING_MAX];
 static volatile uint32_t s_sender;   /* 1 while a core sends                    */
 static int               s_help = 1; /* `nohelp`: the system core alone         */
-/* the pass draws from the last frame's raster record (md_raster.c): the
- * system core alone, in order - the record is applied line by line */
+/* the pass draws from the last frame's raster record (md_raster.c): a
+ * line with writes before it (s_ras_gate) is claimed only once every line
+ * above it is drawn, and its claimer puts the writes in */
 static volatile int      s_pass_raster;
+static volatile int      s_ras_gate;
 /*
  * `shotN`: the first pass after frame N printed as it is drawn - every line,
  * "S<line> <x> <pixels in hex>" - for the host to put together into what
@@ -569,6 +586,24 @@ static int md_core(void)
     return (int)((id >> 13) & 1u);
 }
 
+/*
+ * Every line above `line` drawn: those not sent yet are at most a ring's
+ * rows, each ready once drawn.  A row sent meanwhile reads as not ready, and
+ * the caller asks again.  Asked only at a raster pass's gate: a count of
+ * lines drawn, kept with an atomic add at every line by both cores, cost
+ * Sonic Spinball 42 -> 36 pictures a second (31 Oct 2026).
+ */
+static bool drawn_above(int line)
+{
+    const int n = s_ring_n;
+    for (int l = s_sent; l < line; l++) {
+        if (!s_row_ready[l % n]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* The pass's next line, if its row is free; -1 if not, or no pass is open. */
 static int claim_line(void)
 {
@@ -577,8 +612,17 @@ static int claim_line(void)
         if ((int)c >= s_pass_h || (int)c >= s_sent + s_ring_n) {
             return -1;
         }
+        const int gate = s_ras_gate;
+        if (s_pass_raster && (int)c >= gate && ((int)c > gate || !drawn_above(c))) {
+            return -1;        /* the lines above are still being drawn */
+        }
         if (__atomic_compare_exchange_n((uint32_t *)&s_next, &c, c + 1u, false,
                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            if (s_pass_raster && (int)c == gate) {
+                md_raster_line((int)c);
+                __sync_synchronize();
+                s_ras_gate = md_raster_next();
+            }
             return (int)c;
         }
     }
@@ -588,9 +632,6 @@ static void draw_line(int line)
 {
     const int slot = line % s_ring_n;
     gwenesis_vdp_set_buffer(s_ring[slot]);
-    if (s_pass_raster) {
-        md_raster_line(line);
-    }
 #ifdef MD_VDPPROF
     if ((line & 31) == 7) {
         /* the same line twice: the second with the code just run */
@@ -699,9 +740,8 @@ static bool md_send(void)
 static void md_help_draw(ag_time_t until)
 {
     while ((int64_t)(until - ag_micros()) > 250) {
-        if (s_pass_h == 0 || MODE_SHI || s_pass_raster || s_shot_now) {
-            return;   /* between passes; shadow/highlight has one sprite buffer;
-                       * a raster pass is drawn in order by one core */
+        if (s_pass_h == 0 || MODE_SHI || s_shot_now) {
+            return;   /* between passes; shadow/highlight has one sprite buffer */
         }
         if (md_send()) {
             continue;
@@ -727,6 +767,8 @@ static void md_open_pass(void)
         took = md_raster_take();
     }
     s_pass_raster = (took == 1);
+    s_ras_gate = s_pass_raster ? md_raster_next() : 0x7fffffff;
+    s_ras_passes += s_pass_raster ? 1u : 0u;
     if (s_shot_at != 0u && s_frames_done >= s_shot_at) {
         s_shot_at = 0;
         s_shot_now = 1;
