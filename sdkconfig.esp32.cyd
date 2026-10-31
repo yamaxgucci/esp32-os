@@ -21,3 +21,12 @@ CONFIG_ARGON_ENABLE_NET=n
 CONFIG_ARGON_NET_WIFI=n
 CONFIG_ARGON_ENABLE_BLE=n
 CONFIG_BT_ENABLED=n
+
+# The flash on four lines (QIO), not two (DIO).  Every cache miss on the
+# ESP32 is a 32-byte line read over SPI, ~450 CPU cycles in DIO at 80 MHz;
+# QIO halves the data phase.  The CYD's flash (Zbit, id 5e 4016) takes the
+# bootloader's default QE setting.  Measured 31 Oct 2026 on this board (the
+# cyd-sdfix line) with the Mega Drive on the panel: ECCO 35 -> 55 whole
+# pictures a second, its 68000 12.2 -> 8.9 ms a frame; Thunder Force IV
+# 19 -> 29 pictures; a row to the glass 31 -> 18 us.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
