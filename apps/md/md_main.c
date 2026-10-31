@@ -551,6 +551,13 @@ static int               s_help = 1; /* `nohelp`: the system core alone         
 /* the pass draws from the last frame's raster record (md_raster.c): the
  * system core alone, in order - the record is applied line by line */
 static volatile int      s_pass_raster;
+/*
+ * `shotN`: the first pass after frame N printed as it is drawn - every line,
+ * "S<line> <x> <pixels in hex>" - for the host to put together into what
+ * went to the glass (scratchpad shot.py).  One core draws it, in order.
+ */
+static uint32_t          s_shot_at;
+static volatile int      s_shot_now;
 
 static int md_core(void)
 {
@@ -598,6 +605,25 @@ static void draw_line(int line)
 #endif
     gwenesis_vdp_render_line(line);
     s_row_hash[slot] = md_row_hash(s_ring[slot], screen_width);
+    if (s_shot_now) {
+        const uint16_t *px = s_ring[slot];
+        for (int x = 0; x < screen_width; x += 16) {
+            char hex[16 * 4 + 1]; /* small: the drawer's stack has ~500 bytes spare */
+            for (int k = 0; k < 16; k++) {
+                static const char d[] = "0123456789abcdef";
+                const uint16_t v = px[x + k];
+                hex[k * 4] = d[v >> 12];
+                hex[k * 4 + 1] = d[(v >> 8) & 15];
+                hex[k * 4 + 2] = d[(v >> 4) & 15];
+                hex[k * 4 + 3] = d[v & 15];
+            }
+            hex[16 * 4] = 0;
+            ag_printf("S%d %d %s\n", line, x, hex);
+            /* the console is a ring smaller than a line: each 72 bytes
+             * reach the UART (11.5 KB/s) before the next are written */
+            ag_delay(8);
+        }
+    }
     __sync_synchronize();
     s_row_ready[slot] = 1;
 }
@@ -670,7 +696,7 @@ static bool md_send(void)
 static void md_help_draw(ag_time_t until)
 {
     while ((int64_t)(until - ag_micros()) > 250) {
-        if (s_pass_h == 0 || MODE_SHI || s_pass_raster) {
+        if (s_pass_h == 0 || MODE_SHI || s_pass_raster || s_shot_now) {
             return;   /* between passes; shadow/highlight has one sprite buffer;
                        * a raster pass is drawn in order by one core */
         }
@@ -689,6 +715,13 @@ static void md_open_pass(void)
 {
     const int h = (screen_height < MD_HASH_LINES) ? screen_height : MD_HASH_LINES;
     s_pass_raster = md_raster_on && md_raster_take();
+    if (s_shot_at != 0u && s_frames_done >= s_shot_at) {
+        s_shot_at = 0;
+        s_shot_now = 1;
+        ag_printf("SHOT frame %u raster %d width %d\n", (unsigned)s_frames_done,
+                  s_pass_raster, screen_width);
+        ag_delay(50);
+    }
     s_next = 0;
     s_sent = 0;
     __sync_synchronize();
@@ -729,6 +762,10 @@ static void md_drawer(void)
         if (s_pass_raster) {
             s_pass_raster = 0;
             md_raster_done();
+        }
+        if (s_shot_now) {
+            s_shot_now = 0;
+            ag_printf("SHOT end\n");
         }
         /*
          * The next pass starts with the next frame, never sooner.  A pass
@@ -962,6 +999,12 @@ static void md_line_end(int line)
 }
 
 static int s_blocks; /* blocks the pages were cut from */
+
+/* internal memory for small things, after the pages: what a page cannot use */
+static void *md_crumb_alloc(size_t n)
+{
+    return ag_malloc_caps(n, AG_MEM_FAST);
+}
 
 /*
  * Fill `pages[0..count)` from the largest blocks the heap gives, a page at a
@@ -1454,6 +1497,14 @@ int ag_main(int argc, char **argv)
             ring_rows = ring_rows < 2 ? 2 : ring_rows > MD_RING_MAX ? MD_RING_MAX : ring_rows;
             continue;
         }
+        if (argv[i][0] == 's' && argv[i][1] == 'h' && argv[i][2] == 'o' &&
+            argv[i][3] == 't' && argv[i][4] >= '0' && argv[i][4] <= '9') {
+            s_shot_at = 0;
+            for (const char *c = argv[i] + 4; *c >= '0' && *c <= '9'; c++) {
+                s_shot_at = s_shot_at * 10u + (uint32_t)(*c - '0');
+            }
+            continue;
+        }
         if (arg_eq(argv[i], "nohelp")) {
             s_help = 0;        /* the system core draws every line alone */
             continue;
@@ -1661,8 +1712,13 @@ int ag_main(int argc, char **argv)
         md_snd_async_start(s_run_z80_cpu, s_run_sound);
         ag_printf("md: the Z80 and the sound chips on the system core\n");
     }
-    /* the picture drawn after the frame: its raster writes written down */
-    md_raster_on = (s_sysdraw && s_ring_n > 0 && !s_headless) ? 1 : 0;
+    /* the picture drawn after the frame: its raster writes written down, in
+     * what the heap has left after the machine's pages */
+    md_raster_on = (s_sysdraw && s_ring_n > 0 && !s_headless &&
+                    md_raster_init(md_crumb_alloc)) ? 1 : 0;
+    if (!md_raster_on && s_sysdraw && s_ring_n > 0 && !s_headless) {
+        ag_printf("md: no memory left to follow raster effects\n");
+    }
 #endif
 
     s_use_live_pad = want_livepad;

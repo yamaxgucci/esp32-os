@@ -15,6 +15,11 @@
 #define MD_RAS_VSRAM 40
 #define MD_RAS_CRAM  64
 
+#include <stddef.h>
+
+/* Its memory, from `alloc` once the machine's pages are cut; 0 if short. */
+int md_raster_init(void *(*alloc)(size_t));
+
 /* The 68000's side (the frame loop and the VDP's write paths). */
 extern int md_raster_on;
 void md_raster_begin(void);
