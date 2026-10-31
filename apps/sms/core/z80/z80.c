@@ -357,7 +357,22 @@ static inline uint8_t flags_sub(uint32_t a, uint32_t v, uint32_t full)
 #else
 #define Z80_CC_PLACE __attribute__((aligned(4), section(".hot_rodata")))
 #endif
-#define CC_OF(t, op) ((((const volatile uint32_t *)(const void *)cc[t])[(op) >> 2] >> (((op) & 3) << 3)) & 0xFF)
+/*
+ * A whole word, and the byte cut out of it - loaded by an instruction the
+ * compiler cannot narrow, rather than through a volatile pointer: volatile
+ * put a memory barrier (memw) in every instruction the Z80 ran.
+ */
+static inline __attribute__((always_inline)) uint32_t md_cc_byte(const uint8_t *t, uint32_t op)
+{
+	uint32_t w;
+#ifdef __XTENSA__
+	__asm__("l32i %0, %1, 0" : "=r"(w) : "r"((const uint32_t *)(const void *)t + (op >> 2)));
+#else
+	w = ((const uint32_t *)(const void *)t)[op >> 2];
+#endif
+	return (w >> ((op & 3u) << 3)) & 0xffu;
+}
+#define CC_OF(t, op) md_cc_byte(cc[t], (op))
 /*
  * The two every instruction reads - its own cycles, and a taken jump's,
  * call's or return's extra - with the hot part: read out of flash through the
@@ -4306,114 +4321,139 @@ MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
 		    md_z80_wait_candidate(op))
 			md_z80_skip_waits((uint8_t)op);
 		Z80.icount -= CC_OF(Z80_TABLE_op, op);
-		if ((op & 0xc0u) == 0x40u)
+		/* by the opcode's fields: its quadrant, then its low three bits */
+		switch (op >> 6)
 		{
-			/* LD r,r' / LD r,(HL) / LD (HL),r (HALT went back) */
+		case 1: /* LD r,r' / LD r,(HL) / LD (HL),r (HALT went back) */
 			md_r8_set((op >> 3) & 7u, md_r8_get(op & 7u));
-		}
-		else if ((op & 0xc0u) == 0x80u)
-		{
+			break;
+		case 2:
 			md_alu((op >> 3) & 7u, md_r8_get(op & 7u));
-		}
-		else if ((op & 0xc7u) == 0x04u)
-		{
-			const uint32_t d = (op >> 3) & 7u;
-			md_r8_set(d, inc(md_r8_get(d)));
-		}
-		else if ((op & 0xc7u) == 0x05u)
-		{
-			const uint32_t d = (op >> 3) & 7u;
-			md_r8_set(d, dec(md_r8_get(d)));
-		}
-		else if ((op & 0xc7u) == 0x06u)
-		{
-			md_r8_set((op >> 3) & 7u, arg());
-		}
-		else if ((op & 0xe7u) == 0x20u)
-		{
-			jr_cond(md_cond(((op >> 3) & 7u) - 4u), (uint8_t)op);
-		}
-		else if ((op & 0xc7u) == 0xc0u)
-		{
-			ret_cond(md_cond((op >> 3) & 7u), (uint8_t)op);
-		}
-		else if ((op & 0xc7u) == 0xc2u)
-		{
-			jp_cond(md_cond((op >> 3) & 7u));
-		}
-		else if ((op & 0xc7u) == 0xc4u)
-		{
-			call_cond(md_cond((op >> 3) & 7u), (uint8_t)op);
-		}
-		else if ((op & 0xc7u) == 0xc6u)
-		{
-			md_alu((op >> 3) & 7u, arg());
-		}
-		else if ((op & 0xc7u) == 0xc7u)
-		{
-			rst((uint16_t)(op & 0x38u));
-		}
-		else if ((op & 0xcfu) == 0x01u)
-		{
-			md_pair16[(op >> 4) & 3u]->w.l = arg16();
-		}
-		else if ((op & 0xcfu) == 0x03u)
-		{
-			md_pair16[(op >> 4) & 3u]->w.l++;
-		}
-		else if ((op & 0xcfu) == 0x0bu)
-		{
-			md_pair16[(op >> 4) & 3u]->w.l--;
-		}
-		else if ((op & 0xcfu) == 0x09u)
-		{
-			PAIR *const p = md_pair16[(op >> 4) & 3u];
-			add16(Z80.hl, (*p));
-		}
-		else if ((op & 0xcfu) == 0xc1u)
-		{
-			PAIR *const p = md_pair[(op >> 4) & 3u];
-			pop((*p));
-		}
-		else if ((op & 0xcfu) == 0xc5u)
-		{
-			PAIR *const p = md_pair[(op >> 4) & 3u];
-			push((*p));
-		}
-		else
-		{
-			switch (op)
+			break;
+		case 0:
+			switch (op & 7u)
 			{
-			case 0x00: op_00(); break;
-			case 0x02: op_02(); break;
-			case 0x07: op_07(); break;
-			case 0x08: op_08(); break;
-			case 0x0a: op_0a(); break;
-			case 0x0f: op_0f(); break;
-			case 0x10: op_10(); break;
-			case 0x12: op_12(); break;
-			case 0x17: op_17(); break;
-			case 0x18: op_18(); break;
-			case 0x1a: op_1a(); break;
-			case 0x1f: op_1f(); break;
-			case 0x22: op_22(); break;
-			case 0x2a: op_2a(); break;
-			case 0x2f: op_2f(); break;
-			case 0x32: op_32(); break;
-			case 0x37: op_37(); break;
-			case 0x3a: op_3a(); break;
-			case 0x3f: op_3f(); break;
-			case 0xc3: op_c3(); break;
-			case 0xc9: op_c9(); break;
-			case 0xcd: op_cd(); break;
-			case 0xd9: op_d9(); break;
-			case 0xe9: op_e9(); break;
-			case 0xeb: op_eb(); break;
-			case 0xf3: op_f3(); break;
-			case 0xf9: op_f9(); break;
-			case 0xfb: op_fb(); break;
-			default: break;
+			case 0:
+				if (op >= 0x20u)
+					jr_cond(md_cond(((op >> 3) & 7u) - 4u), (uint8_t)op);
+				else if (op == 0x10u)
+					op_10();
+				else if (op == 0x18u)
+					op_18();
+				else if (op == 0x08u)
+					op_08();
+				break;
+			case 1:
+				if (op & 8u)
+				{
+					PAIR *const p = md_pair16[(op >> 4) & 3u];
+					add16(Z80.hl, (*p));
+				}
+				else
+					md_pair16[(op >> 4) & 3u]->w.l = arg16();
+				break;
+			case 2:
+				switch (op)
+				{
+				case 0x02: op_02(); break;
+				case 0x0a: op_0a(); break;
+				case 0x12: op_12(); break;
+				case 0x1a: op_1a(); break;
+				case 0x22: op_22(); break;
+				case 0x2a: op_2a(); break;
+				case 0x32: op_32(); break;
+				default: op_3a(); break;
+				}
+				break;
+			case 3:
+				if (op & 8u)
+					md_pair16[(op >> 4) & 3u]->w.l--;
+				else
+					md_pair16[(op >> 4) & 3u]->w.l++;
+				break;
+			case 4:
+			{
+				const uint32_t d = (op >> 3) & 7u;
+				md_r8_set(d, inc(md_r8_get(d)));
+				break;
 			}
+			case 5:
+			{
+				const uint32_t d = (op >> 3) & 7u;
+				md_r8_set(d, dec(md_r8_get(d)));
+				break;
+			}
+			case 6:
+				md_r8_set((op >> 3) & 7u, arg());
+				break;
+			default:
+				switch (op)
+				{
+				case 0x07: op_07(); break;
+				case 0x0f: op_0f(); break;
+				case 0x17: op_17(); break;
+				case 0x1f: op_1f(); break;
+				case 0x2f: op_2f(); break;
+				case 0x37: op_37(); break;
+				default: op_3f(); break; /* (27, DAA, went back) */
+				}
+				break;
+			}
+			break;
+		default: /* quadrant 3 */
+			switch (op & 7u)
+			{
+			case 0:
+				ret_cond(md_cond((op >> 3) & 7u), (uint8_t)op);
+				break;
+			case 1:
+				if (!(op & 8u))
+				{
+					PAIR *const p = md_pair[(op >> 4) & 3u];
+					pop((*p));
+				}
+				else if (op == 0xc9u)
+					op_c9();
+				else if (op == 0xd9u)
+					op_d9();
+				else if (op == 0xe9u)
+					op_e9();
+				else
+					op_f9();
+				break;
+			case 2:
+				jp_cond(md_cond((op >> 3) & 7u));
+				break;
+			case 3: /* (CB, D3, DB and E3 went elsewhere) */
+				if (op == 0xc3u)
+					op_c3();
+				else if (op == 0xebu)
+					op_eb();
+				else if (op == 0xf3u)
+					op_f3();
+				else
+					op_fb();
+				break;
+			case 4:
+				call_cond(md_cond((op >> 3) & 7u), (uint8_t)op);
+				break;
+			case 5: /* (DD, ED and FD went elsewhere) */
+				if (!(op & 8u))
+				{
+					PAIR *const p = md_pair[(op >> 4) & 3u];
+					push((*p));
+				}
+				else
+					op_cd();
+				break;
+			case 6:
+				md_alu((op >> 3) & 7u, arg());
+				break;
+			default:
+				rst((uint16_t)(op & 0x38u));
+				break;
+			}
+			break;
 		}
 		MD_SPIN_CHECK();
 	}

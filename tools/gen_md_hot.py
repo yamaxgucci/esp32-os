@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Which 68000 handlers go in MD32's hot part: the ones a game actually runs.
+"""Which 68000 handlers go in MD-NO-PSRAM's (the CYD's) hot part: the ones a game actually runs.
 
     python tools/gen_md_hot.py HIST SIZES BUDGET > apps/md/core/cpus/M68K/md_hot.h
 
 HIST is a histogram of handler indexes from the host harness (MD_HOST_COUNT,
 MD_HIST_OUT: "index count" per line, over a whole session of a game); SIZES is
-`nm -S` of an MD32 build ("size name" per line) so the budget is in the CYD's
+`nm -S` of an MD-NO-PSRAM build ("size name" per line) so the budget is in the CYD's
 own bytes.  Handlers are taken most-executed first until BUDGET bytes are
 spent.  What is not taken stays in flash and still works - only slower.
 """

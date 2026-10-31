@@ -5,8 +5,8 @@
  *   run a:\MD.AXE a:\game.bin
  *   run a:\MD.AXE 600 stats          # bench the 68000 + VDP path
  *   run a:\MD.AXE a:\game.bin fps30  # emulate 60, show 30
- *   the CYD (MD32.AXE, the ROM byte-swapped on the host):
- *   run a:\md32.axe a:\game.swp fps15 noz80 waitcard   then Ctrl+\, eject, Alt+1
+ *   the CYD (MD-NO-PSRAM.AXE, the ROM byte-swapped on the host):
+ *   run a:\md-no-psram.axe a:\game.swp waitcard   then Ctrl+\, eject, Alt+1
  *
  * Cores: gwenesis, GPLv3 (see LICENSE and README).  This file: Apache-2.0.
  *

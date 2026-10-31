@@ -118,8 +118,8 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   --libs c -o build/apps/MDYM.AXE `
   apps/md/md_main.c `
   apps/md/port/md_z80.c apps/md/port/md_ym_native.c apps/md/port/md_psg.c `
-  apps/md/port/md_sound_out.c apps/md/port/md_savestate_stub.c `
-  apps/common/libc/libc_shim.c `
+  apps/md/port/md_sound_out.c apps/md/port/md_snd_async.c apps/md/port/md_raster.c `
+  apps/md/port/md_savestate_stub.c apps/common/libc/libc_shim.c `
   apps/sms/core/z80/z80.c apps/sms/core/sound/sn76489.c `
   apps/md/core/sound/ym2612.c `
   apps/md/core/bus/gwenesis_bus.c apps/md/core/cpus/M68K/m68kcpu.c `
@@ -139,7 +139,7 @@ The image is **~170 KB of code** (`MD.AXE`) in the 192 KB arena and asks for a
 tables stay in ordinary `.rodata` (PSRAM) so the Z80 fits; put them back in
 `AG_HOT_RODATA` only if the arena grows.
 
-### The CYD (`MD32.AXE`: ESP32, no PSRAM)
+### The CYD (`MD-NO-PSRAM.AXE`: ESP32, no PSRAM)
 
 `ARGON_MD_SMALL`: the machine's memory in 512-byte pages, VRAM partly in IRAM
 (word access only), the cartridge staged in flash, tables in flash read by
@@ -148,12 +148,12 @@ handlers a game runs (`md_hot.h`) and the YM2612's synthesis loop in the hot
 part, the rest streamed into flash. Sound is the native YM2612 with its tables
 at 1 KB (`tools/gen_ym2612_tables.py`) and the PSG, mono, to `/dev/pcm0`, the
 chips at 11 025 Hz (`hifi`: 22 050). Run from the card, then give the card back
-so the machine's memory fits: `run a:\md32.axe a:\game.swp noz80 waitcard`,
+so the machine's memory fits: `run a:\md-no-psram.axe a:\game.swp waitcard`,
 Ctrl+\, `eject`, Alt+1.
 
 ```
 . .\tools\idf-env.ps1
-python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc --no-stage --keep-elf build/apps/MD32.AXE.elf `
+python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc --no-stage --keep-elf build/apps/MD-NO-PSRAM.AXE.elf `
   --include sdk/include --include apps/common --include apps/common/libc --include apps/md `
   --include apps/md/port --include apps/md/core/bus --include apps/md/core/cpus/M68K `
   --include apps/md/core/vdp --include apps/md/core/io `
@@ -162,11 +162,11 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc --no-stage --keep
   --cflags "-Os -DMD_SPLIT -ffunction-sections -fdata-sections -fno-builtin -include md_cfg.h -DARGON_MD_Z80 -DARGON_MD_SMALL -DARGON_SMS_SMALL -DLSB_FIRST -Wno-unused -Wno-sign-compare" `
   --code-rodata .rodata.op_cb --code-rodata .rodata.op_dd --code-rodata .rodata.op_ed --code-rodata .rodata.op_fd `
   --code-rodata .rodata.dd_cb --code-rodata .rodata.fd_cb --code-rodata .rodata.sms_z80_execute `
-  --libs c --split-hot -o build/apps/MD32.AXE `
+  --libs c --split-hot -o build/apps/MD-NO-PSRAM.AXE `
   apps/md/md_main.c `
   apps/md/port/md_z80.c apps/md/port/md_ym_native.c apps/md/core/sound/ym2612.c apps/md/port/md_psg.c `
-  apps/md/port/md_sound_out.c apps/md/port/md_savestate_stub.c `
-  apps/common/libc/libc_shim.c `
+  apps/md/port/md_sound_out.c apps/md/port/md_snd_async.c apps/md/port/md_raster.c `
+  apps/md/port/md_savestate_stub.c apps/common/libc/libc_shim.c `
   apps/sms/core/z80/z80.c apps/sms/core/sound/sn76489.c `
   apps/md/core/bus/gwenesis_bus.c apps/md/core/cpus/M68K/m68kcpu.c `
   apps/md/core/vdp/gwenesis_vdp_gfx.c apps/md/core/vdp/gwenesis_vdp_mem.c `
