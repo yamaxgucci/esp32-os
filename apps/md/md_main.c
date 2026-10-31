@@ -24,6 +24,7 @@
 #include "z80inst.h"
 #ifdef ARGON_MD_SMALL
 #include "md_snd_async.h"
+#include "md_raster.h"
 #endif
 
 /* 24 KB stack: with OpenEth/lwIP the largest internal free block is ~31 KB. */
@@ -547,6 +548,9 @@ static volatile uint8_t  s_row_ready[MD_RING_MAX];
 static volatile uint32_t s_row_hash[MD_RING_MAX];
 static volatile uint32_t s_sender;   /* 1 while a core sends                    */
 static int               s_help = 1; /* `nohelp`: the system core alone         */
+/* the pass draws from the last frame's raster record (md_raster.c): the
+ * system core alone, in order - the record is applied line by line */
+static volatile int      s_pass_raster;
 
 static int md_core(void)
 {
@@ -574,6 +578,9 @@ static void draw_line(int line)
 {
     const int slot = line % s_ring_n;
     gwenesis_vdp_set_buffer(s_ring[slot]);
+    if (s_pass_raster) {
+        md_raster_line(line);
+    }
 #ifdef MD_VDPPROF
     if ((line & 31) == 7) {
         /* the same line twice: the second with the code just run */
@@ -663,8 +670,9 @@ static bool md_send(void)
 static void md_help_draw(ag_time_t until)
 {
     while ((int64_t)(until - ag_micros()) > 250) {
-        if (s_pass_h == 0 || MODE_SHI) {
-            return;   /* between passes; shadow/highlight has one sprite buffer */
+        if (s_pass_h == 0 || MODE_SHI || s_pass_raster) {
+            return;   /* between passes; shadow/highlight has one sprite buffer;
+                       * a raster pass is drawn in order by one core */
         }
         if (md_send()) {
             continue;
@@ -680,6 +688,7 @@ static void md_help_draw(ag_time_t until)
 static void md_open_pass(void)
 {
     const int h = (screen_height < MD_HASH_LINES) ? screen_height : MD_HASH_LINES;
+    s_pass_raster = md_raster_on && md_raster_take();
     s_next = 0;
     s_sent = 0;
     __sync_synchronize();
@@ -717,6 +726,10 @@ static void md_drawer(void)
         }
         s_pass_h = 0;             /* closed: the other core stops */
         s_passes++;
+        if (s_pass_raster) {
+            s_pass_raster = 0;
+            md_raster_done();
+        }
         /*
          * The next pass starts with the next frame, never sooner.  A pass
          * more often than the game makes pictures draws the same picture
@@ -1648,6 +1661,8 @@ int ag_main(int argc, char **argv)
         md_snd_async_start(s_run_z80_cpu, s_run_sound);
         ag_printf("md: the Z80 and the sound chips on the system core\n");
     }
+    /* the picture drawn after the frame: its raster writes written down */
+    md_raster_on = (s_sysdraw && s_ring_n > 0 && !s_headless) ? 1 : 0;
 #endif
 
     s_use_live_pad = want_livepad;
@@ -1695,7 +1710,13 @@ int ag_main(int argc, char **argv)
         const int show = (present_div <= 1) || ((ran % present_div) == 0);
         s_inframe_left = MD_INFRAME_LINES;
 #ifdef ARGON_MD_SMALL
+        if (md_raster_on) {
+            md_raster_begin();
+        }
         run_frame(show && !(s_sysdraw && s_ring_n > 0));
+        if (md_raster_on) {
+            md_raster_end();
+        }
 #else
         run_frame(show);
 #endif

@@ -59,6 +59,20 @@ extern unsigned short CRAM565[];    // CRAM - Palettes
 
 extern unsigned short VSRAM[];        // VSRAM - Scrolling
 
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD: the registers, the vertical scroll and the palette read through
+ * pointers - the live VDP, or the copy a pass of a frame with raster effects
+ * draws from (md_raster.c).
+ */
+extern unsigned char  *md_vr_regs;
+extern unsigned short *md_vr_vsram;
+extern unsigned short *md_vr_cram565;
+#define gwenesis_vdp_regs md_vr_regs
+#define VSRAM md_vr_vsram
+#define CRAM565 md_vr_cram565
+#endif
+
 // Define screen buffers: original and scaled for host RGB
 unsigned char *screen, *scaled_screen;
 

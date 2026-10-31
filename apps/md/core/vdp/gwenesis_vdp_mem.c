@@ -24,6 +24,9 @@ __license__ = "GPLv3"
 #include "m68k.h"
 #include "ym2612.h"
 #include "gwenesis_vdp.h"
+#ifdef ARGON_MD_SMALL
+#include "md_raster.h"
+#endif
 #include "gwenesis_io.h"
 #include "gwenesis_bus.h"
 #include "gwenesis_sn76489.h"
@@ -296,6 +299,9 @@ static inline __attribute__((always_inline)) void gwenesis_vdp_register_w(int re
         return;
 
     gwenesis_vdp_regs[reg] = value;
+#ifdef ARGON_MD_SMALL
+    MD_VDP_NOTE(MD_RAS_REG, reg);
+#endif
     vdpm_log(__FUNCTION__, "reg:%02d <- %02x", reg, value);
 
 
@@ -449,6 +455,10 @@ void gwenesis_vdp_dma_fill(unsigned short value)
   case 0x3: // undocumented and buggy, see vdpfifotesting
     do {
       CRAM[(address_reg & 0x7f) >> 1] = fifo[3];
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_CR, (address_reg & 0x7f) >> 1);
+#endif
+
 
       unsigned short pixel;
       // Blue >> 9 << 2
@@ -474,6 +484,10 @@ void gwenesis_vdp_dma_fill(unsigned short value)
   case 0x5: // undocumented and buggy, see vdpfifotesting:
     do {
       VSRAM[(address_reg & 0x7f) >> 1] = fifo[3] & 0x03FF;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_VS, (address_reg & 0x7f) >> 1);
+#endif
+
       address_reg += REG15_DMA_INCREMENT;
       src_addr_low++;
     } while (--dma_length);
@@ -553,6 +567,10 @@ void gwenesis_vdp_dma_m68k()
           value = FETCH16RAM( src_addr );
           push_fifo(value);
           CRAM[(address_reg & 0x7f) >> 1] = value;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_CR, (address_reg & 0x7f) >> 1);
+#endif
+
 
           unsigned short pixel;
          // unsigned short pixel_shadow, pixel_highlight;
@@ -581,6 +599,10 @@ void gwenesis_vdp_dma_m68k()
           value = FETCH16RAM( src_addr );
           push_fifo(value);
           VSRAM[(address_reg & 0x7f) >> 1] = value & 0x03FF;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_VS, (address_reg & 0x7f) >> 1);
+#endif
+
           address_reg += REG15_DMA_INCREMENT;
           src_addr += 2;
         } while (--dma_length);
@@ -614,6 +636,10 @@ void gwenesis_vdp_dma_m68k()
           value = FETCH16ROM(src_addr);
           push_fifo(value);
           CRAM[(address_reg & 0x7f) >> 1] = value;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_CR, (address_reg & 0x7f) >> 1);
+#endif
+
 
           unsigned short pixel;
        //   unsigned short pixel_shadow, pixel_highlight;
@@ -645,6 +671,10 @@ void gwenesis_vdp_dma_m68k()
           value = FETCH16ROM(src_addr);
           push_fifo(value);
           VSRAM[(address_reg & 0x7f) >> 1] = value & 0x03FF;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_VS, (address_reg & 0x7f) >> 1);
+#endif
+
           address_reg += REG15_DMA_INCREMENT;
           src_addr += 2;
         } while (--dma_length);
@@ -860,6 +890,10 @@ void gwenesis_vdp_write_data_port_16(unsigned int value)
             //vdpm_log(__FUNCTION__,"CRAM write : addr:%x increment:%d value:%04x",
              // address_reg, REG15_DMA_INCREMENT, value);
             CRAM[(address_reg & 0x7f) >> 1] = value;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_CR, (address_reg & 0x7f) >> 1);
+#endif
+
 
             unsigned short pixel;
             //unsigned short pixel_shadow,pixel_highlight;
@@ -886,6 +920,10 @@ void gwenesis_vdp_write_data_port_16(unsigned int value)
             //  address_reg, REG15_DMA_INCREMENT, value);
            // printf("write dataport 16: VSRAM@%04x:%04x\n",address_reg,value);
             VSRAM[(address_reg & 0x7f) >> 1] = value & 0X03FF;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_VS, (address_reg & 0x7f) >> 1);
+#endif
+
             address_reg += REG15_DMA_INCREMENT;
             address_reg &= 0xFFFF;
             break;
