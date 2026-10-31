@@ -83,6 +83,18 @@ static int s_run_z80_cpu = 1;   /* 0: advance zclk only, no sms_z80_execute */
 static int s_run_sound = 1;
 static int s_snd_here;     /* `sndhere`: the sound side stays on this core */     /* 0: skip sample mix (still accepts reg writes) */
 static int s_profile_frames = 0; /* m68k/z80/snd/vdp split with the stats */
+#ifdef MD_Z80PROF
+static int          s_z80bench;
+static volatile int s_z80bench_done;
+void md_z80_bench(const char *where); /* md_z80.c */
+static void md_z80bench_sys(void *arg)
+{
+    (void)arg;
+    md_z80_bench("system core");
+    s_z80bench_done = 1;
+    ag_thread_exit();
+}
+#endif
 static int s_quit;
 static ag_gfxinfo_t s_gi;
 
@@ -1411,6 +1423,12 @@ int ag_main(int argc, char **argv)
             wait_card = 1;
             continue;
         }
+#ifdef MD_Z80PROF
+        if (arg_eq(argv[i], "z80bench")) {
+            s_z80bench = 1;
+            continue;
+        }
+#endif
 #ifdef ARGON_MD_SMALL
         if ((argv[i][0] == 'r' || argv[i][0] == 'R') &&
             (argv[i][1] == 'i' || argv[i][1] == 'I') &&
@@ -1605,6 +1623,19 @@ int ag_main(int argc, char **argv)
     load_cartridge(rom_data, rom_size);
     power_on();
     reset_emulation();
+#ifdef MD_Z80PROF
+    if (s_z80bench) {
+        md_z80_bench("application core");
+        ag_thread_t bt = ag_thread_create(md_z80bench_sys, NULL, "z80bench", 2048, 4,
+                                          AG_THREAD_SYS_CORE);
+        if (bt != NULL) {
+            while (!s_z80bench_done) {
+                ag_delay(10);
+            }
+        }
+        return 0;
+    }
+#endif
     md_sound_init();
 #ifdef ARGON_MD_SMALL
     /* the Z80 and the chips on the system core, in the picture's thread,

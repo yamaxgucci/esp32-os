@@ -74,6 +74,7 @@ static inline uint32_t zp_cc(void)
 }
 uint32_t md_zp_ym_cyc, md_zp_rom_cyc, md_zp_ym_n, md_zp_rom_n;
 uint32_t md_zp_fast_n, md_zp_slow_n; /* instructions, by which loop ran them */
+uint32_t md_zp_exec_cyc, md_zp_exec_n; /* cycles inside the interpreter, slices */
 #endif
 
 #ifdef ARGON_SMS_SMALL
@@ -210,6 +211,13 @@ void md_z80_prof_report(void)
               (unsigned)md_zp_rom_n, (unsigned)(md_zp_rom_cyc / 240u));
     ag_printf("md: z80 instructions %u from the hot part, %u from flash\n",
               (unsigned)md_zp_fast_n, (unsigned)md_zp_slow_n);
+    {
+        extern uint32_t md_zp_spin_n, md_zp_spin_cyc;
+        ag_printf("md: z80 interpreter %u slices, %u ms; spin checks %u, %u ms\n",
+                  (unsigned)md_zp_exec_n, (unsigned)(md_zp_exec_cyc / 240000u),
+                  (unsigned)md_zp_spin_n, (unsigned)(md_zp_spin_cyc / 240000u));
+        md_zp_spin_n = md_zp_spin_cyc = md_zp_exec_n = md_zp_exec_cyc = 0;
+    }
     md_zp_fast_n = md_zp_slow_n = 0;
     md_zp_ym_cyc = md_zp_rom_cyc = md_zp_ym_n = md_zp_rom_n = 0;
     for (int k = 0; k < 8; k++) {
@@ -234,6 +242,45 @@ void md_z80_prof_report(void)
         s_zp_n[i] = 0;
     }
 }
+/*
+ * `z80bench` (profile builds): the interpreter alone, on a loop of the kinds
+ * a driver is made of, in the Z80's own RAM - cycles an instruction, on the
+ * core that calls it.  Run before the machine starts.
+ */
+void md_z80_bench(const char *where)
+{
+    static const uint8_t prog[] = {
+        0x21, 0x00, 0x10,       /* 0000 ld hl,1000h   */
+        0x11, 0x00, 0x18,       /* 0003 ld de,1800h   */
+        0x06, 0x00,             /* 0006 ld b,0        */
+        0x7e,                   /* 0008 ld a,(hl)     */
+        0x23,                   /* 0009 inc hl        */
+        0x80,                   /* 000a add a,b       */
+        0x12,                   /* 000b ld (de),a     */
+        0x13,                   /* 000c inc de        */
+        0xcb, 0x47,             /* 000d bit 0,a       */
+        0x28, 0x01,             /* 000f jr z,+1       */
+        0x00,                   /* 0011 nop           */
+        0x10, 0xf4,             /* 0012 djnz 0008     */
+        0xc3, 0x00, 0x00,       /* 0014 jp 0000       */
+    };
+    for (unsigned i = 0; i < sizeof(prog); i++) {
+        MD_ZRAM(i) = prog[i];
+    }
+    z80_reset();
+    const uint32_t n0 = md_zp_fast_n + md_zp_slow_n;
+    const uint32_t c0 = zp_cc();
+    uint32_t t = 0;
+    for (int k = 0; k < 100; k++) {
+        t += (uint32_t)sms_z80_execute(10000);
+    }
+    const uint32_t c = zp_cc() - c0;
+    const uint32_t n = md_zp_fast_n + md_zp_slow_n - n0;
+    ag_printf("md: z80bench %s: %u instructions, %u T-states, %u cycles - "
+              "%u cycles an instruction\n", where, (unsigned)n, (unsigned)t,
+              (unsigned)c, n ? (unsigned)(c / n) : 0u);
+}
+
 static void zp_sample(void)
 {
     const uint16_t pc = (uint16_t)(Z80.pc.d & 0xffffu);
