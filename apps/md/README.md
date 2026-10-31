@@ -151,11 +151,11 @@ chips at 11 025 Hz (`hifi`: 22 050). Run from the card, then give the card back
 so the machine's memory fits: `run a:\md-no-psram.axe a:\game.swp waitcard`,
 Ctrl+\, `eject`, Alt+1.
 
-The firmware under it is the CYD's kernel line (branch `cyd-sdfix`) built as
-`argon target esp32-cyd-md`: the CYD plus `sdkconfig.esp32.cydmd`, which puts
-the radio's PHY paths in flash for the 9 KB of IRAM the machine's pages need.
-A plain `esp32-cyd` keeps them in IRAM, and the machine comes up one or more
-pages short there.
+The firmware under it is the CYD's kernel line (branch `cyd-sdfix`), the plain
+`argon target esp32-cyd`: on 1 Nov 2026 the machine started five times in a row
+there and ran at the same speed as with `esp32-cyd-md`. That target adds
+`sdkconfig.esp32.cydmd` - the radio's PHY paths in flash, 9 KB more IRAM - as
+a margin for a start that comes up a page short.
 
 Raster effects (`md_raster.c`): the frame's mid-screen writes to the VDP's
 registers, vertical scroll and palette are recorded with their lines, and the
