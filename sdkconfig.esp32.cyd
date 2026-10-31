@@ -109,3 +109,12 @@ CONFIG_ARGON_HEAP_TWOEND=y
 # heap's functions in flash - each made the panel's present path slower (the
 # heap alone: 155 -> 270 us a row, 6 -> 3.4 pictures a second).
 CONFIG_ESP_PHY_IRAM_OPT=n
+
+# The flash on four lines (QIO), not two (DIO).  Every cache miss on the
+# ESP32 is a 32-byte line read over SPI, ~450 CPU cycles in DIO at 80 MHz;
+# QIO halves the data phase.  The CYD's flash (Zbit, id 5e 4016) takes the
+# bootloader's default QE setting.  Measured 31 Oct 2026 with MD32 on the
+# panel: ECCO 35 -> 55 whole pictures a second, its 68000 12.2 -> 8.9 ms a
+# frame; Thunder Force IV 19 -> 29 pictures, its sound 618 -> 521 ms a second;
+# a row to the glass 31 -> 18 us.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
