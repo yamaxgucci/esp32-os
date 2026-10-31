@@ -275,13 +275,16 @@ void z80_run(int target)
     if (s_reset_once && !s_bus_ack && !s_reset) {
         int cycles = s_timeslice / Z80_FREQ_DIVISOR;
 #ifdef ARGON_SMS_SMALL
-        /* a slice it can only wait through, counted out (z80.c) */
+        /*
+         * A slice it can only wait through: the whole passes counted out
+         * (z80.c), and the last one - a few instructions - run, so the slice
+         * ends where the interpreter alone would have ended it.
+         */
         const int idle = (cycles > 0) ? md_z80_idle_pass() : 0;
-        if (idle > 0 && cycles >= idle) {
-            const int n = cycles / idle;
+        if (idle > 0 && cycles > idle) {
+            const int n = (cycles - 1) / idle;
             md_z80_idle_advance(n);
-            zclk = target - (cycles - n * idle) * Z80_FREQ_DIVISOR;
-            return;
+            cycles -= n * idle;
         }
 #endif
         if (cycles > 0) {

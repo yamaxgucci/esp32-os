@@ -3800,7 +3800,7 @@ md_z80_skip_poll(uint8_t v, uint32_t p, uint32_t load)
 	if (!round)
 		return;
 	const uint32_t pass = load + test + jcyc;
-	const uint32_t n = (uint32_t)Z80.icount / pass;
+	const uint32_t n = ((uint32_t)Z80.icount - 1u) / pass;
 	if (n == 0u)
 		return;
 	Z80.icount -= (int32_t)(pass * n);
@@ -3847,7 +3847,7 @@ __attribute__((noinline)) static void md_z80_skip_idle(uint8_t opcode)
 	s_idle_op = opcode;
 	s_idle_pass = (uint8_t)pass;
 	s_idle_r = (uint8_t)(at - target + 1u);
-	const uint32_t n = (uint32_t)Z80.icount / pass;
+	const uint32_t n = ((uint32_t)Z80.icount - 1u) / pass;
 	if (n == 0u)
 		return;
 	Z80.icount -= (int32_t)(pass * n);
@@ -3869,6 +3869,9 @@ __attribute__((noinline)) static void md_z80_skip_idle(uint8_t opcode)
  */
 int md_z80_idle_pass(void)
 {
+#ifdef MD_NO_ZSKIP
+	return 0;
+#endif
 	if (Z80.nmi_pending || (Z80.irq_state != CLEAR_LINE && Z80.iff1) || Z80.after_ei)
 		return 0;
 	if (Z80.halt)
@@ -3982,7 +3985,7 @@ MD_HOT __attribute__((noinline)) static void md_z80_spin(void)
 }
 
 /* after an instruction: a jump back by a little (or to itself) - a loop */
-#ifdef MD_NO_SPIN
+#if defined(MD_NO_SPIN) || defined(MD_NO_ZSKIP)
 #define MD_SPIN_CHECK() ((void)0)
 #else
 #define MD_SPIN_CHECK() do { \
@@ -3994,6 +3997,15 @@ MD_HOT __attribute__((noinline)) static void md_z80_spin(void)
 /* noinline: one copy, not one in md_z80_fast's flattened body as well */
 MD_HOT __attribute__((noinline)) static void md_z80_skip_waits(uint8_t opcode)
 {
+#ifdef MD_NO_ZSKIP
+	return;
+#endif
+	/*
+	 * Called with the instruction that closes a pass fetched but not run: the
+	 * passes counted out must leave it a T-state, or it runs past the slice's
+	 * end where the interpreter would have stopped before it (Road Rash II's
+	 * DAC writes came 4 T-states early, 31 Oct 2026).
+	 */
 	if (Z80.icount <= 0)
 		return;
 	/* an interrupt waiting ends any wait at the next instruction */
@@ -4001,17 +4013,27 @@ MD_HOT __attribute__((noinline)) static void md_z80_skip_waits(uint8_t opcode)
 		return;
 	if (opcode == 0x10)
 	{
-		if (cpu_readop_arg(PCD) != 0xfe)
+		/* djnz $, or back over nothing but NOPs: a delay counted in B (Road
+		 * Rash II times its samples by `ld b,12 / nop / djnz`, 31 Oct 2026) */
+		const uint32_t d = cpu_readop_arg(PCD);
+		if (d < 0xf6u || d > 0xfeu)
 			return;
+		const uint32_t nops = 0xfeu - d; /* the bytes between target and djnz */
+		for (uint32_t k = 1u; k <= nops; k++)
+		{
+			if (cpu_readop_arg((PRVPC - k) & 0xffffu) != 0x00)
+				return;
+		}
+		const uint32_t pass = 13u + 4u * nops;
 		const uint32_t b = B ? B : 256u;
-		uint32_t n = (uint32_t)Z80.icount / 13u;
+		uint32_t n = ((uint32_t)Z80.icount - 1u) / pass;
 		if (n > b - 1u)
 			n = b - 1u;
 		if (n == 0u)
 			return;
 		B = (uint8_t)(b - n);
-		Z80.icount -= (int32_t)(13u * n);
-		Z80.r = (uint8_t)(Z80.r + n);
+		Z80.icount -= (int32_t)(pass * n);
+		Z80.r = (uint8_t)(Z80.r + (1u + nops) * n);
 		return;
 	}
 	if (opcode == 0x7e)
@@ -4050,6 +4072,9 @@ MD_HOT __attribute__((noinline)) static void md_z80_skip_waits(uint8_t opcode)
  */
 __attribute__((noinline)) static void md_z80_skip_halt(void)
 {
+#ifdef MD_NO_ZSKIP
+	return;
+#endif
 	if (Z80.icount <= 4)
 		return;
 	const uint32_t n = ((uint32_t)Z80.icount - 1u) / 4u;
