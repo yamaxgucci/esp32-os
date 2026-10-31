@@ -552,6 +552,13 @@ menu "ArgonOS"
     config ARGON_USB_HOST
         bool "USB host: HID keyboard (boot protocol)"
         depends on SOC_USB_OTG_SUPPORTED
+        # The one OTG port is a host or a device, not both.  The exclusion
+        # lives here and not on ARGON_USB_DEVICE: that symbol is read by
+        # main/idf_component.yml, and a symbol whose dependency is unmet does
+        # not reach sdkconfig at all, so every board with a USB host
+        # (esp32s3-board) died in configure with "Missing required kconfig
+        # option" (31 Oct 2026).  This one nothing outside Kconfig reads.
+        depends on !ARGON_USB_DEVICE
         default n
         help
             The USB-OTG peripheral as a host, so a wired keyboard plugged into
@@ -589,7 +596,6 @@ menu "ArgonOS"
         # compiles nothing for it on a chip with no OTG peripheral, and the
         # help below says so.
         bool "USB device: be a HID keyboard and mouse for another computer"
-        depends on !ARGON_USB_HOST
         default n
         help
             The other direction of the same cable.  With this on, the board
