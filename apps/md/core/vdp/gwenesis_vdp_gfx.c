@@ -781,6 +781,20 @@ unsigned int get_hscroll_vram(int line)
 
     return table + idx*4;
 }
+
+/* a line's horizontal scroll, plane A (0) or B (2): from VRAM, or from the
+ * copy a raster pass draws with (md_raster.c) */
+#ifdef ARGON_MD_SMALL
+extern uint16_t *const *md_vr_hs;
+#endif
+static inline __attribute__((always_inline)) unsigned int md_hs_fetch(int line, unsigned int off)
+{
+#ifdef ARGON_MD_SMALL
+  if (md_vr_hs != NULL)
+    return md_vr_hs[line >> 5][((line & 31) << 1) | (off >> 1)];
+#endif
+  return FETCH16VRAM(get_hscroll_vram(line) + off);
+}
 /******************************************************************************
  *
  *  Render PLANE B on screen line
@@ -793,7 +807,7 @@ void draw_line_b(int line)
   uint8_t *scr  = &render_buffer[PIX_OVERFLOW];
 
   unsigned int ntaddr = REG4_NAMETABLE_B;
-  uint16_t scrollx=FETCH16VRAM(get_hscroll_vram(line) + 2) & 0x3FF;
+  uint16_t scrollx=md_hs_fetch(line, 2) & 0x3FF;
   uint16_t *vsram = &VSRAM[1];
   uint8_t *end = scr + screen_width;
 
@@ -852,7 +866,7 @@ void draw_line_aw(int line) {
   uint8_t *scr  = &render_buffer[PIX_OVERFLOW];
 
   unsigned int ntaddr = REG2_NAMETABLE_A;
-  uint16_t scrollx=FETCH16VRAM(get_hscroll_vram(line) + 0) & 0x3FF;
+  uint16_t scrollx=md_hs_fetch(line, 0) & 0x3FF;
   uint16_t *vsram = &VSRAM[0];
 
   // Check if we are in the window region only

@@ -24,10 +24,13 @@ int md_raster_init(void *(*alloc)(size_t));
 extern int md_raster_on;
 void md_raster_begin(void);
 void md_raster_note(int kind, int index);
+void md_raster_visible(void); /* the last visible line has run */
 void md_raster_end(void);
 
 /* The drawer's: a pass on the last whole frame's record, line by line. */
-int  md_raster_take(void); /* 1: the pass draws from the record */
+/* 1: the pass draws from the record; 0: from the live VDP; 2: the last
+ * frame published was drawn already - wait for the next */
+int  md_raster_take(void);
 void md_raster_line(int line);
 void md_raster_done(void);
 

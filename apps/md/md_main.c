@@ -22,6 +22,9 @@
 #include "md_sound.h"
 #include "ym2612.h"
 #include "z80inst.h"
+/* a line's horizontal blank, in master clocks: where its picture starts */
+#define MD_LINE_HBLANK 860
+
 #ifdef ARGON_MD_SMALL
 #include "md_snd_async.h"
 #include "md_raster.h"
@@ -714,7 +717,16 @@ static void md_help_draw(ag_time_t until)
 static void md_open_pass(void)
 {
     const int h = (screen_height < MD_HASH_LINES) ? screen_height : MD_HASH_LINES;
-    s_pass_raster = md_raster_on && md_raster_take();
+    int took = md_raster_on ? md_raster_take() : 0;
+    while (took == 2 && s_ring_run) {
+        /* the frame it would draw went by while the last pass held the
+         * copy: the next one, not the same one again */
+        if (!md_snd_core0_poll()) {
+            ag_delay(1);
+        }
+        took = md_raster_take();
+    }
+    s_pass_raster = (took == 1);
     if (s_shot_at != 0u && s_frames_done >= s_shot_at) {
         s_shot_at = 0;
         s_shot_now = 1;
@@ -1302,6 +1314,7 @@ static void run_frame(int render)
      */
     static int hint_counter;
     static int system_clock;
+    static int rendered;   /* the line drawn last (the address-error resume) */
     const int  profile = s_profile_frames > 0;
     uint64_t   m68k_us = 0;
     uint64_t   z80_us = 0;
@@ -1315,6 +1328,7 @@ static void run_frame(int render)
     hint_counter = gwenesis_vdp_regs[10];
     system_clock = 0;
     scan_line = 0;
+    rendered = -1;
 #ifdef ARGON_MD_SMALL
     const int here = !md_snd_async; /* the sound side on this core */
 #else
@@ -1341,6 +1355,31 @@ static void run_frame(int render)
         system_clock += VDP_CYCLES_PER_LINE;
 resume_m68k:
         t0 = profile ? ag_micros() : 0;
+        /*
+         * The line is drawn when its picture starts, not when it ends.  A
+         * line's 3420 clocks start (here) with its horizontal blank, ~860
+         * clocks, where a line interrupt's handler begins; what the 68000
+         * writes after that comes while the line is being shown and counts
+         * from the next one.  Drawn after the whole line, Road Rash II's road
+         * took the next band's vertical scroll a line early - written 1900
+         * clocks in - and one line of mountains crossed the sky (host
+         * harness, 31 Oct 2026).
+         */
+        if (render && rendered != scan_line) {
+            rendered = scan_line;
+            m68k_run(system_clock - VDP_CYCLES_PER_LINE + MD_LINE_HBLANK);
+#ifdef ARGON_MD_SMALL
+            const int line = md_line_begin(scan_line);
+            if (line >= 0) {
+                gwenesis_vdp_render_line(line);
+                md_line_end(line);
+            }
+#else
+            if (scan_line < screen_height) {
+                gwenesis_vdp_render_line(scan_line);
+            }
+#endif
+        }
         m68k_run(system_clock);
         if (profile) {
             t1 = ag_micros();
@@ -1375,23 +1414,6 @@ resume_m68k:
             t0 = t1;
         }
 
-#ifdef ARGON_MD_SMALL
-        if (render) {
-            const int line = md_line_begin(scan_line);
-            if (line >= 0) {
-                gwenesis_vdp_render_line(line);
-                md_line_end(line);
-            }
-        }
-#else
-        if (render && scan_line < screen_height) {
-            gwenesis_vdp_render_line(scan_line);
-        }
-#endif
-        if (profile) {
-            t1 = ag_micros();
-            vdp_us += (uint64_t)(t1 - t0);
-        }
 
         /* The line-interrupt counter reloads outside the active display. */
         if ((scan_line == 0) || (scan_line > screen_height)) {
@@ -1411,6 +1433,11 @@ resume_m68k:
 
         /* Vblank starts at the end of the last displayed line. */
         if (scan_line == screen_height) {
+#ifdef ARGON_MD_SMALL
+            if (md_raster_on) {
+                md_raster_visible(); /* before the vertical blank's DMA */
+            }
+#endif
             if (REG1_VBLANK_INTERRUPT != 0) {
                 gwenesis_vdp_status |= STATUS_VIRQPENDING;
                 m68k_set_irq(6);
