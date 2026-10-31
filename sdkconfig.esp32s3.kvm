@@ -77,3 +77,8 @@ CONFIG_TINYUSB_MSC_BUFSIZE=4096
 # The partition table still carries `usbdisk` (harmless, unused) so the layout
 # does not change if the drive comes back.  See partitions_kvm.csv.
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_kvm.csv"
+
+# The T-Dongle's flash has not been tried in QIO (sdkconfig.esp32s3.board turns
+# it on for the S3-CAM).  A flash that does not take the bootloader's QE write
+# does not boot at all, so this board stays on two lines until it is checked.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y

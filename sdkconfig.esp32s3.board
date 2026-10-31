@@ -158,3 +158,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"
 # not the screen, the sound or the card (-23, the registry full), so the
 # picture went into its own fb0.  The C3 has 48 and the CYD 40.
 CONFIG_ARGON_DEV_MAX=48
+
+# The flash on four lines (QIO), not two (DIO).  Code and every mapped file
+# (fs->map, the cold part of a split .AXE) run from flash through the cache,
+# and a miss is a line read over SPI; QIO halves its data phase.  The S3-CAM's
+# flash (Boya, id 68 4018) takes the bootloader's default QE setting and boots
+# in QIO.  Measured 31 Oct 2026 with XIPBENCH over a 512 KB file mapped from
+# C:, three runs each, DIO -> QIO: a random read that misses 1932 -> 1118 ns,
+# a sequential one 260 -> 152 ns a word; SRAM unchanged.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
