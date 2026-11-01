@@ -67,6 +67,26 @@ CLAUDE.md
 # Board WiFi password, read by the flashing tools (assets/pwd). Never committed.
 assets/pwd
 
+# Credentials / private keys / confidential values - repo is PUBLIC, never commit.
+# A pre-commit hook (.git/hooks/pre-commit) enforces this across all worktrees too.
+*.pem
+*.key
+*.ppk
+*.p12
+*.pfx
+*.pkcs12
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa
+*_rsa
+*_ed25519
+.env
+.env.*
+*.env
+
 # Board transcripts are RENDERED SCREENS - the same rows painted over and over -
 # so one run is megabytes of repetition.  The numbers out of them are extracted
 # into logs/*.md, and THAT is committed: the last round of SPI work put every
