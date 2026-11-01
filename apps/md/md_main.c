@@ -509,6 +509,22 @@ static void md_present_rows(const unsigned short *px, int line, int rows, int w,
         .w = (uint16_t)w,
         .h = (uint16_t)rows,
     };
+    if (s_gi.fb != NULL) {
+        /*
+         * A screen with a framebuffer (the S3-CAM's soft fb0 in front of its
+         * ST7789): the rows go into it and that rectangle is flushed - pixels
+         * presented past it reached the panel and were painted over by the
+         * framebuffer's own refresh, and the glass showed nothing of the game
+         * (1 Nov 2026).  The CYD's screen has no framebuffer and takes rows.
+         */
+        for (int r = 0; r < rows; r++) {
+            memcpy((uint8_t *)s_gi.fb + (size_t)(b.y + r) * s_gi.stride +
+                       (size_t)b.x * sizeof(uint16_t),
+                   px + (size_t)r * MD_WIDTH, (size_t)w * sizeof(uint16_t));
+        }
+        ag_gfx_flush(b.x, b.y, (uint32_t)w, (uint32_t)rows);
+        return;
+    }
     if (ag_gfx_present(&b) != AG_OK) {
         s_present_bad++;
     }
