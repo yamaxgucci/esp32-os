@@ -11,6 +11,7 @@
 #include <argon/path.h>
 #include <argon/proc.h>
 #include <argon/vfs.h>
+#include <argon/port/mem.h>
 
 #include "appcfg_text.h"
 #include "proc/proc_internal.h"
@@ -18,13 +19,25 @@
 #define TAG "appcfg"
 
 /*
- * Two static buffers rather than stack ones: the caller is an application's own
- * task, and how much stack it has is the application's business.  AG_APPCFG_TEXT_MAX
- * is 1 KB each - a settings file that outgrows it is holding something other
- * than settings, and the rewrite refuses rather than truncating.
+ * The file's text, old and new, in a block taken for the call rather than on
+ * the stack: the caller is an application's own task, and how much stack it
+ * has is the application's business.  AG_APPCFG_TEXT_MAX is 1 KB each - a
+ * settings file that outgrows it is holding something other than settings,
+ * and the rewrite refuses rather than truncating.
+ *
+ * Not static: 2 KB of .bss for a call made a few times in a program's life
+ * pushed the S3's QEMU image 832 bytes past its DRAM when the shop's line met
+ * main (1 Nov 2026) - the same budget cmd_fs.c's copy buffer gave back.  PSRAM
+ * first where there is any.  It also lets two programs ask at once.
  */
-static char s_old[AG_APPCFG_TEXT_MAX];
-static char s_new[AG_APPCFG_TEXT_MAX];
+static char *text_alloc(void)
+{
+    char *p = ag_port_alloc(2u * AG_APPCFG_TEXT_MAX, AG_MEM_SLOW | AG_MEM_BYTE);
+    if (p == NULL) {
+        p = ag_port_alloc(2u * AG_APPCFG_TEXT_MAX, AG_MEM_FAST | AG_MEM_BYTE);
+    }
+    return p;
+}
 
 static const char *app_name(void)
 {
@@ -85,27 +98,27 @@ static void app_path(const char *app, bool temp, char *out, size_t len)
     out[at] = '\0';
 }
 
-/* Reads the whole file into s_old.  Zero when there is no file yet, which is
- * every program's first run. */
-static size_t read_text(const char *app)
+/* Reads the whole file into `old` (AG_APPCFG_TEXT_MAX).  Zero when there is
+ * no file yet, which is every program's first run. */
+static size_t read_text(const char *app, char *old)
 {
     char path[AG_PATH_MAX];
     app_path(app, false, path, sizeof(path));
     const ag_handle_t h = ag_vfs_open(path, NULL, AG_O_RDONLY);
     if (h < 0) {
-        s_old[0] = '\0';
+        old[0] = '\0';
         return 0;
     }
     size_t at = 0;
-    while (at + 1u < sizeof(s_old)) {
-        const int32_t n = ag_vfs_read(h, s_old + at, sizeof(s_old) - 1u - at);
+    while (at + 1u < AG_APPCFG_TEXT_MAX) {
+        const int32_t n = ag_vfs_read(h, old + at, AG_APPCFG_TEXT_MAX - 1u - at);
         if (n <= 0) {
             break;
         }
         at += (size_t)n;
     }
     (void)ag_vfs_close(h);
-    s_old[at] = '\0';
+    old[at] = '\0';
     return at;
 }
 
@@ -114,10 +127,17 @@ ag_err_t ag_appcfg_get(const char *key, char *out, size_t len)
     if (key == NULL || out == NULL || len == 0) {
         return -AG_EINVAL;
     }
-    if (read_text(app_name()) == 0) {
-        return -AG_ENOENT;
+    char *const text = text_alloc();
+    if (text == NULL) {
+        return -AG_ENOMEM;
     }
-    return ag_appcfg_text_get(s_old, key, out, len) ? AG_OK : -AG_ENOENT;
+    ag_err_t err = -AG_ENOENT;
+    if (read_text(app_name(), text) != 0 &&
+        ag_appcfg_text_get(text, key, out, len)) {
+        err = AG_OK;
+    }
+    ag_port_free(text);
+    return err;
 }
 
 int32_t ag_appcfg_get_int(const char *key, int32_t fallback)
@@ -125,28 +145,51 @@ int32_t ag_appcfg_get_int(const char *key, int32_t fallback)
     if (key == NULL) {
         return fallback;
     }
-    if (read_text(app_name()) == 0) {
+    char *const text = text_alloc();
+    if (text == NULL) {
         return fallback;
     }
-    return ag_appcfg_text_get_int(s_old, key, fallback);
+    int32_t v = fallback;
+    if (read_text(app_name(), text) != 0) {
+        v = ag_appcfg_text_get_int(text, key, fallback);
+    }
+    ag_port_free(text);
+    return v;
 }
+
+static ag_err_t write_text(const char *app, const char *text, size_t len);
 
 ag_err_t ag_appcfg_set(const char *key, const char *value)
 {
     if (key == NULL || value == NULL) {
         return -AG_EINVAL;
     }
+    char *const old = text_alloc();
+    if (old == NULL) {
+        return -AG_ENOMEM;
+    }
+    char *const new_text = old + AG_APPCFG_TEXT_MAX;
     const char *const app = app_name();
-    (void)read_text(app);
+    (void)read_text(app, old);
 
-    const size_t len = ag_appcfg_text_set(s_old, key, value, s_new,
-                                          sizeof(s_new));
+    const size_t len = ag_appcfg_text_set(old, key, value, new_text,
+                                          AG_APPCFG_TEXT_MAX);
+    ag_err_t err;
     if (len == 0) {
         ag_log(AG_LOG_WARN, TAG,
                "%s = %s does not fit in %u bytes; the file is left alone", key,
-               value, (unsigned)sizeof(s_new));
-        return -AG_ENOSPC;
+               value, (unsigned)AG_APPCFG_TEXT_MAX);
+        err = -AG_ENOSPC;
+    } else {
+        err = write_text(app, new_text, len);
     }
+    ag_port_free(old);
+    return err;
+}
+
+/* The new text to the program's file, through a temporary. */
+static ag_err_t write_text(const char *app, const char *text, size_t len)
+{
 
     const ag_err_t made = ag_vfs_mkdir(AG_APPCFG_DIR, NULL);
     if (made != AG_OK && made != -AG_EEXIST) {
@@ -164,7 +207,7 @@ ag_err_t ag_appcfg_set(const char *key, const char *value)
     if (h < 0) {
         return (ag_err_t)h;
     }
-    if (ag_vfs_write(h, s_new, len) != (int32_t)len) {
+    if (ag_vfs_write(h, text, len) != (int32_t)len) {
         (void)ag_vfs_close(h);
         (void)ag_vfs_unlink(temp, NULL);
         return -AG_EIO;
