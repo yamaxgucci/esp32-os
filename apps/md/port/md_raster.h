@@ -42,6 +42,7 @@ void md_raster_hs_write(void);
 void md_raster_visible(void); /* the last visible line has run */
 void md_raster_end(void);
 unsigned md_raster_cap(void); /* writes a record holds */
+const char *md_raster_hs_mode(void); /* how the scroll table is followed */
 
 /* The drawer's: a pass on the last whole frame's record, line by line. */
 /* 1: the pass draws from the record; 0: from the live VDP; 2: the last

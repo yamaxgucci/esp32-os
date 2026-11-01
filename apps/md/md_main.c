@@ -359,8 +359,9 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
             const uint32_t rp = s_ras_passes - s_rp_seen;
             s_rp_seen += rp;
             ag_printf("md: raster record holds %u writes; %u of %u frames had "
-                      "more; %u passes drawn from it\n", md_raster_cap(), ro,
-                      rf, (unsigned)rp);
+                      "more; %u passes drawn from it; scroll table %s\n",
+                      md_raster_cap(), ro, rf, (unsigned)rp,
+                      md_raster_hs_mode());
         }
     }
 #endif
@@ -1817,6 +1818,12 @@ int ag_main(int argc, char **argv)
                     md_raster_init(md_crumb_alloc)) ? 1 : 0;
     if (!md_raster_on && s_sysdraw && s_ring_n > 0 && !s_headless) {
         ag_printf("md: no memory left to follow raster effects\n");
+    }
+    {
+        extern unsigned md_raster_blocks, md_raster_bytes;
+        ag_printf("md: raster record from %u blocks, %u bytes; scroll table %s; "
+                  "the machine's pages from %d blocks\n", md_raster_blocks,
+                  md_raster_bytes, md_raster_hs_mode(), s_blocks);
     }
 #endif
 

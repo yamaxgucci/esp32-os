@@ -88,7 +88,7 @@ unsigned short *md_vr_cram565 = CRAM565;
 /* the writes a record holds, in pieces */
 #define MD_RAS_PIECE  32
 #ifndef MD_RAS_PIECES
-#define MD_RAS_PIECES 8
+#define MD_RAS_PIECES 4 /* a record of 124 bytes: two and a copy fit 256-byte holes */
 #endif
 #define MD_RAS_EVENTS (MD_RAS_PIECE * MD_RAS_PIECES)
 
@@ -108,9 +108,12 @@ static unsigned          s_cap; /* events a record holds: whole pieces */
 static md_ras_t         *s_rec[2];
 
 /* the horizontal scroll a line of the published frame was drawn with, plane
- * A and B, in 32-line pieces (the heap's leftovers are small) */
-#define MD_RAS_HS_LINES 256
-#define MD_RAS_HS_PIECE 32
+ * A and B, in 16-line pieces of 64 bytes: the heap's leftovers are small, and
+ * after the lines met on the CYD (1 Nov 2026) not one 128-byte piece of a
+ * table was left - MD_RAS_HS_PIECE and gwenesis_vdp_gfx.c's md_hs_fetch
+ * agree on the size */
+#define MD_RAS_HS_LINES 224 /* NTSC; a PAL frame is not published */
+#define MD_RAS_HS_PIECE 16
 static uint16_t         *s_hs[MD_RAS_HS_LINES / MD_RAS_HS_PIECE];
 static int               s_hs_ok;
 /* the frame being run's: its lines up to s_hs_upto copied so far; swapped
@@ -144,24 +147,63 @@ static int              s_ev_n, s_ev_at;
 
 int md_raster_on;
 
-/* a record's next piece of writes, for both records at once */
-static int add_piece(void *(*alloc)(size_t), unsigned pieces)
+/*
+ * What the heap has left is a few kilobytes in small holes, and every block
+ * taken is one of the process's 32 resources - the machine's pages are about
+ * 21 of them.  A block apiece came to 34 once the lines met, the scroll tables
+ * were refused, and frames with raster effects were drawn torn between two
+ * frames (he saw it on the CYD, 1 Nov 2026); one block for all of it found no
+ * hole that large.  So the largest holes there are, taken whole and cut here.
+ */
+static void *(*s_alloc)(size_t);
+static uint8_t *s_cut, *s_cut_end;
+unsigned md_raster_blocks, md_raster_bytes; /* what it got (the stats) */
+
+static void *carve(size_t n)
 {
-    uint32_t *const a = (uint32_t *)alloc(MD_RAS_PIECE * sizeof(uint32_t));
-    uint32_t *const b = (a != NULL) ? (uint32_t *)alloc(MD_RAS_PIECE * sizeof(uint32_t)) : NULL;
-    if (b == NULL) {
-        return 0; /* (a, if it came, stays unused: alloc has no free) */
+    static const uint16_t k_sizes[] = {2048, 1536, 1024, 768, 640, 512, 384, 256, 192, 128, 64};
+    n = (n + 3u) & ~(size_t)3u;
+    if (s_cut == NULL || (size_t)(s_cut_end - s_cut) < n) {
+        s_cut = NULL;
+        for (unsigned i = 0; i < sizeof(k_sizes) / sizeof(k_sizes[0]); i++) {
+            if (k_sizes[i] < n) {
+                break;
+            }
+            uint8_t *const b = (uint8_t *)s_alloc(k_sizes[i]);
+            if (b != NULL) {
+                s_cut = b;
+                s_cut_end = b + k_sizes[i];
+                md_raster_blocks++;
+                md_raster_bytes += k_sizes[i];
+                break;
+            }
+        }
+        if (s_cut == NULL) {
+            return NULL;
+        }
+    }
+    void *const p = s_cut;
+    s_cut += n;
+    return p;
+}
+
+/* a record's next piece of writes, for both records at once */
+static int add_piece(unsigned pieces)
+{
+    uint32_t *const a = (uint32_t *)carve(2u * MD_RAS_PIECE * sizeof(uint32_t));
+    if (a == NULL) {
+        return 0;
     }
     s_rec[0]->ev[pieces] = a;
-    s_rec[1]->ev[pieces] = b;
+    s_rec[1]->ev[pieces] = a + MD_RAS_PIECE;
     return 1;
 }
 
-/* a 256-line scroll table in 32-line pieces; 0 if a piece did not come */
-static int alloc_hs(void *(*alloc)(size_t), uint16_t **t)
+/* a scroll table in the renderer's 16-line pieces; 0 if one did not come */
+static int alloc_hs(uint16_t **t)
 {
     for (int i = 0; i < MD_RAS_HS_LINES / MD_RAS_HS_PIECE; i++) {
-        t[i] = (uint16_t *)alloc(MD_RAS_HS_PIECE * 2 * sizeof(uint16_t));
+        t[i] = (uint16_t *)carve(MD_RAS_HS_PIECE * 2u * sizeof(uint16_t));
         if (t[i] == NULL) {
             return 0;
         }
@@ -170,26 +212,27 @@ static int alloc_hs(void *(*alloc)(size_t), uint16_t **t)
 }
 
 /*
- * What the heap has left is a few kilobytes at best, so it goes where it
- * buys most, in order: a piece of each record and the drawer's copy
- * (without them nothing is followed), the scroll tables, the palette, and
- * only then more pieces.  Gunstar Heroes' 10 writes a frame need one piece;
- * the pieces taken first left the scroll and palette copies nothing.
+ * In the order it buys most: both records, the drawer's copy and a piece of
+ * writes (without them nothing is followed), the scroll tables, the palette,
+ * and only then more pieces.
  */
 int md_raster_init(void *(*alloc)(size_t))
 {
-    s_rec[0] = (md_ras_t *)alloc(sizeof(md_ras_t));
-    s_rec[1] = (md_ras_t *)alloc(sizeof(md_ras_t));
-    s_cp = (md_ras_copy_t *)alloc(sizeof(md_ras_copy_t));
-    if (s_rec[0] == NULL || s_rec[1] == NULL || s_cp == NULL ||
-        !add_piece(alloc, 0)) {
+    s_alloc = alloc;
+    /* in the order that wastes least of 256-byte holes, which is what the
+     * CYD has left (six of them, measured 1 Nov 2026): a record and the copy
+     * share one, the other record leaves room for two pieces of a table */
+    s_rec[0] = (md_ras_t *)carve(sizeof(md_ras_t));
+    s_cp = (md_ras_copy_t *)carve(sizeof(md_ras_copy_t));
+    s_rec[1] = (md_ras_t *)carve(sizeof(md_ras_t));
+    s_hs_ok = alloc_hs(s_hs); /* its first pieces in what the record left */
+    if (s_rec[0] == NULL || s_rec[1] == NULL || s_cp == NULL || !add_piece(0)) {
         return 0;
     }
     unsigned pieces = 1;
-    s_hs_ok = alloc_hs(alloc, s_hs);
-    s_hs_run_ok = s_hs_ok && alloc_hs(alloc, s_hs_run);
-    s_cram565 = (uint16_t *)alloc(MD_RAS_CRAM * 4 * sizeof(uint16_t));
-    while (pieces < MD_RAS_PIECES && add_piece(alloc, pieces)) {
+    s_hs_run_ok = s_hs_ok && alloc_hs(s_hs_run);
+    s_cram565 = (uint16_t *)carve(MD_RAS_CRAM * 4 * sizeof(uint16_t));
+    while (pieces < MD_RAS_PIECES && add_piece(pieces)) {
         pieces++;
     }
     s_cap = pieces * MD_RAS_PIECE;
@@ -302,6 +345,13 @@ unsigned md_raster_cap(void)
     return s_cap;
 }
 
+/* how the scroll table is followed (the stats): "as written" with the
+ * frame's own copy, "at the end" without it, "not" without either */
+const char *md_raster_hs_mode(void)
+{
+    return s_hs_run_ok ? "as written" : s_hs_ok ? "at the end" : "not";
+}
+
 /* frames recorded, and frames with too many writes to follow (the stats) */
 unsigned md_raster_frames, md_raster_over;
 /* the frame's end: nothing - it was published when its last line was shown */
@@ -373,8 +423,16 @@ void md_raster_visible(void)
         unlock();
         return;
     }
-    if ((r->n == 0 && !s_hs_moved) || r->n > s_cap) {
-        s_pub = -1; /* nothing to draw differently, or too much to */
+    if ((r->n == 0 && !s_hs_moved) || r->n > s_cap || !s_hs_ok ||
+        screen_height > MD_RAS_HS_LINES) {
+        /*
+         * Nothing to draw differently, or too much to - or no copy of the
+         * scroll table: the record's registers with the table the vertical
+         * blank has rewritten for the next frame is a picture torn between
+         * two frames, worse than the live VDP's one frame (he saw it on the
+         * CYD, 1 Nov 2026).
+         */
+        s_pub = -1;
     } else {
         if (s_hs_run_ok) {
             hs_upto(MD_RAS_HS_LINES);

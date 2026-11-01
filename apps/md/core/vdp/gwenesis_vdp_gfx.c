@@ -791,7 +791,7 @@ static inline __attribute__((always_inline)) unsigned int md_hs_fetch(int line, 
 {
 #ifdef ARGON_MD_SMALL
   if (md_vr_hs != NULL)
-    return md_vr_hs[line >> 5][((line & 31) << 1) | (off >> 1)];
+    return md_vr_hs[line >> 4][((line & 15) << 1) | (off >> 1)]; /* 16-line pieces (md_raster.c) */
 #endif
   return FETCH16VRAM(get_hscroll_vram(line) + off);
 }
