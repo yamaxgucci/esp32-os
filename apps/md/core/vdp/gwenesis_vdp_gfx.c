@@ -52,9 +52,7 @@ extern unsigned char VRAM[];
 #endif
 
 extern unsigned short CRAM[];            // CRAM - Palettes
-#ifndef ARGON_MD_SMALL
 extern unsigned char SAT_CACHE[]__attribute__((aligned(4)));        // Sprite cache
-#endif
 extern unsigned char gwenesis_vdp_regs[]; // Registers
 
 extern unsigned short CRAM565[];    // CRAM - Palettes
@@ -788,7 +786,6 @@ unsigned int get_hscroll_vram(int line)
  * copy a raster pass draws with (md_raster.c) */
 #ifdef ARGON_MD_SMALL
 extern uint16_t *const *md_vr_hs;
-extern uint8_t *md_vr_sat;
 #endif
 static inline __attribute__((always_inline)) unsigned int md_hs_fetch(int line, unsigned int off)
 {
@@ -994,22 +991,13 @@ void draw_sprites_over_planes(int line)
     {
 #ifdef ARGON_MD_SMALL
         unsigned int ent_[2];   /* the entry by words: VRAM is in IRAM */
-        uint8_t *table, *cache;
-        if (md_vr_sat != NULL) {
-          /* the frame's own table (md_raster.c), not the next frame's */
-          table = cache = md_vr_sat + sidx * 8;
-        } else {
-          unsigned int o_ = (unsigned int)(REG5_SAT_ADDRESS & VRAM_MASK) + sidx * 8;
-          ent_[0] = VRAM_W(o_); ent_[1] = VRAM_W(o_ + 4);
-          /* no cache of the table's first half here: its 640 bytes are
-           * the record's copy (md_raster.c) - Castlevania Bloodlines' trick
-           * with a moved table is not followed */
-          table = cache = (uint8_t *)ent_;
-        }
+        { unsigned int o_ = (unsigned int)(REG5_SAT_ADDRESS & VRAM_MASK) + sidx * 8;
+          ent_[0] = VRAM_W(o_); ent_[1] = VRAM_W(o_ + 4); }
+        uint8_t *table = (uint8_t *)ent_;
 #else
         uint8_t *table = start_table + sidx*8;
-        uint8_t *cache = SAT_CACHE + sidx*8;
 #endif
+        uint8_t *cache = SAT_CACHE + sidx*8;
         //uint8_t *cache = start_table + sidx*8;
         
 
@@ -1117,14 +1105,9 @@ void draw_sprites(int line)
   for (int i = 0; i < SPRITE_TABLE_SIZE && sidx < SPRITE_TABLE_SIZE; ++i) {
 #ifdef ARGON_MD_SMALL
     unsigned int ent_[2];   /* the entry by words: VRAM is in IRAM */
-    uint8_t *table;
-    if (md_vr_sat != NULL) {
-      table = md_vr_sat + sidx * 8; /* the frame's own table (md_raster.c) */
-    } else {
-      unsigned int o_ = (unsigned int)(REG5_SAT_ADDRESS & VRAM_MASK) + sidx * 8;
-      ent_[0] = VRAM_W(o_); ent_[1] = VRAM_W(o_ + 4);
-      table = (uint8_t *)ent_;
-    }
+    { unsigned int o_ = (unsigned int)(REG5_SAT_ADDRESS & VRAM_MASK) + sidx * 8;
+      ent_[0] = VRAM_W(o_); ent_[1] = VRAM_W(o_ + 4); }
+    uint8_t *table = (uint8_t *)ent_;
 #else
     uint8_t *table = start_table + sidx * 8;
 #endif

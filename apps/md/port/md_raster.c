@@ -142,18 +142,6 @@ typedef struct {
 static md_ras_copy_t   *s_cp;
 static const md_ras_t  *s_cp_rec;
 static uint16_t        *s_cram565; /* NULL: palette writes are not followed */
-/*
- * The sprite table as the frame's lines saw it, 8 bytes a sprite.  The
- * vertical blank rewrites the table for the next frame before a pass draws
- * this one, and without the copy the sprites came out a frame ahead of the
- * planes - the only thing wrong in Gunstar Heroes' story scenes, and most of
- * what was wrong in Sonic 2 and Spinball (host harness, 1 Nov 2026).  Its
- * 640 bytes are the VDP's sprite cache's, which this build does without
- * (gwenesis_vdp_mem.c).
- */
-#define MD_RAS_SPRITES 80
-static uint32_t         s_sat[MD_RAS_SPRITES * 2];
-uint8_t                *md_vr_sat; /* the renderer's: s_sat, or NULL */
 static int              s_ev_n, s_ev_at;
 
 int md_raster_on;
@@ -460,12 +448,6 @@ void md_raster_visible(void)
                 hs_words(l, &s_hs[l / MD_RAS_HS_PIECE][(l % MD_RAS_HS_PIECE) * 2]);
             }
         }
-        {
-            const unsigned base = REG5_SAT_ADDRESS & VRAM_MASK;
-            for (unsigned i = 0; i < MD_RAS_SPRITES * 2; i++) {
-                s_sat[i] = VRAM_W((base + i * 4u) & VRAM_MASK);
-            }
-        }
         s_pub = s_rec_k;
         s_rec_k ^= 1;
         s_pub_seq++;
@@ -500,7 +482,6 @@ int md_raster_take(void)
     if (s_hs_ok) {
         md_vr_hs = s_hs;
     }
-    md_vr_sat = (uint8_t *)s_sat;
     md_vr_regs = s_cp->regs;
     md_vr_vsram = s_cp->vsram;
     if (cram && s_cram565 != NULL) {
@@ -543,7 +524,6 @@ int md_raster_next(void)
 void md_raster_done(void)
 {
     md_vr_hs = NULL;
-    md_vr_sat = NULL;
     __atomic_store_n(&s_hs_busy, 0, __ATOMIC_RELEASE);
     md_vr_regs = gwenesis_vdp_regs;
     md_vr_vsram = VSRAM;
