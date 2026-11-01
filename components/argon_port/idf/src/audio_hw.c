@@ -941,6 +941,13 @@ static bool board_wants_i2s(void)
 #define i2s_be_space()            0
 #define i2s_be_capture()          false
 #define i2s_be_read(p, f)         (-AG_ENOSYS)
+/* The converters' ring is cut by the DAC driver, not by a block asked for:
+ * half of it is the block that keeps it fed (the I2S path's own rule). */
+uint32_t ag_port_audio_period(uint32_t frames)
+{
+    (void)frames;
+    return (uint32_t)DAC_FRAMES / 2u;
+}
 #endif
 #if !SOC_DAC_SUPPORTED
 uint32_t ag_port_audio_stops(void) { return 0; }
