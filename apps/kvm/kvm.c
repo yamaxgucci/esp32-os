@@ -123,9 +123,14 @@ typedef struct {
      * listener stays up alongside it as a fallback.
      */
     bool        use_relay;
-    uint32_t    relay_addr;      /* VPS IPv4, first octet in the high byte     */
+    char        relay_host[80];  /* VPS host NAME - dialled over TLS, verified */
     uint16_t    relay_port;      /* the relay's board port                     */
     char        relay_secret[64];
+    char        relay_id[48];    /* this board's public id, or empty = auto    */
+    bool        allow_update;    /* the relay may push app/system updates      */
+    char        eff_id[48];      /* the id actually in use: relay_id or derived */
+    char        node[17];        /* this board, for the relay: C:\KVMNODE.TXT  */
+    bool        id_busy;         /* the relay said another board holds our id  */
     ag_handle_t relay;           /* the parked outbound socket, or -1          */
     uint32_t    relay_next_dial; /* backoff: do not redial before this         */
     uint32_t    relay_born;      /* when the parked socket was dialled         */
@@ -300,12 +305,15 @@ static void handle_line(kvm_t *k, const char *line, size_t len)
 
     /* "P <password>": the phone proving it may drive.  The reply tells the
      * page whether to go on or ask again.  A board with no password set is
-     * open, and says so. */
+     * open, and says so.  A session already authed - the relay checked the
+     * password on the way in - stays authed whatever is sent here: the page
+     * sends what it has stored, possibly nothing, and that must not undo it. */
     if (len >= 1 && line[0] == 'P' && (len == 1 || line[1] == ' ')) {
         const char  *pw = (len >= 2) ? line + 2 : "";
         const size_t pwn = (len >= 2) ? len - 2 : 0;
         const size_t wl = strlen(k->webpass);
-        k->authed = (wl == 0) || (pwn == wl && memcmp(pw, k->webpass, wl) == 0);
+        k->authed = k->authed || (wl == 0) ||
+                    (pwn == wl && memcmp(pw, k->webpass, wl) == 0);
         (void)ws_send(k, AG_KVMWS_TEXT, k->authed ? "A 1" : "A 0", 3);
         return;
     }
@@ -474,12 +482,14 @@ static void kvm_read_cfg(kvm_t *k)
         return;
     }
     buf[n] = 0;
-    /* Three lines: ssid, pass, webpass. */
-    char        *into[3] = {k->ssid, k->wpass, k->webpass};
-    const size_t cap[3] = {sizeof(k->ssid), sizeof(k->wpass),
-                           sizeof(k->webpass)};
+    /* Four lines: ssid, pass, webpass, and an optional relay id (the label the
+     * phone reaches this board by - empty means the relay derives one).  Older
+     * files have only the first three; the id then stays empty, which is auto. */
+    char        *into[4] = {k->ssid, k->wpass, k->webpass, k->relay_id};
+    const size_t cap[4] = {sizeof(k->ssid), sizeof(k->wpass),
+                           sizeof(k->webpass), sizeof(k->relay_id)};
     char *p = buf;
-    for (int i = 0; i < 3 && p != NULL; i++) {
+    for (int i = 0; i < 4 && p != NULL; i++) {
         char  *nl = strchr(p, '\n');
         size_t L = nl ? (size_t)(nl - p) : strlen(p);
         if (L > 0 && p[L - 1] == '\r') {
@@ -505,49 +515,18 @@ static void kvm_write_cfg(kvm_t *k)
         return;
     }
     char      buf[256];
-    const int n = snprintf(buf, sizeof(buf), "%s\n%s\n%s\n", k->ssid, k->wpass,
-                           k->webpass);
+    const int n = snprintf(buf, sizeof(buf), "%s\n%s\n%s\n%s\n", k->ssid,
+                           k->wpass, k->webpass, k->relay_id);
     if (n > 0) {
         (void)ag_write(h, buf, (size_t)n);
     }
     (void)ag_close(h);
 }
 
-/* "a.b.c.d" to a uint32 with the first octet in the high byte - the order
- * ag_tcp_connect and the kernel's own ifaddr formatting both use. */
-static bool parse_ipv4(const char *s, uint32_t *out)
-{
-    uint32_t v = 0;
-    for (int parts = 0; parts < 4; parts++) {
-        if (*s < '0' || *s > '9') {
-            return false;
-        }
-        uint32_t oct = 0;
-        int      d = 0;
-        while (*s >= '0' && *s <= '9') {
-            oct = oct * 10u + (uint32_t)(*s - '0');
-            s++;
-            if (++d > 3 || oct > 255u) {
-                return false;
-            }
-        }
-        v = (v << 8) | oct;
-        if (parts < 3) {
-            if (*s != '.') {
-                return false;
-            }
-            s++;
-        }
-    }
-    if (*s != 0) {
-        return false;
-    }
-    *out = v;
-    return true;
-}
-
-/* C:\KVMRLY.TXT, three lines: VPS host (IPv4), board port, secret.  Present
- * means "reach me through this relay"; absent means LAN only, as before. */
+/* C:\KVMRLY.TXT, three lines: VPS host NAME, board port, secret.  Present means
+ * "reach me through this relay"; absent means LAN only, as before.  The host is
+ * a name, not an address: the board dials it over TLS and the certificate is
+ * checked against the name, so a name is what must be written here. */
 static void kvm_read_relay(kvm_t *k)
 {
     const ag_handle_t h = ag_open(KVM_RELAY_PATH, AG_O_RDONLY);
@@ -562,10 +541,9 @@ static void kvm_read_relay(kvm_t *k)
     }
     buf[n] = 0;
 
-    char         host[64] = {0};
     char         ports[16] = {0};
-    char        *into[3] = {host, ports, k->relay_secret};
-    const size_t cap[3] = {sizeof(host), sizeof(ports),
+    char        *into[3] = {k->relay_host, ports, k->relay_secret};
+    const size_t cap[3] = {sizeof(k->relay_host), sizeof(ports),
                            sizeof(k->relay_secret)};
     char *p = buf;
     for (int i = 0; i < 3 && p != NULL; i++) {
@@ -582,36 +560,117 @@ static void kvm_read_relay(kvm_t *k)
         p = nl ? nl + 1 : NULL;
     }
 
-    uint32_t addr = 0;
-    long     port = 0;
+    /* An optional fourth line, "update": the owner lets the relay push new
+     * software to this board (see handle_update).  Off unless written - a relay
+     * shared by several people must not be able to reflash somebody's dongle. */
+    if (p != NULL && strncmp(p, "update", 6) == 0) {
+        k->allow_update = true;
+    }
+
+    long port = 0;
     for (const char *c = ports; *c >= '0' && *c <= '9'; c++) {
         port = port * 10 + (*c - '0');
     }
-    if (!parse_ipv4(host, &addr) || port <= 0 || port > 65535 ||
+    if (k->relay_host[0] == 0 || port <= 0 || port > 65535 ||
         k->relay_secret[0] == 0) {
         ag_printf("relay config bad (%s), ignoring it\n", KVM_RELAY_PATH);
         k->relay_secret[0] = 0;
         return;
     }
-    k->relay_addr = addr;
     k->relay_port = (uint16_t)port;
     k->use_relay = true;
 }
 
+static void sha256_hex(const char *msg, char out[65]);
+
+/*
+ * The id the phone reaches this board by: the one the owner chose at setup, or,
+ * left empty, the one the relay derives from the secret - worked out here the
+ * same way (sha256("id:" + secret), first ten hex digits) so the agent can show
+ * the right link either way.
+ */
+static void kvm_eff_id(kvm_t *k)
+{
+    if (k->relay_id[0] != 0) {
+        (void)snprintf(k->eff_id, sizeof(k->eff_id), "%s", k->relay_id);
+        return;
+    }
+    char src[80];
+    char hex[65];
+    (void)snprintf(src, sizeof(src), "id:%s", k->relay_secret);
+    sha256_hex(src, hex);
+    hex[10] = '\0';
+    (void)snprintf(k->eff_id, sizeof(k->eff_id), "%s", hex);
+}
+
+/*
+ * Who this board is, to the relay: not the id (anyone may pick any id) and not
+ * the secret (every board on a relay shares it), but a token made once, from
+ * whatever differs between two boards and two moments, and kept in
+ * C:\KVMNODE.TXT so it survives restarts and updates.  The relay uses it to
+ * tell "the same board dialling again" from "another board claiming its id" -
+ * and a board back from a reboot is still the same board, so it does not
+ * collide with the connection it left behind.
+ */
+#define KVM_NODE_PATH "c:\\KVMNODE.TXT"
+
+static void kvm_node_token(kvm_t *k)
+{
+    const ag_handle_t h = ag_open(KVM_NODE_PATH, AG_O_RDONLY);
+    if (h >= 0) {
+        char          t[24] = {0};
+        const int32_t n = ag_read(h, t, sizeof(t) - 1);
+        (void)ag_close(h);
+        if (n >= 16) {
+            memcpy(k->node, t, 16);
+            k->node[16] = '\0';
+            return;
+        }
+    }
+    char     seed[200];
+    uint32_t addr = 0;
+    (void)ag_net_ifaddr(&addr);
+    (void)snprintf(seed, sizeof(seed), "%s|%s|%s|%llu|%lu|%lu",
+                   k->relay_secret, k->webpass, k->ssid,
+                   (unsigned long long)ag_micros(), (unsigned long)ag_millis(),
+                   (unsigned long)addr);
+    char hex[65];
+    sha256_hex(seed, hex);
+    memcpy(k->node, hex, 16);
+    k->node[16] = '\0';
+    const ag_handle_t w =
+        ag_open(KVM_NODE_PATH, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (w >= 0) {
+        (void)ag_write(w, k->node, 16);
+        (void)ag_close(w);
+    }
+}
+
 /* The agent sent credentials: remember them, join, and make the page ask for
- * the new password. */
+ * the new password.  A fourth field, when present, is the relay id (empty =
+ * automatic); a changed id takes effect at once, by dialling the relay again. */
 static void kvm_apply_config(kvm_t *k, const uint8_t *p, uint32_t len)
 {
     const char *s = (const char *)p;
     uint32_t    rem = len;
     s = take_field(k->ssid, sizeof(k->ssid), s, &rem);
     s = take_field(k->wpass, sizeof(k->wpass), s, &rem);
-    (void)take_field(k->webpass, sizeof(k->webpass), s, &rem);
+    s = take_field(k->webpass, sizeof(k->webpass), s, &rem);
+    if (rem > 0) {
+        (void)take_field(k->relay_id, sizeof(k->relay_id), s, &rem);
+    }
 
     k->have_cfg = (k->ssid[0] != 0);
     k->authed = (k->webpass[0] == 0);
     kvm_write_cfg(k);
-    ag_printf("configured: joining %s\n", k->ssid);
+    kvm_eff_id(k);
+    k->id_busy = false;
+    if (k->relay >= 0) { /* re-announce under the (possibly) new id */
+        (void)ag_net_close(k->relay);
+        k->relay = -1;
+        k->relay_next_dial = ag_millis();
+    }
+    ag_printf("configured: joining %s, id %s\n", k->ssid, k->eff_id);
     kvm_join(k);
 }
 
@@ -622,7 +681,7 @@ static void send_cfg_state(kvm_t *k)
     if (k->vid < 0) {
         return;
     }
-    uint8_t  buf[AG_VID_HDR + 1 + 16];
+    uint8_t  buf[AG_VID_HDR + 1 + 16 + 48 + 1];
     uint32_t addr = 0;
     char     ip[16] = "0.0.0.0";
     const bool ready = ag_net_is_ready();
@@ -636,11 +695,17 @@ static void send_cfg_state(kvm_t *k)
     const uint8_t state = ready ? AG_VID_CFG_READY
                                 : (k->have_cfg ? AG_VID_CFG_JOINING
                                                : AG_VID_CFG_NEED);
+    /* state, "ip\0", then (newer agents read it, older ones stop at the NUL)
+     * "id\0" and '1' when the relay refused that id as taken by another board. */
     const size_t   iplen = strlen(ip) + 1;
-    const uint32_t plen = 1u + (uint32_t)iplen;
+    const char    *id = k->use_relay ? k->eff_id : "";
+    const size_t   idlen = strlen(id) + 1;
+    const uint32_t plen = 1u + (uint32_t)iplen + (uint32_t)idlen + 1u;
     (void)ag_vid_header(buf, AG_VID_CFG_STATE, 0, plen);
     buf[AG_VID_HDR] = state;
     memcpy(buf + AG_VID_HDR + 1, ip, iplen);
+    memcpy(buf + AG_VID_HDR + 1 + iplen, id, idlen);
+    buf[AG_VID_HDR + 1 + iplen + idlen] = k->id_busy ? '1' : '0';
     /* One non-blocking write, no retry: this runs on a timer whether or not an
      * agent is draining the pipe, and the keyboard must not wait behind it.  A
      * dropped state message is picked up by the next tick 700 ms later.  The
@@ -685,15 +750,85 @@ static void screen_stats(kvm_t *k, int16_t y, bool ready, bool phone)
     ag_gfx_fill_rect(0, y, s_pw, 18, 0x001018);
     char line[24];
     if (ready && phone) {
-        (void)snprintf(line, sizeof(line), "%u/s  rs %u",
+        (void)snprintf(line, sizeof(line), "phone %u/s rs %u",
                        (unsigned)s_fps, (unsigned)k->vrx.resyncs);
         ag_gfx_text(4, y, line, 0x9AA5AD, AG_GFX_TRANS);
     } else if (ready) {
-        ag_gfx_text(4, y, "open on the phone", 0x9AA5AD, AG_GFX_TRANS);
+        ag_gfx_text(4, y, "waiting phone", 0x9AA5AD, AG_GFX_TRANS);
     } else if (!k->have_cfg) {
         ag_gfx_text(4, y, "run the agent", 0x9AA5AD, AG_GFX_TRANS);
     }
     ag_gfx_flush(0, (uint16_t)y, s_pw, 18);
+}
+
+/*
+ * A line too long for the glass - the addresses, mostly: the outside link alone
+ * is fifty characters and the dongle's panel takes twenty - goes by as a
+ * running line, one character every MARQ_MS, in its own strip so nothing else
+ * on the card is repainted for it.  A line that fits just stands still.
+ */
+#define MARQ_MS 220u
+static char    s_marq[176];
+static size_t  s_marq_len, s_marq_off;
+static int16_t s_marq_y = -1;
+static bool    s_marq_run;
+
+static void marquee_paint(void)
+{
+    if (s_marq_y < 0 || s_marq_len == 0) {
+        return;
+    }
+    const size_t cols = s_pw / 8u;
+    char         win[64];
+    size_t       n = 0;
+    if (!s_marq_run) {
+        n = s_marq_len < sizeof(win) - 1 ? s_marq_len : sizeof(win) - 1;
+        memcpy(win, s_marq, n);
+    } else {
+        for (; n < cols && n < sizeof(win) - 1; n++) {
+            win[n] = s_marq[(s_marq_off + n) % s_marq_len];
+        }
+    }
+    win[n] = ' ';
+    ag_gfx_fill_rect(0, s_marq_y, s_pw, 16, 0x001018);
+    ag_gfx_text(s_marq_run ? 0 : 4, s_marq_y, win, 0x40FF80, AG_GFX_TRANS);
+    ag_gfx_flush(0, (uint16_t)s_marq_y, s_pw, 16);
+}
+
+/* Set what the running line says and where; it starts from the beginning. */
+static void marquee_set(int16_t y, const char *text)
+{
+    (void)snprintf(s_marq, sizeof(s_marq), "%s", text);
+    s_marq_len = strlen(s_marq);
+    s_marq_y = y;
+    s_marq_off = 0;
+    s_marq_run = (s_marq_len * 8u > (size_t)s_pw - 4u);
+    if (s_marq_run && s_marq_len + 4 < sizeof(s_marq)) {
+        memcpy(s_marq + s_marq_len, "    ", 5); /* a gap before it repeats */
+        s_marq_len += 4;
+    }
+    marquee_paint();
+}
+
+/* Called on its own tick from the main loop. */
+static void kvm_marquee(const kvm_t *k)
+{
+    if (!k->panel || !s_marq_run) {
+        return;
+    }
+    s_marq_off = (s_marq_off + 1u) % s_marq_len;
+    marquee_paint();
+}
+
+/* The addresses for the running line: on this network, and from anywhere. */
+static void kvm_addr_line(const kvm_t *k, const char *ip, char *out, size_t cap)
+{
+    if (k->use_relay && !k->id_busy && k->eff_id[0] != 0) {
+        (void)snprintf(out, cap, "http://%s/   web: https://%s/?id=%s", ip,
+                       k->relay_host, k->eff_id);
+    } else {
+        (void)snprintf(out, cap, "http://%s/", ip);
+    }
 }
 
 static void kvm_screen(kvm_t *k)
@@ -741,8 +876,8 @@ static void kvm_screen(kvm_t *k)
     const bool  small = (s_pw <= 200u || s_ph <= 120u);
     static char shown[40] = "\x01";
     char        now[40];
-    (void)snprintf(now, sizeof(now), "%d|%d|%s", k->have_cfg ? 1 : 0,
-                   phone ? 1 : 0, ip);
+    (void)snprintf(now, sizeof(now), "%d|%d|%s|%s|%d", k->have_cfg ? 1 : 0,
+                   phone ? 1 : 0, ip, k->eff_id, k->id_busy ? 1 : 0);
     const bool changed = (strcmp(now, shown) != 0);
     if (changed) {
         strncpy(shown, now, sizeof(shown) - 1);
@@ -757,16 +892,26 @@ static void kvm_screen(kvm_t *k)
             ag_gfx_text(3, 1, "ArgonOS KVM", 0x33CCFF, AG_GFX_TRANS);
             ag_gfx_fill_circle((int16_t)(s_pw - 10), 9, 4,
                                dot_colour(k, ready, phone));
-            if (ready) {
-                ag_gfx_text(4, 24, ip, 0x40FF80, AG_GFX_TRANS);
-                ag_gfx_text(4, 42, phone ? "phone linked" : "waiting phone",
-                            phone ? 0x40FF80 : 0x9AA5AD, AG_GFX_TRANS);
-            } else if (k->have_cfg) {
-                ag_gfx_text(4, 30, "joining Wi-Fi...", 0xFFC640, AG_GFX_TRANS);
-            } else {
-                ag_gfx_text(4, 30, "not set up", 0xFFC640, AG_GFX_TRANS);
+            s_marq_y = -1;
+            if (k->use_relay && k->eff_id[0] != 0) {
+                char idl[64];
+                (void)snprintf(idl, sizeof(idl), k->id_busy ? "id TAKEN: %s"
+                                                            : "id %s",
+                               k->eff_id);
+                ag_gfx_text(4, 20, idl, k->id_busy ? 0xFF5040 : 0xFFFFFF,
+                            AG_GFX_TRANS);
             }
-            ag_gfx_flush(0, 0, s_pw, s_ph);
+            if (ready) {
+                char addr_l[160];
+                kvm_addr_line(k, ip, addr_l, sizeof(addr_l));
+                ag_gfx_flush(0, 0, s_pw, s_ph);
+                marquee_set(40, addr_l);
+            } else {
+                ag_gfx_text(4, 40, k->have_cfg ? "joining Wi-Fi..."
+                                               : "not set up",
+                            0xFFC640, AG_GFX_TRANS);
+                ag_gfx_flush(0, 0, s_pw, s_ph);
+            }
         }
         screen_stats(k, stats_y, ready, phone);
         return;
@@ -778,12 +923,23 @@ static void kvm_screen(kvm_t *k)
     }
     ag_gfx_clear(0x001018);
     ag_gfx_text(10, 12, "ArgonOS  KVM", 0x33CCFF, AG_GFX_TRANS);
+    s_marq_y = -1;
+    if (k->use_relay && k->eff_id[0] != 0) {
+        char idl[64];
+        (void)snprintf(idl, sizeof(idl),
+                       k->id_busy ? "id TAKEN by another board: %s" : "id %s",
+                       k->eff_id);
+        ag_gfx_text(10, 36, idl, k->id_busy ? 0xFF5040 : 0xFFFFFF,
+                    AG_GFX_TRANS);
+    }
     if (ready) {
-        char line[40];
-        (void)snprintf(line, sizeof(line), "http://%s/", ip);
-        ag_gfx_text(10, 44, line, 0x40FF80, AG_GFX_TRANS);
-        ag_gfx_text(10, 68, phone ? "phone linked" : "open on the phone",
+        ag_gfx_text(10, 92, phone ? "phone linked" : "open on the phone",
                     0x9AA5AD, AG_GFX_TRANS);
+        ag_gfx_flush(0, 0, s_pw, s_ph);
+        char addr_l[160];
+        kvm_addr_line(k, ip, addr_l, sizeof(addr_l));
+        marquee_set(60, addr_l);
+        return;
     } else if (k->have_cfg) {
         ag_gfx_text(10, 44, "joining Wi-Fi...", 0xFFC640, AG_GFX_TRANS);
     } else {
@@ -866,6 +1022,128 @@ static size_t read_request(ag_handle_t c, char *buf, size_t cap)
     return 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* SHA-256 - small and self-contained, so the board can hand the relay a hash */
+/* of its web password instead of the password itself.  Public-domain style. */
+/* ------------------------------------------------------------------------ */
+
+static uint32_t sha_ror(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+
+typedef struct {
+    uint32_t h[8];
+    uint8_t  buf[64];
+    size_t   blen;
+    uint64_t total;
+} sha256_t;
+
+static void sha256_block(uint32_t h[8], const uint8_t blk[64])
+{
+    static const uint32_t K[64] = {
+        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu,
+        0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u, 0xd807aa98u, 0x12835b01u,
+        0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u,
+        0xc19bf174u, 0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+        0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau, 0x983e5152u,
+        0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u,
+        0x06ca6351u, 0x14292967u, 0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu,
+        0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u,
+        0xd6990624u, 0xf40e3585u, 0x106aa070u, 0x19a4c116u, 0x1e376c08u,
+        0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu,
+        0x682e6ff3u, 0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+        0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u};
+
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)blk[i * 4] << 24) | ((uint32_t)blk[i * 4 + 1] << 16) |
+               ((uint32_t)blk[i * 4 + 2] << 8) | (uint32_t)blk[i * 4 + 3];
+    }
+    for (int i = 16; i < 64; i++) {
+        const uint32_t s0 =
+            sha_ror(w[i - 15], 7) ^ sha_ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        const uint32_t s1 =
+            sha_ror(w[i - 2], 17) ^ sha_ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5],
+             g = h[6], hh = h[7];
+    for (int i = 0; i < 64; i++) {
+        const uint32_t S1 = sha_ror(e, 6) ^ sha_ror(e, 11) ^ sha_ror(e, 25);
+        const uint32_t ch = (e & f) ^ (~e & g);
+        const uint32_t t1 = hh + S1 + ch + K[i] + w[i];
+        const uint32_t S0 = sha_ror(a, 2) ^ sha_ror(a, 13) ^ sha_ror(a, 22);
+        const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        const uint32_t t2 = S0 + maj;
+        hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+    h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
+static void sha256_init(sha256_t *s)
+{
+    static const uint32_t iv[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
+                                   0xa54ff53au, 0x510e527fu, 0x9b05688cu,
+                                   0x1f83d9abu, 0x5be0cd19u};
+    memcpy(s->h, iv, sizeof(iv));
+    s->blen = 0;
+    s->total = 0;
+}
+
+static void sha256_update(sha256_t *s, const void *data, size_t n)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    s->total += n;
+    while (n > 0) {
+        size_t take = 64u - s->blen;
+        if (take > n) {
+            take = n;
+        }
+        memcpy(s->buf + s->blen, p, take);
+        s->blen += take;
+        p += take;
+        n -= take;
+        if (s->blen == 64u) {
+            sha256_block(s->h, s->buf);
+            s->blen = 0;
+        }
+    }
+}
+
+static void sha256_final_hex(sha256_t *s, char out[65])
+{
+    const uint64_t bits = s->total * 8u;
+    const uint8_t  pad = 0x80u;
+    const uint8_t  zero = 0;
+    sha256_update(s, &pad, 1);
+    while (s->blen != 56u) {
+        sha256_update(s, &zero, 1);
+    }
+    uint8_t len[8];
+    for (int i = 0; i < 8; i++) {
+        len[i] = (uint8_t)(bits >> (56 - 8 * i));
+    }
+    sha256_update(s, len, 8);
+
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 4; j++) {
+            const uint8_t byte = (uint8_t)(s->h[i] >> (24 - j * 8));
+            out[(i * 4 + j) * 2] = hex[byte >> 4];
+            out[(i * 4 + j) * 2 + 1] = hex[byte & 0xf];
+        }
+    }
+    out[64] = '\0';
+}
+
+static void sha256_hex(const char *msg, char out[65])
+{
+    sha256_t s;
+    sha256_init(&s);
+    sha256_update(&s, msg, strlen(msg));
+    sha256_final_hex(&s, out);
+}
+
 /*
  * Keep one connection parked at the relay, ready for the next phone.  Only when
  * no phone is on the line (k->ws < 0): one socket is enough for one phone at a
@@ -873,6 +1151,12 @@ static size_t read_request(ag_handle_t c, char *buf, size_t cap)
  * between serving the page on one socket and the WebSocket arriving on the next.
  * Redial is rate-limited, and a long-parked socket is recycled so a connection
  * the home router dropped in silence does not sit here looking alive.
+ *
+ * The connection is TLS: the host in KVMRLY.TXT is a name, dialled and verified
+ * against the root bundle, so the whole relay leg - the hello with the password
+ * hash included - is encrypted.  The hello announces this board's public id (or
+ * "-" for the relay to derive one) and a SHA-256 of the web password, so the
+ * relay can gate a takeover without the password ever being configured on it.
  */
 static void relay_ensure(kvm_t *k)
 {
@@ -886,23 +1170,35 @@ static void relay_ensure(kvm_t *k)
         k->relay = -1;
     }
     if (k->relay >= 0) {
+        /* A refusal comes at once; a socket still parked after a few seconds
+         * means the relay took our id this time. */
+        if (k->id_busy && (int32_t)(now - k->relay_born) >= 5000) {
+            k->id_busy = false;
+            ag_printf("relay: id '%s' accepted\n", k->eff_id);
+        }
         return;
     }
     if ((int32_t)(now - k->relay_next_dial) < 0) {
         return;
     }
-    k->relay_next_dial = now + RELAY_RETRY_MS;
+    /* Taken id: ask again now and then (the other board may leave), not every
+     * three seconds. */
+    k->relay_next_dial = now + (k->id_busy ? 30000u : RELAY_RETRY_MS);
     if (!k->have_cfg) {
         return; /* no network joined yet - nothing to dial over */
     }
-    const ag_handle_t c = ag_tcp_connect(k->relay_addr, k->relay_port, 5000u);
+    const ag_handle_t c =
+        ag_tls_connect(k->relay_host, k->relay_port, 8000u);
     if (c < 0) {
         return;
     }
     (void)ag_net_set_nonblock(c, true);
-    char      hello[80];
-    const int hn = snprintf(hello, sizeof(hello), "AGKVM1 %s\n",
-                            k->relay_secret);
+    char pwhex[65];
+    sha256_hex(k->webpass, pwhex);
+    const char *id = (k->relay_id[0] != 0) ? k->relay_id : "-";
+    char      hello[200];
+    const int hn = snprintf(hello, sizeof(hello), "AGKVM1 %s %s %s %s\n",
+                            k->relay_secret, id, pwhex, k->node);
     if (hn <= 0 || !send_all(c, hello, (size_t)hn)) {
         (void)ag_net_close(c);
         return;
@@ -927,6 +1223,16 @@ static size_t read_relay_request(kvm_t *k)
     }
     size_t n = (size_t)r;
     k->req[n] = '\0';
+    /* The relay refusing our id: another board holds it right now.  Say so to
+     * the agent and stop dialling every few seconds (relay_ensure backs off). */
+    if (strncmp(k->req, "AGKVM1-IDBUSY", 13) == 0) {
+        if (!k->id_busy) {
+            ag_printf("relay: id '%s' is taken by another board - choose "
+                      "another with the agent's setup\n", k->eff_id);
+        }
+        k->id_busy = true;
+        return 0;
+    }
     if (n >= 4 && strstr(k->req, "\r\n\r\n") != NULL) {
         return n;
     }
@@ -993,7 +1299,7 @@ static void ws_drop(kvm_t *k, const char *why)
     k->rx_n = 0;
 }
 
-static void ws_adopt(kvm_t *k, ag_handle_t c)
+static void ws_adopt(kvm_t *k, ag_handle_t c, bool preauth)
 {
     if (k->ws >= 0) {
         /* One phone at a time, and the newest wins: a page left open on a
@@ -1002,9 +1308,16 @@ static void ws_adopt(kvm_t *k, ag_handle_t c)
     }
     k->ws = c;
     k->rx_n = 0;
-    k->authed = (k->webpass[0] == 0); /* a fresh phone must give the password */
+    /*
+     * A fresh phone must give the password - unless the relay already checked it
+     * (preauth): it validated the password on the way in and marked the session,
+     * so asking again here would be the same password a second time.  A board
+     * with no password set is open either way.  LAN connections never carry the
+     * mark, so they still ask.
+     */
+    k->authed = preauth || (k->webpass[0] == 0);
     ag_kvm_reset(&k->st);
-    ag_printf("phone connected\n");
+    ag_printf("phone connected%s\n", preauth ? " (relay-authed)" : "");
 }
 
 /*
@@ -1013,7 +1326,7 @@ static void ws_adopt(kvm_t *k, ag_handle_t c)
  * (returns true, caller keeps the socket); the page and 404 are served and the
  * caller closes.
  */
-static bool handle_http(kvm_t *k, ag_handle_t c, size_t n)
+static bool handle_http(kvm_t *k, ag_handle_t c, size_t n, bool preauth)
 {
     if (n == 0) {
         return false;
@@ -1031,7 +1344,7 @@ static bool handle_http(kvm_t *k, ag_handle_t c, size_t n)
                                     "Sec-WebSocket-Accept: %s\r\n\r\n",
                                     accept);
             if (rn > 0 && send_all(c, resp, (size_t)rn)) {
-                ws_adopt(k, c);
+                ws_adopt(k, c, preauth);
                 return true;
             }
         }
@@ -1042,6 +1355,183 @@ static bool handle_http(kvm_t *k, ag_handle_t c, size_t n)
         serve_404(c);
     }
     return false;
+}
+
+/*
+ * An update pushed by the relay down a parked connection, in place of a phone's
+ * request:
+ *
+ *   AGKVM-UPD <app|os|disk> <size> <sha256 hex>\r\n\r\n   then <size> bytes
+ *
+ * "app" replaces C:\KVM.AXE (written to KVM.NEW, checked, then swapped, the old
+ * one kept as KVM.OLD); "os" goes into the spare app slot and is set to boot.
+ * Either way the bytes are hashed as they arrive and nothing is installed unless
+ * the hash matches.  Only when the owner put "update" in KVMRLY.TXT, and only
+ * from the relay - the connection is TLS to a server whose certificate the board
+ * checked, so nobody else can feed it.  The answer goes back down the same
+ * connection, then the board restarts into what it installed.
+ */
+#define UPD_IDLE_MS 20000u /* give up when the relay sends nothing this long */
+
+static void upd_reply(ag_handle_t c, const char *msg)
+{
+    (void)send_all(c, msg, strlen(msg));
+}
+
+static void handle_update(kvm_t *k, ag_handle_t c, size_t n)
+{
+    char *end = strstr(k->req, "\r\n\r\n");
+    if (end == NULL) {
+        upd_reply(c, "UPD BAD header\r\n");
+        return;
+    }
+    *end = '\0';
+    const char *p = k->req + 10; /* past "AGKVM-UPD " */
+    char        kind[8] = {0};
+    char        want[65] = {0};
+    uint32_t    size = 0;
+    size_t      i = 0;
+    while (*p != '\0' && *p != ' ' && i < sizeof(kind) - 1) {
+        kind[i++] = *p++;
+    }
+    while (*p == ' ') {
+        p++;
+    }
+    while (*p >= '0' && *p <= '9') {
+        size = size * 10u + (uint32_t)(*p - '0');
+        p++;
+    }
+    while (*p == ' ') {
+        p++;
+    }
+    i = 0;
+    while (*p != '\0' && *p != ' ' && i < 64) {
+        want[i++] = *p++;
+    }
+
+    if (!k->allow_update) {
+        upd_reply(c, "UPD DENIED (no 'update' line in KVMRLY.TXT)\r\n");
+        return;
+    }
+    const bool is_os = strcmp(kind, "os") == 0;
+    const bool is_app = strcmp(kind, "app") == 0;
+    const bool is_disk = strcmp(kind, "disk") == 0; /* the agent's flash drive */
+    if ((!is_os && !is_app && !is_disk) || size == 0 || strlen(want) != 64) {
+        upd_reply(c, "UPD BAD request\r\n");
+        return;
+    }
+
+    ag_handle_t f = -1;
+    void       *ota = NULL;
+    if (is_disk) {
+        ota = ag_disk_begin(size);
+        if (ota == NULL) {
+            upd_reply(c, "UPD FAIL no usbdisk partition (or image too big)\r\n");
+            return;
+        }
+    } else if (is_app) {
+        f = ag_open("c:\\KVM.NEW", AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+        if (f < 0) {
+            upd_reply(c, "UPD FAIL cannot open c:\\KVM.NEW\r\n");
+            return;
+        }
+    } else {
+        ota = ag_ota_begin(size);
+        if (ota == NULL) {
+            upd_reply(c, "UPD FAIL no spare app slot (or image too big)\r\n");
+            return;
+        }
+    }
+    ag_printf("update: %s, %u bytes from the relay\n", kind, (unsigned)size);
+
+    sha256_t s;
+    sha256_init(&s);
+    static uint8_t buf[2048];
+    const char    *body = end + 4;
+    const uint8_t *chunk = (const uint8_t *)body;
+    size_t         clen = n - (size_t)(body - k->req);
+    uint32_t       got = 0;
+    bool           ok = true;
+    uint32_t       last = ag_millis();
+    for (;;) {
+        if (clen > 0) {
+            if (clen > size - got) {
+                clen = size - got;
+            }
+            sha256_update(&s, chunk, clen);
+            if (is_disk) {
+                if (ag_disk_write(ota, chunk, clen) != AG_OK) {
+                    ok = false;
+                    break;
+                }
+            } else if (is_app) {
+                if (ag_write(f, chunk, clen) != (int32_t)clen) {
+                    ok = false;
+                    break;
+                }
+            } else if (ag_ota_write(ota, chunk, clen) != AG_OK) {
+                ok = false;
+                break;
+            }
+            got += (uint32_t)clen;
+            last = ag_millis();
+        }
+        if (got >= size) {
+            break;
+        }
+        const int32_t r = ag_net_recv(c, buf, sizeof(buf));
+        if (r > 0) {
+            chunk = buf;
+            clen = (size_t)r;
+            continue;
+        }
+        clen = 0;
+        if (r == -AG_EAGAIN &&
+            (int32_t)(ag_millis() - last) < (int32_t)UPD_IDLE_MS) {
+            ag_delay(2);
+            continue;
+        }
+        ok = false; /* the link died, or the relay went quiet */
+        break;
+    }
+
+    char hex[65];
+    sha256_final_hex(&s, hex);
+    if (ok && strcmp(hex, want) != 0) {
+        ok = false;
+    }
+
+    if (is_disk) {
+        /* Erased and part-written when it failed; the next push rewrites it. */
+        const bool whole = (ag_disk_end(ota) == AG_OK);
+        ok = ok && whole;
+    } else if (is_app) {
+        (void)ag_close(f);
+        if (ok) {
+            (void)ag_unlink("c:\\KVM.OLD");
+            (void)ag_rename("c:\\KVM.AXE", "c:\\KVM.OLD");
+            if (ag_rename("c:\\KVM.NEW", "c:\\KVM.AXE") != AG_OK) {
+                (void)ag_rename("c:\\KVM.OLD", "c:\\KVM.AXE");
+                ok = false;
+            }
+        } else {
+            (void)ag_unlink("c:\\KVM.NEW");
+        }
+    } else if (ok) {
+        ok = (ag_ota_end(ota, true) == AG_OK);
+    } else {
+        ag_ota_abort(ota);
+    }
+
+    char msg[160];
+    (void)snprintf(msg, sizeof(msg), "UPD %s %s %u/%u sha %s\r\n",
+                   ok ? "OK" : "FAIL", kind, (unsigned)got, (unsigned)size, hex);
+    upd_reply(c, msg);
+    ag_printf("update: %s\n", ok ? "installed, restarting" : "failed");
+    if (ok) {
+        ag_delay(500); /* let the answer leave before the radio goes down */
+        ag_reboot();
+    }
 }
 
 /* Returns true when it read something, so the main loop knows not to sleep. */
@@ -1217,6 +1707,8 @@ int ag_main(int argc, char **argv)
      * as the radio associates; if nothing is set, wait for the agent. */
     kvm_read_cfg(&k);
     kvm_read_relay(&k);
+    kvm_eff_id(&k);
+    kvm_node_token(&k);
     kvm_join(&k);
 
     k.lfd = ag_tcp_listen(port);
@@ -1244,17 +1736,15 @@ int ag_main(int argc, char **argv)
         ag_printf("keyboard and mouse for the PC on the OTG port\n");
         ag_printf("open http://%s:%u/ on the phone\n", ip, (unsigned)port);
         if (k.use_relay) {
-            ag_printf("relay: via %u.%u.%u.%u - reachable from anywhere\n",
-                      (unsigned)((k.relay_addr >> 24) & 0xFFu),
-                      (unsigned)((k.relay_addr >> 16) & 0xFFu),
-                      (unsigned)((k.relay_addr >> 8) & 0xFFu),
-                      (unsigned)(k.relay_addr & 0xFFu));
+            ag_printf("relay: via %s (TLS) - reachable from anywhere\n",
+                      k.relay_host);
         }
         ag_printf("Ctrl+C to stop\n");
     }
 
     uint32_t next_status = ag_millis();
     uint32_t next_cfg = ag_millis();
+    uint32_t next_marq = ag_millis();
 
     while (!ag_interrupted()) {
         /*
@@ -1266,6 +1756,7 @@ int ag_main(int argc, char **argv)
         bool        busy = false;
         ag_handle_t c = -1;
         size_t      n = 0;
+        bool        preauth = false;
 
         /*
          * A connection to handle, from the relay or straight off the LAN.  The
@@ -1281,6 +1772,26 @@ int ag_main(int argc, char **argv)
                     c = k.relay;
                     k.relay = -1; /* consumed: served and closed, or adopted */
                     n = rn;
+                    /*
+                     * The relay prepends this line when it has already checked
+                     * the password for this session; strip it and remember, so
+                     * the WebSocket is adopted already authed (no second ask).
+                     */
+                    static const char mark[] = "AGKVM-AUTH\r\n";
+                    const size_t      mlen = sizeof(mark) - 1;
+                    if (n >= mlen && memcmp(k.req, mark, mlen) == 0) {
+                        preauth = true;
+                        memmove(k.req, k.req + mlen, n - mlen);
+                        n -= mlen;
+                        k.req[n] = '\0';
+                    }
+                    /* Not a phone at all: the relay pushing an update. */
+                    if (n > 10 && strncmp(k.req, "AGKVM-UPD ", 10) == 0) {
+                        handle_update(&k, c, n);
+                        (void)ag_net_close(c);
+                        c = -1;
+                        n = 0;
+                    }
                 }
             }
         }
@@ -1293,7 +1804,7 @@ int ag_main(int argc, char **argv)
         }
         if (c >= 0) {
             busy = true;
-            if (!handle_http(&k, c, n)) {
+            if (!handle_http(&k, c, n, preauth)) {
                 (void)ag_net_close(c);
             }
         }
@@ -1315,6 +1826,10 @@ int ag_main(int argc, char **argv)
             next_cfg = ag_millis() + 700u;
             send_cfg_state(&k);
             kvm_screen(&k);
+        }
+        if ((int32_t)(ag_millis() - next_marq) >= 0) {
+            next_marq = ag_millis() + MARQ_MS;
+            kvm_marquee(&k);
         }
 
         if (!busy) {

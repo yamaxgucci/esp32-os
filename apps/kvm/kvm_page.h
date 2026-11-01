@@ -151,14 +151,15 @@ static const char k_page[] =
 
     /* The password the board asks for on connect.  Kept in localStorage so a
      * phone only types it once; an in-memory copy stands in when localStorage
-     * throws (private mode) or is empty.  A stored empty string is a real
-     * answer - a board with no password accepts it - so only a missing entry
-     * (getItem returns null) falls through to the prompt. */
+     * throws (private mode) or is empty.  Nothing is asked up front: whatever is
+     * stored (or nothing) is sent, and only the board's 'A 0' brings up the
+     * prompt.  That is what lets a session the relay has already checked - a
+     * takeover, where the password was just typed on the relay's page - go
+     * straight through on 'A 1' instead of being asked a second time. */
     "var pwmem='';"
     "function pwset(p){pwmem=p;try{localStorage.setItem('kvmpw',p)}catch(e){}return p}"
     "function pwget(){try{var v=localStorage.getItem('kvmpw');if(v!==null)return v}"
-    "catch(e){}if(pwmem)return pwmem;"
-    "var p=window.prompt('Password for this KVM:');if(p===null)p='';return pwset(p)}"
+    "catch(e){}return pwmem}"
     "function pwclear(){pwmem='';try{localStorage.removeItem('kvmpw')}catch(e){}}"
 
     /* One socket, reopened for as long as the page is up.  A phone that
@@ -186,7 +187,7 @@ static const char k_page[] =
      * first picture.  'A 0' means the stored password was wrong: forget it and
      * ask again, once, for the one 'A 0' the board sends per attempt. */
     "if(s=='A 1'){dot.className='on';st.textContent='connected';B(0x11,null);return}"
-    "if(s=='A 0'){pwclear();st.textContent='wrong password';"
+    "if(s=='A 0'){pwclear();st.textContent='password';"
     "var p=window.prompt('Password for this KVM:');if(p===null)p='';"
     "S('P '+pwset(p));return}"
     "var a=s.split(' ');if(a[0]!='S')return;"

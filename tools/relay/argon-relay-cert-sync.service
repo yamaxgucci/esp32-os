@@ -1,0 +1,5 @@
+[Unit]
+Description=Sync Caddy's KVM cert to the relay board TLS port
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/argon-relay-cert-sync

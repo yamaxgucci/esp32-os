@@ -45,6 +45,7 @@
  * and needs windows.h ahead of it; include it last so those are in scope. */
 #include <winusb.h>
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -678,6 +679,8 @@ static int g_force_setup = 0;
  * next to this exe on the flash drive - no secret on the agent's side, and the
  * board's firmware is untouched.  Empty means "LAN only", the old behaviour. */
 static char g_relay_host[128] = "";
+static char g_link_id[48] = "";  /* the id the printed link carries          */
+static int  g_busy_shown = 0;    /* the "id taken" warning is on the console  */
 
 /* Read one line from the console into buf, without its trailing CR/LF.  An EOF
  * (the user closed the input) leaves an empty string, which the board reads as
@@ -748,7 +751,7 @@ static void load_relay_host(void)
  */
 static void run_setup(link_t *l)
 {
-    char ssid[128], pass[128], webpass[128];
+    char ssid[128], pass[128], webpass[128], rid[48];
 
     printf("\n-- First-run setup --\n");
     printf("The dongle needs a Wi-Fi network to put the phone page on.\n");
@@ -765,10 +768,23 @@ static void run_setup(link_t *l)
     fflush(stdout);
     read_line(webpass, sizeof(webpass));
 
-    /* ssid '\0' pass '\0' webpass '\0' - the trailing NULs are part of the
-     * length so the board gets three C strings back, empty ones included. */
-    const size_t ls = strlen(ssid), lp = strlen(pass), lw = strlen(webpass);
-    const size_t total = ls + 1 + lp + 1 + lw + 1;
+    /* The name in the link (https://<relay>/?id=<this>).  Nothing is asked of
+     * the server here - setup is local; if somebody else's dongle is already
+     * using the same id there, the board says so once it dials in. */
+    printf("Id for the web link (letters/digits, Enter = automatic): ");
+    fflush(stdout);
+    read_line(rid, sizeof(rid));
+    for (char *c = rid; *c; c++) {
+        if (!(isalnum((unsigned char)*c) || *c == '-' || *c == '_')) {
+            *c = '-'; /* keep it typeable and URL-safe */
+        }
+    }
+
+    /* ssid '\0' pass '\0' webpass '\0' id '\0' - the trailing NULs are part of
+     * the length so the board gets four C strings back, empty ones included. */
+    const size_t ls = strlen(ssid), lp = strlen(pass), lw = strlen(webpass),
+                 li = strlen(rid);
+    const size_t total = ls + 1 + lp + 1 + lw + 1 + li + 1;
     uint8_t *payload = (uint8_t *)malloc(total);
     if (payload == NULL) {
         return;
@@ -780,6 +796,8 @@ static void run_setup(link_t *l)
     o += lp + 1;
     memcpy(payload + o, webpass, lw + 1);
     o += lw + 1;
+    memcpy(payload + o, rid, li + 1);
+    o += li + 1;
 
     send_msg(l, AG_VID_CONFIG, payload, (uint32_t)total);
     free(payload);
@@ -1225,6 +1243,61 @@ int main(int argc, char **argv)
                         memcpy(ip, p + 1, iplen);
                         ip[iplen] = '\0'; /* terminate even if the board did not */
 
+                        /* Newer boards follow the IP with "id\0" and a '1' when
+                         * the relay refused that id as taken by another board. */
+                        char bid[48] = "";
+                        int  busy = 0;
+                        {
+                            const char    *q = (const char *)(p + 1);
+                            const uint32_t tot = len - 1;
+                            uint32_t       i = 0;
+                            while (i < tot && q[i] != '\0') {
+                                i++;
+                            }
+                            if (i + 1 < tot) {
+                                const char    *r = q + i + 1;
+                                const uint32_t rl = tot - i - 1;
+                                uint32_t       j = 0;
+                                while (j < rl && r[j] != '\0') {
+                                    j++;
+                                }
+                                const uint32_t cp =
+                                    (j < sizeof(bid) - 1) ? j : sizeof(bid) - 1;
+                                memcpy(bid, r, cp);
+                                bid[cp] = '\0';
+                                busy = (j + 1 < rl) && r[j + 1] == '1';
+                            }
+                        }
+                        if (busy && !g_busy_shown) {
+                            /* The owner must see this even with the console
+                             * folded into the tray: bring it back. */
+                            console_show(1);
+                            printf("\n!! The id '%s' is already in use on the relay"
+                                   " by another KVM.\n"
+                                   "   From outside, that link reaches the other"
+                                   " dongle, not this one.\n"
+                                   "   Choose another id: run kvmagent --setup, or"
+                                   " tray icon > Reconfigure.\n",
+                                   bid);
+                            fflush(stdout);
+                            g_busy_shown = 1;
+                            g_link_id[0] = '\0';
+                        } else if (!busy && g_busy_shown && state == 2) {
+                            printf("relay accepted the id '%s'\n", bid);
+                            g_busy_shown = 0;
+                        }
+                        /* The link from anywhere, printed again whenever the id
+                         * changes (a Reconfigure that picked a new one). */
+                        if (g_configured && state == 2 && !busy &&
+                            g_relay_host[0] != '\0' && bid[0] != '\0' &&
+                            strcmp(bid, g_link_id) != 0) {
+                            printf("From anywhere (any network):  "
+                                   "https://%s/?id=%s\n", g_relay_host, bid);
+                            fflush(stdout);
+                            (void)snprintf(g_link_id, sizeof(g_link_id), "%s",
+                                           bid);
+                        }
+
                         if (g_force_setup && !g_asked) {
                             /* --setup: reconfigure regardless of the reported
                              * state (the board may already be on a network). */
@@ -1240,11 +1313,14 @@ int main(int argc, char **argv)
                                 g_asked = 1;
                             }
                         } else if (state == 2 && !g_configured) {
-                            printf("\nReady. Open  http://%s/  on the phone\n",
+                            printf("\nReady. On the same network:  http://%s/\n",
                                    ip);
-                            if (g_relay_host[0] != '\0') {
+                            if (g_relay_host[0] != '\0' && bid[0] != '\0' &&
+                                !busy) {
                                 printf("From anywhere (any network):  "
-                                       "http://%s/\n", g_relay_host);
+                                       "https://%s/?id=%s\n", g_relay_host, bid);
+                                (void)snprintf(g_link_id, sizeof(g_link_id),
+                                               "%s", bid);
                             }
                             fflush(stdout);
                             g_configured = 1;

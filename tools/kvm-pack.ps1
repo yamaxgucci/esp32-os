@@ -91,14 +91,14 @@ if ($Relay) {
     --partition_size 0x80000 --sector_size 4096 --long_name_support
 
 if ($Flash) {
-    Write-Host "flashing C: (0x310000) and the drive (0x780000) on $Port"
+    Write-Host "flashing C: (0x520000) and the drive (0x780000) on $Port"
     & $idfpy -m esptool --chip esp32s3 -p $Port -b 921600 `
-        --before default_reset --after hard_reset write_flash `
-        0x310000 build\sysfs_kvm.bin 0x780000 build\usbdisk.img
+        --before default_reset --after watchdog_reset write_flash `
+        0x520000 build\sysfs_kvm.bin 0x780000 build\usbdisk.img
 }
 
 Write-Host ''
 Write-Host 'done:'
-Write-Host '  build\sysfs_kvm.bin  -> C: (flash at 0x310000)'
+Write-Host '  build\sysfs_kvm.bin  -> C: (flash at 0x520000)'
 Write-Host '  build\usbdisk.img    -> flash drive (flash at 0x780000)'
 Write-Host '  build\kvmagent.exe   -> the Windows agent (also on the drive)'

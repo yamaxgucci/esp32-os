@@ -1,0 +1,8 @@
+kvm.170-168-150-42.sslip.io {
+    tls {
+        issuer acme {
+            disable_http_challenge
+        }
+    }
+    reverse_proxy 127.0.0.1:8080
+}

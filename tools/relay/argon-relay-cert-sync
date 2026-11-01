@@ -1,0 +1,33 @@
+#!/bin/sh
+# Copy Caddy's cert for the KVM host to the relay's TLS board port, dropping the
+# "ISRG Root X2 cross-signed by X1" cert: the ESP-IDF cert bundle on the boards
+# rejects the full 4-cert Gen-Y chain (TLS alert access_denied) but accepts it
+# ending at "Root YE signed by X2" (X2 is in the bundle).  Restart the relay
+# only when something changed.
+set -e
+src=$(find /var/lib/caddy -type f -name 'kvm.170-168-150-42.sslip.io.crt' | head -1)
+[ -n "$src" ] || { echo "no caddy cert"; exit 1; }
+key=${src%.crt}.key
+tmp=$(mktemp)
+python3 - "$src" "$tmp" <<'PY'
+import re, subprocess, sys
+pem = open(sys.argv[1]).read()
+certs = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem, re.S)
+keep = []
+for c in certs:
+    subj = subprocess.run(["openssl", "x509", "-noout", "-subject"], input=c,
+                          capture_output=True, text=True).stdout
+    if "ISRG Root X2" in subj:
+        continue
+    keep.append(c + "\n")
+open(sys.argv[2], "w").write("".join(keep))
+PY
+if ! cmp -s "$tmp" /etc/argon-relay/board.crt || ! cmp -s "$key" /etc/argon-relay/board.key; then
+    install -m 644 "$tmp" /etc/argon-relay/board.crt
+    install -m 640 -o root -g argonrelay "$key" /etc/argon-relay/board.key
+    systemctl restart argon-relay
+    echo "board cert updated"
+else
+    echo "board cert unchanged"
+fi
+rm -f "$tmp"
