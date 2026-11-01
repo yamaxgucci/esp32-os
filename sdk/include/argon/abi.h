@@ -531,7 +531,7 @@ extern "C" {
  *      a flag of its own, so nothing moved for either line's images.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 73u
+#define AG_ABI_MINOR 76u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -705,6 +705,39 @@ typedef struct ag_sys_api {
      * refusal, when it is switched on, is `[flash] strict`.
      */
     bool (*audio_live)(void);
+
+    /*
+     * ABI 0.75: restart the board.  Does not return.  For an application that
+     * has just installed an update of itself or of the system and has nobody at
+     * a console to type `reboot` for it.
+     */
+    void (*reboot)(void);
+
+    /*
+     * ABI 0.75: install a system image fed piece by piece, into the spare app
+     * slot (the bootloader keeps the running one until the new one is set to
+     * boot).  For an image that arrives over a channel the caller already
+     * trusts - the KVM relay pushes one down its own TLS connection - so there
+     * is no URL and no second certificate to check.  begin returns NULL when the
+     * partition table has no spare slot or the image would not fit; end
+     * validates the image and, with `activate`, makes it the one that boots.
+     * -AG_ENOSYS in a build without OTA.
+     */
+    void *(*ota_begin)(uint32_t size);
+    ag_err_t (*ota_write)(void *h, const void *buf, size_t len);
+    ag_err_t (*ota_end)(void *h, bool activate);
+    void (*ota_abort)(void *h);
+
+    /*
+     * ABI 0.76: rewrite the "usbdisk" partition - the FAT volume a KVM dongle
+     * shows the machine it is plugged into, with the agent on it - from an image
+     * fed piece by piece, the same way as ota_*.  That partition and no other:
+     * begin erases it (size must fit) and NULL means there is none.  The host
+     * sees the new contents after the board restarts and re-enumerates.
+     */
+    void *(*disk_begin)(uint32_t size);
+    ag_err_t (*disk_write)(void *h, const void *buf, size_t len);
+    ag_err_t (*disk_end)(void *h);
 } ag_sys_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -2942,6 +2975,19 @@ typedef struct ag_net_api {
                              const char *headers, const void *body,
                              uint32_t body_len, const char *dest,
                              uint16_t *status);
+
+    /*
+     * ABI 0.74: a TLS client socket.  Connect to host:port, verify the peer
+     * against the built-in root bundle, and hand back an ordinary handle that
+     * send/recv/close/set_nonblock/reset work on exactly as a plain socket -
+     * so an application reaches a server over TLS without learning a second
+     * API.  By host NAME (the certificate is checked against it), not an
+     * address.  Non-blocking from the start.  -AG_ENOSYS in a build without
+     * TLS; a negative handle (an -AG_E* code) on any failure - name, connect,
+     * or a certificate that does not check out.
+     */
+    ag_handle_t (*tls_connect)(const char *host, uint16_t port,
+                               uint32_t timeout_ms);
 } ag_net_api_t;
 
 /*

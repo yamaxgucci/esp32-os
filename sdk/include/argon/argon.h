@@ -1298,6 +1298,72 @@ static inline ag_err_t ag_net_resolve(const char *host, uint32_t *addr_out)
     return g_ag_api->net->resolve(host, addr_out);
 }
 
+/*
+ * ABI 0.74: a TLS connection to host:port, handed back as an ordinary handle -
+ * ag_net_send/recv/close/set_nonblock/reset all work on it.  By host NAME, so
+ * the certificate can be checked against it.  -AG_ENOSYS on a system whose net
+ * table predates this slot or whose build has no TLS; a negative handle on any
+ * connect/handshake/certificate failure.
+ */
+static inline ag_handle_t ag_tls_connect(const char *host, uint16_t port,
+                                         uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->net, tls_connect)) {
+        return (ag_handle_t)(-AG_ENOSYS);
+    }
+    return g_ag_api->net->tls_connect(host, port, timeout_ms);
+}
+
+/* ABI 0.75: restart the board (does not return when the system has it). */
+static inline void ag_reboot(void)
+{
+    if (AG_HAS(g_ag_api->sys, reboot)) {
+        g_ag_api->sys->reboot();
+    }
+}
+
+/* ABI 0.75: a system image fed piece by piece into the spare app slot. */
+static inline void *ag_ota_begin(uint32_t size)
+{
+    return AG_HAS(g_ag_api->sys, ota_begin) ? g_ag_api->sys->ota_begin(size)
+                                            : NULL;
+}
+static inline ag_err_t ag_ota_write(void *h, const void *buf, size_t len)
+{
+    return AG_HAS(g_ag_api->sys, ota_write)
+               ? g_ag_api->sys->ota_write(h, buf, len)
+               : -AG_ENOSYS;
+}
+static inline ag_err_t ag_ota_end(void *h, bool activate)
+{
+    return AG_HAS(g_ag_api->sys, ota_end) ? g_ag_api->sys->ota_end(h, activate)
+                                          : -AG_ENOSYS;
+}
+static inline void ag_ota_abort(void *h)
+{
+    if (AG_HAS(g_ag_api->sys, ota_abort)) {
+        g_ag_api->sys->ota_abort(h);
+    }
+}
+
+/* ABI 0.76: rewrite the "usbdisk" partition from an image fed piece by piece. */
+static inline void *ag_disk_begin(uint32_t size)
+{
+    return AG_HAS(g_ag_api->sys, disk_begin) ? g_ag_api->sys->disk_begin(size)
+                                             : NULL;
+}
+static inline ag_err_t ag_disk_write(void *h, const void *buf, size_t len)
+{
+    return AG_HAS(g_ag_api->sys, disk_write)
+               ? g_ag_api->sys->disk_write(h, buf, len)
+               : -AG_ENOSYS;
+}
+static inline ag_err_t ag_disk_end(void *h)
+{
+    return AG_HAS(g_ag_api->sys, disk_end) ? g_ag_api->sys->disk_end(h)
+                                           : -AG_ENOSYS;
+}
+
 /* ---- power helpers (ABI 0.35+) ------------------------------------------ */
 
 /*

@@ -25,6 +25,8 @@
 #include <argon/port/net.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
+#include <argon/port/tls.h>
+#include <argon/port/sntp.h>
 
 /* 3 virt drivers × (listen+conn) plus brief replace peaks and reload slack. */
 #define AG_NET_MAX_SOCK 16
@@ -32,6 +34,14 @@
 
 static int             s_fds[AG_NET_MAX_SOCK];
 static bool            s_in_use[AG_NET_MAX_SOCK];
+/*
+ * A slot is either a plain socket (s_fds >= 0, s_tls NULL) or a TLS connection
+ * (s_fds == -1, s_tls set).  The handle the ABI hands out is the same either
+ * way, so send/recv/close branch here on which one a slot holds - an
+ * application that dialled with tls_connect reads and writes it exactly as a
+ * plain socket, which is the whole point.
+ */
+static void           *s_tls[AG_NET_MAX_SOCK];
 /*
  * Whose socket it is.  AG_PID_KERNEL for one opened by a driver's own task or
  * by a kernel service, and those are nobody's to reclaim: the phone link's
@@ -108,6 +118,72 @@ static int fd_of(ag_handle_t h)
     return s_fds[slot];
 }
 
+#if AG_PORT_HAS_TLS
+/*
+ * A TLS connection the port handed us becomes a handle, the same table and the
+ * same numbering as a plain socket.  No slot: the connection is closed and the
+ * caller gets ENFILE, just as for a plain fd that could not be written down.
+ */
+static ag_handle_t adopt_tls(ag_port_tls_t t)
+{
+    if (t == NULL) {
+        return (ag_handle_t)(-AG_EIO);
+    }
+    lock();
+    for (int i = 0; i < AG_NET_MAX_SOCK; i++) {
+        if (!s_in_use[i]) {
+            s_in_use[i] = true;
+            s_fds[i] = -1;
+            s_tls[i] = (void *)t;
+            s_owner[i] = ag_proc_self();
+            unlock();
+            return (ag_handle_t)(AG_NET_HANDLE_BASE + i);
+        }
+    }
+    unlock();
+    ag_log(AG_LOG_ERROR, "net", "adopt_tls ENFILE");
+    ag_port_tls_close(t);
+    return (ag_handle_t)(-AG_ENFILE);
+}
+#endif
+
+/* The TLS connection a slot holds, or NULL for a plain socket / bad handle. */
+static void *tls_of(ag_handle_t h)
+{
+    const int slot = slot_of(h);
+    if (slot < 0 || !s_in_use[slot]) {
+        return NULL;
+    }
+    return s_tls[slot];
+}
+
+#if AG_PORT_HAS_SNTP
+/*
+ * The clock starts at the epoch and nothing moves it, so the first time anything
+ * speaks TLS the certificate is "not yet valid" and the handshake fails - which
+ * is a trap for an application dialling out over TLS, since it never ran `date
+ * sync` by hand.  So the system syncs the clock itself, once, the moment it has
+ * an address.  One shot in its own task (the sync blocks for up to ten seconds),
+ * best-effort: a board with no reachable time server simply keeps the epoch, as
+ * before.
+ */
+static bool s_time_sync_started;
+
+static void sntp_once(void *arg)
+{
+    (void)arg;
+    const ag_err_t e = ag_port_sntp_sync(NULL, 10000);
+    if (e == AG_OK) {
+        ag_log(AG_LOG_INFO, "net", "clock synced from the network (sntp)");
+    } else {
+        ag_log(AG_LOG_WARN, "net",
+               "sntp sync failed (%d); TLS will fail until the clock is set",
+               (int)e);
+    }
+    ag_port_task_delete(NULL);
+}
+#endif
+
 /*
  * The address arrives long after boot has moved on, and nothing polls for it.
  * Printed here because nobody can use the network without knowing what the
@@ -115,6 +191,15 @@ static int fd_of(ag_handle_t h)
  */
 static void on_ready(uint32_t addr, uint32_t mask, uint32_t gw)
 {
+#if AG_PORT_HAS_SNTP
+    /* First address of this boot: set the wall clock, so TLS can verify a
+     * certificate's dates.  Once is enough; a reconnect does not redo it. */
+    if (!s_time_sync_started) {
+        s_time_sync_started = true;
+        (void)ag_port_task_create(sntp_once, "ag_sntp", 4096, NULL, 5, 0, 0,
+                                  NULL);
+    }
+#endif
     ag_log(AG_LOG_INFO, "net", "ip %u.%u.%u.%u mask %u.%u.%u.%u gw %u.%u.%u.%u",
            (unsigned)(addr >> 24), (unsigned)((addr >> 16) & 0xffu),
            (unsigned)((addr >> 8) & 0xffu), (unsigned)(addr & 0xffu),
@@ -145,6 +230,7 @@ ag_err_t ag_net_init(void)
         for (int i = 0; i < AG_NET_MAX_SOCK; i++) {
             s_fds[i] = -1;
             s_in_use[i] = false;
+            s_tls[i] = NULL;
         }
     }
 
@@ -172,8 +258,18 @@ void ag_net_reset_sockets(void)
     for (int i = 0; i < AG_NET_MAX_SOCK; i++) {
         if (s_in_use[i]) {
             const int fd = s_fds[i];
+            void     *tls = s_tls[i];
             s_in_use[i] = false;
             s_fds[i] = -1;
+            s_tls[i] = NULL;
+#if AG_PORT_HAS_TLS
+            if (tls != NULL) {
+                ag_port_tls_close((ag_port_tls_t)tls);
+                continue;
+            }
+#else
+            (void)tls;
+#endif
             ag_netprov_close(fd);
         }
     }
@@ -250,26 +346,59 @@ static ag_handle_t api_tcp_connect(uint32_t addr, uint16_t port,
     return adopt_fd(ag_netprov_connect(addr, port, timeout_ms));
 }
 
+/*
+ * A TLS connection to host:port, verified against the root bundle, handed back
+ * as an ordinary handle.  By host name, not an address: the certificate is
+ * checked against the name, so a name is what the caller must give.  -AG_ENOSYS
+ * in a build without TLS.
+ */
+static ag_handle_t api_tls_connect(const char *host, uint16_t port,
+                                   uint32_t timeout_ms)
+{
+    if (host == NULL) {
+        return (ag_handle_t)(-AG_EINVAL);
+    }
+#if AG_PORT_HAS_TLS
+    return adopt_tls(ag_port_tls_connect(host, port, timeout_ms));
+#else
+    (void)port;
+    (void)timeout_ms;
+    return (ag_handle_t)(-AG_ENOSYS);
+#endif
+}
+
 static int32_t api_send(ag_handle_t h, const void *buf, size_t len)
 {
+    if (buf == NULL && len > 0) {
+        return -AG_EINVAL;
+    }
+#if AG_PORT_HAS_TLS
+    void *tls = tls_of(h);
+    if (tls != NULL) {
+        return ag_port_tls_send((ag_port_tls_t)tls, buf, len);
+    }
+#endif
     const int fd = fd_of(h);
     if (fd < 0) {
         return -AG_EBADF;
-    }
-    if (buf == NULL && len > 0) {
-        return -AG_EINVAL;
     }
     return ag_netprov_send(fd, buf, len);
 }
 
 static int32_t api_recv(ag_handle_t h, void *buf, size_t len)
 {
+    if (buf == NULL && len > 0) {
+        return -AG_EINVAL;
+    }
+#if AG_PORT_HAS_TLS
+    void *tls = tls_of(h);
+    if (tls != NULL) {
+        return ag_port_tls_recv_now((ag_port_tls_t)tls, buf, len);
+    }
+#endif
     const int fd = fd_of(h);
     if (fd < 0) {
         return -AG_EBADF;
-    }
-    if (buf == NULL && len > 0) {
-        return -AG_EINVAL;
     }
     return ag_netprov_recv(fd, buf, len);
 }
@@ -286,10 +415,20 @@ static ag_err_t api_close(ag_handle_t h)
         return -AG_EBADF;
     }
     const int fd = s_fds[slot];
+    void     *tls = s_tls[slot];
     s_in_use[slot] = false;
     s_fds[slot] = -1;
+    s_tls[slot] = NULL;
     s_owner[slot] = AG_PID_KERNEL;
     unlock();
+#if AG_PORT_HAS_TLS
+    if (tls != NULL) {
+        ag_port_tls_close((ag_port_tls_t)tls);
+        return AG_OK;
+    }
+#else
+    (void)tls;
+#endif
     ag_netprov_close(fd);
     return AG_OK;
 }
@@ -306,10 +445,21 @@ static ag_err_t api_reset(ag_handle_t h)
         return -AG_EBADF;
     }
     const int fd = s_fds[slot];
+    void     *tls = s_tls[slot];
     s_in_use[slot] = false;
     s_fds[slot] = -1;
+    s_tls[slot] = NULL;
     s_owner[slot] = AG_PID_KERNEL;
     unlock();
+#if AG_PORT_HAS_TLS
+    if (tls != NULL) {
+        /* TLS has no hard reset of its own; a close is the strongest thing. */
+        ag_port_tls_close((ag_port_tls_t)tls);
+        return AG_OK;
+    }
+#else
+    (void)tls;
+#endif
     ag_netprov_close_hard(fd);
     return AG_OK;
 }
@@ -321,14 +471,18 @@ uint32_t ag_net_close_owned_by(ag_pid_t pid)
     }
 
     int      fds[AG_NET_MAX_SOCK];
+    void    *tlss[AG_NET_MAX_SOCK];
     uint32_t n = 0;
 
     lock();
     for (int i = 0; i < AG_NET_MAX_SOCK; i++) {
         if (s_in_use[i] && s_owner[i] == pid) {
-            fds[n++] = s_fds[i];
+            fds[n] = s_fds[i];
+            tlss[n] = s_tls[i];
+            n++;
             s_in_use[i] = false;
             s_fds[i] = -1;
+            s_tls[i] = NULL;
             s_owner[i] = AG_PID_KERNEL;
         }
     }
@@ -337,6 +491,14 @@ uint32_t ag_net_close_owned_by(ag_pid_t pid)
     /* Outside the lock: a close goes into the stack, and the stack is
      * entitled to take its time about a connection it is still flushing. */
     for (uint32_t i = 0; i < n; i++) {
+#if AG_PORT_HAS_TLS
+        if (tlss[i] != NULL) {
+            ag_port_tls_close((ag_port_tls_t)tlss[i]);
+            continue;
+        }
+#else
+        (void)tlss;
+#endif
         ag_netprov_close(fds[i]);
     }
     if (n != 0u) {
@@ -348,6 +510,14 @@ uint32_t ag_net_close_owned_by(ag_pid_t pid)
 
 static ag_err_t api_set_nonblock(ag_handle_t h, bool on)
 {
+#if AG_PORT_HAS_TLS
+    if (tls_of(h) != NULL) {
+        /* A TLS connection is non-blocking from the handshake on (the port
+         * contract), so there is nothing to toggle - accept it either way. */
+        (void)on;
+        return AG_OK;
+    }
+#endif
     const int fd = fd_of(h);
     if (fd < 0) {
         return -AG_EBADF;
@@ -394,6 +564,7 @@ const ag_net_api_t ag_net_api_impl = {
     .set_nonblock = api_set_nonblock,
     .resolve = api_resolve,
     .http_request = api_http_request,
+    .tls_connect = api_tls_connect,
 };
 
 const ag_net_api_t *ag_net_api_table(void) { return &ag_net_api_impl; }

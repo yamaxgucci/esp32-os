@@ -48,7 +48,12 @@
 
 #include "core/sysconfig.h"
 
+#include <stdlib.h>
+
 #include <argon/port/config.h>
+#include <argon/port/flash.h>
+#include <argon/port/ota.h>
+#include <argon/port/sys.h>
 
 #include <argon/port/ble.h>
 #include <argon/port/bt.h>
@@ -194,6 +199,90 @@ static int32_t api_prompt_in_slot(int slot, const char *cwd);
  */
 static bool api_audio_live(void) { return ag_port_flash_guarded(); }
 
+/* ABI 0.75: restart, and a system image fed by the caller (see abi.h). */
+static void api_reboot(void) { ag_port_restart(); }
+
+#if defined(CONFIG_ARGON_NET_OTA) && CONFIG_ARGON_NET_OTA
+static void *api_ota_begin(uint32_t size) { return ag_port_ota_begin(size); }
+static ag_err_t api_ota_write(void *h, const void *buf, size_t len)
+{
+    return (ag_port_ota_write(h, buf, len) == 0) ? AG_OK : -AG_EIO;
+}
+static ag_err_t api_ota_end(void *h, bool activate)
+{
+    return (ag_port_ota_end(h, activate) == 0) ? AG_OK : -AG_EIO;
+}
+static void api_ota_abort(void *h) { ag_port_ota_abort(h); }
+#else
+static void *api_ota_begin(uint32_t size)
+{
+    (void)size;
+    return NULL;
+}
+static ag_err_t api_ota_write(void *h, const void *buf, size_t len)
+{
+    (void)h;
+    (void)buf;
+    (void)len;
+    return -AG_ENOSYS;
+}
+static ag_err_t api_ota_end(void *h, bool activate)
+{
+    (void)h;
+    (void)activate;
+    return -AG_ENOSYS;
+}
+static void api_ota_abort(void *h) { (void)h; }
+#endif
+
+/* ABI 0.76: the "usbdisk" partition rewritten from a fed image (see abi.h). */
+typedef struct {
+    ag_port_part_t part;
+    uint64_t       off;
+    uint64_t       size;
+} ag_disk_push_t;
+
+static void *api_disk_begin(uint32_t size)
+{
+    const ag_port_part_t p = ag_port_part_find("usbdisk");
+    if (p == NULL || size == 0 || size > ag_port_part_size(p)) {
+        return NULL;
+    }
+    if (ag_port_part_erase(p, 0, (size_t)ag_port_part_size(p)) != AG_OK) {
+        return NULL;
+    }
+    ag_disk_push_t *d = calloc(1, sizeof(*d));
+    if (d != NULL) {
+        d->part = p;
+        d->size = size;
+    }
+    return d;
+}
+
+static ag_err_t api_disk_write(void *h, const void *buf, size_t len)
+{
+    ag_disk_push_t *d = (ag_disk_push_t *)h;
+    if (d == NULL || d->off + len > d->size) {
+        return -AG_EINVAL;
+    }
+    const ag_err_t err = ag_port_part_write(d->part, d->off, buf, len);
+    if (err == AG_OK) {
+        d->off += len;
+    }
+    return err;
+}
+
+static ag_err_t api_disk_end(void *h)
+{
+    ag_disk_push_t *d = (ag_disk_push_t *)h;
+    if (d == NULL) {
+        return -AG_EINVAL;
+    }
+    const bool whole = (d->off == d->size);
+    free(d);
+    return whole ? AG_OK : -AG_EIO;
+}
+
 
 static const ag_sys_api_t k_sys = {
     .size = sizeof(ag_sys_api_t),
@@ -209,6 +298,14 @@ static const ag_sys_api_t k_sys = {
     .prompt_in_slot = api_prompt_in_slot,
     .module_task = api_module_task,
     .audio_live = api_audio_live,
+    .reboot = api_reboot,
+    .ota_begin = api_ota_begin,
+    .ota_write = api_ota_write,
+    .ota_end = api_ota_end,
+    .ota_abort = api_ota_abort,
+    .disk_begin = api_disk_begin,
+    .disk_write = api_disk_write,
+    .disk_end = api_disk_end,
 };
 
 /* ---------------------------------------------------------------------- */

@@ -14,13 +14,20 @@
 # device* before it is plugged into a machine that has never seen it.  Put
 # KVMAGENT.EXE there once, from any computer, by dragging it onto the drive.
 #
-# appfs loses 512 KB and keeps 3.4 MB, which is more relocated .AXE code than
-# anything in this tree comes close to using.
+# Two app slots (ota_0/ota_1) so the system can be replaced over the air: the
+# KVM relay pushes an image down its TLS connection into the slot not running,
+# and the bootloader switches to it - a dongle in somebody's machine never has
+# to come out for a button press again.  2.5 MB each (the system is ~2 MB).
+# They come out of appfs, which keeps 1.4 MB - still far more relocated .AXE
+# code than anything here uses.  usbdisk stays where it was, so the agent on
+# the drive survives the change.
 #
 # Name,     Type, SubType,  Offset,   Size,     Flags
 nvs,        data, nvs,      0x9000,   0x6000,
 phy_init,   data, phy,      0xf000,   0x1000,
-factory,    app,  factory,  0x10000,  0x300000,
-sysfs,      data, littlefs, 0x310000, 0x100000,
-appfs,      data, 0x40,     0x410000, 0x370000,
+ota_0,      app,  ota_0,    0x10000,  0x280000,
+ota_1,      app,  ota_1,    0x290000, 0x280000,
+otadata,    data, ota,      0x510000, 0x2000,
+sysfs,      data, littlefs, 0x520000, 0x100000,
+appfs,      data, 0x40,     0x620000, 0x160000,
 usbdisk,    data, fat,      0x780000, 0x80000,

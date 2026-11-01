@@ -82,3 +82,13 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_kvm.csv"
 # it on for the S3-CAM).  A flash that does not take the bootloader's QE write
 # does not boot at all, so this board stays on two lines until it is checked.
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
+# TLS buffers in PSRAM, not internal RAM.  The relay leg is TLS now, and an
+# mbedTLS handshake takes ~20-30 KB; taken from internal RAM it left Wi-Fi with
+# no RX buffers after a session, so the board stopped ACKing mid-handshake and
+# could not dial back.  The dongle has 8 MB of PSRAM for this.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# Over-the-air system update: the KVM relay pushes an image into the spare slot
+# (partitions_kvm.csv has two), so a dongle in place never needs a button press.
+CONFIG_ARGON_NET_OTA=y
