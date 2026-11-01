@@ -80,7 +80,9 @@ void vdpm_log(const char *subs, const char *fmt, ...) {
 #endif
 
 unsigned short CRAM[CRAM_MAX_SIZE];           // CRAM - Palettes
+#ifndef ARGON_MD_SMALL
 unsigned char SAT_CACHE[SAT_CACHE_MAX_SIZE];  // Sprite cache
+#endif
 unsigned char gwenesis_vdp_regs[REG_SIZE];    // Registers
 unsigned short fifo[FIFO_SIZE];               // Fifo
 unsigned short CRAM565[CRAM_MAX_SIZE * 4];    // CRAM - Palettes
@@ -166,7 +168,9 @@ void gwenesis_vdp_reset() {
 #else
   memset(VRAM, 0, VRAM_MASK + 1);
 #endif
+#ifndef ARGON_MD_SMALL
   memset(SAT_CACHE, 0, sizeof(SAT_CACHE));
+#endif
   memset(CRAM, 0, sizeof(CRAM));
   memset(CRAM565, 0, sizeof(CRAM565));
   memset(VSRAM, 0, sizeof(VSRAM));
@@ -364,11 +368,13 @@ void gwenesis_vdp_vram_write(unsigned int address, unsigned int value)
 {
   VRAM_WR8(address, value);
 
+#ifndef ARGON_MD_SMALL
   // Update internal SAT Cache
   // used in Castlevania Bloodlines
   if (address >= REG5_SAT_ADDRESS && address < REG5_SAT_ADDRESS + REG5_SAT_SIZE &&
       address - REG5_SAT_ADDRESS < SAT_CACHE_MAX_SIZE)
     SAT_CACHE[address - REG5_SAT_ADDRESS] = value;
+#endif
 }
 
 static inline __attribute__((always_inline)) 
@@ -1065,7 +1071,9 @@ void gwenesis_vdp_mem_save_state() {
 
   saveGwenesisStateSetBuffer(state, "VRAM", VRAM, VRAM_MAX_SIZE);
   saveGwenesisStateSetBuffer(state, "CRAM", CRAM, sizeof(CRAM));
+#ifndef ARGON_MD_SMALL
   saveGwenesisStateSetBuffer(state, "SAT_CACHE", SAT_CACHE, sizeof(SAT_CACHE));
+#endif
   saveGwenesisStateSetBuffer(state, "gwenesis_vdp_regs", gwenesis_vdp_regs, sizeof(gwenesis_vdp_regs));
   saveGwenesisStateSetBuffer(state, "fifo", fifo, sizeof(fifo));
   saveGwenesisStateSetBuffer(state, "CRAM565", CRAM565, sizeof(CRAM565));
@@ -1085,7 +1093,9 @@ void gwenesis_vdp_mem_load_state() {
 
   saveGwenesisStateGetBuffer(state, "VRAM", VRAM, VRAM_MAX_SIZE);
   saveGwenesisStateGetBuffer(state, "CRAM", CRAM, sizeof(CRAM));
+#ifndef ARGON_MD_SMALL
   saveGwenesisStateGetBuffer(state, "SAT_CACHE", SAT_CACHE, sizeof(SAT_CACHE));
+#endif
   saveGwenesisStateGetBuffer(state, "gwenesis_vdp_regs", gwenesis_vdp_regs, sizeof(gwenesis_vdp_regs));
   saveGwenesisStateGetBuffer(state, "fifo", fifo, sizeof(fifo));
   saveGwenesisStateGetBuffer(state, "CRAM565", CRAM565, sizeof(CRAM565));

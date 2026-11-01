@@ -1097,6 +1097,37 @@ static void *md_crumb_alloc(size_t n)
 }
 
 /*
+ * Pages out of heap blocks of `caps`, each block as large as the heap will
+ * give for what is still wanted, none under `least`: every block is one of
+ * the process's 32 resources, and blocks of fixed sizes from 32 KB down took
+ * 24 of them on the CYD - the raster record, which lives in the holes the
+ * pages leave, then found no resource left for itself (1 Nov 2026).
+ */
+static unsigned heap_pages(unsigned char **pages, unsigned got, unsigned count,
+                           unsigned caps, size_t least)
+{
+    if (least < MD_PAGE) {
+        least = MD_PAGE;
+    }
+    size_t size = (size_t)(count - got) * MD_PAGE;
+    while (got < count && size >= least) {
+        unsigned char *b = (unsigned char *)ag_malloc_caps(size, caps);
+        if (b == NULL) {
+            size -= MD_PAGE;
+            continue;
+        }
+        s_blocks++;
+        for (size_t o = 0; o < size; o += MD_PAGE) {
+            pages[got++] = b + o;
+        }
+        if (size > (size_t)(count - got) * MD_PAGE) {
+            size = (size_t)(count - got) * MD_PAGE;
+        }
+    }
+    return got;
+}
+
+/*
  * Fill `pages[0..count)` from the largest blocks the heap gives, a page at a
  * time cut out of each: what is left after the image is in pieces, and every
  * system-heap block is one of the process's 32 resources, so asking page by
@@ -1105,33 +1136,12 @@ static void *md_crumb_alloc(size_t n)
  */
 static unsigned fill_pages(unsigned char **pages, unsigned count, int iram)
 {
-    static const size_t k_sizes[] = {32768, 16384, 8192, 4096, 2048, 1024, 512};
-    unsigned got = 0;
-    unsigned s = 0;
-
-    while (got < count && s < sizeof(k_sizes) / sizeof(k_sizes[0])) {
-        const size_t size = k_sizes[s];
-        if (size > (size_t)(count - got) * MD_PAGE) {
-            s++;
-            continue;
-        }
-        unsigned char *b = (unsigned char *)ag_malloc_caps(
-            size, iram ? AG_MEM_EXEC : AG_MEM_FAST);
-        if (b == NULL) {
-            s++;
-            continue;
-        }
-        s_blocks++;
-        for (size_t o = 0; o < size; o += MD_PAGE) {
-            pages[got++] = b + o;
-        }
-    }
+    const unsigned caps = iram ? AG_MEM_EXEC : AG_MEM_FAST;
     /*
-     * Then the process's own arena, by what its largest block actually holds
-     * rather than by powers of two: its allocator keeps its bookkeeping inside
-     * it, so a 16 KB arena never has a 16 KB block, and halving from there
-     * leaves kilobytes behind.
+     * Blocks under 4 KB last, after the arena: each costs a resource as a
+     * large one does.
      */
+    unsigned got = heap_pages(pages, 0, count, caps, 4096);
 #ifdef MD_PSRAM_PAGES
     /*
      * A board with PSRAM (the S3-CAM): what internal memory could not give,
@@ -1140,23 +1150,16 @@ static unsigned fill_pages(unsigned char **pages, unsigned count, int iram)
      * what the radio and the system keep (1 Nov 2026: 34 of 64 KB of the
      * 68000's RAM came from it, and MD stopped short).
      */
-    for (unsigned s2 = 0; !iram && got < count && s2 < sizeof(k_sizes) / sizeof(k_sizes[0]);) {
-        const size_t size = k_sizes[s2];
-        if (size > (size_t)(count - got) * MD_PAGE) {
-            s2++;
-            continue;
-        }
-        unsigned char *b = (unsigned char *)ag_malloc_caps(size, AG_MEM_DEFAULT);
-        if (b == NULL) {
-            s2++;
-            continue;
-        }
-        s_blocks++;
-        for (size_t o = 0; o < size; o += MD_PAGE) {
-            pages[got++] = b + o;
-        }
+    if (!iram) {
+        got = heap_pages(pages, got, count, AG_MEM_DEFAULT, 0);
     }
 #endif
+    /*
+     * Then the process's own arena, by what its largest block actually holds
+     * rather than by powers of two: its allocator keeps its bookkeeping inside
+     * it, so a 16 KB arena never has a 16 KB block, and halving from there
+     * leaves kilobytes behind.
+     */
     while (!iram && got < count) {
         ag_meminfo_t mi;
         ag_meminfo(&mi);
@@ -1175,7 +1178,7 @@ static unsigned fill_pages(unsigned char **pages, unsigned count, int iram)
             pages[got++] = b + o;
         }
     }
-    return got;
+    return heap_pages(pages, got, count, caps, 0);
 }
 
 /*

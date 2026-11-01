@@ -121,7 +121,6 @@ static int               s_hs_ok;
 static uint16_t         *s_hs_run[MD_RAS_HS_LINES / MD_RAS_HS_PIECE];
 static int               s_hs_run_ok;
 static int               s_hs_upto;
-static int               s_hs_moved; /* written while lines were shown */
 /* the bytes of the table the scroll mode reads, while the frame's lines are
  * shown, for the VRAM write path (gwenesis_vdp_mem.c); 0x80000000 when it is
  * not to be watched */
@@ -143,6 +142,18 @@ typedef struct {
 static md_ras_copy_t   *s_cp;
 static const md_ras_t  *s_cp_rec;
 static uint16_t        *s_cram565; /* NULL: palette writes are not followed */
+/*
+ * The sprite table as the frame's lines saw it, 8 bytes a sprite.  The
+ * vertical blank rewrites the table for the next frame before a pass draws
+ * this one, and without the copy the sprites came out a frame ahead of the
+ * planes - the only thing wrong in Gunstar Heroes' story scenes, and most of
+ * what was wrong in Sonic 2 and Spinball (host harness, 1 Nov 2026).  Its
+ * 640 bytes are the VDP's sprite cache's, which this build does without
+ * (gwenesis_vdp_mem.c).
+ */
+#define MD_RAS_SPRITES 80
+static uint32_t         s_sat[MD_RAS_SPRITES * 2];
+uint8_t                *md_vr_sat; /* the renderer's: s_sat, or NULL */
 static int              s_ev_n, s_ev_at;
 
 int md_raster_on;
@@ -277,7 +288,6 @@ void md_raster_begin(void)
     r->n = 0;
     r->cram = 0;
     s_hs_upto = 0;
-    s_hs_moved = 0;
     if (s_hs_run_ok) {
         hs_watch();
     } else {
@@ -399,9 +409,6 @@ void md_raster_hs_write(void)
     if (m68k_cycles_master() - scan_line * VDP_CYCLES_PER_LINE > MD_RAS_HBLANK) {
         line++;
     }
-    if (line > 0) {
-        s_hs_moved = 1; /* the frame has something to draw differently */
-    }
     hs_upto(line);
 }
 
@@ -412,7 +419,7 @@ void md_raster_hs_write(void)
  */
 void md_raster_visible(void)
 {
-    const md_ras_t *r = s_rec[s_rec_k];
+    md_ras_t *const r = s_rec[s_rec_k];
     md_ras_hs_lo = 0x80000000u; /* the vertical blank's writes are the next frame's */
     md_raster_frames++;
     if (r->n > s_cap) {
@@ -423,17 +430,23 @@ void md_raster_visible(void)
         unlock();
         return;
     }
-    if ((r->n == 0 && !s_hs_moved) || r->n > s_cap || !s_hs_ok ||
-        screen_height > MD_RAS_HS_LINES) {
+    if (!s_hs_ok || screen_height > MD_RAS_HS_LINES) {
         /*
-         * Nothing to draw differently, or too much to - or no copy of the
-         * scroll table: the record's registers with the table the vertical
-         * blank has rewritten for the next frame is a picture torn between
-         * two frames, worse than the live VDP's one frame (he saw it on the
-         * CYD, 1 Nov 2026).
+         * No copy of the scroll table: the record's registers with the
+         * table the vertical blank has rewritten for the next frame is a
+         * picture torn between two frames (he saw it on the CYD, 1 Nov 2026).
          */
         s_pub = -1;
     } else {
+        /*
+         * More writes than the record holds - Gunstar Heroes' SEGA, one
+         * scroll a line: the lines past the last one held keep its state.
+         * Drawn from the live VDP instead, they were the next frame's lines
+         * half-run on the other core, torn (he saw it, 1 Nov 2026).
+         */
+        if (r->n > s_cap) {
+            r->n = (uint16_t)s_cap;
+        }
         if (s_hs_run_ok) {
             hs_upto(MD_RAS_HS_LINES);
             for (int i = 0; i < MD_RAS_HS_LINES / MD_RAS_HS_PIECE; i++) {
@@ -445,6 +458,12 @@ void md_raster_visible(void)
             const int h = (screen_height < MD_RAS_HS_LINES) ? screen_height : MD_RAS_HS_LINES;
             for (int l = 0; l < h; l++) {
                 hs_words(l, &s_hs[l / MD_RAS_HS_PIECE][(l % MD_RAS_HS_PIECE) * 2]);
+            }
+        }
+        {
+            const unsigned base = REG5_SAT_ADDRESS & VRAM_MASK;
+            for (unsigned i = 0; i < MD_RAS_SPRITES * 2; i++) {
+                s_sat[i] = VRAM_W((base + i * 4u) & VRAM_MASK);
             }
         }
         s_pub = s_rec_k;
@@ -481,6 +500,7 @@ int md_raster_take(void)
     if (s_hs_ok) {
         md_vr_hs = s_hs;
     }
+    md_vr_sat = (uint8_t *)s_sat;
     md_vr_regs = s_cp->regs;
     md_vr_vsram = s_cp->vsram;
     if (cram && s_cram565 != NULL) {
@@ -523,6 +543,7 @@ int md_raster_next(void)
 void md_raster_done(void)
 {
     md_vr_hs = NULL;
+    md_vr_sat = NULL;
     __atomic_store_n(&s_hs_busy, 0, __ATOMIC_RELEASE);
     md_vr_regs = gwenesis_vdp_regs;
     md_vr_vsram = VSRAM;
