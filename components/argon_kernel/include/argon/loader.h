@@ -87,6 +87,12 @@ typedef struct {
      * place.code is inside it, rounded up to 16.  NULL otherwise.
      */
     void *code_heap;
+    /*
+     * The cold part of a split image: the code that is not hot, always in
+     * flash - an appfs slot programmed a page at a time (split_load_chunked),
+     * so a board without PSRAM needs no buffer the size of it.
+     */
+    void *cold_slot;
 } ag_loaded_app_t;
 
 /*

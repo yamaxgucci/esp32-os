@@ -142,7 +142,63 @@ static size_t fb_bytes(void)
  */
 /* The display drivers that take rectangles, one entry per table; see the
  * walk in driver_present_blit for why it is locked and the calls are not. */
+static unsigned collect_drivers_walk(const ag_display_ops_t *ops[AG_DISPLAY_MAX]);
+
+/*
+ * The walk below, kept and handed out again while the registry has not
+ * changed.
+ *
+ * Walked on every present, it was the dearest part of one: by index, each
+ * index a scan of the whole table with the names copied out, then the device
+ * found again by name - 90 to 150 us of every call on the CYD while MD's
+ * drawer sent its rows two at a time, more than the panel driver spent on the
+ * bits (30 Oct 2026).  The registry says when it changes (ag_dev_generation),
+ * and nothing but a change can make the answer different.
+ */
 static unsigned collect_drivers(const ag_display_ops_t *ops[AG_DISPLAY_MAX])
+{
+    static const ag_display_ops_t *s_ops[AG_DISPLAY_MAX];
+    static unsigned                s_n;
+    static volatile uint32_t       s_gen;
+    static volatile bool           s_have;
+
+    /*
+     * Unchanged since the list was made: the list, without the lock.  The
+     * registry's lock is a recursive mutex and taking and giving it was 3400
+     * cycles of every call - more than the rest of the kernel's part of a
+     * present (30 Oct 2026).  It bought nothing a reader here can use: the
+     * lock is let go before any driver is called, so a registration landing
+     * just after this read is one the locked version would have missed too.
+     * The list is written before s_have and s_gen under the lock below, so a
+     * matching generation here is a whole list.
+     */
+    if (s_have && ag_dev_generation() == s_gen) {
+        const unsigned n = s_n;
+        for (unsigned k = 0; k < n; k++) {
+            ops[k] = s_ops[k];
+        }
+        return n;
+    }
+
+    /* Under the registry's lock, which is the lock a registration takes:
+     * the generation cannot move between reading it and using the list. */
+    ag_dev_lock_hold();
+    const uint32_t gen = ag_dev_generation();
+    if (!s_have || gen != s_gen) {
+        s_n = collect_drivers_walk(s_ops);
+        __sync_synchronize(); /* the list before what says it is whole */
+        s_gen = gen;
+        s_have = true;
+    }
+    const unsigned n = s_n;
+    for (unsigned k = 0; k < n; k++) {
+        ops[k] = s_ops[k];
+    }
+    ag_dev_lock_release();
+    return n;
+}
+
+static unsigned collect_drivers_walk(const ag_display_ops_t *ops[AG_DISPLAY_MAX])
 {
     unsigned n = 0;
 
@@ -542,7 +598,29 @@ static uint16_t  s_br_rows;
 static uint32_t  s_br_lost;   /* operations that did not fit, this list  */
 static bool      s_br_moaned;
 
-static bool br_on(void) { return s_surfaceless && s_br_list != NULL; }
+/*
+ * MADE ON THE FIRST PRIMITIVE, NOT AT ACQUIRE (28 Oct 2026).  The strip and the
+ * list are 12 KB, and an application that hands over finished pixels with
+ * gfx->present never draws a primitive: on the CYD that was the Mega Drive,
+ * which needed those 12 KB for the rows it sends.  So acquire only says the
+ * list may be made, and the first primitive makes it - once per acquire, so a
+ * board without the memory says so once and draws nothing, as before.
+ */
+static bool s_br_pending;
+static void br_take(void);
+
+/* The list exists: flush and swap have something to render. */
+static bool br_live(void) { return s_surfaceless && s_br_list != NULL; }
+
+/* A primitive is about to be recorded: the list, made now if it is not yet. */
+static bool br_on(void)
+{
+    if (s_surfaceless && s_br_list == NULL && s_br_pending) {
+        s_br_pending = false;
+        br_take();
+    }
+    return br_live();
+}
 
 static void br_free(void)
 {
@@ -1262,7 +1340,6 @@ static bool gfx_may_present(void)
 
     bool           ok = true;
     const ag_pid_t me = ag_proc_self();
-    const ag_pid_t focused = ag_session_focused_pid();
 
     if (!s_acquired) {
         ok = false;
@@ -1272,7 +1349,7 @@ static bool gfx_may_present(void)
         ok = true;
     } else {
         /* Safety net: ignore flush/swap from a background session slot. */
-        ok = (me == focused);
+        ok = (me == ag_session_focused_pid()); /* asked only here: it costs */
     }
 
     if (!ok) {
@@ -1284,7 +1361,7 @@ static bool gfx_may_present(void)
                    "%u flushes dropped: acquired %u, asking pid %u, owner "
                    "pid %u, focused pid %u",
                    (unsigned)dropped, (unsigned)s_acquired, (unsigned)me,
-                   (unsigned)s_owner, (unsigned)focused);
+                   (unsigned)s_owner, (unsigned)ag_session_focused_pid());
             dropped = 0;
         }
     }
@@ -1334,7 +1411,15 @@ static ag_err_t gfx_acquire(ag_gfxinfo_t *out)
         s_clip_y = 0;
         s_clip_w = 0;
         s_clip_h = 0;
-        br_take(); /* the primitives draw through a list now; see br_render */
+        /* The primitives draw through a list: kept if an earlier owner had it
+         * made (freeing it here is the race br_take describes), made on the
+         * first primitive otherwise (br_on) - so an application that only
+         * presents finished pixels never pays its 12 KB. */
+        if (s_br_list != NULL) {
+            br_take();
+        } else {
+            s_br_pending = true;
+        }
         if (out != NULL) {
             out->width = pw;
             out->height = ph;
@@ -1403,6 +1488,7 @@ static void gfx_release(void)
          * under the owner's painting thread, which is a fault at address
          * zero and a dead application. */
         s_br_len = 0;
+        s_br_pending = false;
         s_acquired = false;
         s_owner = AG_PID_KERNEL;
         drivers_held(false);
@@ -1447,7 +1533,7 @@ static void gfx_flush(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
      * see shim_kick - but one that does gets its whole frame in one request.
      */
     if (s_surfaceless) {
-        if (br_on()) {
+        if (br_live()) {
             br_flush((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h);
             s_shim_seen = true; /* the primitives did draw, so no warning */
         }
@@ -1485,7 +1571,7 @@ static void gfx_swap(void)
         return;
     }
     if (s_surfaceless) {
-        if (br_on()) {
+        if (br_live()) {
             br_flush(0, 0, 0, 0);
             s_shim_seen = true;
         }

@@ -100,6 +100,16 @@ extern "C" {
  *
  *     AG_HOT_RODATA const uint8_t k_gamma[256] = { ... };
  *
+ * Word-aligned and word-wide only, on the chips whose code part is instruction
+ * RAM (ESP32, ESP32-S3).  That memory is the same SRAM seen through two buses,
+ * and the address the image is linked at is the instruction-bus one: it answers
+ * 32-bit accesses and raises a load/store error for a byte or halfword one, so
+ * `k_gamma[3]` compiled to an `l8ui` ends the program.  Measured on an S3 on
+ * 22 Oct 2026 - a word read of the same address returned the right four bytes,
+ * the byte read faulted.  A table read a byte at a time - most fonts and
+ * bitmaps - belongs in the data part, which is PSRAM; this is for the small
+ * word-wise exception, and the program reads it with `((const uint32_t *)k)[i]`.
+ *
  * It says nothing in a built-in build: that code is already inside the kernel
  * image, which has its own linker script and no .hot_rodata in it, and a section
  * nobody places is a section the linker puts wherever it likes.
@@ -1685,6 +1695,134 @@ static inline ag_err_t ag_usbd_status(ag_usbd_status_t *out)
         return -AG_ENOSYS;
     }
     return g_ag_api->usbd->status(out);
+}
+
+/* ---- crypto (ABI 0.71) --------------------------------------------------- */
+/*
+ * Ed25519 (RFC 8032) and SHA-256/SHA-512 (FIPS 180-4), done by the kernel.
+ *
+ * An image cannot carry its own: Monocypher is 46 KB of C and an image has
+ * 64 KB of code for everything it does.  The shop used to keep a copy - 11 KB
+ * of its 39 KB - to check three signatures, and this is the same maths, once,
+ * for every program that needs it.
+ *
+ * The state is yours, so a hash can go over a file in chunks:
+ *
+ *     ag_sha512_t ctx;
+ *     ag_sha512_init(&ctx);
+ *     while (read(chunk)) { ag_sha512_update(&ctx, chunk, n); }
+ *     ag_sha512_final(&ctx, digest);
+ *
+ * A build with CONFIG_ARGON_ENABLE_CRYPTO=n has no table at all, so probe with
+ * ag_crypto_ready() and say so rather than computing with nothing.
+ */
+static inline bool ag_crypto_ready(void)
+{
+    return g_ag_api->crypto != NULL &&
+           AG_HAS(g_ag_api->crypto, ed25519_verify);
+}
+
+static inline void ag_sha256_init(ag_sha256_t *c)
+{
+    g_ag_api->crypto->sha256_init(c);
+}
+static inline void ag_sha256_update(ag_sha256_t *c, const void *data,
+                                    size_t len)
+{
+    g_ag_api->crypto->sha256_update(c, data, len);
+}
+static inline void ag_sha256_final(ag_sha256_t *c, uint8_t out[32])
+{
+    g_ag_api->crypto->sha256_final(c, out);
+}
+static inline void ag_sha256(const void *data, size_t len, uint8_t out[32])
+{
+    ag_sha256_t c;
+    ag_sha256_init(&c);
+    ag_sha256_update(&c, data, len);
+    ag_sha256_final(&c, out);
+}
+
+static inline void ag_sha512_init(ag_sha512_t *c)
+{
+    g_ag_api->crypto->sha512_init(c);
+}
+static inline void ag_sha512_update(ag_sha512_t *c, const void *data,
+                                    size_t len)
+{
+    g_ag_api->crypto->sha512_update(c, data, len);
+}
+static inline void ag_sha512_final(ag_sha512_t *c, uint8_t out[64])
+{
+    g_ag_api->crypto->sha512_final(c, out);
+}
+static inline void ag_sha512(const void *data, size_t len, uint8_t out[64])
+{
+    ag_sha512_t c;
+    ag_sha512_init(&c);
+    ag_sha512_update(&c, data, len);
+    ag_sha512_final(&c, out);
+}
+
+/* True when `sig` is `pub`'s signature over the len bytes at `msg`. */
+static inline bool ag_ed25519_verify(const uint8_t sig[64], const void *msg,
+                                     size_t len, const uint8_t pub[32])
+{
+    return g_ag_api->crypto->ed25519_verify(sig, msg, len, pub);
+}
+
+/* ---- settings of this application (ABI 0.71) ----------------------------- */
+/*
+ * What this program must remember between runs, in `C:\CFG\<APP>.CFG` - one
+ * file per program, named from the program's own name, so no program can name
+ * another's and every program's settings are where a person would look.
+ *
+ * The format is the system's: `key = value`, comments with `;`.  A write
+ * rewrites the file through a temporary, so a power cut leaves the old settings
+ * rather than half of the new ones.
+ *
+ *     char dir[AG_PATH_MAX];
+ *     if (ag_setting_get("install.dir", dir, sizeof(dir)) != AG_OK) {
+ *         ag_strlcpy(dir, "C:\\APPS", sizeof(dir));
+ *         (void)ag_setting_set("install.dir", dir);
+ *     }
+ */
+static inline bool ag_settings_ready(void)
+{
+    return g_ag_api->cfg != NULL && AG_HAS(g_ag_api->cfg, app_set);
+}
+
+static inline ag_err_t ag_setting_get(const char *key, char *buf, size_t len)
+{
+    if (!ag_settings_ready()) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->cfg->app_get(key, buf, len);
+}
+
+static inline int32_t ag_setting_get_int(const char *key, int32_t def)
+{
+    if (!ag_settings_ready() || g_ag_api->cfg->app_get_int == NULL) {
+        return def;
+    }
+    return g_ag_api->cfg->app_get_int(key, def);
+}
+
+static inline ag_err_t ag_setting_set(const char *key, const char *value)
+{
+    if (!ag_settings_ready()) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->cfg->app_set(key, value);
+}
+
+/* Where those settings are, for a message a person can act on. */
+static inline ag_err_t ag_settings_path(char *buf, size_t len)
+{
+    if (!ag_settings_ready() || g_ag_api->cfg->app_path == NULL) {
+        return -AG_ENOTSUP;
+    }
+    return g_ag_api->cfg->app_path(buf, len);
 }
 
 #ifdef __cplusplus

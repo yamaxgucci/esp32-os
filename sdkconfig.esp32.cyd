@@ -1,12 +1,23 @@
-# ArgonOS - the CYD as a monitor: no radios at all, every byte to the heap.
+# ArgonOS - the CYD: what every build for it shares, and the CYD as a monitor.
 #
-#   argon target esp32-cyd
+#   argon target esp32-cyd       this file: no radios at all, every byte to
+#                                the heap - a screen at the end of a wire
+#   argon target esp32-cyd-net   + sdkconfig.esp32.cydnet: Wi-Fi with the
+#                                smallest buffers, the shop's terminal
+#   argon target esp32-cyd-md    + cydnet + sdkconfig.esp32.cydmd: 9 KB more
+#                                IRAM for the Mega Drive
 #
-# The CYD's job in this project is to be a screen at the end of a wire, and the
-# thing that job needs is memory: a 320x240 frame is 150 KB, and a frame that
-# cannot be assembled whole appears on the glass in pieces.  With the radios in
-# the image the heap tops out around 125 KB free - and 92 in one piece - which
-# is not enough however the code is arranged.
+# The two lines met on 1 Nov 2026: main had the CYD as a monitor, the shop's
+# line (cyd-sdfix) as a terminal with the radio, and each had the same file.
+# What makes the whole system better whatever the board is for - the heap, the
+# card's sector size, the flash on four lines, the timer task's stack - is
+# here; what is for one job is in that job's overlay.
+#
+# The monitor's case: the CYD's job is to be a screen at the end of a wire,
+# and the thing that job needs is memory: a 320x240 frame is 150 KB, and a
+# frame that cannot be assembled whole appears on the glass in pieces.  With
+# the radios in the image the heap tops out around 125 KB free - and 92 in one
+# piece - which is not enough however the code is arranged.
 #
 # `wifi off` does not help.  Switching the radio off hands back about 27 KB of
 # what it had allocated; the rest is the stacks, the buffers and the static
@@ -22,11 +33,40 @@ CONFIG_ARGON_NET_WIFI=n
 CONFIG_ARGON_ENABLE_BLE=n
 CONFIG_BT_ENABLED=n
 
+# ESP-IDF's own timer task: 3584 by default and measured at 529 bytes used, so
+# 2048 keeps a 4x margin.  This one is a build option and cannot be a line of
+# SYSTEM.CFG - IDF creates the task before any file is read.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=2048
+
+# The card's file system at the card's own sector size.  4096 is for a FAT on
+# internal flash (wear levelling), which this board does not have - C: is
+# littlefs.  At 4096 every one of the eight files the mount reserves carries a
+# 4 KB cache, and mounting the card took 44 KB of the 136 the board has free,
+# from the middle of its one 84 KB block (measured 28 Oct 2026, with the Mega
+# Drive needing 64 KB of it in one piece).  At 512, about 5 KB.
+CONFIG_FATFS_SECTOR_512=y
+CONFIG_FATFS_SECTOR_4096=n
+# ...and the wear-levelling layer's too: FatFs sizes every buffer to the larger
+# of the two (FF_MAX_SS = MAX(SD, WL) in ffconf.h), so 512 for the card alone
+# changed nothing - measured, 44 KB both ways.  Nothing here uses wear levelling.
+CONFIG_WL_SECTOR_SIZE_512=y
+CONFIG_WL_SECTOR_SIZE_4096=n
+
+# The two-ended heap in place of ESP-IDF's TLSF: small blocks from the top of
+# the fullest arena, large ones from the bottom (twoend_core.h).  Measured on
+# this board 29 Oct 2026 over one session (boot, radio off, card out and in, an
+# application): largest pieces after `wifi off` 80/11/10 KB with TLSF, 93/8/7
+# with this - the kernel's boot placed with the long-lived, the radio started
+# last, the SPI staging buffer moved into what the radio left (memshape.h).
+# The Master System emulator, refused under TLSF for want of a 13 KB arena,
+# starts; the Mega Drive still gets its 128 KB.
+CONFIG_ARGON_HEAP_TWOEND=y
+
 # The flash on four lines (QIO), not two (DIO).  Every cache miss on the
 # ESP32 is a 32-byte line read over SPI, ~450 CPU cycles in DIO at 80 MHz;
 # QIO halves the data phase.  The CYD's flash (Zbit, id 5e 4016) takes the
-# bootloader's default QE setting.  Measured 31 Oct 2026 on this board (the
-# cyd-sdfix line) with the Mega Drive on the panel: ECCO 35 -> 55 whole
-# pictures a second, its 68000 12.2 -> 8.9 ms a frame; Thunder Force IV
-# 19 -> 29 pictures; a row to the glass 31 -> 18 us.
+# bootloader's default QE setting.  Measured 31 Oct 2026 with MD32 on the
+# panel: ECCO 35 -> 55 whole pictures a second, its 68000 12.2 -> 8.9 ms a
+# frame; Thunder Force IV 19 -> 29 pictures, its sound 618 -> 521 ms a second;
+# a row to the glass 31 -> 18 us.
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y

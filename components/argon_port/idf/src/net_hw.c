@@ -126,24 +126,61 @@ void ag_port_net_on_ready(ag_port_net_ready_fn fn) { s_on_ready = fn; }
  *
  * Idempotent: init once, and the name can be set again to change it.
  */
+static bool s_mdns_on;     /* the responder is running */
+static bool s_mdns_paused; /* it was, and the radio went off */
+static char s_mdns_host[32];
+
 ag_err_t ag_port_net_mdns(const char *hostname)
 {
-    static bool inited;
-
     if (hostname == NULL || hostname[0] == '\0') {
         hostname = "argon";
     }
-    if (!inited) {
+    if (hostname != s_mdns_host) {
+        strncpy(s_mdns_host, hostname, sizeof(s_mdns_host) - 1u);
+        s_mdns_host[sizeof(s_mdns_host) - 1u] = '\0';
+    }
+    if (!s_mdns_on) {
         if (mdns_init() != ESP_OK) {
             return -AG_EIO;
         }
-        inited = true;
+        s_mdns_on = true;
     }
     if (mdns_hostname_set(hostname) != ESP_OK) {
         return -AG_EIO;
     }
     (void)mdns_instance_name_set(hostname);
     return AG_OK;
+}
+
+/*
+ * The responder goes with the radio and comes back with it.
+ *
+ * It used to be made once and kept: a task of 4 KB and its buffers, answering
+ * on no interface at all once `wifi off` had taken the only one there was.
+ * On the CYD that was the memory the Mega Drive's Z80 needed for its code
+ * (30 Oct 2026).  Called by the Wi-Fi port as the radio stops and starts; a
+ * board whose other link is up (Ethernet) never stops it here.
+ */
+void ag_port_net_mdns_pause(void)
+{
+    if (!s_mdns_on || s_netif != NULL) {
+        return;
+    }
+    mdns_free();
+    s_mdns_on = false;
+    s_mdns_paused = true;
+}
+
+void ag_port_net_mdns_resume(void)
+{
+    if (!s_mdns_paused) {
+        return;
+    }
+    s_mdns_paused = false;
+    const ag_err_t err = ag_port_net_mdns(s_mdns_host);
+    if (err != AG_OK) {
+        ESP_LOGW("net", "mdns: %s.local not back (%d)", s_mdns_host, (int)err);
+    }
 }
 
 /* Everything both links need before either can be brought up. */

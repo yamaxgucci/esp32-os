@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
+#include <argon/memshape.h>
 #include <argon/shell.h>
 
 #include <stdio.h>
@@ -764,12 +765,187 @@ static int mem_map(void)
     return 0;
 }
 
+/*
+ * mem /i: internal memory in address order - what cuts it into pieces.
+ *
+ * On the CYD 112 KB were free and a 13 KB arena was refused (29 Oct 2026):
+ * the largest block is decided by what sits between the free ones, often a
+ * few bytes someone took and kept.  Every free block of MEM_GAP_MIN or more
+ * gets a line; the used blocks between two of them are one line, with their
+ * count, and the address of the smallest - the cheapest wall to move.  A
+ * jump in the addresses is a new region of the heap, and starts a line too.
+ */
+#define MEM_GAP_MIN    1024u
+#define MEM_IMAP_LINES 96
+
+typedef struct {
+    uintptr_t addr;        /* first block of the line */
+    uintptr_t small;       /* used: its smallest block */
+    uint32_t  bytes;
+    uint32_t  small_bytes;
+    uint16_t  count;
+    uint8_t   used;
+    uint8_t   region;      /* starts a region of the heap */
+} mem_imap_line_t;
+
+typedef struct {
+    mem_imap_line_t line[MEM_IMAP_LINES];
+    unsigned        n;
+    uintptr_t       next;  /* where a block following the last would start */
+    uint32_t        lost;  /* small free blocks, not worth a line */
+    bool            cut;
+} mem_imap_t;
+
+static void mem_imap_block(void *ctx, const void *addr, size_t bytes, int used)
+{
+    mem_imap_t *m = (mem_imap_t *)ctx;
+    const uintptr_t a = (uintptr_t)addr;
+    const bool region = m->n == 0 || a < m->next || a > m->next + 64u;
+    m->next = a + bytes;
+    if (!used && bytes < MEM_GAP_MIN) {
+        m->lost += (uint32_t)bytes;    /* counted, and part of the wall */
+        used = 1;
+    }
+    mem_imap_line_t *last = (m->n > 0) ? &m->line[m->n - 1] : NULL;
+    if (used && !region && last != NULL && last->used) {
+        last->count++;
+        last->bytes += (uint32_t)bytes;
+        if (bytes < last->small_bytes) {
+            last->small = a;
+            last->small_bytes = (uint32_t)bytes;
+        }
+        return;
+    }
+    if (m->n == MEM_IMAP_LINES) {
+        m->cut = true;
+        return;
+    }
+    mem_imap_line_t *l = &m->line[m->n++];
+    l->addr = a;
+    l->small = a;
+    l->bytes = (uint32_t)bytes;
+    l->small_bytes = (uint32_t)bytes;
+    l->count = 1;
+    l->used = (uint8_t)(used != 0);
+    l->region = (uint8_t)region;
+}
+
+#if CONFIG_ARGON_HEAP_WHO
+/*
+ * mem who: who holds each block of the heap, and who held the last ones given
+ * back (diagnostic build only).  One line a record, in hex, for
+ * tools/heapwho.py to lay over `mem /i`:
+ *   L <ptr> <size> <seq> 0 <task> <pc>...       held
+ *   G <ptr> <size> <seq> <gone> <task> <pc>...  given back
+ *   M <seq> <name>                              a mark
+ * `seq` is the order of allocation.  `mem who mark <word>` names the moment,
+ * between the steps of a session.
+ */
+static void mem_who_line(char kind, const ag_port_heap_rec_t *r)
+{
+    ag_console_printf("%c %08x %x %x %x %08x", kind, (unsigned)r->ptr,
+                      (unsigned)r->size, (unsigned)r->seq, (unsigned)r->gone,
+                      (unsigned)r->task);
+    for (int k = 0; k < AG_PORT_HEAP_PCS; k++) {
+        ag_console_printf(" %08x", (unsigned)r->pc[k]);
+    }
+    ag_console_puts("\n");
+}
+
+static int mem_who(int argc, char **argv)
+{
+    if (argc >= 1 && strcmp(argv[0], "mark") == 0) {
+        ag_port_heap_who_mark(argc >= 2 ? argv[1] : "mark");
+        return 0;
+    }
+    ag_port_heap_rec_t r;
+    uint32_t lost = 0;
+    const uint32_t seq = ag_port_heap_who_seq(&lost);
+    ag_console_printf("S %x lost %u\n", (unsigned)seq, (unsigned)lost);
+    for (uint32_t i = 0; ag_port_heap_who_get(2, i, &r); i++) {
+        ag_console_printf("M %x %08x\n", (unsigned)r.seq, (unsigned)r.task);
+    }
+    for (uint32_t i = 0; ag_port_heap_who_get(0, i, &r); i++) {
+        if (r.ptr != 0) {
+            mem_who_line('L', &r);
+        }
+    }
+    for (uint32_t i = 0; ag_port_heap_who_get(1, i, &r); i++) {
+        if (r.ptr != 0) {
+            mem_who_line('G', &r);
+        }
+    }
+    ag_console_puts("E\n");
+    return 0;
+}
+#endif
+
+static int mem_imap(void)
+{
+    /* taken for the walk, not kept: a static would cost the CYD its 2 KB for
+     * good.  It shows in the map as one used block of its size. */
+    mem_imap_t *mp = (mem_imap_t *)ag_port_alloc(sizeof(*mp),
+                                                AG_MEM_FAST | AG_MEM_BYTE);
+    if (mp == NULL) {
+        ag_console_puts("mem: no room for the map\n");
+        return 1;
+    }
+    const mem_imap_t *const mm = mp;
+    memset(mp, 0, sizeof(*mp));
+    ag_port_mem_walk(AG_MEM_FAST, mem_imap_block, mp);
+    ag_console_printf("address  free   used  blocks (map: %u)\n",
+                      (unsigned)sizeof(*mp));
+    for (unsigned i = 0; i < mm->n; i++) {
+        const mem_imap_line_t *l = &mm->line[i];
+        if (l->region) {
+            ag_console_puts("--\n");
+        }
+        if (!l->used) {
+            ag_console_printf("%08x %5uK\n", (unsigned)l->addr,
+                              (unsigned)(l->bytes / 1024u));
+        } else if (l->count == 1) {
+            ag_console_printf("%08x      %6u\n", (unsigned)l->addr,
+                              (unsigned)l->bytes);
+        } else {
+            ag_console_printf("%08x      %6u %u, least %u @%08x\n",
+                              (unsigned)l->addr, (unsigned)l->bytes,
+                              (unsigned)l->count, (unsigned)l->small_bytes,
+                              (unsigned)l->small);
+        }
+    }
+    ag_console_printf("free in pieces under %uK: %u\n",
+                      (unsigned)(MEM_GAP_MIN / 1024u), (unsigned)mm->lost);
+    if (mm->cut) {
+        ag_console_printf("(only the first %u lines)\n",
+                          (unsigned)MEM_IMAP_LINES);
+    }
+    ag_port_free(mp);
+    return 0;
+}
+
 static int cmd_mem(int argc, char **argv)
 {
     if (argc > 1 && (strcmp(argv[1], "/x") == 0 ||
                      strcmp(argv[1], "map") == 0)) {
         return mem_map();
     }
+    if (argc > 1 && strcmp(argv[1], "/i") == 0) {
+        return mem_imap();
+    }
+    /* `mem compact`: every buffer that can be made again elsewhere, now */
+    if (argc > 1 && strcmp(argv[1], "compact") == 0) {
+        const size_t before = ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE);
+        (void)ag_mem_reshape("mem compact");
+        const size_t after = ag_port_mem_largest(AG_MEM_FAST | AG_MEM_BYTE);
+        ag_console_printf("largest free %u -> %u KB\n",
+                          (unsigned)(before / 1024u), (unsigned)(after / 1024u));
+        return 0;
+    }
+#if CONFIG_ARGON_HEAP_WHO
+    if (argc > 1 && strcmp(argv[1], "who") == 0) {
+        return mem_who(argc - 2, argv + 2);
+    }
+#endif
     if (argc > 1 && (strcmp(argv[1], "/t") == 0 ||
                      strcmp(argv[1], "tasks") == 0)) {
         return mem_tasks();
@@ -852,6 +1028,41 @@ static int cmd_mem(int argc, char **argv)
     }
     ag_console_printf("\n  %u KB used by the system\n",
                       (unsigned)((int_total - int_free) / 1024));
+#if CONFIG_ARGON_HEAP_TWOEND
+    ag_port_twoend_info_t te;
+    if (ag_port_twoend(&te)) {
+        ag_console_printf(narrow_screen()
+                              ? "  two-ended, <=%u B on top:\n"
+                                "  %uK of %uK free (least %uK)\n"
+                              : "  two-ended heap, blocks of %u B or less on top: "
+                                "%u KB of %u KB free (least %u KB)\n",
+                          (unsigned)te.small_max, (unsigned)(te.free / 1024u),
+                          (unsigned)(te.total / 1024u),
+                          (unsigned)(te.low / 1024u));
+        for (uint32_t i = 0; i < te.arenas && i < 8u; i++) {
+            ag_console_printf("  arena %08x-%08x %uK\n", (unsigned)te.lo[i],
+                              (unsigned)te.hi[i],
+                              (unsigned)((te.hi[i] - te.lo[i]) / 1024u));
+        }
+    }
+#endif
+#if CONFIG_ARGON_SMALL_ZONE_KB > 0
+    /* counted as used above: one block of the heap, run as a heap of its own */
+    ag_port_zone_info_t z;
+    if (ag_port_small_zone(&z)) {
+        ag_console_printf(narrow_screen()
+                              ? "  small<=%u: %uK of %uK free\n"
+                                "  (least %uK, %u blocks, %u spilled, "
+                                "%u lent)\n"
+                              : "  blocks of %u B or less: %u KB of %u KB "
+                                "free (least %u KB), %u held, %u spilled, "
+                                "%u lent\n",
+                          (unsigned)z.max, (unsigned)(z.free / 1024u),
+                          (unsigned)(z.total / 1024u),
+                          (unsigned)(z.low / 1024u), (unsigned)z.blocks,
+                          (unsigned)z.spilled, (unsigned)z.lent);
+    }
+#endif
 
     /*
      * The arena is the honest answer to "how much executable memory is there":
@@ -1044,6 +1255,7 @@ static int cmd_boot(int argc, char **argv)
         [AG_STAGE_MEDIA]      = "media",
         [AG_STAGE_MODULES]    = "modules",
         [AG_STAGE_SUPERVISOR] = "supervisor",
+        [AG_STAGE_RADIO]      = "radio",
         [AG_STAGE_SHELL]      = "shell",
     };
 
@@ -2542,102 +2754,231 @@ static int hex_digit(char c)
 /*
  * Rewrites one section of SYSTEM.CFG, keeping the rest as it stands.
  *
- * The two buffers come from the heap, and that is a fix rather than a taste.
- * As stack arrays they were four kilobytes each in a task with twelve, and the
- * shell reaches this function several frames deep: `wifi connect` remembers the
- * network here, and remembering it overflowed the stack of the task the shell
- * runs in.
+ * Line by line, into a temporary file, which is then renamed over the original.
+ * It used to read the whole file into four kilobytes of heap and write the
+ * result from a second four, and that put a ceiling on a file which is
+ * documentation as much as configuration: the CYD's SYSTEM.CFG is 5.4 KB of
+ * comments around a dozen settings, and what `wifi connect` said there was
  *
- * What that looked like from outside was a board that restarts when a Wi-Fi
- * password is typed - so the password was the suspect, then the memory the radio
- * takes, and neither had anything to do with it.  What said otherwise was one
- * line the chip prints and nobody had been reading:
+ *     SYSTEM.CFG: -28 (joining anyway)
  *
- *     ***ERROR*** A stack overflow in task main has been detected.
+ * - the board could not remember its own network, because of a buffer size.  It
+ * also truncated the file before writing the replacement, so a failure part-way
+ * lost the configuration instead of leaving it as it was.
  *
- * Rewriting a configuration file happens when somebody types a command, so a
- * heap allocation and a free cost nothing that matters, and eight kilobytes of
- * stack in a twelve kilobyte task was never going to be safe for long.
+ * Streaming costs no memory beyond one line, and the rename is what makes a
+ * half-written file invisible: either the old file is there or the new one is.
+ * (The four kilobyte heap buffers were themselves a fix, and stay in the
+ * story: as stack arrays they were eight kilobytes in a twelve kilobyte task,
+ * and `wifi connect` overflowed it - a board that restarts when a password is
+ * typed.  A line at a time answers both.)
  */
-static ag_err_t cfg_replace_section(const char *section, const char *body)
+#define CFG_TMP_PATH "/sys/SYSTEM.NEW"
+#define CFG_BAK_PATH "/sys/SYSTEM.OLD"
+
+/* Writes all of `n` bytes, or why not. */
+static ag_err_t cfg_write_all(ag_handle_t h, const char *text, size_t n)
 {
-    size_t      used = 0;
-    size_t      len = 0;
-
-    char *const text = (char *)ag_port_alloc(DRV_CFG_MAX * 2u,
-                                             AG_MEM_FAST | AG_MEM_BYTE);
-    if (text == NULL) {
-        return -AG_ENOMEM;
+    size_t off = 0;
+    while (off < n) {
+        const int32_t w = ag_vfs_write(h, text + off, n - off);
+        if (w <= 0) {
+            return (w < 0) ? (ag_err_t)w : -AG_ENOSPC;
+        }
+        off += (size_t)w;
     }
-    char *const out = text + DRV_CFG_MAX;
-
-    ag_handle_t h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
-
-    if (h >= 0) {
-        const int32_t n = ag_vfs_read(h, text, DRV_CFG_MAX - 1u);
-        ag_vfs_close(h);
-        if (n < 0) {
-            ag_port_free(text);
-            return (ag_err_t)n;
-        }
-        used = (size_t)n;
-    }
-    text[used] = '\0';
-
-    const size_t seclen = strlen(section);
-    bool         drop = false;
-    const char  *p = text;
-    while (p < text + used) {
-        const char  *eol = strchr(p, '\n');
-        const size_t line = (eol != NULL) ? (size_t)(eol - p) + 1u
-                                          : (size_t)(text + used - p);
-        const char  *s = p;
-        while (*s == ' ' || *s == '\t') {
-            s++;
-        }
-        if (*s == '[') {
-            const char *close = strchr(s, ']');
-            drop = (close != NULL) && ((size_t)(close - s) == seclen + 1u) &&
-                   (ag_path_icmpn_local(s + 1, section, seclen) == 0);
-        }
-        if (!drop) {
-            if (len + line >= DRV_CFG_MAX) {
-                ag_port_free(text);
-                return -AG_ENOSPC;
-            }
-            memcpy(out + len, p, line);
-            len += line;
-        }
-        if (eol == NULL) {
-            break;
-        }
-        p = eol + 1;
-    }
-
-    if (body != NULL && body[0] != '\0') {
-        if (len > 0 && out[len - 1u] != '\n') {
-            out[len++] = '\n';
-        }
-        const int n = snprintf(out + len, DRV_CFG_MAX - len, "[%s]\n%s",
-                               section, body);
-        if (n < 0 || (size_t)n >= DRV_CFG_MAX - len) {
-            ag_port_free(text);
-            return -AG_ENOSPC;
-        }
-        len += (size_t)n;
-    }
-
-    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
-    if (h < 0) {
-        ag_port_free(text);
-        return (ag_err_t)h;
-    }
-    const int32_t w = ag_vfs_write(h, out, len);
-    (void)ag_vfs_close(h);
-    ag_port_free(text);
-    return (w < 0) ? (ag_err_t)w : AG_OK;
+    return AG_OK;
 }
 
+/* Whether this line opens any section at all. */
+static bool cfg_line_starts_section(const char *line, size_t len)
+{
+    size_t i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    return i < len && line[i] == '[';
+}
+
+/* Whether this line opens `section` - the header this write replaces. */
+static bool cfg_line_is_section(const char *line, size_t len,
+                                const char *section, size_t seclen)
+{
+    size_t i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    if (i >= len || line[i] != '[') {
+        return false;
+    }
+    const char *close = (const char *)memchr(line + i, ']', len - i);
+    return close != NULL && (size_t)(close - (line + i)) == seclen + 1u &&
+           ag_path_icmpn_local(line + i + 1u, section, seclen) == 0;
+}
+
+static ag_err_t cfg_emit_section(ag_handle_t out, const char *section,
+                                 const char *body)
+{
+    if (body == NULL || body[0] == '\0') {
+        return AG_OK; /* nothing to add, and an empty header is noise */
+    }
+    char head[64];
+    const int n = snprintf(head, sizeof(head), "\n[%s]\n", section);
+    if (n <= 0 || (size_t)n >= sizeof(head)) {
+        return -AG_EINVAL;
+    }
+    ag_err_t err = cfg_write_all(out, head, (size_t)n);
+    if (err == AG_OK) {
+        err = cfg_write_all(out, body, strlen(body));
+    }
+    return err;
+}
+
+/* What the copy of the file is doing, from one line to the next. */
+typedef struct {
+    ag_handle_t out;
+    const char *section;
+    size_t      seclen;
+    const char *body;
+    bool        drop;    /* inside the section being replaced */
+    bool        written; /* the new section has been written        */
+} cfg_rw_t;
+
+/*
+ * One complete line, newline included on the way out.  `cut` says the line was
+ * longer than the buffer, so it cannot be a section header - it goes through as
+ * it is, in as many pieces as it takes, and nothing is dropped.
+ */
+static ag_err_t cfg_rw_line(cfg_rw_t *rw, const char *line, size_t len, bool cut)
+{
+    const bool header = !cut && cfg_line_starts_section(line, len);
+    if (header && cfg_line_is_section(line, len, rw->section, rw->seclen)) {
+        rw->drop = true;
+        if (!rw->written) {
+            const ag_err_t err =
+                cfg_emit_section(rw->out, rw->section, rw->body);
+            if (err != AG_OK) {
+                return err;
+            }
+            rw->written = true;
+        }
+        return AG_OK;
+    }
+    if (header) {
+        rw->drop = false; /* the section being replaced ended here */
+    }
+    if (rw->drop) {
+        return AG_OK;
+    }
+    ag_err_t err = cfg_write_all(rw->out, line, len);
+    if (err == AG_OK) {
+        err = cfg_write_all(rw->out, "\n", 1);
+    }
+    return err;
+}
+
+static ag_err_t cfg_replace_section(const char *section, const char *body)
+{
+    /* A leftover from a write that did not finish - this one or an older one. */
+    (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+
+    const ag_handle_t in = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
+    const ag_handle_t out =
+        ag_vfs_open(CFG_TMP_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    if (out < 0) {
+        if (in >= 0) {
+            (void)ag_vfs_close(in);
+        }
+        return (ag_err_t)out;
+    }
+
+    cfg_rw_t rw = {.out = out, .section = section, .seclen = strlen(section),
+                   .body = body};
+    char     line[256];
+    size_t   len = 0;
+    bool     cut = false;
+    ag_err_t err = AG_OK;
+
+    while (in >= 0) {
+        char          chunk[128];
+        const int32_t n = ag_vfs_read(in, chunk, sizeof(chunk));
+        if (n < 0) {
+            err = (ag_err_t)n;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        for (int32_t i = 0; i < n && err == AG_OK; i++) {
+            const char c = chunk[i];
+            if (c == '\r') {
+                continue; /* the file is written back with plain newlines */
+            }
+            if (c != '\n') {
+                if (len + 1u >= sizeof(line)) {
+                    /* Longer than a section header can be: out it goes, and
+                     * the rest of the line follows as more of the same. */
+                    err = cfg_rw_line(&rw, line, len, true);
+                    len = 0;
+                    cut = true;
+                }
+                if (err == AG_OK) {
+                    line[len++] = c;
+                }
+                continue;
+            }
+            err = cfg_rw_line(&rw, line, len, cut);
+            len = 0;
+            cut = false;
+        }
+        if (err != AG_OK) {
+            break;
+        }
+    }
+
+    if (err == AG_OK && len > 0) { /* a last line with no newline after it */
+        err = cfg_rw_line(&rw, line, len, cut);
+    }
+    if (err == AG_OK && !rw.written) {
+        err = cfg_emit_section(out, section, body); /* a section that was absent */
+    }
+    if (in >= 0) {
+        (void)ag_vfs_close(in);
+    }
+    const ag_err_t cerr = ag_vfs_close(out);
+    if (err == AG_OK) {
+        err = cerr;
+    }
+    if (err != AG_OK) {
+        (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+        return err;
+    }
+
+    /*
+     * The old file becomes the backup for as long as it takes the new one to
+     * take its name, and is deleted only once that worked.  Two renames rather
+     * than an unlink and a rename, because a board that loses its file loses
+     * everything it was told - the network it joins, the drivers it loads.
+     */
+    (void)ag_vfs_unlink(CFG_BAK_PATH, NULL);
+    if (ag_vfs_rename(DRV_CFG_PATH, CFG_BAK_PATH, NULL) == AG_OK) {
+        err = ag_vfs_rename(CFG_TMP_PATH, DRV_CFG_PATH, NULL);
+        if (err == AG_OK) {
+            (void)ag_vfs_unlink(CFG_BAK_PATH, NULL);
+        } else {
+            (void)ag_vfs_rename(CFG_BAK_PATH, DRV_CFG_PATH, NULL);
+            (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+        }
+        return err;
+    }
+    /* No rename on this filesystem: replace it in place, as it used to. */
+    (void)ag_vfs_unlink(DRV_CFG_PATH, NULL);
+    err = ag_vfs_rename(CFG_TMP_PATH, DRV_CFG_PATH, NULL);
+    if (err != AG_OK) {
+        (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+    }
+    return err;
+}
 #endif /* ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID || CONFIG_ARGON_NET_SSH */
 
 #if ARGON_SHELL_HAS_WIFI
@@ -4025,6 +4366,9 @@ static int cmd_wifi(int argc, char **argv)
             const size_t after = ag_port_mem_free(AG_MEM_FAST);
             ag_console_printf("radio off, %u KB back\n",
                               (unsigned)((after - before) / 1024u));
+            /* the radio's memory is back: buffers made while it held the
+             * rest can move into it (argon/memshape.h) */
+            (void)ag_mem_reshape("wifi off");
         } else {
             ag_console_printf("radio off on %s\n", ag_netprov_active());
         }
@@ -4862,6 +5206,7 @@ static int cmd_bt(int argc, char **argv)
         const size_t after = ag_port_mem_free(AG_MEM_FAST);
         ag_console_printf("radio off, %u KB back\n",
                           (unsigned)((after - before) / 1024u));
+        (void)ag_mem_reshape("bt off");
         return 0;
     }
 
@@ -6330,7 +6675,7 @@ static int cmd_guard(int argc, char **argv)
 static const ag_command_t k_commands[] = {
     {"help", "", "list these commands", cmd_help},
     {"ver", "", "version and hardware", cmd_ver},
-    {"mem", "[/t|/p|/x]", "memory usage; /t: every task and its stack; /p: [memory] placement; /x: extended memory block by block", cmd_mem},
+    {"mem", "[/t|/p|/x|/i|compact]", "memory usage; /t: every task and its stack; /p: [memory] placement; /x: extended memory block by block; /i: what cuts internal memory up; compact: buffers that can move, moved", cmd_mem},
     {"cpu", "[secs]", "who spends the processor, per core", cmd_cpu},
     {"flash", "[strict [on|off]]", "flash traffic while sound plays", cmd_flash},
     {"tick", "", "what the system tick itself costs", cmd_tick},

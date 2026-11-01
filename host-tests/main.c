@@ -11,6 +11,7 @@ int ag_test_checks = 0;
 void run_rdcodec_tests(void);
 void run_path_tests(void);
 void run_cfg_tests(void);
+void run_appcfg_tests(void);
 void run_screen_tests(void);
 void run_vtout_tests(void);
 void run_vtin_tests(void);
@@ -24,10 +25,12 @@ void run_power_tests(void);
 void run_journal_tests(void);
 void run_axeload_tests(void);
 void run_axesig_tests(void);
+void run_licence_tests(void);
 void run_codepage_tests(void);
 void run_hidrep_tests(void);
 void run_reslist_tests(void);
 void run_arena_tests(void);
+void run_twoend_tests(void);
 void run_probe_tests(void);
 void run_cc_tests(void);
 void run_rv32_tests(void);
@@ -49,6 +52,10 @@ void run_cluframe_tests(void);
 void run_phonelink_tests(void);
 void run_espldr_tests(void);
 void run_stm32ldr_tests(void);
+void run_store_tests(void);
+void run_store_sig_tests(void);
+void run_agx_tests(void);
+void run_store_web_tests(void);
 void run_place_tests(void);
 
 int main(void)
@@ -56,6 +63,7 @@ int main(void)
     run_rdcodec_tests();
     run_path_tests();
     run_cfg_tests();
+    run_appcfg_tests();
     run_place_tests();
     run_screen_tests();
     run_vtout_tests();
@@ -70,10 +78,12 @@ int main(void)
     run_journal_tests();
     run_axeload_tests();
     run_axesig_tests();
+    run_licence_tests();
     run_codepage_tests();
     run_hidrep_tests();
     run_reslist_tests();
     run_arena_tests();
+    run_twoend_tests();
     run_probe_tests();
     run_cc_tests();
     run_rv32_tests();
@@ -95,6 +105,10 @@ int main(void)
     run_phonelink_tests();
     run_espldr_tests();
     run_stm32ldr_tests();
+    run_store_tests();
+    run_store_sig_tests();
+    run_agx_tests();
+    run_store_web_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);
     return ag_test_failures == 0 ? 0 : 1;

@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <argon/memshape.h>
 #include <argon/board.h>
 #include <argon/device.h>
 #include <argon/ioclaim.h>
@@ -594,6 +595,21 @@ static int spi_index(int bus) { return bus - AG_SPI_FIRST; }
  * spi_take_cs), while a slave hands its one select to the driver at init and
  * has no transfer call to carry another.
  */
+/*
+ * A master bus keeps a staging buffer between transfers (16 KB on the ESP32)
+ * and needs none of what is in it: asked to, it lets the buffer go, and the
+ * next long transfer makes it again wherever the heap then has room.
+ */
+static void spi_reshape(void *ctx)
+{
+    (void)ctx;
+    for (int idx = 0; idx < AG_SPI_BUSES; idx++) {
+        if (s_spi[idx].up && !s_spi[idx].slave) {
+            ag_port_spi_shed(idx + AG_SPI_FIRST);
+        }
+    }
+}
+
 static ag_err_t spi_bring_up(int bus, bool slave, int cs)
 {
     const int idx = spi_index(bus);
@@ -666,6 +682,9 @@ static ag_err_t spi_bring_up(int bus, bool slave, int cs)
     s_spi[idx].up = true;
     s_spi[idx].slave = slave;
     s_spi[idx].cs = slave ? cs : AG_PIN_NONE;
+    if (!slave) {
+        (void)ag_mem_reshaper_add("spi staging", spi_reshape, NULL);
+    }
 
     if (cfg->drive >= 0) {
         const ag_err_t drv = ag_port_spi_set_drive(bus, cfg->drive);
@@ -764,6 +783,41 @@ static ag_err_t io_spi_xfer(int bus, int cs, const void *tx, void *rx,
     }
     unlock();
     return err;
+}
+
+/*
+ * The same write, queued out of the caller's memory and not waited for (ABI
+ * 0.73).  The checks are spi_xfer's - the bus, and the select as the caller's
+ * - and the wait needs none: it only reaps what this bus already has out.
+ */
+static ag_err_t io_spi_write_start(int bus, int cs, const void *tx, size_t len)
+{
+    if (len == 0 || len > AG_PORT_SPI_MAX_XFER || tx == NULL) {
+        return -AG_EINVAL;
+    }
+
+    lock();
+    ag_err_t err = spi_bring_up(bus, false, AG_PIN_NONE);
+    if (err == AG_OK) {
+        err = spi_take_cs(bus, cs);
+    }
+    if (err == AG_OK) {
+        err = ag_port_spi_write_start(bus, cs, tx, len);
+    }
+    unlock();
+    return err;
+}
+
+static ag_err_t io_spi_write_wait(int bus)
+{
+    const int idx = spi_index(bus);
+    if (idx < 0 || idx >= AG_SPI_BUSES) {
+        return -AG_ERANGE;
+    }
+    if (!s_spi[idx].up) {
+        return AG_OK; /* never brought up: nothing can be out */
+    }
+    return ag_port_spi_write_wait(bus);
 }
 
 /*
@@ -1595,6 +1649,8 @@ const ag_io_api_t ag_io_api_table = {
     .spi_link_recv2 = ag_spilink_recv2,
     .uart_link_send2 = ag_uartlink_send2,
     .uart_link_recv2 = ag_uartlink_recv2,
+    .spi_write_start = io_spi_write_start,
+    .spi_write_wait = io_spi_write_wait,
 };
 
 ag_err_t ag_io_init(void)

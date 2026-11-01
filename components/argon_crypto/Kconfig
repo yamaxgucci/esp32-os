@@ -1,0 +1,23 @@
+menu "ArgonOS crypto"
+
+    config ARGON_ENABLE_CRYPTO
+        bool "Ed25519 and SHA-256/SHA-512 in the kernel"
+        default y
+        help
+            The maths a signature needs, in the kernel rather than in every
+            image that checks one: RFC 8032 Ed25519, FIPS 180-4 SHA-256 and
+            SHA-512, and Monocypher under them.
+
+            It is here because an application cannot afford it.  Monocypher is
+            46 KB of C, an image has 64 KB of code for everything it does, and
+            the shop was spending 11 KB of its 39 KB on its own copy - to check
+            three signatures, in a program that also parses a catalogue, keeps
+            a registry and speaks HTTP.  One copy in flash is shared by every
+            image that needs it.
+
+            Turn it off on a board that cannot spare the room.  api->crypto is
+            then NULL, and the shop says "this firmware has no signature
+            checking" and refuses to install anything - which is the honest
+            answer, not a crash.  Nothing else in the tree depends on it.
+
+endmenu

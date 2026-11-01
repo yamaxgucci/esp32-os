@@ -16,6 +16,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "core/sysconfig.h"
+#include <argon/cfg.h>
 #include <argon/clu.h>
 #include <argon/budget.h>
 #include <argon/console.h>
@@ -675,8 +677,10 @@ ag_err_t ag_supervisor_init(void)
     /* [memory] supervisor, `only iram` unless the configuration says
      * otherwise: it writes the crash record, and a stack in PSRAM would make
      * that write depend on the flash relay (flashop_hw.c) a crashed program
-     * may have left holding its lock. */
-    if (!ag_place_task("supervisor", supervisor_task, "ag_super", AG_SUP_STACK,
+     * may have left holding its lock.  [stacks] supervisor, its size. */
+    const size_t supervisor_stack =
+        ag_cfg_bytes(ag_sysconfig(), "stacks.supervisor", AG_SUP_STACK);
+    if (!ag_place_task("supervisor", supervisor_task, "ag_super", supervisor_stack,
                        NULL, AG_SUP_PRIORITY, 0, (void **)&s_task, NULL)) {
         return -AG_ENOMEM;
     }

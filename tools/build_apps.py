@@ -150,6 +150,16 @@ def command_for(app, defaults, extra_cflags, target_pair, forced_gcc,
             if extra_cflags:
                 hot_cflags = (hot_cflags + " " + extra_cflags).strip()
             cmd += ["--hot-cflags", hot_cflags]
+    # Linker flags, for an image that has to throw away code nothing calls.
+    # A vendored library is one object file, so every function in it is kept
+    # unless the linker is told to collect: Monocypher is 46 KB that way and
+    # 20 KB with --gc-sections, and the code arena is 64 KB for every process
+    # there is.  The entry that needs it says so, in apps.json, where the rest
+    # of how this image is built already lives.
+    for flag in app.get("ldflags", []):
+        # With '=', because a linker flag starts with a dash and argparse would
+        # take it for the next option.
+        cmd += ["--ldflags=" + flag]
     if app.get("icon"):
         # A program's own face, carried in its file (mkaxe --icon).  Kept in
         # apps.json beside its sources because that is where everything else

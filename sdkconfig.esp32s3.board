@@ -56,6 +56,46 @@ CONFIG_BT_NIMBLE_HID_SERVICE=y
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
+# --- what the two radios cost, and what is trimmed so both can be up ---------
+#
+# Both radios in one image was never the question (section 5 of
+# logs/firmware-size-ble.md has the numbers): at link time there are ~100 KB
+# of internal RAM to spare once the kernel's statics live in PSRAM.  Running
+# them at the same time is the question, and it is answered in kilobytes that
+# are taken when a radio starts:
+#
+#   `ble adv`  -> 66 KB   (the controller's 30 720-byte exchange memory, the
+#                          NimBLE host, its task, its buffers)
+#   `wifi on`  -> 49 KB   (driver task and stack, lwIP, and 10 x 1600-byte
+#                          static receive buffers)
+#
+# 66 + 49 is more than the board has, and the failure is not a clean "no
+# memory": Wi-Fi got 8 of its 10 receive buffers, said "Expected to init 10 rx
+# buffer, actual is 8", and then could not deinitialise itself either
+# (measured on the S3-CAM, 23 Oct 2026).  So three things come down to what a
+# board that installs programs actually needs:
+#
+#   - four static receive buffers instead of ten.  These are the ones held for
+#     the life of the radio; the dynamic pool below covers bursts, and a shop
+#     client downloads one file at a time over a link that is idle otherwise.
+#   - sixteen dynamic buffers instead of thirty-two, receive and transmit: the
+#     cap is on what *can* be allocated, so this is headroom given back to the
+#     heap rather than memory saved at init.
+#   - sixteen kilobytes of application code arena instead of thirty-two.  The
+#     arena is where an application's instructions run when they cannot run
+#     from PSRAM; on this board PSRAM reaches the instruction bus, so the
+#     arena's real work is the odd image that needs a contiguous block, and
+#     16 KB is four times the largest .SYS here.  It is set where the arena is
+#     described below, not here.
+#
+# What is *not* trimmed: TX_BUFFER_TYPE, RX_BA_WIN, the management buffers, and
+# coexistence.  The first two are throughput and the last is the whole point.
+# Measured after the trim: both radios up with the Wi-Fi joined, the BLE
+# advertising, and the store polling the shop - see the plan, F6.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
 # The photoresistor/ADC path: no work to enable, only a board to run it on -
 # esp_adc would not even let QEMU boot (pitfall 26), so the primary target
 # leaves it off.  Here it is real.
@@ -92,7 +132,13 @@ CONFIG_ARGON_ENABLE_ADC=y
 # them has to come from outside its own arena, because inside it the art cache
 # gives nothing back - shrinking that from 1800 to 1400 KB was measured at 0.16
 # frames a second and four hundred evictions a window.
-CONFIG_ARGON_APP_ARENA_KB=32
+#
+# 16 KB of internal arena, not 32 (23 Oct 2026): it is reserved at link time
+# whether anything runs in it or not, and it was the block standing between
+# "Bluetooth advertising" and "Wi-Fi joined" - see the radio note above.  What
+# goes through it on this board is a .SYS of two or three kilobytes; everything
+# larger already runs from the 64 KB PSRAM arena.
+CONFIG_ARGON_APP_ARENA_KB=16
 CONFIG_ARGON_APP_ARENA_PSRAM=y
 CONFIG_ARGON_APP_ARENA_PSRAM_KB=64
 

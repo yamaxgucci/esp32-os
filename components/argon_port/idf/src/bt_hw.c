@@ -335,18 +335,30 @@ void ag_port_bt_on_report(ag_port_bt_report_fn fn) { s_on_report = fn; }
  * that has said it will not use Bluetooth ([bt] release), because once this runs
  * the controller cannot be started again until reset.
  */
+static bool s_released;
+
 void ag_port_bt_mem_release(void)
 {
     if (s_state != AG_BT_OFF) {
         return; /* already up; nothing to give back */
     }
     (void)esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+    s_released = true;
 }
 
 ag_err_t ag_port_bt_start(void)
 {
     if (s_state != AG_BT_OFF) {
         return AG_OK;
+    }
+    /*
+     * After the release the controller's init fails, and IDF's own undo of
+     * that failure deletes a semaphore it never made: `store -web` on an
+     * S3-CAM with [bt] release faulted in semphr_delete_wrapper (24 Oct 2026).
+     * Refused here, the caller hears "no device" and goes on without it.
+     */
+    if (s_released) {
+        return -AG_ENODEV;
     }
 
     s_lock = xSemaphoreCreateMutex();

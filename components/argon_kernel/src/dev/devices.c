@@ -35,6 +35,7 @@
 #include <argon/usbhid.h>
 #include <argon/port/bt.h>
 #include <argon/port/fault.h>
+#include <argon/port/mem.h>
 #include <argon/port/sync.h>
 #include <argon/port/task.h>
 #include <argon/port/time.h>
@@ -604,6 +605,94 @@ ag_err_t ag_devices_init(void)
         return err;
     }
 
+#if !CONFIG_ARGON_HEAP_TWOEND
+    /* Here, where they always were - see ag_devices_start_radios. */
+    (void)ag_devices_start_radios();
+#endif
+
+#if AG_PORT_HAS_USB_HID
+    /*
+     * The wired keyboard.  Unlike the radio, there is nothing to name and no
+     * pairing: USB announces a device when it is plugged in, so the host is
+     * simply brought up and left waiting.  Started at boot when the image has
+     * it compiled in - a keyboard is basic input, and a board that built the
+     * host in wants it usable at the prompt without a command first.  Opt-out
+     * with [usb] host = 0 in SYSTEM.CFG for a board that would rather not spend
+     * the two tasks until asked (`usb on`).
+     */
+    if (ag_cfg_get_int(ag_sysconfig(), "usb.host", 1) != 0) {
+        const ag_err_t uerr = ag_port_usb_start();
+        if (uerr != AG_OK) {
+            ag_log(AG_LOG_WARN, "usb", "host did not start (%d)", (int)uerr);
+        } else {
+            (void)ag_usbinput_init();
+            ag_log(AG_LOG_INFO, "usb", "host up, waiting for a keyboard");
+        }
+    }
+#endif
+
+#if AG_PORT_HAS_USB_DEVICE
+    /*
+     * The other direction: this board as a keyboard and a mouse for the machine
+     * its OTG port is plugged into.  /dev/usbhid0 is registered whether or not
+     * the gadget runs - an application that opens it on a board with the cable
+     * out gets -AG_ENODEV from the write, which is a better answer than a
+     * missing device, because the cable is the thing that changes.
+     *
+     * The gadget itself is attached at boot for the same reason the host is
+     * started at boot: enumeration takes a moment and a driver install on the
+     * far machine takes longer, and both are better spent before somebody is
+     * waiting to type.  Opt out with [usb] device = 0 in SYSTEM.CFG.
+     */
+    (void)ag_usbhid_init();
+#if AG_PORT_HAS_USB_CDC
+    /*
+     * The serial pipe on the same cable, for the program on the far machine
+     * that sends its screen back.  Registered unconditionally beside the
+     * keyboard: nothing has to be running over there for the device to exist,
+     * and a read simply says -AG_ENODEV until something does.
+     */
+    (void)ag_usbcdc_init();
+#endif
+    if (ag_cfg_get_int(ag_sysconfig(), "usb.device", 1) != 0) {
+        const ag_err_t derr = ag_port_usbdev_start();
+        if (derr != AG_OK) {
+            ag_log(AG_LOG_WARN, "usbhid", "gadget did not start (%d)",
+                   (int)derr);
+        } else {
+            ag_log(AG_LOG_INFO, "usbhid",
+                   "attached as a keyboard and mouse");
+        }
+    }
+#endif
+
+    ag_log(AG_LOG_INFO, "dev", "%u devices", (unsigned)ag_dev_count());
+    return AG_OK;
+}
+
+/*
+ * The radios: Wi-Fi with its name on the network, and Bluetooth.  A boot
+ * stage of their own, after the supervisor, and the reason is memory.  A
+ * radio is the one thing here that comes and goes - `wifi off` gives back
+ * some 70 KB - and everything started after it at boot stays for good:
+ * started in the devices stage, the radio's blocks went first and the
+ * card's, the drivers', the supervisor's and the shell's were laid down
+ * around them, so switching it off left holes walled in by blocks that
+ * never go (tools/heapwho.py, the CYD, 29 Oct 2026).  Started last, what
+ * it takes is one stretch, and it comes back as one: after `wifi off` the
+ * largest free piece there went from 80 KB to 93.
+ *
+ * Only with the two-ended heap (CONFIG_ARGON_HEAP_TWOEND), which is what
+ * makes the order pay - on its own, moving the radio only shuffled the
+ * holes - and which only the CYD has been measured with.  Everywhere else
+ * the radios still start in the devices stage, before the drivers in
+ * SYSTEM.CFG load: a driver that expects a radio already up (PHONE.SYS on
+ * BLE) has not been tried the other way round.
+ */
+ag_err_t ag_devices_start_radios(void)
+{
+    ag_err_t err = AG_OK;
+
     /*
      * Networking is optional and non-fatal: OpenEth only exists under QEMU.
      * api->net is still present when the build enables it; ready() stays
@@ -635,6 +724,14 @@ ag_err_t ag_devices_init(void)
     const bool want_net = true; /* a cable has nothing to configure */
 #endif
 
+#if CONFIG_ARGON_HEAP_TWOEND
+    /*
+     * The radios come and go - `wifi off` gives back what they take now - so
+     * their part of the boot is not placed with the boot's long-lived blocks.
+     * Turned back on below, after Bluetooth.
+     */
+    ag_port_mem_keep(false);
+#endif
     if (want_net) {
         err = ag_net_init();
         if (err != AG_OK && err != -AG_ENOSYS) {
@@ -657,6 +754,8 @@ ag_err_t ag_devices_init(void)
              */
             const char *host =
                 ag_cfg_get(ag_sysconfig(), "net.hostname", "argon");
+            /* not placed with what stays: it goes with the radio now
+             * (ag_port_net_mdns_pause) */
             const ag_err_t merr = ag_port_net_mdns(host);
             if (merr == AG_OK) {
                 ag_log(AG_LOG_INFO, "net", "mdns: %s.local", host);
@@ -799,63 +898,8 @@ ag_err_t ag_devices_init(void)
         ag_log(AG_LOG_INFO, "bt", "controller memory released ([bt] release)");
     }
 #endif
-
-#if AG_PORT_HAS_USB_HID
-    /*
-     * The wired keyboard.  Unlike the radio, there is nothing to name and no
-     * pairing: USB announces a device when it is plugged in, so the host is
-     * simply brought up and left waiting.  Started at boot when the image has
-     * it compiled in - a keyboard is basic input, and a board that built the
-     * host in wants it usable at the prompt without a command first.  Opt-out
-     * with [usb] host = 0 in SYSTEM.CFG for a board that would rather not spend
-     * the two tasks until asked (`usb on`).
-     */
-    if (ag_cfg_get_int(ag_sysconfig(), "usb.host", 1) != 0) {
-        const ag_err_t uerr = ag_port_usb_start();
-        if (uerr != AG_OK) {
-            ag_log(AG_LOG_WARN, "usb", "host did not start (%d)", (int)uerr);
-        } else {
-            (void)ag_usbinput_init();
-            ag_log(AG_LOG_INFO, "usb", "host up, waiting for a keyboard");
-        }
-    }
+#if CONFIG_ARGON_HEAP_TWOEND
+    ag_port_mem_keep(true);
 #endif
-
-#if AG_PORT_HAS_USB_DEVICE
-    /*
-     * The other direction: this board as a keyboard and a mouse for the machine
-     * its OTG port is plugged into.  /dev/usbhid0 is registered whether or not
-     * the gadget runs - an application that opens it on a board with the cable
-     * out gets -AG_ENODEV from the write, which is a better answer than a
-     * missing device, because the cable is the thing that changes.
-     *
-     * The gadget itself is attached at boot for the same reason the host is
-     * started at boot: enumeration takes a moment and a driver install on the
-     * far machine takes longer, and both are better spent before somebody is
-     * waiting to type.  Opt out with [usb] device = 0 in SYSTEM.CFG.
-     */
-    (void)ag_usbhid_init();
-#if AG_PORT_HAS_USB_CDC
-    /*
-     * The serial pipe on the same cable, for the program on the far machine
-     * that sends its screen back.  Registered unconditionally beside the
-     * keyboard: nothing has to be running over there for the device to exist,
-     * and a read simply says -AG_ENODEV until something does.
-     */
-    (void)ag_usbcdc_init();
-#endif
-    if (ag_cfg_get_int(ag_sysconfig(), "usb.device", 1) != 0) {
-        const ag_err_t derr = ag_port_usbdev_start();
-        if (derr != AG_OK) {
-            ag_log(AG_LOG_WARN, "usbhid", "gadget did not start (%d)",
-                   (int)derr);
-        } else {
-            ag_log(AG_LOG_INFO, "usbhid",
-                   "attached as a keyboard and mouse");
-        }
-    }
-#endif
-
-    ag_log(AG_LOG_INFO, "dev", "%u devices", (unsigned)ag_dev_count());
     return AG_OK;
 }

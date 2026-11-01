@@ -98,6 +98,45 @@ static inline void ag_port_mem_walk(unsigned caps, ag_port_mem_walk_fn fn,
     heap_caps_walk(caps, ag_port_mem_walk_one, &w);
 }
 
+#if CONFIG_ARGON_HEAP_TWOEND
+/* The two-ended heap (src/twoend_hw.c): small blocks from the top. */
+typedef struct {
+    uint32_t total, free, low, blocks, arenas, small_max;
+    uint32_t lo[8], hi[8];
+} ag_port_twoend_info_t;
+bool ag_port_twoend(ag_port_twoend_info_t *out);
+/* Take what has become free since start-up: the ESP32 gives the heap the
+ * memory of its start-up stacks only once the scheduler runs. */
+void ag_port_twoend_take_rest(void);
+/* Allocations by the calling task stay for good until this is turned off:
+ * place them with the long-lived (src/twoend_hw.c). */
+void ag_port_mem_keep(bool on);
+#endif
+
+#if CONFIG_ARGON_SMALL_ZONE_KB > 0
+/* The heap of small blocks (src/smallzone_hw.c).  `spilled`: small requests
+ * the zone had no room for, served by the ordinary heap instead; `lent`: big
+ * ones the ordinary heap had no room for, served by the zone. */
+typedef struct {
+    uint32_t total, free, low, blocks, max, spilled, lent;
+} ag_port_zone_info_t;
+bool ag_port_small_zone(ag_port_zone_info_t *out);
+#endif
+
+#if CONFIG_ARGON_HEAP_WHO
+/* Diagnostic build only (src/heapwho_hw.c): who holds each block, and who
+ * held the ones given back.  `seq` is the block's number in the order of
+ * allocation, `gone` the number reached when it was given back. */
+#define AG_PORT_HEAP_PCS 4
+typedef struct {
+    uint32_t ptr, size, seq, gone, task;
+    uint32_t pc[AG_PORT_HEAP_PCS];
+} ag_port_heap_rec_t;
+void     ag_port_heap_who_mark(const char *text);
+bool     ag_port_heap_who_get(int which, uint32_t i, ag_port_heap_rec_t *out);
+uint32_t ag_port_heap_who_seq(uint32_t *lost);
+#endif
+
 static inline size_t ag_port_alloc_size(const void *p)
 {
     return heap_caps_get_allocated_size((void *)p);

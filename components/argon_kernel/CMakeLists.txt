@@ -9,6 +9,9 @@ set(ARGON_KERNEL_SRCS
     "src/core/place_parse.c"
     "src/core/cmdline.c"
     "src/core/sysconfig.c"
+    # api->cfg.app_*: each application's own settings file.
+    "src/core/appcfg.c"
+    "src/core/appcfg_text.c"
     "src/core/nodename.c"
     "src/dev/devdefault.c"
     "src/core/journal.c"
@@ -17,6 +20,7 @@ set(ARGON_KERNEL_SRCS
     "src/core/powerctl.c"
     "src/core/reslist.c"
     "src/core/arena.c"
+    "src/core/memshape.c"
     "src/console/codepage.c"
     "src/console/screen.c"
     "src/console/vtout.c"
@@ -53,6 +57,7 @@ set(ARGON_KERNEL_SRCS
     "src/fs/hostfs.c"
     "src/loader/axeload.c"
     "src/loader/axesig.c"
+    "src/loader/licence.c"
     "src/loader/appfs.c"
     "src/loader/loader.c"
     "src/loader/module.c"
@@ -138,6 +143,10 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
     REQUIRES argon_abi argon_port
+    # api->crypto (ABI 0.71): Ed25519, SHA-256 and SHA-512, one copy in flash
+    # for every image that checks a signature.  It is a component of its own so
+    # a board with no room can leave it out - CONFIG_ARGON_ENABLE_CRYPTO.
+    PRIV_REQUIRES argon_crypto
     PRIV_REQUIRES esp_psram esp_timer esp_partition nvs_flash spi_flash
                   esp_system esp_hw_support esp_driver_uart log
                   fatfs wear_levelling vfs sdmmc esp_driver_sdmmc

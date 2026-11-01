@@ -481,9 +481,57 @@ extern "C" {
  *      about to touch a file can ask first instead of taking a block of
  *      somebody's audio with it.  Both optional: an image that never asks is
  *      unaffected.
+ *
+ * 0.70 on the shop's line (cyd-sdfix), which numbered its additions on its
+ *      own until the two lines met on 1 Nov 2026 - the same number, a
+ *      different table, so both stand and an image of either 0.70 loads:
+ *      appended net->http_request: one HTTP(S) exchange through the kernel's
+ *      own client, as the shop's board half needs it.
+ *
+ *      `ag_http_fetch` is a kernel function and applications do not have it;
+ *      what they have is raw TCP (api->net), and an HTTP client written a
+ *      second time inside a .AXE is a second set of timeouts and a second
+ *      chance to lose the first kilobyte of a body.  So the client the kernel
+ *      already has - redirects, chunked bodies, "open the file only after 2xx",
+ *      TLS - is published as one call rather than compiled again.
+ *
+ *      The response body goes to `dest`, an absolute path; `dest` NULL means
+ *      the caller wants the status and not the answer, and the body is counted
+ *      and discarded.  `status` gets the last status code seen (0 when the
+ *      request never reached a server).  `method` is "GET" or "POST" and
+ *      nothing else, because a typo here goes out on the wire; `headers` is a
+ *      run of "Name: value\r\n" lines, which is what the Authorization header
+ *      the shop needs is spelled as.  A POST that is redirected becomes a GET
+ *      unless the server answered 307 or 308, so a form post cannot press its
+ *      own button twice.
+ *
+ *      Silent on the console: this is the path an application polls with, and
+ *      a poll that prints is a program typing over somebody else's screen.  An
+ *      application that wants to say something says it itself.
+ *
+ *      APPENDED past resolve for the reason written out at 0.54: an image from
+ *      the build before leaves it NULL, and AG_HAS answers "no".  Unlike the
+ *      optional members elsewhere, the slot is never NULL in a build that has
+ *      the network at all: without CONFIG_ARGON_ENABLE_NET the whole table is
+ *      absent, and api->net being NULL is how a caller learns that.
+ *
+ * 0.72 AG_AXE_LICENSED (27 Oct 2026): a program bought in the shop, its parts
+ *      XORed for one account's key (argon/licence.h), undone by the loader
+ *      with C:\STORE\OWNER.KEY.  The shop stamps such a copy 0.72, so a kernel
+ *      that does not know the flag refuses it by version instead of running
+ *      the keystream as code.  Nothing in the api table moves.
+ *
+ * 0.73 io->spi_write_start / spi_write_wait (30 Oct 2026): a write out of the
+ *      caller's buffer that is on the wire while the caller carries on.  The
+ *      CYD's panel driver sends from one half of its row buffer while the
+ *      next rows are copied into the other; synchronous, the core that draws
+ *      MD's picture sat out every bit of it.  APPENDED past uart_link_recv2.
+ *
+ *      Merged 1 Nov 2026 at 0.73: every addition above is in its own table or
+ *      a flag of its own, so nothing moved for either line's images.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 70u
+#define AG_ABI_MINOR 73u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -2427,6 +2475,19 @@ typedef struct ag_io_api {
     int32_t (*uart_link_recv2)(int port, void *head, size_t hcap, void *buf,
                                size_t cap, ag_spilink_block_t *info,
                                uint32_t timeout_ms);
+    /*
+     * ABI 0.73: spi_xfer's write, queued and not waited for.  `tx` is the
+     * caller's own memory - DMA-capable and word-aligned, or -AG_EINVAL - and
+     * it is the wire's until spi_write_wait returns: write into it before then
+     * and the panel gets whatever is there when the engine reaches it.  Two
+     * can be out at once; a third waits for the oldest.  Anything else on the
+     * bus, and any gpio_write, waits for them first, so a driver that shares
+     * its bus needs no care beyond the buffer - but a driver that toggles a
+     * pin between writes (a panel's D/C line) waits at every toggle, and
+     * should skip the toggles that change nothing.
+     */
+    ag_err_t (*spi_write_start)(int bus, int cs, const void *tx, size_t len);
+    ag_err_t (*spi_write_wait)(int bus);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -2727,6 +2788,30 @@ typedef struct ag_cfg_api {
     bool (*get_bool)(const char *key, bool def);
     ag_err_t (*set_str)(const char *key, const char *value);
     ag_err_t (*commit)(void);
+
+    /*
+     * ABI 0.71: this application's OWN settings, in `C:\CFG\<APP>.CFG`.
+     *
+     * The system's file above is the board's - a network, a driver, a screen -
+     * and an application has no business writing it.  What an application does
+     * have is a handful of things it must remember between runs: where the shop
+     * keeps programs, which session it was paired with, whether the user likes
+     * green.  That lives in a file of its own, named from the application's own
+     * name in its image header, so the name is not an argument and one program
+     * cannot reach another's settings by asking for them.
+     *
+     * The format is SYSTEM.CFG's: `key = value`, `;` for comments.  A person may
+     * open it, and the shop's answer to "where do my programs go" is one line in
+     * it.  app_path() is there so a program can tell the user where to look.
+     *
+     * Nothing here is required to be fast - a settings read is a small file read
+     * and a write is a whole-file rewrite through a temporary - because the
+     * calls are rare by nature.
+     */
+    ag_err_t (*app_get)(const char *key, char *buf, size_t len);
+    int32_t (*app_get_int)(const char *key, int32_t def);
+    ag_err_t (*app_set)(const char *key, const char *value);
+    ag_err_t (*app_path)(char *buf, size_t len);
 } ag_cfg_api_t;
 
 /* ------------------------------------------------------------------------ */
@@ -2838,6 +2923,25 @@ typedef struct ag_net_api {
      * nothing for half a minute.  Everything else should close.
      */
     ag_err_t (*reset)(ag_handle_t sock);
+
+    /*
+     * ABI 0.69: one HTTP(S) exchange through the kernel's own client.
+     *
+     * The body goes to `dest` (an already resolved absolute path) and `status`
+     * gets the last status code; `dest` NULL discards the body and `status`
+     * NULL discards the code.  `method` is "GET" or "POST"; `headers` is extra
+     * "Name: value\r\n" lines or NULL; `body`/`body_len` are the request body
+     * for a POST.
+     *
+     * No console output at all - this is the path an application polls with.
+     * -AG_ENOTSUP for https in a build without TLS; -AG_ENOENT/-AG_EACCES for
+     * 404-410/401-403, so a caller can tell "no such file" from "the server is
+     * broken"; -AG_ETIMEDOUT when the server accepted and then said nothing.
+     */
+    ag_err_t (*http_request)(const char *method, const char *url,
+                             const char *headers, const void *body,
+                             uint32_t body_len, const char *dest,
+                             uint16_t *status);
 } ag_net_api_t;
 
 /*
@@ -3913,6 +4017,61 @@ typedef struct ag_store_api {
 } ag_store_api_t;
 
 /* ------------------------------------------------------------------------ */
+/* ABI 0.71: the maths behind a signature                                     */
+/* ------------------------------------------------------------------------ */
+/*
+ * An application cannot have a crypto library: Monocypher is 46 KB of C, and
+ * an image has 64 KB of code for everything it does.  The shop was carrying
+ * its own copy - 11 KB of the 39 KB it spent - to check three Ed25519
+ * signatures.  So the maths lives in the kernel, once, and this table is how
+ * an image reaches it.
+ *
+ * The state structs are the caller's, not the kernel's: a signature is checked
+ * over a file that does not fit in a buffer, so the hash has to go in chunks,
+ * and the kernel keeps no per-application memory.  Their layout is the ABI -
+ * these types are the ones the kernel itself hashes with, so a mismatch is a
+ * compile error inside the kernel rather than a wrong digest at run time.
+ *
+ * NULL when the build set CONFIG_ARGON_ENABLE_CRYPTO=n (a board with no room),
+ * so a caller must probe: AG_HAS(ag_api()->crypto, ed25519_verify).  What is
+ * checked is RFC 8032 Ed25519, and the two hashes of FIPS 180-4.
+ */
+typedef struct {
+    uint32_t h[8];
+    uint64_t bytes;   /* total input, for the length padding                 */
+    uint8_t  buf[64];
+    uint32_t have;    /* bytes sitting in buf                                */
+} ag_sha256_t;
+
+typedef struct {
+    uint64_t hash[8];
+    uint64_t input[16];
+    uint64_t input_size[2];
+    size_t   input_idx;
+} ag_sha512_t;
+
+typedef struct ag_crypto_api {
+    uint32_t size;
+
+    void (*sha256_init)(ag_sha256_t *c);
+    void (*sha256_update)(ag_sha256_t *c, const void *data, size_t len);
+    void (*sha256_final)(ag_sha256_t *c, uint8_t out[32]);
+
+    void (*sha512_init)(ag_sha512_t *c);
+    void (*sha512_update)(ag_sha512_t *c, const void *data, size_t len);
+    void (*sha512_final)(ag_sha512_t *c, uint8_t out[64]);
+
+    /*
+     * True when `sig` is `pub`'s signature over the `len` bytes at `msg`.
+     * Written in the order a person says it - the signature, the message, the
+     * key - and not in Monocypher's (sig, pub, msg, len), which is the sort of
+     * thing that gets passed backwards exactly once.
+     */
+    bool (*ed25519_verify)(const uint8_t sig[64], const void *msg, size_t len,
+                           const uint8_t pub[32]);
+} ag_crypto_api_t;
+
+/* ------------------------------------------------------------------------ */
 
 typedef struct ag_api {
     uint32_t size;
@@ -3975,6 +4134,10 @@ typedef struct ag_api {
     /* ABI 0.55+: the board as a USB mass-storage device, on demand.  NULL
      * unless CONFIG_ARGON_USB_MSC (off by default) - probe with AG_HAS. */
     const ag_usbd_api_t *usbd;
+
+    /* ABI 0.71+: the maths a signature needs, in the kernel rather than in
+     * every image that checks one.  NULL unless CONFIG_ARGON_ENABLE_CRYPTO. */
+    const ag_crypto_api_t *crypto;
 } ag_api_t;
 /* ------------------------------------------------------------------------ */
 /* Executable image header                                                  */
@@ -4017,6 +4180,18 @@ enum ag_axe_flags {
      */
     AG_AXE_WANT_XIP = 1u << 7,
     /*
+     * Code from the PSRAM arena first, where this build has one.
+     *
+     * For a program that does not need internal SRAM's speed and does need it
+     * left whole for something else: the shop, whose `store -web` brings up a
+     * radio that wants one 30 KB block of internal RAM, measured short by
+     * exactly the shop's own 32 KB of code on the S3-CAM (24 Oct 2026).  Not
+     * flash (WANT_XIP): a run from flash costs a flash write and is slow.  When
+     * the PSRAM arena cannot take it the usual order applies.  An older loader
+     * ignores the bit and places the program as it always did.
+     */
+    AG_AXE_WANT_PSRAM = 1u << 9,
+    /*
      * ABI 0.53: this program can be moved to another node while it runs.
      *
      * It is a PROMISE, not a permission, and the system will not move anything
@@ -4051,6 +4226,13 @@ enum ag_axe_flags {
      * pointers, and both kinds of image run on the P4.
      */
     AG_AXE_NEEDS_FPU = 1u << 9,
+    /*
+     * ABI 0.72: a copy the shop made for one account (argon/licence.h).  Set
+     * by the shop, never by a build: the code and data parts are XORed with a
+     * keystream from that account's key, and the loader refuses the file on a
+     * board without it.
+     */
+    AG_AXE_LICENSED = 1u << 10,
 };
 
 /*

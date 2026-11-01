@@ -108,6 +108,49 @@ static void test_sizes(void)
     AG_CHECK_INT(ag_cfg_parse_size("4G", -1), -1);
 }
 
+/* [stacks], the sizes the kernel's own tasks ask for. */
+static void test_stack_sizes(void)
+{
+    char     text[512];
+    ag_cfg_t cfg;
+
+    ag_cfg_reset(&cfg);
+    ag_cfg_parse(dup_text(text, sizeof(text),
+                          "[stacks]\n"
+                          "supervisor = 4K\n"
+                          "console    = 2560\n"
+                          "link       = 1536\n"
+                          "shell      = 0\n"
+                          "nonsense   = big\n"),
+                 &cfg);
+
+    AG_CHECK_INT(ag_cfg_bytes(&cfg, "stacks.supervisor", 6144), 4096);
+    AG_CHECK_INT(ag_cfg_bytes(&cfg, "stacks.console", 3072), 2560);
+    AG_CHECK_INT(ag_cfg_bytes(&cfg, "stacks.link", 3072), 1536);
+
+    /* Not a size: a stack of nothing boots into nothing, and a task cannot
+     * have a negative one; both leave the built-in default standing. */
+    AG_CHECK_INT(ag_cfg_bytes(&cfg, "stacks.shell", 12288), 12288);
+    AG_CHECK_INT(ag_cfg_bytes(&cfg, "stacks.nonsense", 2048), 2048);
+    /* Missing keys too, which is how every board that says nothing works. */
+    AG_CHECK_INT(ag_cfg_bytes(&cfg, "stacks.absent", 1024), 1024);
+
+    /* A stack is 8-byte aligned whatever the file says. */
+    ag_cfg_reset(&cfg);
+    ag_cfg_parse(dup_text(text, sizeof(text), "[stacks]\nconsole = 2561\n"),
+                 &cfg);
+    AG_CHECK_INT(ag_cfg_bytes(&cfg, "stacks.console", 3072), 2560);
+
+    /* 64 KB is the largest any piece of the kernel asks for: past it the value
+     * is a typo, and 64 MB of it would be a board that cannot boot. */
+    ag_cfg_reset(&cfg);
+    ag_cfg_parse(dup_text(text, sizeof(text), "[stacks]\nshell = 64M\n"), &cfg);
+    AG_CHECK_INT(ag_cfg_bytes(&cfg, "stacks.shell", 12288), 12288);
+    ag_cfg_reset(&cfg);
+    ag_cfg_parse(dup_text(text, sizeof(text), "[stacks]\nshell = 64K\n"), &cfg);
+    AG_CHECK_INT(ag_cfg_bytes(&cfg, "stacks.shell", 12288), 64 * 1024);
+}
+
 static void test_override_and_layering(void)
 {
     char     base[256];
@@ -185,6 +228,7 @@ void run_cfg_tests(void)
     test_basic();
     test_comments_and_quotes();
     test_sizes();
+    test_stack_sizes();
     test_override_and_layering();
     test_malformed();
     test_crlf();

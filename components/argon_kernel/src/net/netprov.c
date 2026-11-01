@@ -285,6 +285,36 @@ static void let_go(held_t *h) { ag_dev_call_end(h->dev); } /* NULL: no-op */
 /* provider it reached.  A provider that went away mid-call answers ENODEV.   */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * Bring the interface up if it is down, and give it up to `ms` to answer with
+ * an address.  True when it is ready.
+ *
+ * An application asking for a URL is asking for the network, and until this
+ * existed only the shell could turn the radio on (`wifi on`) - so `store -web`
+ * on a board whose radio was off sat waiting for a network nobody had started.
+ * On the CYD that is the only workable order: the shop loads on a fresh boot,
+ * when there is one contiguous piece of internal RAM big enough, and the radio
+ * has to come up afterwards (24 Oct 2026).
+ */
+bool ag_netprov_bring_up(uint32_t ms)
+{
+    if (ag_netprov_ready()) {
+        return true;
+    }
+    if (ag_netprov_start() != AG_OK) {
+        return false;
+    }
+    const ag_port_ticks_t start = ag_port_ticks();
+    const ag_port_ticks_t budget = ag_port_ms_to_ticks(ms);
+    while (!ag_netprov_ready()) {
+        if ((ag_port_ticks() - start) >= budget) {
+            return false;
+        }
+        ag_port_task_delay(ag_port_ms_to_ticks(50));
+    }
+    return true;
+}
+
 ag_err_t ag_netprov_start(void)
 {
     held_t h;

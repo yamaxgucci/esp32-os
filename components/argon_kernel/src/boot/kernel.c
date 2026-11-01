@@ -342,6 +342,16 @@ static ag_err_t stage_config(void)
     return AG_OK;
 }
 
+/* The radios last, where the heap makes that pay (ag_devices_start_radios). */
+static ag_err_t stage_radio(void)
+{
+#if CONFIG_ARGON_HEAP_TWOEND
+    return ag_devices_start_radios();
+#else
+    return AG_OK;
+#endif
+}
+
 static ag_err_t stage_devices(void)
 {
     const ag_err_t err = ag_devices_init();
@@ -408,6 +418,9 @@ static const ag_stage_desc_t s_stages[AG_STAGE_COUNT] = {
     [AG_STAGE_MEDIA]      = {"media",      ag_storage_mount_media, false},
     [AG_STAGE_MODULES]    = {"modules",    stage_modules,  false},
     [AG_STAGE_SUPERVISOR] = {"supervisor", ag_supervisor_init, false},
+    /* Last before the prompt: what the radio takes it gives back with
+     * `wifi off`, so nothing permanent may be laid down after it. */
+    [AG_STAGE_RADIO]      = {"radio",      stage_radio,    false},
     [AG_STAGE_SHELL]      = {"shell",      stage_shell,    true},
 };
 
@@ -452,6 +465,12 @@ void ag_kernel_main(void)
 {
     AG_TRACE("kernel entry\n");
     const int64_t t0 = ag_port_us();
+#if CONFIG_ARGON_HEAP_TWOEND
+    /* what ESP-IDF added to the heap after the start-up stacks were done */
+    ag_port_twoend_take_rest();
+    /* what the boot takes stays: placed with the long-lived, until the shell */
+    ag_port_mem_keep(true);
+#endif
 
     memset(&s_report, 0, sizeof(s_report));
     /*
@@ -541,10 +560,29 @@ void ag_kernel_main(void)
      * goes through the port's relay (flashop_hw.c): copy and dir slower by a
      * sixth and a half, measured on the S3-Zero (9 Oct 2026), which a prompt
      * can afford.  Otherwise it stays where it is.
+     *
+     * [stacks] shell (argon/cfg.h) says how big that task's stack should be,
+     * and a number there is reason enough to move even where the stack stays
+     * internal.  ESP-IDF makes the main task with CONFIG_ESP_MAIN_TASK_STACK_SIZE
+     * before any of this runs, and its stack is the biggest thing `mem /t`
+     * reports as unused - 12 KB of which the prompt touches five - but a size
+     * fixed at build time is memory a board with a small heap cannot get back.
+     * Returning from here hands the whole of it to the heap; the prompt goes on
+     * in a task the file sized, and what that costs is a reboot.
      */
-    if (ag_place_first("shell.stack") == AG_PLACE_PSRAM &&
-        ag_place_task("shell.stack", shell_task, "shell", AG_SHELL_STACK,
-                      NULL, AG_SHELL_PRIORITY, 0, NULL, NULL)) {
+    size_t shell_stack = ag_cfg_bytes(ag_sysconfig(), "stacks.shell", 0);
+    if (shell_stack == 0 && ag_place_first("shell.stack") == AG_PLACE_PSRAM) {
+        shell_stack = AG_SHELL_STACK; /* where it goes was asked for, not how big */
+    }
+    const bool moved =
+        shell_stack > 0 &&
+        ag_place_task("shell.stack", shell_task, "shell", shell_stack, NULL,
+                      AG_SHELL_PRIORITY, 0, NULL, NULL);
+#if CONFIG_ARGON_HEAP_TWOEND
+    /* the boot is over: what the prompt takes comes and goes */
+    ag_port_mem_keep(false);
+#endif
+    if (moved) {
         return;
     }
     ag_place_adopt("shell.stack", (void *)ag_port_task_self());

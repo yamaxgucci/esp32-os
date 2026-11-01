@@ -241,6 +241,8 @@ function Build-HostTools {
 $script:BoardPackOf = @{
     'esp32'         = 'esp32-cyd'
     'esp32-cyd'     = 'esp32-cyd'
+    'esp32-cyd-net' = 'esp32-cyd'
+    'esp32-cyd-md'  = 'esp32-cyd'
     'esp32s3-board' = 'esp32s3-cam'
     'esp32s3-cam'   = 'esp32s3-cam'
     'esp32s3-zero'  = 'esp32s3-zero'
@@ -426,6 +428,9 @@ switch ($Command.ToLowerInvariant()) {
             Write-Host '                               serial pipe and flash drive (KVM.AXE, partitions_kvm.csv)'
             Write-Host '                esp32s3-lcd2   Waveshare ESP32-S3-Touch-LCD-2: 16 MB flash, ST7789 panel and TF card on one SPI bus'
             Write-Host '                esp32       hardware: Wi-Fi and Bluetooth'
+            Write-Host '                esp32-cyd   the CYD as a monitor: no radios (sdkconfig.esp32.cyd)'
+            Write-Host '                esp32-cyd-net  the CYD with Wi-Fi, the shop terminal (+ sdkconfig.esp32.cydnet)'
+            Write-Host '                esp32-cyd-md   cyd-net with 9 KB more IRAM for the Mega Drive (+ sdkconfig.esp32.cydmd)'
             Write-Host '                esp32-dsp   hardware: neither, 48 KB arena'
             Write-Host '                esp32-a1s   ESP32-A1S Audio Kit: ES8388 codec on I2S, external RAM'
             Write-Host '                esp32-a1s-net  the same, with Wi-Fi for a phone screen (smaller arena)'
@@ -458,6 +463,12 @@ switch ($Command.ToLowerInvariant()) {
             # It costs the code arena; see sdkconfig.esp32.a1s.net.
             'esp32-a1s-net' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.a1s;sdkconfig.esp32.a1s.net'
                               $chip = 'esp32' }
+            # The CYD with Wi-Fi, the shop's terminal (sdkconfig.esp32.cydnet).
+            'esp32-cyd-net' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.cyd;sdkconfig.esp32.cydnet'
+                              $chip = 'esp32' }
+            # That, with what helps only the Mega Drive (sdkconfig.esp32.cydmd).
+            'esp32-cyd-md' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.esp32.cyd;sdkconfig.esp32.cydnet;sdkconfig.esp32.cydmd'
+                             $chip = 'esp32' }
             'esp32s3'   { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3' }
             'esp32s3-board' { $defaults = 'sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.esp32s3.board'
                               $chip = 'esp32s3' }
@@ -795,6 +806,26 @@ switch ($Command.ToLowerInvariant()) {
         # of `check`: it wants two ports and a Python that can bind them, and a
         # firewall prompt is not a test failure.
         Invoke-Ps1 (Join-Path $PSScriptRoot 'nettest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'storetest' {
+        # The shop in the emulator: a catalogue this PC serves, a program that
+        # arrives over HTTP and runs, an upgrade, a removal, and the three
+        # refusals a shop has to get right (a wrong hash, a program for another
+        # chip, a program bigger than the disk).  Not part of `check`, for the
+        # same reason as `nettest`: it wants a port and a Python to bind it.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'storetest.ps1') $Rest
+        exit $LASTEXITCODE
+    }
+
+    'webtest' {
+        # The shop's site and a board in the emulator: found, connected by a
+        # person who answers the board's question, installed on - once over
+        # the board's own network and once over the console, the way a page
+        # with Web Serial carries it.  Not part of `check` either: it runs the
+        # shop and wants its ports.
+        Invoke-Ps1 (Join-Path $PSScriptRoot 'webtest.ps1') $Rest
         exit $LASTEXITCODE
     }
 

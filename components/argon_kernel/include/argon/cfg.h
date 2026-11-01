@@ -94,6 +94,22 @@ const char *ag_cfg_next(const ag_cfg_t *cfg, const char *dotted_key,
  */
 int32_t ag_cfg_parse_size(const char *text, int32_t fallback);
 
+/*
+ * A task stack size out of the configuration: "[stacks] supervisor = 4K" is
+ * looked up as "stacks.supervisor", and `fallback` - the size the board was
+ * built with - stands for a key that is missing or that is not a size a task
+ * stack can be: under 1 KB or over 64 KB, or zero, which would be a board that
+ * boots into nothing.  A typo therefore costs the value, not the board, and the
+ * journal is where the mistake shows up (`mem /t` shows what was actually got).
+ *
+ * Read at boot by whoever makes the task, so a change is a reboot, not a
+ * rebuild - the point of the section.  Stack memory is the one thing a board
+ * cannot get back once it is handed out: a stack that is too big is wasted for
+ * as long as its task lives.
+ */
+size_t ag_cfg_bytes(const ag_cfg_t *cfg, const char *dotted_key,
+                    size_t fallback);
+
 #ifdef __cplusplus
 }
 #endif

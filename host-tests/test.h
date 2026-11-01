@@ -15,6 +15,24 @@
 extern int ag_test_failures;
 extern int ag_test_checks;
 
+/*
+ * Lower-case hex, with the terminator.
+ *
+ * It used to travel with the SHA-256 code; since ABI 0.71 that maths is a
+ * kernel library and formatting a digest is the caller's business, so the
+ * tests that print one share this instead of each writing it again.
+ */
+static inline void ag_test_hex(const unsigned char *bytes, size_t len,
+                               char *out)
+{
+    static const char k_digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[2 * i] = k_digits[bytes[i] >> 4];
+        out[2 * i + 1] = k_digits[bytes[i] & 0x0Fu];
+    }
+    out[2 * len] = '\0';
+}
+
 #define AG_CHECK(cond)                                                       \
     do {                                                                     \
         ag_test_checks++;                                                    \

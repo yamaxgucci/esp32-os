@@ -20,6 +20,9 @@
 /* The chip numbers SPI hosts from one below what the schematic calls them. */
 #define AG_PORT_SPI_HOST_OF(chip) ((chip) - 1)
 
+/* io_hw.c: the host has a device of another driver on it */
+void ag_port_spi_host_shared(int host);
+
 ag_err_t ag_port_sysfs_mount(const char *label, const char *base_path,
                              bool format_if_needed)
 {
@@ -129,6 +132,8 @@ static esp_err_t mount_spi(const ag_port_sd_cfg_t *sd, const char *base,
 {
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = AG_PORT_SPI_HOST_OF((int)sd->spi_host);
+    /* the card's driver uses the host directly: no polled writes on it */
+    ag_port_spi_host_shared(host.slot);
     host.max_freq_khz = (int)sd->max_khz;
 
     const spi_bus_config_t bus = {

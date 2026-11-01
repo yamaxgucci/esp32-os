@@ -56,6 +56,24 @@ AG_HOT_RODATA const unsigned char k_hot[16] = {
     0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00,
 };
 
+/*
+ * Read a byte of a constant that lives in the code part - one word at a time.
+ *
+ * On ESP32-S3 the code part is D/IRAM seen through the instruction bus, and that
+ * address answers 32-bit accesses: an `l8ui` from it raises a load/store error
+ * and ends the program.  Found on the board on 22 Oct 2026, on this very table -
+ * `k_hot[0]` faulted at pc offset 0x88 while a word read of the same address
+ * returned the right four bytes.  So anything the program reads a byte at a time
+ * belongs in the data part (k_ramp above, in PSRAM), and anything that stays in
+ * the code part is read word-wise, as here.  The rule is written down beside
+ * AG_HOT_RODATA in sdk/include/argon/argon.h.
+ */
+static unsigned hot_byte(unsigned i)
+{
+    const uint32_t *const words = (const uint32_t *)(const void *)k_hot;
+    return (words[i / 4u] >> (8u * (i % 4u))) & 0xffu;
+}
+
 int ag_main(int argc, char **argv)
 {
     ag_printf("hello from ArgonOS, %d argument(s)\n", argc);
@@ -97,7 +115,7 @@ int ag_main(int argc, char **argv)
     unsigned sum = 0, hot = 0;
     for (unsigned i = 0; i < sizeof(k_ramp); i++) {
         sum += k_ramp[i];
-        hot += k_hot[i];
+        hot += hot_byte(i);
     }
     ag_printf("constants at %p sum %#x (want %#x), hot at %p sum %#x\n",
               (const void *)k_ramp, sum, RAMP_SUM, (const void *)k_hot, hot);

@@ -8,6 +8,7 @@
 #include <setjmp.h>
 #include <string.h>
 
+#include <argon/memshape.h>
 #include <argon/budget.h>
 #include <argon/clu.h>
 #include <argon/console.h>
@@ -34,6 +35,8 @@
 #include <argon/port/task.h>
 #include <argon/port/time.h>
 
+#include "core/sysconfig.h"
+#include <argon/cfg.h>
 #include "dev/io.h"
 #include "fs/storage.h"
 #include "proc/supervisor.h"
@@ -82,6 +85,20 @@ uint32_t ag_proc_unmet_needs(uint32_t axe_flags)
  * be loaded on.
  */
 #define AG_PROC_LOAD_STACK_MIN (8u * 1024u)
+
+/*
+ * That floor, unless [stacks] load in SYSTEM.CFG says otherwise - never
+ * below 4 KB.  The CYD's Mega Drive names 6 KB and was given 8, of which
+ * loading and a whole game together touched 4.0 (30 Oct 2026): the rest was
+ * the 2 KB its Z80 could not find.  A board that sets this has measured its
+ * own images; the default is what it always was.
+ */
+static uint32_t load_stack_min(void)
+{
+    const size_t n = ag_cfg_bytes(ag_sysconfig(), "stacks.load",
+                                  AG_PROC_LOAD_STACK_MIN);
+    return (n < 4096u) ? 4096u : (uint32_t)n;
+}
 #ifndef CONFIG_ARGON_APP_STACK_KB
 #define CONFIG_ARGON_APP_STACK_KB 16
 #endif
@@ -123,6 +140,9 @@ static void release_slot(proc_t *p)
 {
     if (p->out_sink != NULL && s_sinks > 0) {
         s_sinks--;
+    }
+    if (p->argv != NULL) {
+        ag_port_free(p->argv);
     }
     memset(p, 0, sizeof(*p));
 }
@@ -1282,27 +1302,42 @@ static ag_err_t proc_finish_load(proc_t *p)
  */
 static ag_err_t copy_args(proc_t *p, int argc, char **argv)
 {
-    size_t at = 0;
+    size_t text = 0;
 
     p->argc = 0;
     /* Refuse rather than truncate: a dropped argument is invisible. */
-    if (argc > AG_PROC_ARGS_MAX) {
+    if (argc < 0 || argc > AG_PROC_ARGS_MAX) {
+        return -AG_ERANGE;
+    }
+    for (int i = 0; i < argc; i++) {
+        const char *src = (argv != NULL) ? argv[i] : NULL;
+        text += ((src != NULL) ? strlen(src) : 0) + 1;
+    }
+    if (text > AG_PROC_ARGBUF) {
         return -AG_ERANGE;
     }
 
+    /* argv[argc] is NULL, as C's own main is promised. */
+    const size_t ptrs  = sizeof(char *) * (size_t)(argc + 1);
+    char       **block = ag_port_alloc(ptrs + text, AG_MEM_BYTE);
+    if (block == NULL) {
+        return -AG_ENOMEM;
+    }
+    char *at = (char *)block + ptrs;
     for (int i = 0; i < argc; i++) {
         const char  *src = (argv != NULL) ? argv[i] : NULL;
         const size_t len = (src != NULL) ? strlen(src) : 0;
-
-        if (at + len + 1 > sizeof(p->argbuf)) {
-            return -AG_ERANGE;
-        }
-        memcpy(&p->argbuf[at], (src != NULL) ? src : "", len);
-        p->argbuf[at + len] = '\0';
-        p->argv[i] = &p->argbuf[at];
+        memcpy(at, (src != NULL) ? src : "", len);
+        at[len] = '\0';
+        block[i] = at;
         at += len + 1;
-        p->argc++;
     }
+    block[argc] = NULL;
+    if (p->argv != NULL) {
+        ag_port_free(p->argv);
+    }
+    p->argv = block;
+    p->argc = argc;
     return AG_OK;
 }
 
@@ -1730,8 +1765,8 @@ ag_err_t ag_proc_spawn_sink(const char *path, int argc, char **argv,
          * task, through the filesystem, and an image that asks for two
          * kilobytes would overflow before its first instruction ran.
          */
-        if (want != 0 && want < AG_PROC_LOAD_STACK_MIN) {
-            want = AG_PROC_LOAD_STACK_MIN;
+        if (want != 0 && want < load_stack_min()) {
+            want = load_stack_min();
         }
         p->stack_bytes = clamp_stack_bytes(want);
     }
@@ -1885,6 +1920,8 @@ ag_err_t ag_proc_wait(ag_pid_t pid, int32_t *exit_code, uint32_t timeout_ms)
     const bool was_killed = p->killed;
     reap(p);
     unlock();
+    /* its memory is back: buffers that could sit somewhere better can move */
+    (void)ag_mem_reshape("an application ended");
 
     return was_killed ? -AG_EKILLED : AG_OK;
 }
@@ -2054,12 +2091,16 @@ ag_err_t ag_proc_kill(ag_pid_t pid, const char *reason)
      * Given under the lock, as proc_finished does: once the lock is let go a
      * held zombie is its collector's, and may already be gone.
      */
-    if (held_for_collecting(p)) {
+    const bool reaped = !held_for_collecting(p);
+    if (!reaped) {
         ag_port_sem_give(p->done);
     } else {
         reap(p);
     }
     unlock();
+    if (reaped) {
+        (void)ag_mem_reshape("an application was stopped");
+    }
 
     console_restore();
     return AG_OK;
@@ -2079,6 +2120,9 @@ uint32_t ag_proc_reap_finished(void)
         reaped++;
     }
     unlock();
+    if (reaped > 0) {
+        (void)ag_mem_reshape("an application ended");
+    }
     return reaped;
 }
 
@@ -2568,10 +2612,18 @@ ag_pid_t ag_proc_overdue(uint32_t *late_by_ms)
         if (p->state != AG_PS_RUNNING && p->state != AG_PS_BACKGROUND) {
             continue;
         }
-        const uint32_t since = now - p->heartbeat_ms;
-        if (since > p->watchdog_ms) {
+        /*
+         * Signed.  `now` was read before the lock, and an application on the
+         * other core can beat in between - a heartbeat a millisecond in the
+         * future, which unsigned made 4294967 seconds old: Fallout on the
+         * 2.8B was killed as "4294367250 ms past its own deadline" in the
+         * middle of a movie, 11 Oct 2026, the first night it ran on the
+         * application core.
+         */
+        const int32_t since = (int32_t)(now - p->heartbeat_ms);
+        if (since > (int32_t)p->watchdog_ms) {
             found = p->pid;
-            late = since - p->watchdog_ms;
+            late = (uint32_t)since - p->watchdog_ms;
             break;
         }
     }
