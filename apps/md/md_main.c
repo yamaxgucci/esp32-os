@@ -481,6 +481,10 @@ static ag_thread_t       s_presenter;
 static int               s_cursor;
 #define MD_HASH_LINES 240
 static uint32_t          s_line_hash[MD_HASH_LINES]; /* what the glass shows */
+/* the focus came back: the console has been drawn over the glass, so the
+ * next pass clears it and sends every row (md_open_pass) */
+static volatile int      s_glass_lost;
+static void md_clear_glass(void);
 static uint32_t          s_present_us;
 static uint32_t          s_present_bad;
 
@@ -757,6 +761,12 @@ static void md_help_draw(ag_time_t until)
 static void md_open_pass(void)
 {
     const int h = (screen_height < MD_HASH_LINES) ? screen_height : MD_HASH_LINES;
+    if (s_glass_lost) {
+        /* between passes nothing is in the ring: its first row is free */
+        s_glass_lost = 0;
+        md_clear_glass();
+        memset(s_line_hash, 0xff, sizeof(s_line_hash));
+    }
     int took = md_raster_on ? md_raster_take() : 0;
     while (took == 2 && s_ring_run) {
         /* the frame it would draw went by while the last pass held the
@@ -1235,6 +1245,26 @@ static void bind_vdp_to_fb(const ag_gfxinfo_t *info)
 static int handle_session_ev(const ag_event_t *ev)
 {
     if (ev->type == AG_EV_FOCUS_GAINED) {
+#ifdef ARGON_MD_SMALL
+        /*
+         * The CYD's picture goes out as rows (md_present_rows), never through
+         * a framebuffer: a surfaceless screen has none, and binding the VDP
+         * to its address put the next line at an offset from NULL - the
+         * Mega Drive wrote over a task's control block and both cores went
+         * down, once the kernel began answering an owner's re-acquire with
+         * yes instead of busy (1 Nov 2026).  So: the screen, and every row
+         * sent again, since the console was drawn over them.
+         */
+        if (!s_headless && ag_gfx_acquire(&s_gi) == AG_OK) {
+            if (s_ring_n > 0) {
+                s_glass_lost = 1; /* the drawer's, between its passes */
+            } else {
+                md_clear_glass();
+                memset(s_line_hash, 0xff, sizeof(s_line_hash));
+            }
+        }
+        return 1;
+#endif
         if (ag_gfx_acquire(&s_gi) == AG_OK) {
             /*
              * acquire() copies the previous front (often FM/console) into the
