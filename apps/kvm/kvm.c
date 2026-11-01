@@ -111,6 +111,24 @@ typedef struct {
     bool have_cfg;    /* a network has been configured                      */
     bool authed;      /* this phone has given the password (or none is set) */
     bool panel;       /* the board's own screen is ours to draw on          */
+
+    /*
+     * Relay (reverse tunnel).  With a public IP nowhere near it, the board
+     * cannot be dialled from a phone on the far side of a home router.  So it
+     * dials out instead: it opens a connection to a VPS that has a public IP
+     * and parks it there, and the relay glues a phone's connection to that
+     * parked one.  No port open at home, no always-on machine - just the board
+     * calling out, which a home router passes unaided.  Off unless the file
+     * C:\KVMRLY.TXT (host, port, secret - one per line) is present; the LAN
+     * listener stays up alongside it as a fallback.
+     */
+    bool        use_relay;
+    uint32_t    relay_addr;      /* VPS IPv4, first octet in the high byte     */
+    uint16_t    relay_port;      /* the relay's board port                     */
+    char        relay_secret[64];
+    ag_handle_t relay;           /* the parked outbound socket, or -1          */
+    uint32_t    relay_next_dial; /* backoff: do not redial before this         */
+    uint32_t    relay_born;      /* when the parked socket was dialled         */
 } kvm_t;
 
 /* The phone went away, for whatever reason; declared here because the picture
@@ -413,6 +431,12 @@ static void video_out(kvm_t *k, const uint8_t *data, uint32_t len)
 /* ------------------------------------------------------------------------ */
 
 #define KVM_CFG_PATH "c:\\KVMCFG.TXT"
+#define KVM_RELAY_PATH "c:\\KVMRLY.TXT"
+#define RELAY_RECYCLE_MS 90000u /* redial an unused parked socket this often,
+                                 * to keep the NAT mapping alive and to notice
+                                 * a connection the router has quietly dropped */
+#define RELAY_RETRY_MS 3000u    /* and do not hammer a VPS that is down        */
+#define REQ_NOTREADY ((size_t)-1) /* read_relay_request: no phone yet, keep it */
 
 /* Copy one NUL-separated field out of a bounded buffer, advancing past it. */
 static const char *take_field(char *dst, size_t cap, const char *s,
@@ -489,6 +513,91 @@ static void kvm_write_cfg(kvm_t *k)
     (void)ag_close(h);
 }
 
+/* "a.b.c.d" to a uint32 with the first octet in the high byte - the order
+ * ag_tcp_connect and the kernel's own ifaddr formatting both use. */
+static bool parse_ipv4(const char *s, uint32_t *out)
+{
+    uint32_t v = 0;
+    for (int parts = 0; parts < 4; parts++) {
+        if (*s < '0' || *s > '9') {
+            return false;
+        }
+        uint32_t oct = 0;
+        int      d = 0;
+        while (*s >= '0' && *s <= '9') {
+            oct = oct * 10u + (uint32_t)(*s - '0');
+            s++;
+            if (++d > 3 || oct > 255u) {
+                return false;
+            }
+        }
+        v = (v << 8) | oct;
+        if (parts < 3) {
+            if (*s != '.') {
+                return false;
+            }
+            s++;
+        }
+    }
+    if (*s != 0) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+/* C:\KVMRLY.TXT, three lines: VPS host (IPv4), board port, secret.  Present
+ * means "reach me through this relay"; absent means LAN only, as before. */
+static void kvm_read_relay(kvm_t *k)
+{
+    const ag_handle_t h = ag_open(KVM_RELAY_PATH, AG_O_RDONLY);
+    if (h < 0) {
+        return;
+    }
+    char          buf[192];
+    const int32_t n = ag_read(h, buf, sizeof(buf) - 1);
+    (void)ag_close(h);
+    if (n <= 0) {
+        return;
+    }
+    buf[n] = 0;
+
+    char         host[64] = {0};
+    char         ports[16] = {0};
+    char        *into[3] = {host, ports, k->relay_secret};
+    const size_t cap[3] = {sizeof(host), sizeof(ports),
+                           sizeof(k->relay_secret)};
+    char *p = buf;
+    for (int i = 0; i < 3 && p != NULL; i++) {
+        char  *nl = strchr(p, '\n');
+        size_t L = nl ? (size_t)(nl - p) : strlen(p);
+        if (L > 0 && p[L - 1] == '\r') {
+            L--;
+        }
+        if (L >= cap[i]) {
+            L = cap[i] - 1;
+        }
+        memcpy(into[i], p, L);
+        into[i][L] = 0;
+        p = nl ? nl + 1 : NULL;
+    }
+
+    uint32_t addr = 0;
+    long     port = 0;
+    for (const char *c = ports; *c >= '0' && *c <= '9'; c++) {
+        port = port * 10 + (*c - '0');
+    }
+    if (!parse_ipv4(host, &addr) || port <= 0 || port > 65535 ||
+        k->relay_secret[0] == 0) {
+        ag_printf("relay config bad (%s), ignoring it\n", KVM_RELAY_PATH);
+        k->relay_secret[0] = 0;
+        return;
+    }
+    k->relay_addr = addr;
+    k->relay_port = (uint16_t)port;
+    k->use_relay = true;
+}
+
 /* The agent sent credentials: remember them, join, and make the page ask for
  * the new password. */
 static void kvm_apply_config(kvm_t *k, const uint8_t *p, uint32_t len)
@@ -552,26 +661,53 @@ static void send_cfg_state(kvm_t *k)
  * for the SPI bus every tick.  A board with no panel - QEMU, a bare module -
  * just skips it.
  */
+/* Panel geometry and the rate meter, learnt once the glass is acquired. */
+static uint16_t s_pw, s_ph;
+static uint32_t s_rate_tiles, s_rate_ms, s_fps;
+
+/* The colour of the one-glance status light: red not set up, amber joining,
+ * blue ready and waiting for a phone, green a phone is driving. */
+static uint32_t dot_colour(const kvm_t *k, bool ready, bool phone)
+{
+    if (!k->have_cfg) return 0xFF5040;
+    if (!ready)       return 0xFFC640;
+    return phone ? 0x40FF80 : 0x33CCFF;
+}
+
+/*
+ * The stats line - picture frames a second to the phone, and resyncs - redrawn
+ * every tick over its own strip so the number moves without the whole card
+ * flickering.  Only meaningful while a phone is linked; otherwise the strip is
+ * a hint line.
+ */
+static void screen_stats(kvm_t *k, int16_t y, bool ready, bool phone)
+{
+    ag_gfx_fill_rect(0, y, s_pw, 18, 0x001018);
+    char line[24];
+    if (ready && phone) {
+        (void)snprintf(line, sizeof(line), "%u/s  rs %u",
+                       (unsigned)s_fps, (unsigned)k->vrx.resyncs);
+        ag_gfx_text(4, y, line, 0x9AA5AD, AG_GFX_TRANS);
+    } else if (ready) {
+        ag_gfx_text(4, y, "open on the phone", 0x9AA5AD, AG_GFX_TRANS);
+    } else if (!k->have_cfg) {
+        ag_gfx_text(4, y, "run the agent", 0x9AA5AD, AG_GFX_TRANS);
+    }
+    ag_gfx_flush(0, (uint16_t)y, s_pw, 18);
+}
+
 static void kvm_screen(kvm_t *k)
 {
     uint32_t   addr = 0;
     char       ip[16] = "";
     const bool ready = ag_net_is_ready() && ag_net_ifaddr(&addr) == AG_OK;
+    const bool phone = (k->ws >= 0);
     if (ready) {
         (void)snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
                        (unsigned)((addr >> 24) & 0xFFu),
                        (unsigned)((addr >> 16) & 0xFFu),
                        (unsigned)((addr >> 8) & 0xFFu),
                        (unsigned)(addr & 0xFFu));
-    }
-
-    /* One line that stands for what is on the glass, so a redraw happens only
-     * on a real change. */
-    static char shown[48] = "\x01";
-    char        now[48];
-    (void)snprintf(now, sizeof(now), "%d|%s", k->have_cfg ? 1 : 0, ip);
-    if (strcmp(now, shown) == 0) {
-        return;
     }
 
     if (!k->panel) {
@@ -582,25 +718,79 @@ static void kvm_screen(kvm_t *k)
         if (ag_gfx_acquire(&gi) != AG_OK) {
             return; /* no panel, or something else holds it */
         }
+        s_pw = gi.width;
+        s_ph = gi.height;
+        s_rate_tiles = k->tiles;
+        s_rate_ms = ag_millis();
         k->panel = true;
     }
-    strncpy(shown, now, sizeof(shown) - 1);
-    shown[sizeof(shown) - 1] = 0;
 
+    /* Picture frames a second to the phone, measured across the redraw tick. */
+    const uint32_t nowms = ag_millis();
+    const uint32_t dt = nowms - s_rate_ms;
+    if (dt >= 400u) {
+        s_fps = ((k->tiles - s_rate_tiles) * 1000u) / dt;
+        s_rate_tiles = k->tiles;
+        s_rate_ms = nowms;
+    }
+
+    /* The small 160x80 dongle panel gets its own compact card; a larger glass
+     * (the S3-CAM's 320x240) keeps the roomier layout.  What would change the
+     * static part of the card is tracked so it is redrawn only on a real
+     * change; the stats strip repaints every tick on top. */
+    const bool  small = (s_pw <= 200u || s_ph <= 120u);
+    static char shown[40] = "\x01";
+    char        now[40];
+    (void)snprintf(now, sizeof(now), "%d|%d|%s", k->have_cfg ? 1 : 0,
+                   phone ? 1 : 0, ip);
+    const bool changed = (strcmp(now, shown) != 0);
+    if (changed) {
+        strncpy(shown, now, sizeof(shown) - 1);
+        shown[sizeof(shown) - 1] = 0;
+    }
+
+    if (small) {
+        const int16_t stats_y = (int16_t)(s_ph - 18);
+        if (changed) {
+            ag_gfx_clear(0x001018);
+            ag_gfx_fill_rect(0, 0, s_pw, 18, 0x12283C);
+            ag_gfx_text(3, 1, "ArgonOS KVM", 0x33CCFF, AG_GFX_TRANS);
+            ag_gfx_fill_circle((int16_t)(s_pw - 10), 9, 4,
+                               dot_colour(k, ready, phone));
+            if (ready) {
+                ag_gfx_text(4, 24, ip, 0x40FF80, AG_GFX_TRANS);
+                ag_gfx_text(4, 42, phone ? "phone linked" : "waiting phone",
+                            phone ? 0x40FF80 : 0x9AA5AD, AG_GFX_TRANS);
+            } else if (k->have_cfg) {
+                ag_gfx_text(4, 30, "joining Wi-Fi...", 0xFFC640, AG_GFX_TRANS);
+            } else {
+                ag_gfx_text(4, 30, "not set up", 0xFFC640, AG_GFX_TRANS);
+            }
+            ag_gfx_flush(0, 0, s_pw, s_ph);
+        }
+        screen_stats(k, stats_y, ready, phone);
+        return;
+    }
+
+    /* The roomier card for a large panel. */
+    if (!changed) {
+        return;
+    }
     ag_gfx_clear(0x001018);
     ag_gfx_text(10, 12, "ArgonOS  KVM", 0x33CCFF, AG_GFX_TRANS);
     if (ready) {
         char line[40];
         (void)snprintf(line, sizeof(line), "http://%s/", ip);
         ag_gfx_text(10, 44, line, 0x40FF80, AG_GFX_TRANS);
-        ag_gfx_text(10, 68, "open on the phone", 0x9AA5AD, AG_GFX_TRANS);
+        ag_gfx_text(10, 68, phone ? "phone linked" : "open on the phone",
+                    0x9AA5AD, AG_GFX_TRANS);
     } else if (k->have_cfg) {
         ag_gfx_text(10, 44, "joining Wi-Fi...", 0xFFC640, AG_GFX_TRANS);
     } else {
         ag_gfx_text(10, 44, "not set up yet", 0xFFC640, AG_GFX_TRANS);
         ag_gfx_text(10, 68, "run the agent to set me up", 0x9AA5AD, AG_GFX_TRANS);
     }
-    ag_gfx_flush(0, 0, 320, 240);
+    ag_gfx_flush(0, 0, s_pw, s_ph);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -676,6 +866,93 @@ static size_t read_request(ag_handle_t c, char *buf, size_t cap)
     return 0;
 }
 
+/*
+ * Keep one connection parked at the relay, ready for the next phone.  Only when
+ * no phone is on the line (k->ws < 0): one socket is enough for one phone at a
+ * time, and the relay holds a new phone for a few seconds, which covers the gap
+ * between serving the page on one socket and the WebSocket arriving on the next.
+ * Redial is rate-limited, and a long-parked socket is recycled so a connection
+ * the home router dropped in silence does not sit here looking alive.
+ */
+static void relay_ensure(kvm_t *k)
+{
+    if (!k->use_relay || k->ws >= 0) {
+        return;
+    }
+    const uint32_t now = ag_millis();
+    if (k->relay >= 0 &&
+        (int32_t)(now - k->relay_born) >= (int32_t)RELAY_RECYCLE_MS) {
+        (void)ag_net_close(k->relay);
+        k->relay = -1;
+    }
+    if (k->relay >= 0) {
+        return;
+    }
+    if ((int32_t)(now - k->relay_next_dial) < 0) {
+        return;
+    }
+    k->relay_next_dial = now + RELAY_RETRY_MS;
+    if (!k->have_cfg) {
+        return; /* no network joined yet - nothing to dial over */
+    }
+    const ag_handle_t c = ag_tcp_connect(k->relay_addr, k->relay_port, 5000u);
+    if (c < 0) {
+        return;
+    }
+    (void)ag_net_set_nonblock(c, true);
+    char      hello[80];
+    const int hn = snprintf(hello, sizeof(hello), "AGKVM1 %s\n",
+                            k->relay_secret);
+    if (hn <= 0 || !send_all(c, hello, (size_t)hn)) {
+        (void)ag_net_close(c);
+        return;
+    }
+    k->relay = c;
+    k->relay_born = now;
+}
+
+/*
+ * Has the phone's request arrived on the parked socket?  Returns REQ_NOTREADY
+ * when nothing is waiting (leave it parked, do not stall the loop), 0 when the
+ * link died (caller discards it and redials), or the request length in k->req.
+ */
+static size_t read_relay_request(kvm_t *k)
+{
+    int32_t r = ag_net_recv(k->relay, k->req, REQ_MAX - 1);
+    if (r == -AG_EAGAIN) {
+        return REQ_NOTREADY;
+    }
+    if (r <= 0) {
+        return 0;
+    }
+    size_t n = (size_t)r;
+    k->req[n] = '\0';
+    if (n >= 4 && strstr(k->req, "\r\n\r\n") != NULL) {
+        return n;
+    }
+    const uint32_t deadline = ag_millis() + REQ_TIMEOUT_MS;
+    while (n + 1 < REQ_MAX) {
+        r = ag_net_recv(k->relay, k->req + n, REQ_MAX - 1 - n);
+        if (r > 0) {
+            n += (size_t)r;
+            k->req[n] = '\0';
+            if (strstr(k->req, "\r\n\r\n") != NULL) {
+                return n;
+            }
+            continue;
+        }
+        if (r == -AG_EAGAIN) {
+            if ((int32_t)(ag_millis() - deadline) >= 0) {
+                return 0;
+            }
+            ag_delay(2);
+            continue;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 static void serve_page(ag_handle_t c)
 {
     char         head[160];
@@ -728,6 +1005,43 @@ static void ws_adopt(kvm_t *k, ag_handle_t c)
     k->authed = (k->webpass[0] == 0); /* a fresh phone must give the password */
     ag_kvm_reset(&k->st);
     ag_printf("phone connected\n");
+}
+
+/*
+ * One request already read into k->req (n bytes), from the LAN or the relay -
+ * the two are the same once the bytes are here.  A WebSocket upgrade is adopted
+ * (returns true, caller keeps the socket); the page and 404 are served and the
+ * caller closes.
+ */
+static bool handle_http(kvm_t *k, ag_handle_t c, size_t n)
+{
+    if (n == 0) {
+        return false;
+    }
+    size_t      klen = 0;
+    const char *key = hdr_value(k->req, n, "sec-websocket-key:", &klen);
+    if (key != NULL && klen > 0 && klen < 64) {
+        char accept[AG_KVMWS_ACCEPT_LEN];
+        char resp[200];
+        if (ag_kvmws_accept_key(key, klen, accept)) {
+            const int rn = snprintf(resp, sizeof(resp),
+                                    "HTTP/1.1 101 Switching Protocols\r\n"
+                                    "Upgrade: websocket\r\n"
+                                    "Connection: Upgrade\r\n"
+                                    "Sec-WebSocket-Accept: %s\r\n\r\n",
+                                    accept);
+            if (rn > 0 && send_all(c, resp, (size_t)rn)) {
+                ws_adopt(k, c);
+                return true;
+            }
+        }
+    } else if (strncmp(k->req, "GET / ", 6) == 0 ||
+               strncmp(k->req, "GET /index.html ", 16) == 0) {
+        serve_page(c);
+    } else {
+        serve_404(c);
+    }
+    return false;
 }
 
 /* Returns true when it read something, so the main loop knows not to sleep. */
@@ -853,6 +1167,7 @@ int ag_main(int argc, char **argv)
     k.vid = -1;
     k.lfd = -1;
     k.ws = -1;
+    k.relay = -1;
     ag_kvm_reset(&k.st);
 
     k.dev = ag_dev_open("usbhid0");
@@ -901,6 +1216,7 @@ int ag_main(int argc, char **argv)
     /* What the agent set last time.  Join now so the page is reachable as soon
      * as the radio associates; if nothing is set, wait for the agent. */
     kvm_read_cfg(&k);
+    kvm_read_relay(&k);
     kvm_join(&k);
 
     k.lfd = ag_tcp_listen(port);
@@ -927,6 +1243,13 @@ int ag_main(int argc, char **argv)
         }
         ag_printf("keyboard and mouse for the PC on the OTG port\n");
         ag_printf("open http://%s:%u/ on the phone\n", ip, (unsigned)port);
+        if (k.use_relay) {
+            ag_printf("relay: via %u.%u.%u.%u - reachable from anywhere\n",
+                      (unsigned)((k.relay_addr >> 24) & 0xFFu),
+                      (unsigned)((k.relay_addr >> 16) & 0xFFu),
+                      (unsigned)((k.relay_addr >> 8) & 0xFFu),
+                      (unsigned)(k.relay_addr & 0xFFu));
+        }
         ag_printf("Ctrl+C to stop\n");
     }
 
@@ -940,43 +1263,37 @@ int ag_main(int argc, char **argv)
          * a keystroke now and then; with a picture coming down the cable it
          * would cap the whole thing at a few kilobytes a second.
          */
-        bool              busy = false;
-        const ag_handle_t c = ag_tcp_accept(k.lfd, 0u);
-        if (c >= 0) {
-            busy = true;
-            (void)ag_net_set_nonblock(c, true);
+        bool        busy = false;
+        ag_handle_t c = -1;
+        size_t      n = 0;
 
-            const size_t n = read_request(c, k.req, REQ_MAX);
-            bool         adopted = false;
-
-            if (n > 0) {
-                size_t      klen = 0;
-                const char *key =
-                    hdr_value(k.req, n, "sec-websocket-key:", &klen);
-                if (key != NULL && klen > 0 && klen < 64) {
-                    char accept[AG_KVMWS_ACCEPT_LEN];
-                    char resp[200];
-                    if (ag_kvmws_accept_key(key, klen, accept)) {
-                        const int rn =
-                            snprintf(resp, sizeof(resp),
-                                     "HTTP/1.1 101 Switching Protocols\r\n"
-                                     "Upgrade: websocket\r\n"
-                                     "Connection: Upgrade\r\n"
-                                     "Sec-WebSocket-Accept: %s\r\n\r\n",
-                                     accept);
-                        if (rn > 0 && send_all(c, resp, (size_t)rn)) {
-                            ws_adopt(&k, c);
-                            adopted = true;
-                        }
-                    }
-                } else if (strncmp(k.req, "GET / ", 6) == 0 ||
-                           strncmp(k.req, "GET /index.html ", 16) == 0) {
-                    serve_page(c);
-                } else {
-                    serve_404(c);
+        /*
+         * A connection to handle, from the relay or straight off the LAN.  The
+         * relay is tried first: a parked socket that has just been handed a
+         * phone should be served before we go looking on the LAN.  Both fill
+         * k.req, and from there the two paths are identical.
+         */
+        if (k.use_relay) {
+            relay_ensure(&k);
+            if (k.relay >= 0) {
+                const size_t rn = read_relay_request(&k);
+                if (rn != REQ_NOTREADY) {
+                    c = k.relay;
+                    k.relay = -1; /* consumed: served and closed, or adopted */
+                    n = rn;
                 }
             }
-            if (!adopted) {
+        }
+        if (c < 0) {
+            c = ag_tcp_accept(k.lfd, 0u);
+            if (c >= 0) {
+                (void)ag_net_set_nonblock(c, true);
+                n = read_request(c, k.req, REQ_MAX);
+            }
+        }
+        if (c >= 0) {
+            busy = true;
+            if (!handle_http(&k, c, n)) {
                 (void)ag_net_close(c);
             }
         }
@@ -1009,6 +1326,9 @@ int ag_main(int argc, char **argv)
         ag_gfx_release(); /* hand the glass back to the console */
     }
     ws_drop(&k, "stopping");
+    if (k.relay >= 0) {
+        (void)ag_net_close(k.relay);
+    }
     (void)ag_net_close(k.lfd);
     ag_free(k.mem);
     (void)ag_dev_close(k.dev);

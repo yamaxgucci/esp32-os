@@ -672,6 +672,13 @@ static int g_configured = 0;
 static int g_asked = 0;
 static int g_force_setup = 0;
 
+/* The public address of the relay the dongle dials, if there is one.  The board
+ * keeps the relay's host, port and secret in C:\KVMRLY.TXT; the agent needs only
+ * the host, and only to print a URL, so it reads it from a plain RELAY.TXT laid
+ * next to this exe on the flash drive - no secret on the agent's side, and the
+ * board's firmware is untouched.  Empty means "LAN only", the old behaviour. */
+static char g_relay_host[128] = "";
+
 /* Read one line from the console into buf, without its trailing CR/LF.  An EOF
  * (the user closed the input) leaves an empty string, which the board reads as
  * "unchanged"; there is nothing better to do without a console. */
@@ -685,6 +692,50 @@ static void read_line(char *buf, size_t cap)
     while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
         buf[--n] = '\0';
     }
+}
+
+/* Fill g_relay_host from RELAY.TXT sitting next to the exe (the flash drive the
+ * agent runs from).  First non-blank line is the host; leading/trailing spaces
+ * and any CR/LF are trimmed.  No file, or no readable line, leaves it empty and
+ * the agent stays LAN-only. */
+static void load_relay_host(void)
+{
+    char path[MAX_PATH];
+    DWORD got = GetModuleFileNameA(NULL, path, (DWORD)sizeof(path));
+    if (got == 0 || got >= sizeof(path)) {
+        return;
+    }
+    char *slash = strrchr(path, '\\');
+    if (slash == NULL) {
+        return;
+    }
+    slash[1] = '\0';
+    if (strlen(path) + strlen("RELAY.TXT") >= sizeof(path)) {
+        return;
+    }
+    strcat(path, "RELAY.TXT");
+
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return;
+    }
+    char line[128];
+    while (fgets(line, (int)sizeof(line), f) != NULL) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' ||
+                         line[n - 1] == ' ' || line[n - 1] == '\t')) {
+            line[--n] = '\0';
+        }
+        char *s = line;
+        while (*s == ' ' || *s == '\t') {
+            s++;
+        }
+        if (*s != '\0') {
+            snprintf(g_relay_host, sizeof(g_relay_host), "%s", s);
+            break;
+        }
+    }
+    fclose(f);
 }
 
 /*
@@ -993,6 +1044,11 @@ int main(int argc, char **argv)
      * it after every board reboot) through link_open, which reads this. */
     g_tcp = tcp;
 
+    /* If the drive carries a RELAY.TXT, the dongle is reachable from anywhere
+     * through that host; remember it so the "Ready" line can point the phone at
+     * the public address as well as the LAN one. */
+    load_relay_host();
+
     grab_t g;
     if (!grab_open(&g, tile)) {
         fprintf(stderr, "cannot capture the screen\n");
@@ -1186,6 +1242,10 @@ int main(int argc, char **argv)
                         } else if (state == 2 && !g_configured) {
                             printf("\nReady. Open  http://%s/  on the phone\n",
                                    ip);
+                            if (g_relay_host[0] != '\0') {
+                                printf("From anywhere (any network):  "
+                                       "http://%s/\n", g_relay_host);
+                            }
                             fflush(stdout);
                             g_configured = 1;
                             /* Streaming from here on; nothing more to read in
