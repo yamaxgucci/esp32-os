@@ -77,6 +77,9 @@ typedef struct {
      * arena holds the loop and flash holds the setup.
      *
      * `cold_scratch` is freed as soon as the slot is programmed and mapped.
+     * An Xtensa image's cold part is programmed a page at a time instead
+     * (split_load_chunked), with no scratch at all: a board without PSRAM
+     * has no buffer the size of it.
      */
     void *cold_scratch;
     void *cold_slot;
@@ -87,12 +90,6 @@ typedef struct {
      * place.code is inside it, rounded up to 16.  NULL otherwise.
      */
     void *code_heap;
-    /*
-     * The cold part of a split image: the code that is not hot, always in
-     * flash - an appfs slot programmed a page at a time (split_load_chunked),
-     * so a board without PSRAM needs no buffer the size of it.
-     */
-    void *cold_slot;
 } ag_loaded_app_t;
 
 /*
