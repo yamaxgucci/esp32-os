@@ -32,6 +32,12 @@
 
 #if CONFIG_ARGON_ENABLE_AUDIO
 
+#include <string.h>
+
+#include "esp_err.h"
+#include "esp_log.h"
+#include "soc/soc_caps.h"
+
 /*
  * The I2S codec path, unless the board's build leaves it out
  * (CONFIG_ARGON_AUDIO_NO_I2S): the CYD's sound is the chip's own converters,
@@ -44,12 +50,6 @@
 #else
 #define AG_AUDIO_I2S 0
 #endif
-
-#include <string.h>
-
-#include "esp_err.h"
-#include "esp_log.h"
-#include "soc/soc_caps.h"
 
 #define TAG "audio_hw"
 
