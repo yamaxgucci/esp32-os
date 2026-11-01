@@ -70,3 +70,9 @@ CONFIG_ARGON_HEAP_TWOEND=y
 # frame; Thunder Force IV 19 -> 29 pictures, its sound 618 -> 521 ms a second;
 # a row to the glass 31 -> 18 us.
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+
+# The sound driver without its I2S codec path: this board's sound is the
+# chip's own converters, and the I2S driver's DMA handlers sit in IRAM whether
+# or not a channel is opened - 331 bytes that left the Mega Drive two pages
+# short when that path arrived from main (1 Nov 2026).
+CONFIG_ARGON_AUDIO_NO_I2S=y

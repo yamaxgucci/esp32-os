@@ -186,6 +186,18 @@ menu "ArgonOS"
             What it costs when something is playing is about four kilobytes of
             DMA buffers, taken on the first write and given back on close.
 
+
+    config ARGON_AUDIO_NO_I2S
+        bool "Leave the I2S codec path out of the sound driver"
+        depends on ARGON_ENABLE_AUDIO
+        default n
+        help
+            For a board whose sound is the chip's own converters and never a
+            codec on I2S (the CYD).  The I2S driver's DMA handlers are placed
+            in IRAM whether or not a channel is ever opened, and on an ESP32
+            whose IRAM is also an application's memory those bytes are worth
+            having back.  A board left with this on and I2S pins in BOARD.CFG
+            plays through the converters instead.
     config ARGON_ENABLE_PM
         bool "Frequency scaling (power eco)"
         default n

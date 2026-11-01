@@ -32,6 +32,19 @@
 
 #if CONFIG_ARGON_ENABLE_AUDIO
 
+/*
+ * The I2S codec path, unless the board's build leaves it out
+ * (CONFIG_ARGON_AUDIO_NO_I2S): the CYD's sound is the chip's own converters,
+ * and the I2S driver's DMA handlers are IRAM_ATTR whether or not a channel is
+ * ever opened - 331 bytes of the IRAM the Mega Drive's pages come from, which
+ * left it two pages short when this path reached the CYD (1 Nov 2026).
+ */
+#if SOC_I2S_SUPPORTED && !defined(CONFIG_ARGON_AUDIO_NO_I2S)
+#define AG_AUDIO_I2S 1
+#else
+#define AG_AUDIO_I2S 0
+#endif
+
 #include <string.h>
 
 #include "esp_err.h"
@@ -438,7 +451,7 @@ static int32_t dac_be_read(int16_t *pcm, int32_t frames)
 
 #endif /* SOC_DAC_SUPPORTED */
 
-#if SOC_I2S_SUPPORTED
+#if AG_AUDIO_I2S
 
 #include "driver/i2s_std.h"
 
@@ -831,9 +844,9 @@ static int32_t i2s_be_space(void)
     }
 }
 
-#endif /* SOC_I2S_SUPPORTED */
+#endif /* AG_AUDIO_I2S */
 
-#if !SOC_DAC_SUPPORTED && !SOC_I2S_SUPPORTED
+#if !SOC_DAC_SUPPORTED && !AG_AUDIO_I2S
 
 const char *ag_port_audio_name(void) { return "none"; }
 
@@ -875,7 +888,7 @@ int32_t ag_port_audio_read(int16_t *pcm, int32_t frames)
 
 #endif /* neither */
 
-#if SOC_DAC_SUPPORTED || SOC_I2S_SUPPORTED
+#if SOC_DAC_SUPPORTED || AG_AUDIO_I2S
 
 /*
  * WHICH WAY THE SOUND GOES OUT IS THE BOARD'S ANSWER, NOT THE CHIP'S.
@@ -911,15 +924,15 @@ static bool board_wants_i2s(void)
  * entirely, so an S3 pays nothing for a converter branch it does not have and
  * a part with no I2S pays nothing for this.
  */
-#if SOC_DAC_SUPPORTED && SOC_I2S_SUPPORTED
+#if SOC_DAC_SUPPORTED && AG_AUDIO_I2S
 #define USE_I2S() board_wants_i2s()
-#elif SOC_I2S_SUPPORTED
+#elif AG_AUDIO_I2S
 #define USE_I2S() true
 #else
 #define USE_I2S() false
 #endif
 
-#if !SOC_I2S_SUPPORTED
+#if !AG_AUDIO_I2S
 #define i2s_be_name()             "none"
 #define i2s_be_present()          false
 #define i2s_be_open(r, c)         false
@@ -983,7 +996,7 @@ int32_t ag_port_audio_read(int16_t *pcm, int32_t frames)
     return USE_I2S() ? i2s_be_read(pcm, frames) : dac_be_read(pcm, frames);
 }
 
-#endif /* SOC_DAC_SUPPORTED || SOC_I2S_SUPPORTED */
+#endif /* SOC_DAC_SUPPORTED || AG_AUDIO_I2S */
 
 
 
