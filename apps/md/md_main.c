@@ -41,7 +41,13 @@
  * core now (md_snd_async.c).  The kernel gives a process at least the 8 KB
  * loading needs unless [stacks] load in SYSTEM.CFG says less - the CYD says 5.
  */
+#ifdef MD_PSRAM_PAGES
+/* a board with PSRAM: the machine's pages that internal memory cannot give
+ * come from the process's arena, which is PSRAM there - room for all of them */
+AG_APP_SIZED("MD", "0.1", "argon", 0, 5 * 1024, 192 * 1024);
+#else
 AG_APP_SIZED("MD", "0.1", "argon", 0, 5 * 1024, 4 * 1024);
+#endif
 #else
 AG_APP_SIZED("MD", "0.1", "argon", AG_AXE_NEEDS_GFX, 24 * 1024, 5 * 1024 * 1024);
 #endif
@@ -1068,6 +1074,9 @@ static int s_blocks; /* blocks the pages were cut from */
 /* internal memory for small things, after the pages: what a page cannot use */
 static void *md_crumb_alloc(size_t n)
 {
+    /* internal memory only, PSRAM boards too: on the S3-CAM a record taken
+     * from PSRAM stopped the 68000's loop a few seconds after the first
+     * raster pass (1 Nov 2026, not yet understood) - it runs without one */
     return ag_malloc_caps(n, AG_MEM_FAST);
 }
 
@@ -1107,6 +1116,31 @@ static unsigned fill_pages(unsigned char **pages, unsigned count, int iram)
      * it, so a 16 KB arena never has a 16 KB block, and halving from there
      * leaves kilobytes behind.
      */
+#ifdef MD_PSRAM_PAGES
+    /*
+     * A board with PSRAM (the S3-CAM): what internal memory could not give,
+     * from PSRAM, in blocks as large as it has - the machine's RAM is read
+     * through the data cache there, and internal memory on that board is
+     * what the radio and the system keep (1 Nov 2026: 34 of 64 KB of the
+     * 68000's RAM came from it, and MD stopped short).
+     */
+    for (unsigned s2 = 0; !iram && got < count && s2 < sizeof(k_sizes) / sizeof(k_sizes[0]);) {
+        const size_t size = k_sizes[s2];
+        if (size > (size_t)(count - got) * MD_PAGE) {
+            s2++;
+            continue;
+        }
+        unsigned char *b = (unsigned char *)ag_malloc_caps(size, AG_MEM_DEFAULT);
+        if (b == NULL) {
+            s2++;
+            continue;
+        }
+        s_blocks++;
+        for (size_t o = 0; o < size; o += MD_PAGE) {
+            pages[got++] = b + o;
+        }
+    }
+#endif
     while (!iram && got < count) {
         ag_meminfo_t mi;
         ag_meminfo(&mi);

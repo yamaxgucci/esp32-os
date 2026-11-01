@@ -188,6 +188,23 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc --no-stage --keep
   apps/md/core/io/gwenesis_io.c apps/md/core/savestate/gwenesis_savestate.c
 ```
 
+### The S3-CAM (`MDS3.AXE`: the CYD's pipeline on an ESP32-S3 with PSRAM)
+
+The same build as the CYD's (`ARGON_MD_SMALL`, `MD_SPLIT`: rows to the SPI
+panel, both cores drawing, the Z80 and the chips on the system core) with
+`xtensa-esp32s3-elf-gcc` and `-DMD_PSRAM_PAGES`: the machine's pages that
+internal memory cannot give come from the process's arena, which is PSRAM
+there (the image asks for 192 KB). The ordinary `MD.AXE` is 790 KB and the
+S3-CAM's C: is 1 MB with no card in the slot, so this is the one that fits
+beside a ROM. Measured 1 Nov 2026 with Alex Kidd from C: on the ST7789:
+59 fps, 30-58 whole pictures a second. Not yet: the raster record (a record
+in PSRAM stopped the 68000's loop), and the system shell gets little time
+while it runs.
+
+```
+run c:\mds3.axe c:\alex.swp 0 stats
+```
+
 ## Run
 
 ```
