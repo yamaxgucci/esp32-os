@@ -586,12 +586,35 @@ MD_HOT_VDP static uint32_t md_row_hash(const unsigned short *row, int width)
  * A row's line is compared with what the glass last got for that line
  * (s_line_hash) when it is sent: an unchanged line is passed over.
  */
-static volatile uint32_t s_next;     /* the pass's next line to draw            */
+/*
+ * The words both cores change with an atomic instruction, apart from the rest:
+ * on the S3-CAM an application's data is in PSRAM, where the S3 has no atomic
+ * instructions - the sending flag stayed taken with nobody sending, and the
+ * picture stopped a few seconds in for good (1 Nov 2026).  There they are
+ * moved to internal memory (md_sync_internal).
+ */
+static uint32_t   s_sync_words[3];
+uint32_t         *md_sync = s_sync_words; /* md_raster.c takes its lock here */
+#define s_next   (((volatile uint32_t *)md_sync)[0]) /* the pass's next line to draw */
+#define s_sender (((volatile uint32_t *)md_sync)[1]) /* 1 while a core sends */
+#define MD_SYNC_WORDS (sizeof(s_sync_words) / sizeof(s_sync_words[0]))
+
+static void md_sync_internal(void)
+{
+#ifdef MD_PSRAM_PAGES
+    uint32_t *const p = (uint32_t *)ag_malloc_caps(sizeof(s_sync_words), AG_MEM_FAST);
+    if (p != NULL) {
+        for (unsigned i = 0; i < MD_SYNC_WORDS; i++) {
+            p[i] = 0;
+        }
+        md_sync = p;
+    }
+#endif
+}
 static volatile int      s_sent;     /* lines before this one are dealt with    */
 static volatile int      s_pass_h;   /* the pass's lines while one is open, else 0 */
 static volatile uint8_t  s_row_ready[MD_RING_MAX];
 static volatile uint32_t s_row_hash[MD_RING_MAX];
-static volatile uint32_t s_sender;   /* 1 while a core sends                    */
 static int               s_help = 1; /* `nohelp`: the system core alone         */
 /* the pass draws from the last frame's raster record (md_raster.c): a
  * line with writes before it (s_ras_gate) is claimed only once every line
@@ -840,6 +863,12 @@ static void md_drawer(void)
             const ag_time_t t0 = ag_micros();
             while (s_ring_run && s_sent < s_pass_h && !md_send() &&
                    !((int)s_next < s_pass_h && (int)s_next < s_sent + s_ring_n)) {
+                /*
+                 * The sound too, while waiting: the 68000 waits at its next
+                 * line for this core to have played the last frame's sound,
+                 * and the line waited for here may be one it is to draw.
+                 */
+                (void)md_snd_core0_poll();
             }
             s_help_wait_us += (uint32_t)(ag_micros() - t0);
             continue;
@@ -1090,10 +1119,15 @@ static int s_blocks; /* blocks the pages were cut from */
 /* internal memory for small things, after the pages: what a page cannot use */
 static void *md_crumb_alloc(size_t n)
 {
-    /* internal memory only, PSRAM boards too: on the S3-CAM a record taken
-     * from PSRAM stopped the 68000's loop a few seconds after the first
-     * raster pass (1 Nov 2026, not yet understood) - it runs without one */
-    return ag_malloc_caps(n, AG_MEM_FAST);
+    void *b = ag_malloc_caps(n, AG_MEM_FAST);
+#ifdef MD_PSRAM_PAGES
+    /* a record in PSRAM once stopped the 68000's loop on the S3-CAM: its
+     * lock was in PSRAM too, where the S3 has no atomics (md_sync) */
+    if (b == NULL) {
+        b = ag_malloc_caps(n, AG_MEM_DEFAULT);
+    }
+#endif
+    return b;
 }
 
 /*
@@ -1786,6 +1820,7 @@ int ag_main(int argc, char **argv)
     /* The ring before the machine's pages; the glass after them - taking the
      * display costs internal memory too, and it is the one that can be had
      * last. */
+    md_sync_internal();
     if (!s_headless && ring_rows > 0) {
         md_ring_start(ring_rows);
     }

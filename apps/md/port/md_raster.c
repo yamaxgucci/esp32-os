@@ -131,7 +131,8 @@ static volatile uint32_t s_pub_seq, s_took_seq;
 uint16_t *const *md_vr_hs;              /* the renderer's: s_hs, or NULL */
 static int               s_rec_k;       /* the one the 68000 writes */
 static volatile int      s_pub = -1;    /* the last whole frame's, -1: none */
-static volatile uint32_t s_lock;
+extern uint32_t         *md_sync; /* [2]: the lock, in memory with atomics (md_main.c) */
+#define s_lock (((volatile uint32_t *)md_sync)[2])
 
 /* the drawer's copy of the state a line is drawn with; the writes it reads
  * from the published record, which nothing writes while a pass draws */
