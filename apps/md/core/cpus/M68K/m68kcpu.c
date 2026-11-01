@@ -13,7 +13,9 @@ extern int vdp_68k_irq_ack(int int_level);
 
 #ifndef BUILD_TABLES
   #ifndef TABLES_FULL
+    #ifndef ARGON_MD_SMALL /* the small build's cycles are in m68ki_jump_small.h */
     #include "m68ki_cycles.h"
+    #endif
   #else
     #include "m68ki_cycles_full.h"
   #endif
@@ -235,14 +237,14 @@ void m68k_set_irq_delay(unsigned int int_level)
     if ((REG_IR & 0xF000) != 0x2000)
     {
       /* Finish executing current instruction */
-      USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
+      USE_CYCLES(CYC_OF(REG_IR));
 
       /* One instruction delay before interrupt */
       irq_latency = 1;
       m68ki_trace_t1() /* auto-disable (see m68kcpu.h) */
       m68ki_use_data_space() /* auto-disable (see m68kcpu.h) */
       REG_IR = m68ki_read_imm_16();
-      m68ki_instruction_jump_table[REG_IR]();
+      MD_DISPATCH(REG_IR);
       m68ki_exception_if_trace() /* auto-disable (see m68kcpu.h) */
       irq_latency = 0;
     }
@@ -259,7 +261,7 @@ void m68k_set_irq_delay(unsigned int int_level)
   m68ki_check_interrupts(); /* Level triggered (IRQ) */
 }
 
-void m68k_run(unsigned int cycles) 
+MD_HOT void m68k_run(unsigned int cycles)
 {
     //  printf("m68K_run current_cycles=%d add=%d STOP=%x\n",m68k.cycles,cycles,CPU_STOPPED);
 
@@ -304,13 +306,67 @@ void m68k_run(unsigned int cycles)
 #endif
 
     /* Decode next instruction */
+#ifdef MD_CYCPROF
+    const unsigned int cp0 = md_ccount();
+#endif
     REG_IR = m68ki_read_imm_16();
 
-//    printf("PC=%x IR=%x CYCLES=%d \n",m68k.pc,REG_IR,CYC_INSTRUCTION[REG_IR]);
+//    printf("PC=%x IR=%x CYCLES=%d \n",m68k.pc,REG_IR,CYC_OF(REG_IR));
 
     /* Execute instruction */
-    m68ki_instruction_jump_table[REG_IR]();
-    USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
+#ifdef ARGON_MD_SMALL
+    {
+      /* One lookup for the handler and its cycles.  A handler that ran the next
+       * instruction itself (m68k_set_irq_delay) left that one in REG_IR, and
+       * the cycles counted here are its, as they always were. */
+      const unsigned int ir = REG_IR;
+#ifdef MD_CYCPROF
+      const unsigned int cp1 = md_ccount();
+#endif
+#ifdef MD_DECODE_CACHE
+      /*
+       * The handler of a recent opcode, from RAM.  MD_OP reads a 128 KB index
+       * and a 13.6 KB table, both in flash, for every instruction; a busy
+       * scene uses a few hundred opcodes and each lookup that misses the
+       * flash cache costs some 300 cycles.
+       */
+      static unsigned short s_dc_tag[MD_DECODE_CACHE];
+      static const md_op_t *s_dc_op[MD_DECODE_CACHE];
+      const unsigned int dci = (ir ^ (ir >> 7)) & (MD_DECODE_CACHE - 1u);
+      const md_op_t *op;
+      if (s_dc_tag[dci] == ir && s_dc_op[dci] != NULL) {
+        op = s_dc_op[dci];
+      } else {
+        op = MD_OP(ir);
+        s_dc_tag[dci] = (unsigned short)ir;
+        s_dc_op[dci] = op;
+      }
+#else
+      const md_op_t *op = MD_OP(ir);
+#endif
+#ifdef MD_CYCPROF
+      const unsigned int cp2 = md_ccount();
+#endif
+#ifdef MD_HOST_COUNT
+      { extern unsigned md_cnt_instr, md_cnt_op[];
+        md_cnt_instr++; md_cnt_op[op - md_ops]++; }
+#endif
+      op->fn();
+#ifdef MD_CYCPROF
+      {
+        const unsigned int cp3 = md_ccount();
+        md_cp_fetch += cp1 - cp0;
+        md_cp_decode += cp2 - cp1;
+        md_cp_exec += cp3 - cp2;
+        md_cp_n++;
+      }
+#endif
+      USE_CYCLES(REG_IR == ir ? op->cyc : CYC_OF(REG_IR));
+    }
+#else
+    MD_DISPATCH(REG_IR);
+    USE_CYCLES(CYC_OF(REG_IR));
+#endif
 
     /* Trace m68k_exception, if necessary */
     m68ki_exception_if_trace(); /* auto-disable (see m68kcpu.h) */
@@ -319,7 +375,7 @@ void m68k_run(unsigned int cycles)
 
 int m68k_cycles(void)
 {
-  return CYC_INSTRUCTION[REG_IR];
+  return CYC_OF(REG_IR);
 }
 
 int m68k_cycles_run(void)

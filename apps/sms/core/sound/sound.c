@@ -32,6 +32,12 @@
  * October 12th 2019 : Switching some variables in functions to c99 datatypes.
 */
 #include "shared.h"
+#ifdef ARGON_SMS_SMALL
+/* The CYD build: the arena holds the picture's bands; the sound's few KB come
+ * from the system heap, when sound is asked for at all. */
+#undef malloc
+#define malloc(n) sms_alloc_internal(n)
+#endif
 #include "config.h"
 
 snd_t snd;

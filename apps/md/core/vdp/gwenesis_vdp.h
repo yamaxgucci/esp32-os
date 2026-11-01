@@ -75,9 +75,45 @@ __license__ = "GPLv3"
 #define STATUS_PAL (1 << 0)
 
 #define VRAM_MAX_SIZE 0x10000    // VRAM maximum size
+#ifdef ARGON_MD_BENCH_VRAM32
+/* MEASUREMENT ONLY: 32 KB of VRAM, addresses folded into it.  The picture is
+ * wrong; the work a frame costs is not.  Not a build anyone plays. */
+#define VRAM_MASK 0x7FFF
+#else
+#define VRAM_MASK 0xFFFF
+#endif
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD keeps VRAM in pages (md_pages.h), as many as fit in IRAM - memory its
+ * byte-addressable heap does not have - and the rest wherever the heap has a
+ * piece.  The ESP32 reads and writes IRAM only a whole word at a time, so every
+ * VRAM access goes through an aligned word; the bytes sit in it exactly as
+ * they would in ordinary memory.  No 4-byte access crosses a page: patterns
+ * are 32-byte aligned, sprite entries 8.
+ */
+#include "md_pages.h"
+/* volatile: GCC otherwise turns "a word, then one byte of it" back into a
+ * byte load or store - l8ui into IRAM, a LoadStoreError on the first frame. */
+#define VRAM_W(A)   (((volatile unsigned int *)(void *)md_vram[((A) & VRAM_MASK) >> MD_PAGE_SHIFT]) \
+                     [((A) & MD_PAGE_MASK) >> 2])
+#define VRAM_RD8(A) ((unsigned char)(VRAM_W(A) >> (((A) & 3u) << 3)))
+#define VRAM_WR8(A, V) do { unsigned int a_ = (A), s_ = (a_ & 3u) << 3;      \
+    VRAM_W(a_) = (VRAM_W(a_) & ~(0xFFu << s_)) |                              \
+                 ((unsigned int)(unsigned char)(V) << s_); } while (0)
+#else
+#define VRAM_W(A)   (((unsigned int *)(void *)VRAM)[((A) & VRAM_MASK) >> 2])
+#define VRAM_RD8(A) (VRAM[(A) & VRAM_MASK])
+#define VRAM_WR8(A, V) (VRAM[(A) & VRAM_MASK] = (V))
+#endif
 #define CRAM_MAX_SIZE 0x40       // CRAM maximum size
 #define VSRAM_MAX_SIZE 0x40      // VSRAM maximum size
+#ifdef ARGON_MD_SMALL
+/* the CYD: 80 sprites of 8 bytes are all the table holds - the rest of its
+ * 1 KB in H40 is never read, and the 384 bytes were the glass's */
+#define SAT_CACHE_MAX_SIZE 0x280
+#else
 #define SAT_CACHE_MAX_SIZE 0x400 // SAT CACHE maximum size
+#endif
 #define REG_SIZE 0x20            // REGISTERS total
 #define FIFO_SIZE 0x4            // FIFO maximum size
 

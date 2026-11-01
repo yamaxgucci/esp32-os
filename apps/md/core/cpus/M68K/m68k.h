@@ -163,7 +163,11 @@
 	 * array - 64 KB is cheap and it is touched on nearly every instruction.
 	 */
 	extern unsigned char *ROM_DATA;
+#ifdef ARGON_MD_SMALL
+	extern unsigned char *M68K_RAM; /* the CYD: from the heap, md_main */
+#else
 	extern unsigned char M68K_RAM[];
+#endif
 #else
 
 	extern unsigned char ROM_DATA[];
@@ -186,6 +190,24 @@
 #define WRITE32RAM(A, V) ((*(unsigned int   *)( (A)&0XFFFF))      = (((V) << 16) | ((V) >> 16)))
 #else
 
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD: 64 KB in one piece is more than its heap has to give once the image
+ * is loaded, so work RAM is in pages (md_pages.h).  A long access is two
+ * word accesses, so one that crosses from one page to the next (or wraps at
+ * the top) is still right.  Words are stored as the core always kept them: a
+ * long's high word at the lower address.
+ */
+#include "md_pages.h"
+#define MD_RAMP(A) (md_ram[((A) & 0xFFFFu) >> MD_PAGE_SHIFT] + ((A) & MD_PAGE_MASK))
+#define FETCH8RAM(A) (*MD_RAMP((A) ^ 1))
+#define FETCH16RAM(A) (*(unsigned short *)MD_RAMP(A))
+#define FETCH32RAM(A) ((((unsigned int)FETCH16RAM(A)) << 16) | FETCH16RAM((A) + 2))
+#define WRITE8RAM(A, V) (*MD_RAMP((A) ^ 1) = (V))
+#define WRITE16RAM(A, V) (*(unsigned short *)MD_RAMP(A) = (V))
+#define WRITE32RAM(A, V) do { WRITE16RAM((A), (unsigned short)((V) >> 16)); \
+                              WRITE16RAM((A) + 2, (unsigned short)(V)); } while (0)
+#else
 #define FETCH8RAM(A) ((M68K_RAM[(A ^ 1) & 0xFFFF]))
 #define FETCH16RAM(A) ((*(unsigned short *)&M68K_RAM[(A)&0XFFFF]))
 #define FETCH32RAM(A) ( (*(unsigned int *)&M68K_RAM[(A&0XFFFF)] << 16) | (*(unsigned int *)&M68K_RAM[(A&0XFFFF)] >> 16) )
@@ -193,6 +215,7 @@
 #define WRITE8RAM(A, V) (M68K_RAM[(A ^ 1) & 0xFFFF] = (V))
 #define WRITE16RAM(A, V) ((*(unsigned short *)&M68K_RAM[(A)&0XFFFF] = (V)))
 #define WRITE32RAM(A, V) ((*(unsigned int *)&M68K_RAM[(A)&0XFFFF] =( ((V) << 16) | ((V) >> 16) ) ))
+#endif
 
 #endif
 
@@ -321,7 +344,11 @@ typedef struct
 
 typedef struct
 {
+#ifndef ARGON_MD_SMALL
   cpu_memory_map memory_map[256]; /* memory mapping */
+#endif
+  /* (the CYD: nothing reads memory_map - the bus is FETCH/WRITE macros - and
+   * it was 5 KB of the image's internal memory) */
 
   cpu_idle_t poll;      /* polling detection */
 

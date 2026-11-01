@@ -154,3 +154,39 @@ argon test -Sd -TimeoutSec 240 `
   "run a:\SMS.AXE 600 nolivepad stats" "errorlevel" `
   "run a:\SMS.AXE 300 nolivepad fps30 stats" "errorlevel"
 ```
+
+## On the CYD (`SMS32.AXE`, ESP32 without PSRAM)
+
+`ARGON_SMS_SMALL` builds the same core for a board with ~90 KB free at load:
+image data 51 KB instead of 914, cartridge read in place from flash (`ag_map`).
+
+| What the big build keeps in RAM | Small build |
+|---|---|
+| `SZHVC_add/sub` 256 KB | Z80 flags by formula (checked on all 262 144 inputs) |
+| `bp_lut` 256 KB, `bg_pattern_cache` 128 KB | tile rows expanded from VRAM, 2 KB of tables |
+| `lut` 64 KB | sprite over background by three comparisons |
+| TMS9918 tables 45 KB | TMS modes (SG-1000, Coleco) drawn as backdrop |
+| FM 30 KB | no YM2413 |
+| `io_lut` 4 KB | port `$3F` worked out when written |
+| `cart.sram` 32 KB | from the system heap when a game maps it |
+
+The picture goes out in 8-line bands. A thread on the system core sends them
+over the SPI while the application core emulates; a band whose slot is not free
+is not drawn, and the next frame resumes where this one stopped, so the game
+keeps its own time and the glass is renewed as fast as the 40 MHz bus allows.
+Unchanged bands are not sent at all.
+
+Measured on the CYD, 28 Oct 2026, shop firmware (ABI 0.72), radio joined:
+
+| Cartridge | Emulation | Real time |
+|---|---|---|
+| Alex Kidd in Miracle World, title and demo | 63-64 fps | 127-152% |
+| Sonic The Hedgehog, title and demo | 57-65 fps | 101-140% |
+
+```
+run c:\sms32.axe c:\sonic.sms stats
+```
+
+The stack is 16 KB: 10 overflowed on Sonic.  Not in this build yet: sound
+(the PSG to the CYD's DAC) and touch controls.  `-DARGON_SMS_PROF` prints
+where the drawing time goes.

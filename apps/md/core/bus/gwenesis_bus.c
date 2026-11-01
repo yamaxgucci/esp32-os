@@ -32,6 +32,21 @@ __license__ = "GPLv3"
 #include "gwenesis_sn76489.h"
 #include "gwenesis_savestate.h"
 
+#ifdef ARGON_MD_SMALL
+/* The CYD: with the sound side on the other core, the 68000's writes to the
+ * chips are logged for it (md_snd_async.c). */
+#include "md_snd_async.h"
+#define MD_YM_WRITE(a, v, t) \
+  do { if (md_snd_async) md_snd_68k_ym((a), (v)); else YM2612Write((a), (v), (t)); } while (0)
+#define MD_YM_READ(t) (md_snd_async ? md_snd_68k_ym_status() : YM2612Read(t))
+#define MD_PSG_WRITE(v, t) \
+  do { if (md_snd_async) md_snd_68k_psg(v); else gwenesis_SN76489_Write((v), (t)); } while (0)
+#else
+#define MD_YM_WRITE(a, v, t) YM2612Write((a), (v), (t))
+#define MD_YM_READ(t) YM2612Read(t)
+#define MD_PSG_WRITE(v, t) gwenesis_SN76489_Write((v), (t))
+#endif
+
 #if GNW_TARGET_MARIO !=0 || GNW_TARGET_ZELDA!=0
   #pragma GCC optimize("Ofast")
 #endif
@@ -65,7 +80,12 @@ unsigned char *M68K_RAM=(void *)(uint32_t)(0); // 68K RAM
 #elif ARGON_TARGET != 0
 
 unsigned char *ROM_DATA = 0;          // points at the loaded cartridge image
+#ifdef ARGON_MD_SMALL
+unsigned char *M68K_RAM;              // unused on the CYD: md_ram[]
+unsigned char *md_ram[MD_RAM_PAGES];  // pages (md_pages.h, md_main)
+#else
 unsigned char M68K_RAM[MAX_RAM_SIZE]; // 68K RAM
+#endif
 #else
 
 unsigned char ROM_DATA[MAX_ROM_SIZE]; // 68K Main Program (uncompressed)
@@ -74,7 +94,12 @@ unsigned char M68K_RAM[MAX_RAM_SIZE];    // 68K RAM
 
 
 // Setup Z80 Memory
+#ifdef ARGON_MD_SMALL
+unsigned char *ZRAM;                  // unused on the CYD: md_zram[]
+unsigned char *md_zram[MD_ZRAM_PAGES]; // pages
+#else
 unsigned char ZRAM[MAX_Z80_RAM_SIZE]; // Z80 RAM
+#endif
 unsigned char TMSS[0x4];
 extern unsigned short gwenesis_vdp_status;
 
@@ -94,8 +119,16 @@ int tmss_count = 0;
 void load_cartridge()
 {
     // Clear all volatile memory
+#ifdef ARGON_MD_SMALL
+    for (unsigned i = 0; i < MD_RAM_PAGES; i++) memset(md_ram[i], 0, MD_PAGE);
+#else
     memset(M68K_RAM, 0, MAX_RAM_SIZE);
+#endif
+#ifdef ARGON_MD_SMALL
+    for (unsigned i = 0; i < MD_ZRAM_PAGES; i++) memset(md_zram[i], 0, MD_PAGE);
+#else
     memset(ZRAM, 0, MAX_Z80_RAM_SIZE);
+#endif
 
     // Set Z80 Memory as Z80_RAM
     z80_set_memory(ZRAM);
@@ -115,19 +148,33 @@ void load_cartridge()
  */
 void load_cartridge(unsigned char *buffer, size_t size)
 {
+#ifdef ARGON_MD_SMALL
+    for (unsigned i = 0; i < MD_RAM_PAGES; i++) memset(md_ram[i], 0, MD_PAGE);
+#else
     memset(M68K_RAM, 0, MAX_RAM_SIZE);
+#endif
+#ifdef ARGON_MD_SMALL
+    for (unsigned i = 0; i < MD_ZRAM_PAGES; i++) memset(md_zram[i], 0, MD_PAGE);
+#else
     memset(ZRAM, 0, MAX_Z80_RAM_SIZE);
+#endif
 
     z80_set_memory(ZRAM);
     z80_pulse_reset();
 
     ROM_DATA = buffer;
 
+#ifndef ARGON_MD_SMALL
     for (size_t i = 0; i + 1 < size; i += 2) {
         unsigned char z = ROM_DATA[i];
         ROM_DATA[i] = ROM_DATA[i + 1];
         ROM_DATA[i + 1] = z;
     }
+#else
+    /* the CYD maps the cartridge out of flash, read-only: it was swapped on
+     * the host (tools/mdswap) */
+    (void)size;
+#endif
 
     set_region();
 }
@@ -137,8 +184,16 @@ void load_cartridge(unsigned char *buffer, size_t size)
 void load_cartridge(unsigned char *buffer, size_t size)
 {
     // Clear all volatile memory
+#ifdef ARGON_MD_SMALL
+    for (unsigned i = 0; i < MD_RAM_PAGES; i++) memset(md_ram[i], 0, MD_PAGE);
+#else
     memset(M68K_RAM, 0, MAX_RAM_SIZE);
+#endif
+#ifdef ARGON_MD_SMALL
+    for (unsigned i = 0; i < MD_ZRAM_PAGES; i++) memset(md_zram[i], 0, MD_PAGE);
+#else
     memset(ZRAM, 0, MAX_Z80_RAM_SIZE);
+#endif
     memset(ROM_DATA, 0, MAX_ROM_SIZE);
 
     // Set Z80 Memory as ZRAM
@@ -406,7 +461,7 @@ unsigned int gwenesis_bus_map_address(unsigned int address) {
  *   Write an value to memory mapped on specified address
  *
  ******************************************************************************/
-static inline unsigned int gwenesis_bus_read_memory_8(unsigned int address) {
+MD_HOT static inline unsigned int gwenesis_bus_read_memory_8(unsigned int address) {
  bus_log(__FUNCTION__,"read8  %x", address);
 
   switch (gwenesis_bus_map_address(address)) {
@@ -428,10 +483,10 @@ static inline unsigned int gwenesis_bus_read_memory_8(unsigned int address) {
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
-    return ZRAM[address & 0x1FFF];
+    return MD_ZRAM(address);
 
   case Z80_YM2612_ADDR:
-    return YM2612Read(m68k_cycles_master());
+    return MD_YM_READ(m68k_cycles_master());
 
   case Z80_SN76489_ADDR:
     return 0xff;
@@ -452,7 +507,7 @@ static inline unsigned int gwenesis_bus_read_memory_8(unsigned int address) {
   return 0x00;
 }
 
-static inline unsigned int gwenesis_bus_read_memory_16(unsigned int address) {
+MD_HOT static inline unsigned int gwenesis_bus_read_memory_16(unsigned int address) {
    bus_log(__FUNCTION__,"read16 %x", address);
    unsigned int ret_value;
 
@@ -479,10 +534,10 @@ static inline unsigned int gwenesis_bus_read_memory_16(unsigned int address) {
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
-    return ZRAM[address & 0X1FFF] | (ZRAM[address & 0X1FFF] << 8);
+    return MD_ZRAM(address) | (MD_ZRAM(address) << 8);
 
   case Z80_YM2612_ADDR:
-    ret_value = YM2612Read(m68k_cycles_master());
+    ret_value = MD_YM_READ(m68k_cycles_master());
     return ret_value | ret_value << 8;
 
 
@@ -506,7 +561,7 @@ static inline unsigned int gwenesis_bus_read_memory_16(unsigned int address) {
  *   Write an value to memory mapped on specified address
  *
  ******************************************************************************/
-static inline void gwenesis_bus_write_memory_8(unsigned int address,
+MD_HOT static inline void gwenesis_bus_write_memory_8(unsigned int address,
                                               unsigned int value) {
   bus_log(__FUNCTION__,"write8  @%x:%x", address,value);
 
@@ -530,17 +585,17 @@ static inline void gwenesis_bus_write_memory_8(unsigned int address,
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
-    ZRAM[address & 0x1FFF] = value;
+    MD_ZRAM(address) = value;
     return;
 
   case Z80_YM2612_ADDR:
     bus_log(__FUNCTION__,"CPUZ80PSG8 ,m68kclk= %d", m68k_cycles_master());
-    YM2612Write(address & 0x3, value & 0Xff,m68k_cycles_master());
+    MD_YM_WRITE(address & 0x3, value & 0Xff,m68k_cycles_master());
     return;
 
   case Z80_SN76489_ADDR:
     bus_log(__FUNCTION__,"CPUZ80FM8  ,m68kclk= %d", m68k_cycles_master());
-    gwenesis_SN76489_Write( value & 0Xff, m68k_cycles_master());
+    MD_PSG_WRITE( value & 0Xff, m68k_cycles_master());
     return;
 
   case Z80_BANK_ADDR:
@@ -566,7 +621,7 @@ static inline void gwenesis_bus_write_memory_8(unsigned int address,
   return;
 }
 
-static inline void gwenesis_bus_write_memory_16(unsigned int address,
+MD_HOT static inline void gwenesis_bus_write_memory_16(unsigned int address,
                                                unsigned int value) {
   bus_log(__FUNCTION__,"write16  @%x:%x", address,value);
 
@@ -582,7 +637,7 @@ static inline void gwenesis_bus_write_memory_16(unsigned int address,
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
-    ZRAM[address & 0X1FFF]= value >> 8;
+    MD_ZRAM(address) = value >> 8;
     return;
 
   case IO_CTRL:
@@ -595,12 +650,12 @@ static inline void gwenesis_bus_write_memory_16(unsigned int address,
 
   case Z80_YM2612_ADDR:
     bus_log(__FUNCTION__,"CZYM16 ,mclk=%d",  m68k_cycles_master());
-    YM2612Write(address & 0x3, value >> 8,m68k_cycles_master() );
+    MD_YM_WRITE(address & 0x3, value >> 8,m68k_cycles_master() );
     return;
 
   case Z80_SN76489_ADDR:
     bus_log(__FUNCTION__,"CZSN16 ,mclk=%d", m68k_cycles_master());
-    gwenesis_SN76489_Write(value >> 8,m68k_cycles_master() );
+    MD_PSG_WRITE(value >> 8,m68k_cycles_master() );
     return;
 
   default:
@@ -619,10 +674,17 @@ static inline void gwenesis_bus_write_memory_16(unsigned int address,
  *   Read an address from memory mapped and return value as byte
  *
  ******************************************************************************/
-unsigned int m68k_read_memory_8(unsigned int address)
+MD_HOT unsigned int m68k_read_memory_8(unsigned int address)
 {
-      //  if ((address &  0xFF0000 ) == 0xFF0000) return FETCH8RAM(address);
+#ifdef MD_CYCPROF
+    const unsigned int c0 = md_ccount();
+    const unsigned int v = gwenesis_bus_read_memory_8(address);
+    md_cp_mem += md_ccount() - c0;
+    md_cp_memn++;
+    return v;
+#else
     return gwenesis_bus_read_memory_8(address);
+#endif
 }
 
 /******************************************************************************
@@ -631,10 +693,17 @@ unsigned int m68k_read_memory_8(unsigned int address)
  *   Read an address from memory mapped and return value as word
  *
  ******************************************************************************/
- unsigned int m68k_read_memory_16(unsigned int address)
+ MD_HOT unsigned int m68k_read_memory_16(unsigned int address)
 {
-     //   if ((address &  0xFF0000 ) == 0xFF0000) return FETCH16RAM(address);
+#ifdef MD_CYCPROF
+    const unsigned int c0 = md_ccount();
+    const unsigned int v = gwenesis_bus_read_memory_16(address);
+    md_cp_mem += md_ccount() - c0;
+    md_cp_memn++;
+    return v;
+#else
     return gwenesis_bus_read_memory_16(address);
+#endif
 }
 
 /******************************************************************************
@@ -643,7 +712,7 @@ unsigned int m68k_read_memory_8(unsigned int address)
  *   Read an address from memory mapped and return value as long
  *
  ******************************************************************************/
- unsigned int m68k_read_memory_32(unsigned int address)
+ MD_HOT unsigned int m68k_read_memory_32(unsigned int address)
 {
   //  if ((address &  0xFF0000 ) == 0xFF0000) return FETCH32RAM(address);
     return (gwenesis_bus_read_memory_16(address) << 16) | gwenesis_bus_read_memory_16(address + 2);
@@ -655,7 +724,7 @@ unsigned int m68k_read_memory_8(unsigned int address)
  *   Write an value as byte to memory mapped on specified address
  *
  ******************************************************************************/
-void m68k_write_memory_8(unsigned int address, unsigned int value) {
+MD_HOT void m68k_write_memory_8(unsigned int address, unsigned int value) {
   // if ((address & 0xFF0000) == 0xFF0000) {
   //   WRITE8RAM(address, value);
   //   return;
@@ -670,12 +739,19 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
  *   Write an value as word to memory mapped on specified address
  *
  ******************************************************************************/
-void m68k_write_memory_16(unsigned int address, unsigned int value) {
+MD_HOT void m68k_write_memory_16(unsigned int address, unsigned int value) {
   // if ((address & 0xFF0000) == 0xFF0000) {
   //   WRITE16RAM(address, value);
   //   return;
   // }
+#ifdef MD_CYCPROF
+  const unsigned int c0 = md_ccount();
   gwenesis_bus_write_memory_16(address, value);
+  md_cp_mem += md_ccount() - c0;
+  md_cp_memn++;
+#else
+  gwenesis_bus_write_memory_16(address, value);
+#endif
   return;
 }
 /******************************************************************************
@@ -684,7 +760,7 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
  *   Write an value as word to memory mapped on specified address
  *
  ******************************************************************************/
-void m68k_write_memory_32(unsigned int address, unsigned int value) {
+MD_HOT void m68k_write_memory_32(unsigned int address, unsigned int value) {
 
   // if ((address & 0xFF0000) == 0xFF0000) {
   //   WRITE32RAM(address, value);

@@ -33,6 +33,21 @@
 
 #include "shared.h"
 
+#ifdef ARGON_SMS_SMALL
+/* The cartridge's RAM, the first time a game asks for it. */
+uint8_t *cart_sram(void)
+{
+	if (cart.sram == NULL)
+	{
+		cart.sram = (uint8_t *)sms_alloc_internal(0x8000);
+		if (cart.sram == NULL)
+			sms_out_of_memory("32 KB of cartridge RAM");
+		memset(cart.sram, 0, 0x8000);
+	}
+	return cart.sram;
+}
+#endif
+
 /* SMS context */
 sms_t sms;
 
@@ -366,17 +381,17 @@ void sms_reset(void)
       /* $8000-$BFFF mapped to external RAM (lower 16K) */
       for(i = 0x20; i < 0x30; i++)
       {
-        cpu_readmap[i]  = &cart.sram[(i & 0x0F) << 10];
-        cpu_writemap[i] = &cart.sram[(i & 0x0F) << 10];
-		MemoryAddRAM(i, (i & 0x0f) << 10, cart.sram);
+        cpu_readmap[i]  = &CART_SRAM[(i & 0x0F) << 10];
+        cpu_writemap[i] = &CART_SRAM[(i & 0x0F) << 10];
+		MemoryAddRAM(i, (i & 0x0f) << 10, CART_SRAM);
       }
 
       /* $C000-$FFFF mapped to internal RAM (2K) or external RAM (upper 16K) */
       for(i = 0x30; i < 0x40; i++)
       {
-        cpu_readmap[i]  = &cart.sram[0x4000 + ((i & 0x0F) << 10)];
-        cpu_writemap[i] = &cart.sram[0x4000 + ((i & 0x0F) << 10)];
-		MemoryAddRAM(i, 0x4000 + ((i & 0x0F) << 10), cart.sram);
+        cpu_readmap[i]  = &CART_SRAM[0x4000 + ((i & 0x0F) << 10)];
+        cpu_writemap[i] = &CART_SRAM[0x4000 + ((i & 0x0F) << 10)];
+		MemoryAddRAM(i, 0x4000 + ((i & 0x0F) << 10), CART_SRAM);
       }
 
       break;
@@ -545,8 +560,8 @@ void mapper_16k_w(uint16_t address, uint8_t data)
 			int32_t offset = (data & 0x04) ? 0x4000 : 0x0000;
 			for(i = 0x20; i <= 0x2F; i++)
 			{
-				cpu_readmap[i] = cpu_writemap[i] = &cart.sram[offset + ((i & 0x0F) << 10)];
-				MemoryAddRAM(i, offset + ((i & 0x0F) << 10), cart.sram);
+				cpu_readmap[i] = cpu_writemap[i] = &CART_SRAM[offset + ((i & 0x0F) << 10)];
+				MemoryAddRAM(i, offset + ((i & 0x0F) << 10), CART_SRAM);
 			}
 			sms.save = 1;
 		}
@@ -573,8 +588,8 @@ void mapper_16k_w(uint16_t address, uint8_t data)
 			/* external RAM (lower 16K) mapped at $C000-$FFFF */
 			for(i = 0x30; i <= 0x3F; i++)
 			{
-			  cpu_writemap[i] = cpu_readmap[i]  = &cart.sram[(i & 0x0F) << 10];
-			  MemoryAddRAM(i, (i & 0x0F) << 10, cart.sram);
+			  cpu_writemap[i] = cpu_readmap[i]  = &CART_SRAM[(i & 0x0F) << 10];
+			  MemoryAddRAM(i, (i & 0x0F) << 10, CART_SRAM);
 			}
 			sms.save = 1;
 		}
@@ -617,8 +632,8 @@ void mapper_16k_w(uint16_t address, uint8_t data)
 				/* external RAM (8k) mapped at $A000-$BFFF */
 				for(i = 0x28; i <= 0x2F; i++)
 				{
-					cpu_writemap[i] = cpu_readmap[i]  = &cart.sram[(i & 0x0F) << 10];
-					MemoryAddRAM(i, (i & 0x0F) << 10, cart.sram);
+					cpu_writemap[i] = cpu_readmap[i]  = &CART_SRAM[(i & 0x0F) << 10];
+					MemoryAddRAM(i, (i & 0x0F) << 10, CART_SRAM);
 				}
 				sms.save = 1;
 			}

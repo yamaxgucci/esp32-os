@@ -327,6 +327,25 @@
               "apps/sms/core/sound/sound.c", "apps/sms/core/sound/fmintf.c",
               "apps/sms/core/sound/sn76489.c"]
     },
+    {
+      "out": "SMS32.AXE", "group": "board",
+      "_note": "The Master System on the CYD (ESP32, LX6, no PSRAM): ARGON_SMS_SMALL computes the Z80 flags and expands tiles from VRAM instead of 736 KB of tables, maps the cartridge out of flash, draws in bands, and has no FM and no TMS9918 modes.  See apps/sms/README.md.",
+      "gcc": "xtensa-esp32-elf-gcc",
+      "include": ["apps/common", "apps/common/libc", "apps/sms/port",
+                  "apps/sms/core", "apps/sms/core/z80",
+                  "apps/sms/core/sound", "apps/common/dsp"],
+      "cflags": "-Os -ffunction-sections -fdata-sections -fno-builtin -DLSB_FIRST -DNOZIP_SUPPORT -DUSE_Z80 -DARGON_SMS_SMALL -Wno-unused -Wno-sign-compare",
+      "src": ["apps/sms/sms_main.c", "apps/sms/sms_cfg.c",
+              "apps/common/libc/libc_shim.c", "apps/sms/port/platform.c",
+              "apps/sms/port/sound_wav.c",
+              "apps/sms/core/loadrom.c", "apps/sms/core/memz80.c",
+              "apps/sms/core/pio.c", "apps/sms/core/render.c",
+              "apps/sms/core/sms.c", "apps/sms/core/system.c",
+              "apps/sms/core/tms.c", "apps/sms/core/vdp.c",
+              "apps/sms/core/z80/z80.c",
+              "apps/sms/core/sound/sound.c", "apps/sms/core/sound/fmintf.c",
+              "apps/sms/core/sound/sn76489.c"]
+    },
 
     {
       "out": "GB.AXE", "group": "board",

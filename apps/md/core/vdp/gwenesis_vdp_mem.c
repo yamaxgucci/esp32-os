@@ -24,6 +24,12 @@ __license__ = "GPLv3"
 #include "m68k.h"
 #include "ym2612.h"
 #include "gwenesis_vdp.h"
+#ifdef ARGON_MD_SMALL
+#include "md_raster.h"
+#endif
+#ifndef MD_RAS_VRAM
+#define MD_RAS_VRAM(start, bytes) do { } while (0)
+#endif
 #include "gwenesis_io.h"
 #include "gwenesis_bus.h"
 #include "gwenesis_sn76489.h"
@@ -65,7 +71,12 @@ void vdpm_log(const char *subs, const char *fmt, ...) {
   extern uint8_t emulator_framebuffer[1024*64];
   unsigned char* VRAM = &emulator_framebuffer[0];
 #else
+#ifdef ARGON_MD_SMALL
+  unsigned char *VRAM;            /* = md_vram[0]; every access is paged */
+  unsigned char *md_vram[MD_VRAM_PAGES]; /* pages (md_pages.h) */
+#else
   unsigned char VRAM[VRAM_MAX_SIZE];
+#endif
 #endif
 
 unsigned short CRAM[CRAM_MAX_SIZE];           // CRAM - Palettes
@@ -112,7 +123,7 @@ extern bool sprite_collision;
 //static int DMA_RUN=0;
 
 // 16 bits access to VRAM
-#define FETCH16(A) ( ( (*(unsigned short *)&VRAM[(A)]) >> 8 ) | ( (*(unsigned short *)&VRAM[(A)]) << 8 ) )
+#define FETCH16(A) ( VRAM_RD8((A) + 1) | (VRAM_RD8(A) << 8) )
 
 
 /******************************************************************************
@@ -150,7 +161,11 @@ int m68k_irq_acked(int irq) {
 
 
 void gwenesis_vdp_reset() {
-  memset(VRAM, 0, VRAM_MAX_SIZE);
+#ifdef ARGON_MD_SMALL
+  for (unsigned int i = 0; i <= VRAM_MASK; i += 4) VRAM_W(i) = 0;
+#else
+  memset(VRAM, 0, VRAM_MASK + 1);
+#endif
   memset(SAT_CACHE, 0, sizeof(SAT_CACHE));
   memset(CRAM, 0, sizeof(CRAM));
   memset(CRAM565, 0, sizeof(CRAM565));
@@ -286,7 +301,17 @@ static inline __attribute__((always_inline)) void gwenesis_vdp_register_w(int re
     if ((BIT(gwenesis_vdp_regs[0x1], 2)==0) && reg > 0xA)
         return;
 
+#ifdef ARGON_MD_SMALL
+    /* the scroll mode or table changing while lines are shown: the lines
+     * above keep the table as they read it (md_raster.c) */
+    if ((reg == 11 || reg == 13) && md_ras_hs_lo != 0x80000000u &&
+        gwenesis_vdp_regs[reg] != value)
+      md_raster_hs_write();
+#endif
     gwenesis_vdp_regs[reg] = value;
+#ifdef ARGON_MD_SMALL
+    MD_VDP_NOTE(MD_RAS_REG, reg);
+#endif
     vdpm_log(__FUNCTION__, "reg:%02d <- %02x", reg, value);
 
 
@@ -337,11 +362,12 @@ void push_fifo(unsigned int value)
 static inline __attribute__((always_inline))
 void gwenesis_vdp_vram_write(unsigned int address, unsigned int value)
 {
-  VRAM[address] = value;
+  VRAM_WR8(address, value);
 
   // Update internal SAT Cache
   // used in Castlevania Bloodlines
-  if (address >= REG5_SAT_ADDRESS && address < REG5_SAT_ADDRESS + REG5_SAT_SIZE)
+  if (address >= REG5_SAT_ADDRESS && address < REG5_SAT_ADDRESS + REG5_SAT_SIZE &&
+      address - REG5_SAT_ADDRESS < SAT_CACHE_MAX_SIZE)
     SAT_CACHE[address - REG5_SAT_ADDRESS] = value;
 }
 
@@ -411,6 +437,9 @@ void gwenesis_vdp_dma_fill(unsigned short value)
 {
   //vdpm_log(__FUNCTION__,"@%x len:%x val:%x",REG21_DMA_SRCADDR_LOW,REG19_DMA_LENGTH,value);
   int dma_length = REG19_DMA_LENGTH;
+#ifdef MD_HOST_COUNT
+  { extern unsigned md_cnt_fill; md_cnt_fill += dma_length; }
+#endif
 
   // This address is not required for fills,
   // but it's still updated by the DMA engine.
@@ -427,6 +456,7 @@ void gwenesis_vdp_dma_fill(unsigned short value)
         
   switch (code_reg & 0xF) {
   case 0x1:
+    MD_RAS_VRAM(address_reg, dma_length * REG15_DMA_INCREMENT + 2);
     do {
       gwenesis_vdp_vram_write((address_reg ^ 1) & 0xFFFF, value >> 8);
       address_reg += REG15_DMA_INCREMENT;
@@ -436,6 +466,10 @@ void gwenesis_vdp_dma_fill(unsigned short value)
   case 0x3: // undocumented and buggy, see vdpfifotesting
     do {
       CRAM[(address_reg & 0x7f) >> 1] = fifo[3];
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_CR, (address_reg & 0x7f) >> 1);
+#endif
+
 
       unsigned short pixel;
       // Blue >> 9 << 2
@@ -461,6 +495,10 @@ void gwenesis_vdp_dma_fill(unsigned short value)
   case 0x5: // undocumented and buggy, see vdpfifotesting:
     do {
       VSRAM[(address_reg & 0x7f) >> 1] = fifo[3] & 0x03FF;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_VS, (address_reg & 0x7f) >> 1);
+#endif
+
       address_reg += REG15_DMA_INCREMENT;
       src_addr_low++;
     } while (--dma_length);
@@ -494,6 +532,9 @@ void gwenesis_vdp_dma_m68k()
 {
 
     int dma_length = REG19_DMA_LENGTH;
+#ifdef MD_HOST_COUNT
+    { extern unsigned md_cnt_dma; md_cnt_dma += dma_length ? dma_length : 0xFFFF; }
+#endif
 
     // This address is not required for fills,
     // but it's still updated by the DMA engine.
@@ -522,6 +563,7 @@ void gwenesis_vdp_dma_m68k()
       switch (code_reg & 0xF) {
 
       case 0x1: // dest is VRAM
+        MD_RAS_VRAM(address_reg, dma_length * REG15_DMA_INCREMENT + 2);
         do {
           value = FETCH16RAM( src_addr );
           push_fifo(value);
@@ -537,6 +579,10 @@ void gwenesis_vdp_dma_m68k()
           value = FETCH16RAM( src_addr );
           push_fifo(value);
           CRAM[(address_reg & 0x7f) >> 1] = value;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_CR, (address_reg & 0x7f) >> 1);
+#endif
+
 
           unsigned short pixel;
          // unsigned short pixel_shadow, pixel_highlight;
@@ -565,6 +611,10 @@ void gwenesis_vdp_dma_m68k()
           value = FETCH16RAM( src_addr );
           push_fifo(value);
           VSRAM[(address_reg & 0x7f) >> 1] = value & 0x03FF;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_VS, (address_reg & 0x7f) >> 1);
+#endif
+
           address_reg += REG15_DMA_INCREMENT;
           src_addr += 2;
         } while (--dma_length);
@@ -581,7 +631,7 @@ void gwenesis_vdp_dma_m68k()
       switch (code_reg & 0xF) {
 
       case 0x1: // dest is VRAM
-
+        MD_RAS_VRAM(address_reg, dma_length * REG15_DMA_INCREMENT + 2);
         do {
           value = FETCH16ROM(src_addr);
           push_fifo(value);
@@ -598,6 +648,10 @@ void gwenesis_vdp_dma_m68k()
           value = FETCH16ROM(src_addr);
           push_fifo(value);
           CRAM[(address_reg & 0x7f) >> 1] = value;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_CR, (address_reg & 0x7f) >> 1);
+#endif
+
 
           unsigned short pixel;
        //   unsigned short pixel_shadow, pixel_highlight;
@@ -629,6 +683,10 @@ void gwenesis_vdp_dma_m68k()
           value = FETCH16ROM(src_addr);
           push_fifo(value);
           VSRAM[(address_reg & 0x7f) >> 1] = value & 0x03FF;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_VS, (address_reg & 0x7f) >> 1);
+#endif
+
           address_reg += REG15_DMA_INCREMENT;
           src_addr += 2;
         } while (--dma_length);
@@ -662,9 +720,10 @@ void gwenesis_vdp_dma_copy()
     unsigned short src_addr_low = REG21_DMA_SRCADDR_LOW;
     //vdpm_log(__FUNCTION__,"length:%x src:%x",dma_length,src_addr_low);
 
+    MD_RAS_VRAM(address_reg, (dma_length ? dma_length : 0xFFFF) * REG15_DMA_INCREMENT + 2);
     do
     {
-        unsigned short value = VRAM[src_addr_low ^ 1];
+        unsigned short value = VRAM_RD8(src_addr_low ^ 1);
         gwenesis_vdp_vram_write((address_reg ^ 1) & 0xFFFF, value);
 
         address_reg += REG15_DMA_INCREMENT;
@@ -705,8 +764,8 @@ unsigned int gwenesis_vdp_read_data_port_16()
         {
         case 0x0:
             // No byteswapping here
-            value = VRAM[(address_reg)&0xFFFE] << 8;
-            value |= VRAM[(address_reg | 1) & 0xFFFF];
+            value = VRAM_RD8((address_reg) & 0xFFFE) << 8;
+            value |= VRAM_RD8(address_reg | 1);
             address_reg += REG15_DMA_INCREMENT;
             address_reg &= 0xFFFF;
             //vdpm_log(__FUNCTION__,"%04x",value);
@@ -732,7 +791,7 @@ unsigned int gwenesis_vdp_read_data_port_16()
 
             return value;
         case 0xC: /* 8-Bit memory access */
-            value = VRAM[(address_reg ^ 1) & 0xFFFF];
+            value = VRAM_RD8(address_reg ^ 1);
             value = (value & VRAM8_BITMASK) | (fifo[3] & ~VRAM8_BITMASK);
             address_reg += REG15_DMA_INCREMENT;
             address_reg &= 0xFFFF;
@@ -834,6 +893,7 @@ void gwenesis_vdp_write_data_port_16(unsigned int value)
         case 0x1: /* VRAM write */
             //vdpm_log(__FUNCTION__,"VRAM write : addr:%x increment:%d value:%04x",
              // address_reg, REG15_DMA_INCREMENT, value);
+            MD_RAS_VRAM(address_reg, 2);
             gwenesis_vdp_vram_write(address_reg& 0xFFFF, (value >> 8) & 0xFF);
             gwenesis_vdp_vram_write((address_reg^1)& 0xFFFF, (value)&0xFF);
             address_reg += REG15_DMA_INCREMENT;
@@ -844,6 +904,10 @@ void gwenesis_vdp_write_data_port_16(unsigned int value)
             //vdpm_log(__FUNCTION__,"CRAM write : addr:%x increment:%d value:%04x",
              // address_reg, REG15_DMA_INCREMENT, value);
             CRAM[(address_reg & 0x7f) >> 1] = value;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_CR, (address_reg & 0x7f) >> 1);
+#endif
+
 
             unsigned short pixel;
             //unsigned short pixel_shadow,pixel_highlight;
@@ -870,6 +934,10 @@ void gwenesis_vdp_write_data_port_16(unsigned int value)
             //  address_reg, REG15_DMA_INCREMENT, value);
            // printf("write dataport 16: VSRAM@%04x:%04x\n",address_reg,value);
             VSRAM[(address_reg & 0x7f) >> 1] = value & 0X03FF;
+#ifdef ARGON_MD_SMALL
+MD_VDP_NOTE(MD_RAS_VS, (address_reg & 0x7f) >> 1);
+#endif
+
             address_reg += REG15_DMA_INCREMENT;
             address_reg &= 0xFFFF;
             break;
@@ -899,7 +967,7 @@ void gwenesis_vdp_write_data_port_16(unsigned int value)
  *   Return current VDP Status
  *
  ******************************************************************************/
-unsigned int gwenesis_vdp_get_status()
+MD_HOT unsigned int gwenesis_vdp_get_status()
 {
     return gwenesis_vdp_status;
 }
@@ -913,7 +981,7 @@ unsigned int gwenesis_vdp_get_status()
  *
  ******************************************************************************/
  //static inline 
-unsigned int gwenesis_vdp_read_memory_8(unsigned int address)
+MD_HOT unsigned int gwenesis_vdp_read_memory_8(unsigned int address)
 {
     unsigned int ret = gwenesis_vdp_read_memory_16(address & ~1);
     if (address & 1)
@@ -932,7 +1000,7 @@ unsigned int gwenesis_vdp_read_memory_8(unsigned int address)
  *
  ******************************************************************************/
  //static inline 
-unsigned int gwenesis_vdp_read_memory_16(unsigned int address)
+MD_HOT unsigned int gwenesis_vdp_read_memory_16(unsigned int address)
 {
     
     address &= 0x1F;

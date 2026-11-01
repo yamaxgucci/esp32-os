@@ -36,6 +36,10 @@
 #include "hvc.h"
 
 /* Mark a pattern as dirty */
+#ifdef ARGON_SMS_SMALL
+/* the small build draws tiles straight from VRAM: nothing is cached to mark */
+#define MARK_BG_DIRTY(addr) { (void)(addr); }
+#else
 #define MARK_BG_DIRTY(addr)                         \
 {                                                   \
 	int32_t name = (addr >> 5) & 0x1FF;				\
@@ -46,6 +50,7 @@
 	}												\
 	bg_name_dirty[name] |= (1 << ((addr >> 2) & 7));\
 }
+#endif
 
 /*** Vertical Counter Tables ***/
 extern uint8_t *vc_table[2][3];

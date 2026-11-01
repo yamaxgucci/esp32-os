@@ -17,7 +17,15 @@
 #define _H_YM2612_
 
 #if ARGON_TARGET
+#ifdef ARGON_MD_SMALL
+#define GWENESIS_YM2612_BUF_LEN 32 /* a line's worth, drained every line */
+#else
 #define GWENESIS_YM2612_BUF_LEN 1024
+#endif
+extern int ym2612_base;
+#ifdef ARGON_MD_SMALL
+void ym2612_dac_settle(void);
+#endif
 void YM2612SetSampleDivisor(int div);
 #endif
 
@@ -32,6 +40,9 @@ extern void YM2612ResetChip(void);
 extern void YM2612Write(unsigned int a, unsigned int v, int target);
 extern void ym2612_run(int target);
 extern unsigned int YM2612Read(int target);
+/* The system clock until which the status just read cannot change - the
+ * next overflow of a timer that would set its flag; 0x7fffffff if none. */
+extern int ym2612_status_until(void);
 
 #if 0
 extern int YM2612LoadContext(unsigned char *state);

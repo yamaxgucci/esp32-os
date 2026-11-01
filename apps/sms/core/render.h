@@ -50,6 +50,17 @@ extern void render_shutdown(void);
 extern void render_init(void);
 extern void render_reset(void);
 extern void render_line(int32_t line);
+
+#ifdef ARGON_SMS_SMALL
+/*
+ * The small build has no frame: lines go into a band this many lines tall and
+ * the band goes to the panel when it is full (sms_line_done, in the front end).
+ */
+#define ARGON_SMS_BAND 8
+extern void sms_line_done(int32_t line);
+extern int  sms_line_wanted(int32_t line); /* will this line's band be sent? */
+extern uint32_t sms_line_hash; /* of the line just converted, for the band skip */
+#endif
 extern void render_bg_sms(int32_t line);
 extern void render_obj_sms(int32_t line);
 extern void palette_sync(int32_t index);

@@ -148,7 +148,11 @@ typedef struct
 
 typedef struct 
 {
+#ifdef ARGON_SMS_SMALL
+	uint8_t rom[1];       /* no ColecoVision in the small build */
+#else
 	uint8_t rom[0x2000];  /* BIOS ROM */
+#endif
 	uint8_t pio_mode;     /* PIO mode */
 	uint8_t keypad[2];    /* Keypad inputs */
 } t_coleco;
@@ -171,5 +175,16 @@ extern void mapper_16k_w(uint16_t address, uint8_t data);
 extern int32_t sms_irq_callback(int32_t param);
 
 extern uint8_t *MMapPtrs[64];
+
+#ifdef ARGON_SMS_SMALL
+extern uint8_t *cart_sram(void);
+extern void sms_out_of_memory(const char *what);
+/* Internal memory from the system, when it is needed, not from the process
+ * arena reserved at start (the front end; ag_malloc_caps). */
+extern void *sms_alloc_internal(size_t bytes);
+#define CART_SRAM cart_sram()
+#else
+#define CART_SRAM cart.sram
+#endif
 
 #endif /* _SMS_H_ */

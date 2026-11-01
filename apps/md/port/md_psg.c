@@ -23,7 +23,7 @@ void gwenesis_SN76489_Init(int PSGClockValue, int SamplingRate, int freq_divisor
 {
     (void)SamplingRate;
     (void)freq_divisor;
-    sn76489_init(&s_psg, (uint32_t)PSGClockValue, MD_SOUND_RATE,
+    sn76489_init(&s_psg, (uint32_t)PSGClockValue, md_sound_synth_rate(),
                  SN76489_NOISE_BITS_SMS, SN76489_NOISE_TAPPED_SMS);
     sn76489_set_output_channels(&s_psg, 0xffu);
     psg_sn = s_psg;
@@ -34,7 +34,7 @@ void gwenesis_SN76489_Init(int PSGClockValue, int SamplingRate, int freq_divisor
 
 void gwenesis_SN76489_Reset(void)
 {
-    sn76489_reset(&s_psg, 3579545u, MD_SOUND_RATE, SN76489_NOISE_BITS_SMS,
+    sn76489_reset(&s_psg, 3579545u, md_sound_synth_rate(), SN76489_NOISE_BITS_SMS,
                   SN76489_NOISE_TAPPED_SMS);
     psg_sn = s_psg;
 }

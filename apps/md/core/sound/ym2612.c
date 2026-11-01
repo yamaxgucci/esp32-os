@@ -153,6 +153,16 @@ typedef int16_t INT16;
 typedef int8_t INT8;
 #define INLINE static
 
+/*
+ * Detune steps fit sixteen bits; the CYD keeps them so - half of a 1 KB
+ * table in a machine whose last few kilobytes are what the YM2612 runs in.
+ */
+#ifdef ARGON_MD_SMALL
+typedef INT16 YM_DT_T;
+#else
+typedef INT32 YM_DT_T;
+#endif
+
 
 #define YM2612_DISABLE_LOGGING 1
 
@@ -514,6 +524,20 @@ static const UINT8 lfo_pm_output[7*8][8]={
 
 /* all 128 LFO PM waveforms */
 #if ARGON_TARGET
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD: the LFO's 16 KB go to flash with the code, which the ESP32 reads
+ * only by whole words - so the byte is cut out of its word, volatile, or GCC
+ * folds the index back into a byte load and faults.  The table is only read
+ * while a game has the LFO's vibrato on.
+ */
+#define YM_TAB_PLACE __attribute__((aligned(4), section(MD_TABLE_SECTION)))
+#define YM_LFO_PM(i)                                                         \
+  ((((const volatile UINT32 *)(const void *)lfo_pm_table)[(i) >> 2] >>       \
+    (((i) & 3u) << 3)) & 0xffu)
+#else
+#define YM_LFO_PM(i) (lfo_pm_table[(i)])
+#endif
 /* tl_tab / sin_tab / lfo_pm_table: tools/gen_ym2612_tables.py */
 #include "ym2612_tables_argon.inc"
 #elif GW_TARGET
@@ -535,7 +559,7 @@ static INT32 lfo_pm_table[128*8*32] ;  /* 128 combinations of 7 bits meaningful 
 /* struct describing a single operator (SLOT) */
 typedef struct
 {
-  INT32   *DT;        /* detune          :dt_tab[DT]      */
+  YM_DT_T *DT;        /* detune          :dt_tab[DT]      */
   UINT8   KSR;        /* key scale rate  :3-KSR           */
   UINT32  ar;         /* attack rate                      */
   UINT32  d1r;        /* decay rate                       */
@@ -611,7 +635,7 @@ typedef struct
   INT32   TB;             /* timer b value        */
   INT32   TBL;            /* timer b base         */
   INT32   TBC;            /* timer b counter      */
-  INT32   dt_tab[8][32];  /* DeTune table         */
+  YM_DT_T dt_tab[8][32];  /* DeTune table         */
 
 } FM_ST;
 
@@ -674,7 +698,14 @@ static INT32  out_fm[8];  /* outputs of working channels */
 static UINT32 bitmask;    /* working channels output bitmasking (DAC quantization) */
 
 /* mirror of all OPN registers */
+#ifdef ARGON_MD_SMALL
+/* the CYD keeps no copy of the registers: nothing saves a state there */
+static uint8_t OPNREGS[1];
+#define OPNREGS_KEEP(r, v) ((void)(r), (void)(v))
+#else
 static uint8_t OPNREGS[512];
+#define OPNREGS_KEEP(r, v) (OPNREGS[(r)] = (v))
+#endif
 
 INLINE void FM_KEYON(FM_CH *CH , int s )
 {
@@ -818,19 +849,34 @@ INLINE void CSMKeyControll(FM_CH *CH)
   ym2612.OPN.SL3.key_csm = 1;
 }
 
+/*
+ * The timers count the system clock, not samples.
+ *
+ * A tick of timer A is one of the chip's own samples, 1008 system clocks
+ * (the clock / 7 / 144) - upstream's divisor (AUDIO_FREQ_DIVISOR, 1009) made
+ * one sample one tick, and the counters were decremented by one a sample.
+ * ArgonOS makes 22050 samples a second (11025 on the CYD), and the timers ran
+ * 2.4 (4.8) times slow: the music of every driver timed by them - GEMS, ECCO,
+ * Thunder Force IV - at a fraction of its tempo (31 Oct 2026).  So TAC and
+ * TBC hold system clocks, and each sample takes away its divisor's worth.
+ */
+#define YM_TIMER_CLK AUDIO_FREQ_DIVISOR
+
 INLINE void INTERNAL_TIMER_A()
 {
   if (ym2612.OPN.ST.mode & 0x01)
   {
-    ym2612.OPN.ST.TAC--;
+    ym2612.OPN.ST.TAC -= (INT32)ym2612.divisor;
     if (ym2612.OPN.ST.TAC <= 0)
     {
       /* set status (if enabled) */
       if (ym2612.OPN.ST.mode & 0x04)
         ym2612.OPN.ST.status |= 0x01;
 
-      /* reload the counter */
-      ym2612.OPN.ST.TAC = ym2612.OPN.ST.TAL;
+      /* reload the counter, keeping what the sample went past it by */
+      do
+        ym2612.OPN.ST.TAC += ym2612.OPN.ST.TAL * YM_TIMER_CLK;
+      while (ym2612.OPN.ST.TAC <= 0);
 
       /* CSM mode auto key on */
       if ((ym2612.OPN.ST.mode & 0xC0) == 0x80)
@@ -843,18 +889,17 @@ INLINE void INTERNAL_TIMER_B(int step)
 {
   if (ym2612.OPN.ST.mode & 0x02)
   {
-    ym2612.OPN.ST.TBC-=step;
+    ym2612.OPN.ST.TBC -= step * (INT32)ym2612.divisor;
     if (ym2612.OPN.ST.TBC <= 0)
     {
       /* set status (if enabled) */
       if (ym2612.OPN.ST.mode & 0x08)
         ym2612.OPN.ST.status |= 0x02;
 
-      /* reload the counter */
-      if (ym2612.OPN.ST.TBL)
-        ym2612.OPN.ST.TBC += ym2612.OPN.ST.TBL;
-      else
-        ym2612.OPN.ST.TBC = ym2612.OPN.ST.TBL;
+      /* reload the counter (TBL is never 0: (256 - TB) << 4) */
+      do
+        ym2612.OPN.ST.TBC += ym2612.OPN.ST.TBL * YM_TIMER_CLK;
+      while (ym2612.OPN.ST.TBC <= 0);
     }
   }
 }
@@ -890,9 +935,9 @@ INLINE void set_timers(int v )
 
   /* reload Timers */
   if ((v&1) && !(ym2612.OPN.ST.mode&1))
-    ym2612.OPN.ST.TAC = ym2612.OPN.ST.TAL;
+    ym2612.OPN.ST.TAC = ym2612.OPN.ST.TAL * YM_TIMER_CLK;
   if ((v&2) && !(ym2612.OPN.ST.mode&2))
-    ym2612.OPN.ST.TBC = ym2612.OPN.ST.TBL;
+    ym2612.OPN.ST.TBC = ym2612.OPN.ST.TBL * YM_TIMER_CLK;
 
   /* reset Timers flags */
   ym2612.OPN.ST.status &= (~v >> 4);
@@ -1333,7 +1378,7 @@ INLINE void update_phase_lfo_slot(FM_SLOT *SLOT, INT32 pms, UINT32 block_fnum)
 {
 
 #if GW_TARGET
-  INT32 lfo_fn_table_index_offset = lfo_pm_table[(((block_fnum & 0x7f0) >> 4) << 7) + pms  + (ym2612.OPN.LFO_PM & 0xF)];
+  INT32 lfo_fn_table_index_offset = YM_LFO_PM((((block_fnum & 0x7f0) >> 4) << 7) + pms  + (ym2612.OPN.LFO_PM & 0xF));
   if ( ym2612.OPN.LFO_PM & 0x10) lfo_fn_table_index_offset = - lfo_fn_table_index_offset;
 #else
   INT32 lfo_fn_table_index_offset = lfo_pm_table[(((block_fnum & 0x7f0) >> 4) << 8) + pms + ym2612.OPN.LFO_PM];
@@ -1370,7 +1415,7 @@ INLINE void update_phase_lfo_channel(FM_CH *CH)
   UINT32 block_fnum = CH->block_fnum;
 
 #if GW_TARGET
-    INT32 lfo_fn_table_index_offset = lfo_pm_table[(((block_fnum & 0x7f0) >> 4) << 7) + CH->pms + (ym2612.OPN.LFO_PM & 0xF)];
+    INT32 lfo_fn_table_index_offset = YM_LFO_PM((((block_fnum & 0x7f0) >> 4) << 7) + CH->pms + (ym2612.OPN.LFO_PM & 0xF));
   if ( ym2612.OPN.LFO_PM & 0x10) lfo_fn_table_index_offset = - lfo_fn_table_index_offset;
 #else
   INT32 lfo_fn_table_index_offset = lfo_pm_table[(((block_fnum & 0x7f0) >> 4) << 8) + CH->pms + ym2612.OPN.LFO_PM];
@@ -1475,22 +1520,50 @@ INLINE void refresh_fc_eg_chan(FM_CH *CH )
 
 #define volume_calc(OP) ((OP)->vol_out + (AM & (OP)->AMmask))
 
-INLINE signed int op_calc(UINT32 phase, unsigned int env, unsigned int pm)
+#if ARGON_TARGET && defined(ARGON_MD_SMALL)
+/*
+ * The CYD keeps 1 KB of tables where the chip's model keeps 30 (see
+ * tools/gen_ym2612_tables.py, which checks every index): the sine as a
+ * quarter wave, mirrored, its sign in bit 9; and the power table as one row,
+ * shifted right by the octave in bits 9-12, its sign in bit 0.
+ */
+INLINE UINT32 ym_sin(UINT32 i)
 {
-  UINT32 p = (env<<3) + sin_tab[ ( (phase >> SIN_BITS) + (pm >> 1) ) & SIN_MASK ];
+  UINT32 k = i & 511u;
+  if (k & 256u)
+    k = 511u - k;
+  return ((UINT32)sin_quarter[k] << 1) | ((i >> 9) & 1u);
+}
 
+INLINE signed int ym_tl(UINT32 p)
+{
+  if (p >= TL_TAB_LEN)
+    return 0;
+  const signed int v = (signed int)(tl_row[(p & 511u) >> 1] >> (p >> 9));
+  return (p & 1u) ? -v : v;
+}
+#else
+#define ym_sin(i) (sin_tab[(i)])
+INLINE signed int ym_tl(UINT32 p)
+{
   if (p >= TL_TAB_LEN)
     return 0;
   return tl_tab[p];
 }
+#endif
+
+INLINE signed int op_calc(UINT32 phase, unsigned int env, unsigned int pm)
+{
+  UINT32 p = (env<<3) + ym_sin( ( (phase >> SIN_BITS) + (pm >> 1) ) & SIN_MASK );
+
+  return ym_tl(p);
+}
 
 INLINE signed int op_calc1(UINT32 phase, unsigned int env, unsigned int pm)
 {
-  UINT32 p = (env<<3) + sin_tab[ ( (phase + pm ) >> SIN_BITS ) & SIN_MASK ];
+  UINT32 p = (env<<3) + ym_sin( ( (phase + pm ) >> SIN_BITS ) & SIN_MASK );
 
-  if (p >= TL_TAB_LEN)
-    return 0;
-  return tl_tab[p];
+  return ym_tl(p);
 }
 
 INLINE void chan_calc(FM_CH *CH, int num)
@@ -1576,7 +1649,7 @@ INLINE void OPNWriteMode(int r, int v)
   UINT8 c;
   FM_CH *CH;
 
-  OPNREGS[r] = v;
+  OPNREGS_KEEP(r, v);
 
   switch(r){
     case 0x21:  /* Test */
@@ -1633,7 +1706,7 @@ INLINE void OPNWriteReg(int r, int v)
   FM_CH *CH;
   FM_SLOT *SLOT;
 
-  OPNREGS[r] = v;
+  OPNREGS_KEEP(r, v);
 
   UINT8 c = OPN_CHAN(r);
 
@@ -1963,7 +2036,7 @@ static void init_tables(void)
   {
     for (i = 0;i <= 31;i++)
     {
-      ym2612.OPN.ST.dt_tab[d][i]   = (INT32) dt_tab[d*32 + i];
+      ym2612.OPN.ST.dt_tab[d][i]   = (YM_DT_T) dt_tab[d*32 + i];
       ym2612.OPN.ST.dt_tab[d+4][i] = -ym2612.OPN.ST.dt_tab[d][i];
     }
   }
@@ -2026,8 +2099,67 @@ void YM2612ResetChip(void)
 }
 
 /* YM2612 execution */
-/* Generate samples for ym2612 */
-static inline void YM2612Update(int16_t *buffer, int length)
+/*
+ * Generate samples for ym2612.  On the CYD from flash: in the hot part it took
+ * 5.2 ms of a frame against 7.3 at 22 kHz, but 4.4 KB of IRAM the Z80's RAM
+ * needed more, and at the 11 kHz the CYD runs the chips at the difference is
+ * about 0.6 ms (30 Oct 2026).
+ */
+#ifdef ARGON_MD_SMALL
+/*
+ * The DAC's samples, queued by the sample they take effect at, and put in
+ * place by the update as it reaches them.
+ *
+ * A drum is the Z80 writing the DAC a few hundred times a frame, and each
+ * write used to catch the chip up to its own time first: an update for one
+ * sample or none, whose start refreshes all six channels - from flash on the
+ * CYD.  That was most of the Z80's 8 ms a frame (Sonic, 30 Oct 2026).  Queued,
+ * the update runs in its batches and each DAC value still lands on the
+ * sample it was written for.
+ */
+#define YM_DACQ 64
+static uint16_t s_dacq_at[YM_DACQ];
+static int16_t  s_dacq_v[YM_DACQ];
+static int      s_dacq_n, s_dacq_head;
+static int      s_upd_at; /* the frame's sample the running update makes */
+
+MD_HOT static void ym_dac_write(unsigned int v, int target)
+{
+  const int at = target / (int)ym2612.divisor;
+  const int out = ((int)v - 0x80) << 6;
+  if (at <= ym2612_index || s_dacq_n == YM_DACQ) {
+    /* already made, or the queue is full: as before */
+    ym2612_run(target);
+    ym2612.dacout = out;
+    return;
+  }
+  const int k = (s_dacq_head + s_dacq_n) % YM_DACQ;
+  s_dacq_at[k] = (uint16_t)at;
+  s_dacq_v[k] = (int16_t)out;
+  s_dacq_n++;
+}
+
+/* A frame's end: what is left in the queue takes effect now. */
+void ym2612_dac_settle(void)
+{
+  while (s_dacq_n > 0) {
+    ym2612.dacout = s_dacq_v[s_dacq_head];
+    s_dacq_head = (s_dacq_head + 1) % YM_DACQ;
+    s_dacq_n--;
+  }
+}
+
+#define YM_DAC_DUE(i)                                                        \
+  while (s_dacq_n > 0 && (int)s_dacq_at[s_dacq_head] <= s_upd_at + (i)) {     \
+    ym2612.dacout = s_dacq_v[s_dacq_head];                                   \
+    s_dacq_head = (s_dacq_head + 1) % YM_DACQ;                               \
+    s_dacq_n--;                                                              \
+  }
+#else
+#define YM_DAC_DUE(i)
+#endif
+
+static void YM2612Update(int16_t *buffer, int length)
 {
   int i;
   int lt;
@@ -2071,6 +2203,7 @@ static inline void YM2612Update(int16_t *buffer, int length)
     update_ssg_eg_channels(&ym2612.CH[0]);
 
     /* calculate FM */
+    YM_DAC_DUE(i)
     if (!ym2612.dacen)
     {
       chan_calc(&ym2612.CH[0],6);
@@ -2177,12 +2310,22 @@ void ym2612_run( int target) {
   int ym2612_prev_index = ym2612_index;
   ym2612_index += (target-ym2612_clock) / ym2612.divisor;
 #if ARGON_TARGET
-  if (ym2612_index > GWENESIS_YM2612_BUF_LEN) {
-    ym2612_index = GWENESIS_YM2612_BUF_LEN;
+  /* ym2612_base: the frame's sample that sits at the buffer's start - moved
+   * up by md_ym_render when it has taken everything, so the buffer holds a
+   * line's samples rather than a frame's */
+  if (ym2612_index - ym2612_base > GWENESIS_YM2612_BUF_LEN) {
+    ym2612_index = ym2612_base + GWENESIS_YM2612_BUF_LEN;
   }
 #endif
   if (ym2612_index > ym2612_prev_index) {
+#ifdef ARGON_MD_SMALL
+    s_upd_at = ym2612_prev_index;
+#endif
+#if ARGON_TARGET
+    YM2612Update(gwenesis_ym2612_buffer + (ym2612_prev_index - ym2612_base), ym2612_index-ym2612_prev_index);
+#else
     YM2612Update(gwenesis_ym2612_buffer + ym2612_prev_index, ym2612_index-ym2612_prev_index);
+#endif
     ym2612_clock = ym2612_index*ym2612.divisor;
 
   } else {
@@ -2194,15 +2337,51 @@ void ym2612_run( int target) {
 /* n = number  */
 /* a = address */
 /* v = value   */
+#ifdef ARGON_MD_SMALL
+/*
+ * The CYD: an address and the DAC's data - what a drum writes - from the hot
+ * part; anything else goes on to the whole write path in flash.
+ */
+__attribute__((noinline)) static void YM2612WriteAll(unsigned int a, unsigned int v, int target);
+
+MD_HOT void YM2612Write(unsigned int a, unsigned int v, int target)
+{
+  v &= 0xff;
+  if (a == 0 || a == 2) {
+    ym2612.OPN.ST.address = (a == 2) ? (v | 0x100) : v;
+    return;
+  }
+  if (ym2612.OPN.ST.address == 0x2a) {
+    ym_dac_write(v, target);
+    return;
+  }
+  YM2612WriteAll(a, v, target);
+}
+
+static void YM2612WriteAll(unsigned int a, unsigned int v,  int target)
+#else
 void YM2612Write(unsigned int a, unsigned int v,  int target)
+#endif
 {
   ym_log(__FUNCTION__," %06x : %02x",a,v);
 
+  v &= 0xff;  /* adjust to 8 bit bus */
+
+#ifdef ARGON_MD_SMALL
+  /* an address changes no output: no catching up for it; the DAC's data is
+   * queued for the sample it belongs to (ym_dac_write) */
+  if (a == 0 || a == 2) {
+    ym2612.OPN.ST.address = (a == 2) ? (v | 0x100) : v;
+    return;
+  }
+  if (ym2612.OPN.ST.address == 0x2a) {
+    ym_dac_write(v, target);
+    return;
+  }
+#endif
   //Sync
   if (GWENESIS_AUDIO_ACCURATE == 1)
-    ym2612_run(target); 
-
-  v &= 0xff;  /* adjust to 8 bit bus */
+    ym2612_run(target);
 
   switch( a )
   {
@@ -2253,6 +2432,30 @@ unsigned int YM2612Read(int target)
     ym2612_run(target);
   ym_log(__FUNCTION__, "%02x",ym2612.OPN.ST.status & 0xff);
   return ym2612.OPN.ST.status & 0xff;
+}
+
+/*
+ * After a read: when its answer could next be different.  Only a timer's
+ * overflow sets a flag (a write that clears one is the Z80's own, and the
+ * busy flag is not emulated); a timer's counter goes down by the divisor a
+ * sample, so it overflows on the sample that takes it to 0 or below - made
+ * once the chip is run to that sample's clock.
+ */
+int ym2612_status_until(void)
+{
+  const int d = (int)ym2612.divisor;
+  int k = 0x7fffffff;
+  if ((ym2612.OPN.ST.mode & 0x05) == 0x05 && !(ym2612.OPN.ST.status & 0x01)) {
+    const int a = (ym2612.OPN.ST.TAC + d - 1) / d;
+    if (a < k) k = a;
+  }
+  if ((ym2612.OPN.ST.mode & 0x0a) == 0x0a && !(ym2612.OPN.ST.status & 0x02)) {
+    const int b = (ym2612.OPN.ST.TBC + d - 1) / d;
+    if (b < k) k = b;
+  }
+  if (k == 0x7fffffff) return k;
+  if (k < 1) k = 1;
+  return ym2612_clock + k * d;
 }
 
 

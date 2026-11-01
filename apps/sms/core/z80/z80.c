@@ -124,6 +124,10 @@
  * gwenesis host API also owns the name z80_execute(target), so this TU's
  * relative-cycle entry is renamed.
  */
+#if defined(ARGON_SMS_SMALL)
+/* The CYD build: this is the hot loop, and -Os costs it more than size buys. */
+#pragma GCC optimize("O2")
+#endif
 #include <stdint.h>
 #include <string.h>
 #include "z80.h"
@@ -137,15 +141,43 @@ void    argon_z80_write(uint16_t address, uint8_t data);
 
 #undef INLINE
 #define INLINE static __inline__
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL) && !defined(MD_Z80_NOINLINE)
+/*
+ * The CYD: the small helpers always into their callers.  Left to the compiler
+ * (-Os for the image), the byte fetch (arg), the memory write (wm), the word
+ * fetch and the like stayed functions of their own - several windowed calls
+ * an instruction, into flash: 423 cycles an instruction on a quiet core
+ * (`z80bench`, 31 Oct 2026).  Every handler always inlined as well is more
+ * than the compiler has memory for.
+ */
+#define MD_AI static inline __attribute__((always_inline))
+#else
+#define MD_AI INLINE
+#endif
 
 Z80_Regs Z80;
+
+#ifdef ARGON_MD_Z80
+/*
+ * Counts everything the Z80 does that a pass of a wait loop may not do: a
+ * write (memory, a chip, a port, the stack), and a read whose answer is not
+ * fixed for the slice (a port, LD A,R, the YM's status - md_z80.c counts
+ * that one).  md_z80_spin compares it from one pass to the next.
+ */
+uint32_t md_z80_touch;
+#define MD_TOUCH() (md_z80_touch++)
+#else
+#define MD_TOUCH() ((void)0)
+#endif
 
 int32_t z80_cycle_count = 0;        /* running total of cycles executed */
 static int32_t z80_exec = 0;
 static int32_t z80_requested_cycles = 0;
 
+#ifndef ARGON_MD_Z80 /* the Mega Drive reads through argon_z80_read */
 uint8_t *cpu_readmap[64];
 uint8_t *cpu_writemap[64];
+#endif
 
 void (*cpu_writemem16)(uint16_t address, uint8_t data);
 void (*cpu_writeport16)(uint16_t port, uint8_t data);
@@ -156,7 +188,23 @@ uint8_t (*cpu_readport16)(uint16_t port);
    the CMOS Z80, so until knowing (most) Z80 types on hardware, it's disabled */
 #define HAS_LDAIR_QUIRK     0
 
-#ifdef ARGON_MD_Z80
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+/*
+ * The CYD: its own RAM read here, out of the pages, rather than by a call
+ * into md_z80.c for every byte - the opcode fetch is one of those, and a
+ * sound driver's loop is nothing but its own RAM.
+ */
+#include "md_pages.h"
+static inline __attribute__((always_inline)) uint8_t md_z80_rd(uint32_t a)
+{
+	if (a < 0x4000u)
+		return md_zram[(a & 0x1fffu) >> MD_PAGE_SHIFT][a & MD_PAGE_MASK];
+	return argon_z80_read((uint16_t)a);
+}
+#define cpu_readmem16(a) md_z80_rd((uint32_t)(a))
+#define cpu_readop(a) md_z80_rd((uint32_t)(a))
+#define cpu_readop_arg(a) md_z80_rd((uint32_t)(a))
+#elif defined(ARGON_MD_Z80)
 #define cpu_readmem16(a) argon_z80_read((uint16_t)(a))
 #define cpu_readop(a) argon_z80_read((uint16_t)(a))
 #define cpu_readop_arg(a) argon_z80_read((uint16_t)(a))
@@ -226,16 +274,119 @@ uint8_t (*cpu_readport16)(uint16_t port);
 #define WZ_H    Z80.wz.b.h
 #define WZ_L    Z80.wz.b.l
 
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+/*
+ * The CYD's Mega Drive: these five tables are 1.3 KB of internal memory the
+ * picture needs, and each entry is a few instructions to work out - so they
+ * are worked out (the same values z80_init filled the tables with).
+ */
+static inline uint8_t md_sz(unsigned v)
+{
+    v &= 0xFFu;
+    return (uint8_t)((v ? (v & SF) : ZF) | (v & (YF | XF)));
+}
+static inline uint8_t md_sz_bit(unsigned v)
+{
+    v &= 0xFFu;
+    return (uint8_t)((v ? (v & SF) : (ZF | PF)) | (v & (YF | XF)));
+}
+static inline uint8_t md_szp(unsigned v)
+{
+    unsigned x = v & 0xFFu;
+    x ^= x >> 4;
+    return (uint8_t)(md_sz(v) | (((0x6996u >> (x & 0x0Fu)) & 1u) ? 0 : PF));
+}
+static inline uint8_t md_szhv_inc(unsigned v)
+{
+    v &= 0xFFu;
+    return (uint8_t)(md_sz(v) | (v == 0x80u ? VF : 0) | ((v & 0x0Fu) == 0 ? HF : 0));
+}
+static inline uint8_t md_szhv_dec(unsigned v)
+{
+    v &= 0xFFu;
+    return (uint8_t)(md_sz(v) | NF | (v == 0x7Fu ? VF : 0) |
+                     ((v & 0x0Fu) == 0x0Fu ? HF : 0));
+}
+#define MD_Z80_FLAG_FORMULAS 1
+#define Z80_FLAGS(table, formula, v) formula(v)
+#else
+#define Z80_FLAGS(table, formula, v) table[v]
 static uint8_t SZ[256];       /* zero and sign flags */
 static uint8_t SZ_BIT[256];   /* zero, sign and parity/overflow (=zero) flags for BIT opcode */
 static uint8_t SZP[256];      /* zero, sign and parity flags */
 static uint8_t SZHV_inc[256]; /* zero, sign, half carry and overflow flags INC r8 */
 static uint8_t SZHV_dec[256]; /* zero, sign, half carry and overflow flags DEC r8 */
+#endif
 
+#ifndef ARGON_SMS_SMALL
 static uint8_t SZHVC_add[2*256*256];
 static uint8_t SZHVC_sub[2*256*256];
+#else
+/*
+ * ArgonOS, small build (the CYD, 320 KB of SRAM and no PSRAM): the two tables
+ * above are 256 KB, more than the board has free, so the flags of ADD, ADC,
+ * SUB, SBC and CP are computed instead - the same bits the tables are built
+ * from in z80_init, in a handful of instructions.  a is A before, v the
+ * operand, full the unmasked result.
+ */
+static inline uint8_t flags_add(uint32_t a, uint32_t v, uint32_t full)
+{
+	const uint32_t res = full & 0xff;
+	return (uint8_t)(Z80_FLAGS(SZ, md_sz, res) | ((a ^ v ^ res) & HF) | ((full >> 8) & CF) |
+	                 (((~(a ^ v)) & (a ^ res) & 0x80) >> 5));
+}
 
-static const uint8_t cc_op[0x100] = {
+static inline uint8_t flags_sub(uint32_t a, uint32_t v, uint32_t full)
+{
+	const uint32_t res = full & 0xff;
+	return (uint8_t)(NF | Z80_FLAGS(SZ, md_sz, res) | ((a ^ v ^ res) & HF) | ((full >> 8) & CF) |
+	                 (((a ^ v) & (a ^ res) & 0x80) >> 5));
+}
+#endif
+
+/*
+ * The CYD: the cycle tables are read a byte at a time, and 1.5 KB of internal
+ * memory is worth more there than one shift per instruction - so in the small
+ * build they sit in flash with the code, which the ESP32 reads only by whole
+ * words, and the byte is cut out of its word (volatile, or GCC folds a
+ * constant index back into a byte load).
+ */
+#if defined(ARGON_SMS_SMALL) && !defined(AG_BUILTIN)
+#ifdef MD_TABLE_SECTION   /* the Mega Drive's build says which part (md_cfg.h) */
+#define Z80_CC_PLACE __attribute__((aligned(4), section(MD_TABLE_SECTION)))
+#else
+#define Z80_CC_PLACE __attribute__((aligned(4), section(".hot_rodata")))
+#endif
+/*
+ * A whole word, and the byte cut out of it - loaded by an instruction the
+ * compiler cannot narrow, rather than through a volatile pointer: volatile
+ * put a memory barrier (memw) in every instruction the Z80 ran.
+ */
+static inline __attribute__((always_inline)) uint32_t md_cc_byte(const uint8_t *t, uint32_t op)
+{
+	uint32_t w;
+#ifdef __XTENSA__
+	__asm__("l32i %0, %1, 0" : "=r"(w) : "r"((const uint32_t *)(const void *)t + (op >> 2)));
+#else
+	w = ((const uint32_t *)(const void *)t)[op >> 2];
+#endif
+	return (w >> ((op & 3u) << 3)) & 0xffu;
+}
+#define CC_OF(t, op) md_cc_byte(cc[t], (op))
+/*
+ * The two every instruction reads - its own cycles, and a taken jump's,
+ * call's or return's extra - with the hot part: read out of flash through the
+ * instruction bus they made the fast loop's instruction ~300 cycles
+ * (`z80bench`, 31 Oct 2026).
+ */
+#define Z80_CC_HOT __attribute__((aligned(4), section(".hot_rodata")))
+#else
+#define Z80_CC_HOT
+#define Z80_CC_PLACE
+#define CC_OF(t, op) (cc[t][op])
+#endif
+
+static Z80_CC_HOT const uint8_t cc_op[0x100] = {
 	4,10, 7, 6, 4, 4, 7, 4, 4,11, 7, 6, 4, 4, 7, 4,
 	8,10, 7, 6, 4, 4, 7, 4,12,11, 7, 6, 4, 4, 7, 4,
 	7,10,16, 6, 4, 4, 7, 4, 7,11,16, 6, 4, 4, 7, 4,
@@ -254,7 +405,7 @@ static const uint8_t cc_op[0x100] = {
 	5,10,10, 4,10,11, 7,11, 5, 6,10, 4,10, 0, 7,11      /* fd -> cc_xy */
 };
 
-static const uint8_t cc_cb[0x100] = {
+static Z80_CC_PLACE const uint8_t cc_cb[0x100] = {
 	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
 	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
 	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
@@ -273,7 +424,7 @@ static const uint8_t cc_cb[0x100] = {
 	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8
 };
 
-static const uint8_t cc_ed[0x100] = {
+static Z80_CC_PLACE const uint8_t cc_ed[0x100] = {
 	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
 	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
 	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
@@ -293,7 +444,7 @@ static const uint8_t cc_ed[0x100] = {
 };
 
 /* ix/iy: with the exception of (i+offset) opcodes, t-states are main_opcode_table + 4 */
-static const uint8_t cc_xy[0x100] = {
+static Z80_CC_PLACE const uint8_t cc_xy[0x100] = {
 	4+4,10+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4, 4+4,11+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4,
 	8+4,10+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4,12+4,11+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4,
 	7+4,10+4,16+4, 6+4, 4+4, 4+4, 7+4, 4+4, 7+4,11+4,16+4, 6+4, 4+4, 4+4, 7+4, 4+4,
@@ -312,7 +463,7 @@ static const uint8_t cc_xy[0x100] = {
 	5+4,10+4,10+4, 4+4,10+4,11+4, 7+4,11+4, 5+4, 6+4,10+4, 4+4,10+4, 4  , 7+4,11+4      /* fd -> cc_xy again */
 };
 
-static const uint8_t cc_xycb[0x100] = {
+static Z80_CC_PLACE const uint8_t cc_xycb[0x100] = {
 23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
 23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
 23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
@@ -332,7 +483,7 @@ static const uint8_t cc_xycb[0x100] = {
 };
 
 /* extra cycles if jr/jp/call taken and 'interrupt latency' on rst 0-7 */
-static const uint8_t cc_ex[0x100] = {
+static Z80_CC_HOT const uint8_t cc_ex[0x100] = {
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* DJNZ */
 	5, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, /* JR NZ/JR Z */
@@ -464,6 +615,7 @@ PROTOTYPES(Z80ed,ed);
 PROTOTYPES(Z80fd,fd);
 PROTOTYPES(Z80xycb,xycb);
 
+
 /***************************************************************
  * define an opcode function
  ***************************************************************/
@@ -472,7 +624,25 @@ PROTOTYPES(Z80xycb,xycb);
 /***************************************************************
  * adjust cycle count by n T-states
  ***************************************************************/
-#define CC(prefix,opcode) do { Z80.icount -= cc[Z80_TABLE_##prefix][opcode]; } while (0)
+#define CC(prefix,opcode) do { Z80.icount -= CC_OF(Z80_TABLE_##prefix, opcode); } while (0)
+
+/***************************************************************
+ * -DMD_HOST_ZCOUNT (host harness): every instruction counted by its
+ * prefix and opcode, md_zcount[prefix * 256 + opcode]
+ ***************************************************************/
+#ifdef MD_HOST_ZCOUNT
+#define MD_ZC_op   0
+#define MD_ZC_cb   1
+#define MD_ZC_dd   2
+#define MD_ZC_ed   3
+#define MD_ZC_fd   4
+#define MD_ZC_xycb 5
+unsigned long long md_zcount[6 * 256];
+unsigned long long md_zpc[65536];
+#define MD_ZCOUNT(prefix,opcode) (md_zcount[MD_ZC_##prefix * 256 + (opcode)]++, (MD_ZC_##prefix == 0 ? md_zpc[(uint16_t)PRVPC]++ : 0))
+#else
+#define MD_ZCOUNT(prefix,opcode) ((void)0)
+#endif
 
 /***************************************************************
  * execute an opcode
@@ -480,6 +650,7 @@ PROTOTYPES(Z80xycb,xycb);
 #define EXEC(prefix,opcode) do { \
 	uint32_t op = opcode; \
 	CC(prefix,op); \
+	MD_ZCOUNT(prefix,op); \
 	switch(op) \
 	{  \
 	case 0x00:prefix##_##00();break; case 0x01:prefix##_##01();break; case 0x02:prefix##_##02();break; case 0x03:prefix##_##03();break; \
@@ -552,7 +723,7 @@ PROTOTYPES(Z80xycb,xycb);
 /***************************************************************
  * Enter halt state; write 1 to fake port on first execution
  ***************************************************************/
-INLINE void halt()
+MD_AI void halt()
 {
 	if (!Z80.halt) Z80.halt = 1;
 }
@@ -560,7 +731,7 @@ INLINE void halt()
 /***************************************************************
  * Leave halt state; write 0 to fake port
  ***************************************************************/
-INLINE void leave_halt()
+MD_AI void leave_halt()
 {
 	if (Z80.halt) Z80.halt = 0;
 }
@@ -568,23 +739,25 @@ INLINE void leave_halt()
 /***************************************************************
  * Input a byte from given I/O port
  ***************************************************************/
-INLINE uint8_t in(uint16_t port)
+MD_AI uint8_t in(uint16_t port)
 {
+	MD_TOUCH();
 	return (uint8_t)cpu_readport16(port);
 }
 
 /***************************************************************
  * Output a byte to given I/O port
  ***************************************************************/
-INLINE void out(uint16_t port, uint8_t value)
+MD_AI void out(uint16_t port, uint8_t value)
 {
+	MD_TOUCH();
 	cpu_writeport16(port, value);
 }
 
 /***************************************************************
  * Read a byte from given memory location
  ***************************************************************/
-INLINE uint8_t rm(uint32_t addr)
+MD_AI uint8_t rm(uint32_t addr)
 {
 	return (uint8_t)cpu_readmem16(addr);
 }
@@ -599,9 +772,39 @@ INLINE uint8_t rm(uint32_t addr)
 /***************************************************************
  * Write a byte to given memory location
  ***************************************************************/
-INLINE void wm(uint32_t addr, uint8_t value)
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+/*
+ * One copy of the write, called: inlined, it was in every push, call and
+ * store of the fast loop, and that loop has to fit in the hot part.  Its own
+ * RAM written in place (as argon_z80_write would); the same value into it
+ * again changes nothing - Road Rash II's wait loop stores a 1 on every pass
+ * (md_z80_spin).
+ */
+MD_HOT __attribute__((noinline)) static void md_z80_wm(uint32_t addr, uint8_t value)
 {
+	if (addr < 0x4000u)
+	{
+		uint8_t *const p = &md_zram[(addr & 0x1fffu) >> MD_PAGE_SHIFT][addr & MD_PAGE_MASK];
+		if (*p != value)
+		{
+			MD_TOUCH();
+			*p = value;
+		}
+		return;
+	}
+	MD_TOUCH();
 	cpu_writemem16(addr, value);
+}
+#endif
+
+MD_AI void wm(uint32_t addr, uint8_t value)
+{
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+	md_z80_wm(addr, value);
+#else
+	MD_TOUCH();
+	cpu_writemem16(addr, value);
+#endif
 }
 
 /***************************************************************
@@ -616,7 +819,7 @@ INLINE void wm(uint32_t addr, uint8_t value)
  * reading opcodes. In case of system with memory mapped I/O,
  * this function can be used to greatly speed up emulation
  ***************************************************************/
-INLINE uint8_t rop()
+MD_AI uint8_t rop()
 {
 	uint32_t pc = PCD;
 	PC++;
@@ -629,14 +832,14 @@ INLINE uint8_t rop()
  * support systems that use different encoding mechanisms for
  * opcodes and opcode arguments
  ***************************************************************/
-INLINE uint8_t arg()
+MD_AI uint8_t arg()
 {
 	uint32_t pc = PCD;
 	PC++;
 	return cpu_readop_arg(pc);
 }
 
-INLINE uint16_t arg16()
+MD_AI uint16_t arg16()
 {
 	uint32_t pc = PCD;
 	PC += 2;
@@ -647,13 +850,13 @@ INLINE uint16_t arg16()
  * Calculate the effective address EA of an opcode using
  * IX+offset resp. IY+offset addressing.
  ***************************************************************/
-INLINE void eax()
+MD_AI void eax()
 {
 	Z80.ea = (uint16_t)(IX + (int8_t)arg());
 	WZ = Z80.ea;
 }
 
-INLINE void eay()
+MD_AI void eay()
 {
 	Z80.ea = (uint16_t)(IY + (int8_t)arg());
 	WZ = Z80.ea;
@@ -677,7 +880,7 @@ INLINE void eay()
 /***************************************************************
  * JP
  ***************************************************************/
-INLINE void jp(void)
+MD_AI void jp(void)
 {
 	PCD = arg16();
 	WZ = PCD;
@@ -686,7 +889,7 @@ INLINE void jp(void)
 /***************************************************************
  * JP_COND
  ***************************************************************/
-INLINE void jp_cond(uint32_t cond)
+MD_AI void jp_cond(uint32_t cond)
 {
 	if (cond)
 	{
@@ -702,7 +905,7 @@ INLINE void jp_cond(uint32_t cond)
 /***************************************************************
  * JR
  ***************************************************************/
-INLINE void jr()
+MD_AI void jr()
 {
 	int8_t a = (int8_t)arg();    /* arg() also increments PC */
 	PC += a;             /* so don't do PC += arg() */
@@ -712,7 +915,7 @@ INLINE void jr()
 /***************************************************************
  * JR_COND
  ***************************************************************/
-INLINE void jr_cond(uint32_t cond, uint8_t opcode)
+MD_AI void jr_cond(uint32_t cond, uint8_t opcode)
 {
 	if (cond)
 	{
@@ -726,7 +929,7 @@ INLINE void jr_cond(uint32_t cond, uint8_t opcode)
 /***************************************************************
  * CALL
  ***************************************************************/
-INLINE void call()
+MD_AI void call()
 {
 	Z80.ea = arg16();
 	WZ = Z80.ea;
@@ -737,7 +940,7 @@ INLINE void call()
 /***************************************************************
  * CALL_COND
  ***************************************************************/
-INLINE void call_cond(uint32_t cond, uint8_t opcode)
+MD_AI void call_cond(uint32_t cond, uint8_t opcode)
 {
 	if (cond)
 	{
@@ -756,7 +959,7 @@ INLINE void call_cond(uint32_t cond, uint8_t opcode)
 /***************************************************************
  * RET_COND
  ***************************************************************/
-INLINE void ret_cond(uint32_t cond, uint8_t opcode)
+MD_AI void ret_cond(uint32_t cond, uint8_t opcode)
 {
 	if (cond)
 	{
@@ -789,7 +992,7 @@ INLINE void reti()
 /***************************************************************
  * LD   R,A
  ***************************************************************/
-INLINE void ld_r_a()
+MD_AI void ld_r_a()
 {
 	Z80.r = A;
 	Z80.r2 = A & 0x80;            /* keep bit 7 of r */
@@ -800,15 +1003,16 @@ INLINE void ld_r_a()
  ***************************************************************/
 INLINE void ld_a_r()
 {
+	MD_TOUCH();
 	A = (Z80.r & 0x7f) | Z80.r2;
-	F = (F & CF) | SZ[A] | (Z80.iff2 << 2);
+	F = (F & CF) | Z80_FLAGS(SZ, md_sz, A) | (Z80.iff2 << 2);
 	Z80.after_ldair = 1;
 }
 
 /***************************************************************
  * LD   I,A
  ***************************************************************/
-INLINE void ld_i_a()
+MD_AI void ld_i_a()
 {
 	Z80.i = A;
 }
@@ -819,14 +1023,14 @@ INLINE void ld_i_a()
 INLINE void ld_a_i()
 {
 	A = Z80.i;
-	F = (F & CF) | SZ[A] | (Z80.iff2 << 2);
+	F = (F & CF) | Z80_FLAGS(SZ, md_sz, A) | (Z80.iff2 << 2);
 	Z80.after_ldair = 1;
 }
 
 /***************************************************************
  * RST
  ***************************************************************/
-INLINE void rst(uint16_t addr)
+MD_AI void rst(uint16_t addr)
 {
 	push(Z80.pc);
 	PCD = addr;
@@ -836,27 +1040,27 @@ INLINE void rst(uint16_t addr)
 /***************************************************************
  * INC  r8
  ***************************************************************/
-INLINE uint8_t inc(uint8_t value)
+MD_AI uint8_t inc(uint8_t value)
 {
 	uint8_t res = value + 1;
-	F = (F & CF) | SZHV_inc[res];
+	F = (F & CF) | Z80_FLAGS(SZHV_inc, md_szhv_inc, res);
 	return (uint8_t)res;
 }
 
 /***************************************************************
  * DEC  r8
  ***************************************************************/
-INLINE uint8_t dec(uint8_t value)
+MD_AI uint8_t dec(uint8_t value)
 {
 	uint8_t res = value - 1;
-	F = (F & CF) | SZHV_dec[res];
+	F = (F & CF) | Z80_FLAGS(SZHV_dec, md_szhv_dec, res);
 	return res;
 }
 
 /***************************************************************
  * RLCA
  ***************************************************************/
-INLINE void rlca()
+MD_AI void rlca()
 {
 	A = (A << 1) | (A >> 7);
 	F = (F & (SF | ZF | PF)) | (A & (YF | XF | CF));
@@ -865,7 +1069,7 @@ INLINE void rlca()
 /***************************************************************
  * RRCA
  ***************************************************************/
-INLINE void rrca()
+MD_AI void rrca()
 {
 	F = (F & (SF | ZF | PF)) | (A & CF);
 	A = (A >> 1) | (A << 7);
@@ -875,7 +1079,7 @@ INLINE void rrca()
 /***************************************************************
  * RLA
  ***************************************************************/
-INLINE void rla()
+MD_AI void rla()
 {
 	uint8_t res = (A << 1) | (F & CF);
 	uint8_t c = (A & 0x80) ? CF : 0;
@@ -886,7 +1090,7 @@ INLINE void rla()
 /***************************************************************
  * RRA
  ***************************************************************/
-INLINE void rra()
+MD_AI void rra()
 {
 	uint8_t res = (A >> 1) | (F << 7);
 	uint8_t c = (A & 0x01) ? CF : 0;
@@ -903,7 +1107,7 @@ INLINE void rrd()
 	WZ = HL+1;
 	wm(HL, (n >> 4) | (A << 4));
 	A = (A & 0xf0) | (n & 0x0f);
-	F = (F & CF) | SZP[A];
+	F = (F & CF) | Z80_FLAGS(SZP, md_szp, A);
 }
 
 /***************************************************************
@@ -915,50 +1119,66 @@ INLINE void rld()
 	WZ = HL+1;
 	wm(HL, (n << 4) | (A & 0x0f));
 	A = (A & 0xf0) | (n >> 4);
-	F = (F & CF) | SZP[A];
+	F = (F & CF) | Z80_FLAGS(SZP, md_szp, A);
 }
 
 /***************************************************************
  * ADD  A,n
  ***************************************************************/
-INLINE void add_a(uint8_t value)
+MD_AI void add_a(uint8_t value)
 {
 	uint32_t ah = AFD & 0xff00;
 	uint32_t res = (uint8_t)((ah >> 8) + value);
+#ifndef ARGON_SMS_SMALL
 	F = SZHVC_add[ah | res];
+#else
+	F = flags_add(ah >> 8, value, (ah >> 8) + value);
+#endif
 	A = res;
 }
 
 /***************************************************************
  * ADC  A,n
  ***************************************************************/
-INLINE void adc_a(uint8_t value)
+MD_AI void adc_a(uint8_t value)
 {
 	uint32_t ah = AFD & 0xff00, c = AFD & 1;
 	uint32_t res = (uint8_t)((ah >> 8) + value + c);
+#ifndef ARGON_SMS_SMALL
 	F = SZHVC_add[(c << 16) | ah | res];
+#else
+	F = flags_add(ah >> 8, value, (ah >> 8) + value + c);
+#endif
 	A = res;
 }
 
 /***************************************************************
  * SUB  n
  ***************************************************************/
-INLINE void sub(uint8_t value)
+MD_AI void sub(uint8_t value)
 {
 	uint32_t ah = AFD & 0xff00;
 	uint32_t res = (uint8_t)((ah >> 8) - value);
+#ifndef ARGON_SMS_SMALL
 	F = SZHVC_sub[ah | res];
+#else
+	F = flags_sub(ah >> 8, value, (ah >> 8) - value);
+#endif
 	A = res;
 }
 
 /***************************************************************
  * SBC  A,n
  ***************************************************************/
-INLINE void sbc_a(uint8_t value)
+MD_AI void sbc_a(uint8_t value)
 {
 	uint32_t ah = AFD & 0xff00, c = AFD & 1;
 	uint32_t res = (uint8_t)((ah >> 8) - value - c);
+#ifndef ARGON_SMS_SMALL
 	F = SZHVC_sub[(c<<16) | ah | res];
+#else
+	F = flags_sub(ah >> 8, value, (ah >> 8) - value - c);
+#endif
 	A = res;
 }
 
@@ -987,53 +1207,59 @@ INLINE void daa()
 		if ((F&CF) | (A>0x99)) a+=0x60;
 	}
 
-	F = (F&(CF|NF)) | (A>0x99) | ((A^a)&HF) | SZP[a];
+	F = (F&(CF|NF)) | (A>0x99) | ((A^a)&HF) | Z80_FLAGS(SZP, md_szp, a);
 	A = a;
 }
 
 /***************************************************************
  * AND  n
  ***************************************************************/
-INLINE void and_a(uint8_t value)
+MD_AI void and_a(uint8_t value)
 {
 	A &= value;
-	F = SZP[A] | HF;
+	F = Z80_FLAGS(SZP, md_szp, A) | HF;
 }
 
 /***************************************************************
  * OR   n
  ***************************************************************/
-INLINE void or_a(uint8_t value)
+MD_AI void or_a(uint8_t value)
 {
 	A |= value;
-	F = SZP[A];
+	F = Z80_FLAGS(SZP, md_szp, A);
 }
 
 /***************************************************************
  * XOR  n
  ***************************************************************/
-INLINE void xor_a(uint8_t value)
+MD_AI void xor_a(uint8_t value)
 {
 	A ^= value;
-	F = SZP[A];
+	F = Z80_FLAGS(SZP, md_szp, A);
 }
 
 /***************************************************************
  * CP   n
  ***************************************************************/
-INLINE void cp(uint8_t value)
+MD_AI void cp(uint8_t value)
 {
 	unsigned val = value;
 	uint32_t ah = AFD & 0xff00;
 	uint32_t res = (uint8_t)((ah >> 8) - val);
+#ifndef ARGON_SMS_SMALL
 	F = (SZHVC_sub[ah | res] & ~(YF | XF)) |
 		(val & (YF | XF));
+#else
+	(void)res;
+	F = (flags_sub(ah >> 8, val, (ah >> 8) - val) & ~(YF | XF)) |
+		(val & (YF | XF));
+#endif
 }
 
 /***************************************************************
  * EX   AF,AF'
  ***************************************************************/
-INLINE void ex_af()
+MD_AI void ex_af()
 {
 	PAIR tmp;
 	tmp = Z80.af; Z80.af = Z80.af2; Z80.af2 = tmp;
@@ -1042,7 +1268,7 @@ INLINE void ex_af()
 /***************************************************************
  * EX   DE,HL
  ***************************************************************/
-INLINE void ex_de_hl()
+MD_AI void ex_de_hl()
 {
 	PAIR tmp;
 	tmp = Z80.de; Z80.de = Z80.hl; Z80.hl = tmp;
@@ -1051,7 +1277,7 @@ INLINE void ex_de_hl()
 /***************************************************************
  * EXX
  ***************************************************************/
-INLINE void exx()
+MD_AI void exx()
 {
 	PAIR tmp;
 	tmp = Z80.bc; Z80.bc = Z80.bc2; Z80.bc2 = tmp;
@@ -1110,127 +1336,127 @@ INLINE void exx()
 /***************************************************************
  * RLC  r8
  ***************************************************************/
-INLINE uint8_t rlc(uint8_t value)
+MD_AI uint8_t rlc(uint8_t value)
 {
 	unsigned res = value;
 	unsigned c = (res & 0x80) ? CF : 0;
 	res = ((res << 1) | (res >> 7)) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
 /***************************************************************
  * RRC  r8
  ***************************************************************/
-INLINE uint8_t rrc(uint8_t value)
+MD_AI uint8_t rrc(uint8_t value)
 {
 	unsigned res = value;
 	unsigned c = (res & 0x01) ? CF : 0;
 	res = ((res >> 1) | (res << 7)) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
 /***************************************************************
  * RL   r8
  ***************************************************************/
-INLINE uint8_t rl(uint8_t value)
+MD_AI uint8_t rl(uint8_t value)
 {
 	unsigned res = value;
 	unsigned c = (res & 0x80) ? CF : 0;
 	res = ((res << 1) | (F & CF)) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
 /***************************************************************
  * RR   r8
  ***************************************************************/
-INLINE uint8_t rr(uint8_t value)
+MD_AI uint8_t rr(uint8_t value)
 {
 	unsigned res = value;
 	unsigned c = (res & 0x01) ? CF : 0;
 	res = ((res >> 1) | (F << 7)) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
 /***************************************************************
  * SLA  r8
  ***************************************************************/
-INLINE uint8_t sla(uint8_t value)
+MD_AI uint8_t sla(uint8_t value)
 {
 	unsigned res = value;
 	unsigned c = (res & 0x80) ? CF : 0;
 	res = (res << 1) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
 /***************************************************************
  * SRA  r8
  ***************************************************************/
-INLINE uint8_t sra(uint8_t value)
+MD_AI uint8_t sra(uint8_t value)
 {
 	unsigned res = value;
 	unsigned c = (res & 0x01) ? CF : 0;
 	res = ((res >> 1) | (res & 0x80)) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
 /***************************************************************
  * SLL  r8
  ***************************************************************/
-INLINE uint8_t sll(uint8_t value)
+MD_AI uint8_t sll(uint8_t value)
 {
 	unsigned res = value;
 	unsigned c = (res & 0x80) ? CF : 0;
 	res = ((res << 1) | 0x01) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
 /***************************************************************
  * SRL  r8
  ***************************************************************/
-INLINE uint8_t srl(uint8_t value)
+MD_AI uint8_t srl(uint8_t value)
 {
 	unsigned res = value;
 	unsigned c = (res & 0x01) ? CF : 0;
 	res = (res >> 1) & 0xff;
-	F = SZP[res] | c;
+	F = Z80_FLAGS(SZP, md_szp, res) | c;
 	return res;
 }
 
 /***************************************************************
  * BIT  bit,r8
  ***************************************************************/
-INLINE void bit(int bit, uint8_t value)
+MD_AI void bit(int bit, uint8_t value)
 {
-	F = (F & CF) | HF | (SZ_BIT[value & (1<<bit)] & ~(YF|XF)) | (value & (YF|XF));
+	F = (F & CF) | HF | (Z80_FLAGS(SZ_BIT, md_sz_bit, value & (1<<bit)) & ~(YF|XF)) | (value & (YF|XF));
 }
 
 /***************************************************************
  * BIT  bit,(HL)
  ***************************************************************/
-INLINE void bit_hl(int bit, uint8_t value)
+MD_AI void bit_hl(int bit, uint8_t value)
 {
-	F = (F & CF) | HF | (SZ_BIT[value & (1<<bit)] & ~(YF|XF)) | (WZ_H & (YF|XF));
+	F = (F & CF) | HF | (Z80_FLAGS(SZ_BIT, md_sz_bit, value & (1<<bit)) & ~(YF|XF)) | (WZ_H & (YF|XF));
 }
 
 /***************************************************************
  * BIT  bit,(IX/Y+o)
  ***************************************************************/
-INLINE void bit_xy(int bit, uint8_t value)
+MD_AI void bit_xy(int bit, uint8_t value)
 {
-	F = (F & CF) | HF | (SZ_BIT[value & (1<<bit)] & ~(YF|XF)) | ((Z80.ea>>8) & (YF|XF));
+	F = (F & CF) | HF | (Z80_FLAGS(SZ_BIT, md_sz_bit, value & (1<<bit)) & ~(YF|XF)) | ((Z80.ea>>8) & (YF|XF));
 }
 
 /***************************************************************
  * RES  bit,r8
  ***************************************************************/
-INLINE uint8_t res_z80(int bit, uint8_t value)
+MD_AI uint8_t res_z80(int bit, uint8_t value)
 {
 	return value & ~(1<<bit);
 }
@@ -1238,7 +1464,7 @@ INLINE uint8_t res_z80(int bit, uint8_t value)
 /***************************************************************
  * SET  bit,r8
  ***************************************************************/
-INLINE uint8_t set(int bit, uint8_t value)
+MD_AI uint8_t set(int bit, uint8_t value)
 {
 	return value | (1<<bit);
 }
@@ -1266,7 +1492,7 @@ INLINE void cpi()
 	uint8_t res = A - val;
 	WZ++;
 	HL++; BC--;
-	F = (F & CF) | (SZ[res]&~(YF|XF)) | ((A^val^res)&HF) | NF;
+	F = (F & CF) | (Z80_FLAGS(SZ, md_sz, res)&~(YF|XF)) | ((A^val^res)&HF) | NF;
 	if (F & HF) res -= 1;
 	if (res & 0x02) F |= YF; /* bit 1 -> flag 5 */
 	if (res & 0x08) F |= XF; /* bit 3 -> flag 3 */
@@ -1284,11 +1510,11 @@ INLINE void ini()
 	B--;
 	wm(HL, io);
 	HL++;
-	F = SZ[B];
+	F = Z80_FLAGS(SZ, md_sz, B);
 	t = (unsigned)((C + 1) & 0xff) + (unsigned)io;
 	if (io & SF) F |= NF;
 	if (t & 0x100) F |= HF | CF;
-	F |= SZP[(uint8_t)(t & 0x07) ^ B] & PF;
+	F |= Z80_FLAGS(SZP, md_szp, (uint8_t)(t & 0x07) ^ B) & PF;
 }
 
 /***************************************************************
@@ -1302,11 +1528,11 @@ INLINE void outi()
 	WZ = BC + 1;
 	out(BC, io);
 	HL++;
-	F = SZ[B];
+	F = Z80_FLAGS(SZ, md_sz, B);
 	t = (unsigned)L + (unsigned)io;
 	if (io & SF) F |= NF;
 	if (t & 0x100) F |= HF | CF;
-	F |= SZP[(uint8_t)(t & 0x07) ^ B] & PF;
+	F |= Z80_FLAGS(SZP, md_szp, (uint8_t)(t & 0x07) ^ B) & PF;
 }
 
 /***************************************************************
@@ -1332,7 +1558,7 @@ INLINE void cpd()
 	uint8_t res = A - val;
 	WZ--;
 	HL--; BC--;
-	F = (F & CF) | (SZ[res]&~(YF|XF)) | ((A^val^res)&HF) | NF;
+	F = (F & CF) | (Z80_FLAGS(SZ, md_sz, res)&~(YF|XF)) | ((A^val^res)&HF) | NF;
 	if (F & HF) res -= 1;
 	if (res & 0x02) F |= YF; /* bit 1 -> flag 5 */
 	if (res & 0x08) F |= XF; /* bit 3 -> flag 3 */
@@ -1350,11 +1576,11 @@ INLINE void ind()
 	B--;
 	wm(HL, io);
 	HL--;
-	F = SZ[B];
+	F = Z80_FLAGS(SZ, md_sz, B);
 	t = ((unsigned)(C - 1) & 0xff) + (unsigned)io;
 	if (io & SF) F |= NF;
 	if (t & 0x100) F |= HF | CF;
-	F |= SZP[(uint8_t)(t & 0x07) ^ B] & PF;
+	F |= Z80_FLAGS(SZP, md_szp, (uint8_t)(t & 0x07) ^ B) & PF;
 }
 
 /***************************************************************
@@ -1368,11 +1594,11 @@ INLINE void outd()
 	WZ = BC - 1;
 	out(BC, io);
 	HL--;
-	F = SZ[B];
+	F = Z80_FLAGS(SZ, md_sz, B);
 	t = (unsigned)L + (unsigned)io;
 	if (io & SF) F |= NF;
 	if (t & 0x100) F |= HF | CF;
-	F |= SZP[(uint8_t)(t & 0x07) ^ B] & PF;
+	F |= Z80_FLAGS(SZP, md_szp, (uint8_t)(t & 0x07) ^ B) & PF;
 }
 
 /***************************************************************
@@ -1486,7 +1712,7 @@ INLINE void otdr()
 /***************************************************************
  * DI
  ***************************************************************/
-INLINE void di()
+MD_AI void di()
 {
 	Z80.iff1 = Z80.iff2 = 0;
 }
@@ -2773,7 +2999,7 @@ OP(ed,3d) { illegal_2();                                     } /* DB   ED       
 OP(ed,3e) { illegal_2();                                     } /* DB   ED          */
 OP(ed,3f) { illegal_2();                                     } /* DB   ED          */
 
-OP(ed,40) { B = in(BC); F = (F & CF) | SZP[B];               } /* IN   B,(C)       */
+OP(ed,40) { B = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, B);               } /* IN   B,(C)       */
 OP(ed,41) { out(BC, B);                                      } /* OUT  (C),B       */
 OP(ed,42) { sbc_hl(Z80.bc);                                    } /* SBC  HL,BC       */
 OP(ed,43) { Z80.ea = arg16(); wm16(Z80.ea, Z80.bc); WZ = Z80.ea + 1; } /* LD   (w),BC      */
@@ -2782,7 +3008,7 @@ OP(ed,45) { retn();                                          } /* RETN          
 OP(ed,46) { im_0();                                        } /* IM   0           */
 OP(ed,47) { ld_i_a();                                        } /* LD   i,A         */
 
-OP(ed,48) { C = in(BC); F = (F & CF) | SZP[C];               } /* IN   C,(C)       */
+OP(ed,48) { C = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, C);               } /* IN   C,(C)       */
 OP(ed,49) { out(BC, C);                                      } /* OUT  (C),C       */
 OP(ed,4a) { adc_hl(Z80.bc);                                    } /* ADC  HL,BC       */
 OP(ed,4b) { Z80.ea = arg16(); rm16(Z80.ea, Z80.bc); WZ = Z80.ea + 1; } /* LD   BC,(w)      */
@@ -2791,7 +3017,7 @@ OP(ed,4d) { reti();                                          } /* RETI          
 OP(ed,4e) { im_0();                                        } /* IM   0           */
 OP(ed,4f) { ld_r_a();                                        } /* LD   r,A         */
 
-OP(ed,50) { D = in(BC); F = (F & CF) | SZP[D];               } /* IN   D,(C)       */
+OP(ed,50) { D = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, D);               } /* IN   D,(C)       */
 OP(ed,51) { out(BC, D);                                      } /* OUT  (C),D       */
 OP(ed,52) { sbc_hl(Z80.de);                                    } /* SBC  HL,DE       */
 OP(ed,53) { Z80.ea = arg16(); wm16(Z80.ea, Z80.de); WZ = Z80.ea + 1; } /* LD   (w),DE      */
@@ -2800,7 +3026,7 @@ OP(ed,55) { retn();                                          } /* RETN          
 OP(ed,56) { im_1();                                        } /* IM   1           */
 OP(ed,57) { ld_a_i();                                        } /* LD   A,i         */
 
-OP(ed,58) { E = in(BC); F = (F & CF) | SZP[E];               } /* IN   E,(C)       */
+OP(ed,58) { E = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, E);               } /* IN   E,(C)       */
 OP(ed,59) { out(BC, E);                                      } /* OUT  (C),E       */
 OP(ed,5a) { adc_hl(Z80.de);                                    } /* ADC  HL,DE       */
 OP(ed,5b) { Z80.ea = arg16(); rm16(Z80.ea, Z80.de); WZ = Z80.ea + 1; } /* LD   DE,(w)      */
@@ -2809,7 +3035,7 @@ OP(ed,5d) { reti();                                          } /* RETI          
 OP(ed,5e) { im_2();                                        } /* IM   2           */
 OP(ed,5f) { ld_a_r();                                        } /* LD   A,r         */
 
-OP(ed,60) { H = in(BC); F = (F & CF) | SZP[H];               } /* IN   H,(C)       */
+OP(ed,60) { H = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, H);               } /* IN   H,(C)       */
 OP(ed,61) { out(BC, H);                                      } /* OUT  (C),H       */
 OP(ed,62) { sbc_hl(Z80.hl);                                    } /* SBC  HL,HL       */
 OP(ed,63) { Z80.ea = arg16(); wm16(Z80.ea, Z80.hl); WZ = Z80.ea + 1; } /* LD   (w),HL      */
@@ -2818,7 +3044,7 @@ OP(ed,65) { retn();                                          } /* RETN          
 OP(ed,66) { im_0();                                        } /* IM   0           */
 OP(ed,67) { rrd();                                           } /* RRD  (HL)        */
 
-OP(ed,68) { L = in(BC); F = (F & CF) | SZP[L];               } /* IN   L,(C)       */
+OP(ed,68) { L = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, L);               } /* IN   L,(C)       */
 OP(ed,69) { out(BC, L);                                      } /* OUT  (C),L       */
 OP(ed,6a) { adc_hl(Z80.hl);                                    } /* ADC  HL,HL       */
 OP(ed,6b) { Z80.ea = arg16(); rm16(Z80.ea, Z80.hl); WZ = Z80.ea + 1; } /* LD   HL,(w)      */
@@ -2827,7 +3053,7 @@ OP(ed,6d) { reti();                                          } /* RETI          
 OP(ed,6e) { im_0();                                        } /* IM   0           */
 OP(ed,6f) { rld();                                           } /* RLD  (HL)        */
 
-OP(ed,70) { uint8_t res = in(BC); F = (F & CF) | SZP[res];     } /* IN   0,(C)       */
+OP(ed,70) { uint8_t res = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, res);     } /* IN   0,(C)       */
 OP(ed,71) { out(BC, 0);                                      } /* OUT  (C),0       */
 OP(ed,72) { sbc_hl(Z80.sp);                                    } /* SBC  HL,SP       */
 OP(ed,73) { Z80.ea = arg16(); wm16(Z80.ea, Z80.sp); WZ = Z80.ea + 1; } /* LD   (w),SP      */
@@ -2836,7 +3062,7 @@ OP(ed,75) { retn();                                          } /* RETN          
 OP(ed,76) { im_1();                                        } /* IM   1           */
 OP(ed,77) { illegal_2();                                     } /* DB   ED,77       */
 
-OP(ed,78) { A = in(BC); F = (F & CF) | SZP[A]; WZ = BC + 1;  } /* IN   A,(C)       */
+OP(ed,78) { A = in(BC); F = (F & CF) | Z80_FLAGS(SZP, md_szp, A); WZ = BC + 1;  } /* IN   A,(C)       */
 OP(ed,79) { out(BC, A);  WZ = BC + 1;                        } /* OUT  (C),A       */
 OP(ed,7a) { adc_hl(Z80.sp);                                    } /* ADC  HL,SP       */
 OP(ed,7b) { Z80.ea = arg16(); rm16(Z80.ea, Z80.sp); WZ = Z80.ea + 1; } /* LD   SP,(w)      */
@@ -3305,7 +3531,7 @@ void take_interrupt()
 		push(Z80.pc);
 		rm16(irq_vector, Z80.pc);
 		/* CALL opcode timing + 'interrupt latency' cycles */
-		Z80.icount -= cc[Z80_TABLE_op][0xcd] + cc[Z80_TABLE_ex][0xff];
+		Z80.icount -= CC_OF(Z80_TABLE_op, 0xcd) + CC_OF(Z80_TABLE_ex, 0xff);
 	}
 	else
 	/* Interrupt mode 1. RST 38h */
@@ -3314,7 +3540,7 @@ void take_interrupt()
 		push(Z80.pc);
 		PCD = 0x0038;
 		/* RST $38 + 'interrupt latency' cycles */
-		Z80.icount -= cc[Z80_TABLE_op][0xff] + cc[Z80_TABLE_ex][0xff];
+		Z80.icount -= CC_OF(Z80_TABLE_op, 0xff) + CC_OF(Z80_TABLE_ex, 0xff);
 	}
 	else
 	{
@@ -3331,24 +3557,24 @@ void take_interrupt()
 					push(Z80.pc);
 					PCD = irq_vector & 0xffff;
 					/* CALL $xxxx cycles */
-					Z80.icount -= cc[Z80_TABLE_op][0xcd];
+					Z80.icount -= CC_OF(Z80_TABLE_op, 0xcd);
 					break;
 				case 0xc30000:  /* jump */
 					PCD = irq_vector & 0xffff;
 					/* JP $xxxx cycles */
-					Z80.icount -= cc[Z80_TABLE_op][0xc3];
+					Z80.icount -= CC_OF(Z80_TABLE_op, 0xc3);
 					break;
 				default:        /* rst (or other opcodes?) */
 					push(Z80.pc);
 					PCD = irq_vector & 0x0038;
 					/* RST $xx cycles */
-					Z80.icount -= cc[Z80_TABLE_op][0xff];
+					Z80.icount -= CC_OF(Z80_TABLE_op, 0xff);
 					break;
 			}
 		}
 
 		/* 'interrupt latency' cycles */
-		Z80.icount -= cc_ex[0xff];
+		Z80.icount -= CC_OF(Z80_TABLE_ex, 0xff);
 	}
 	WZ=PCD;
 #if HAS_LDAIR_QUIRK == 1
@@ -3382,6 +3608,7 @@ INLINE void take_nmi()
 void z80_init(int32_t (*irqcallback)(int32_t))
 {
 	int32_t i, p;
+#ifndef ARGON_SMS_SMALL
 	int32_t oldval, newval, val;
 	uint8_t *padd = &SZHVC_add[  0*256];
 	uint8_t *padc = &SZHVC_add[256*256];
@@ -3430,6 +3657,8 @@ void z80_init(int32_t (*irqcallback)(int32_t))
 		}
 	}
 
+#endif
+#ifndef MD_Z80_FLAG_FORMULAS
 	for (i = 0; i < 256; i++)
 	{
 		p = 0;
@@ -3453,6 +3682,7 @@ void z80_init(int32_t (*irqcallback)(int32_t))
 		if( i == 0x7f ) SZHV_dec[i] |= VF;
 		if( (i & 0x0f) == 0x0f ) SZHV_dec[i] |= HF;
 	}
+#endif
 
 	/* Reset registers to their initial values */
 	PRVPC = 0;
@@ -3545,16 +3775,721 @@ INLINE void check_interrupts()
 		take_interrupt();
 }
 
+#ifdef ARGON_MD_Z80
+/*
+ * The Mega Drive's sound drivers wait, and the waits are spent here at the
+ * full 3.58 MHz like any other code.  Sonic's driver had the CYD's Z80 at
+ * 11.6 ms of a 16.7 ms frame, sampled by line (30 Oct 2026): seven slices in
+ * ten at `ld a,(hl) / or a / jp p,$-2` on $1FFF, waiting for the 68000 to
+ * post a sound, the rest mostly at `djnz $`, the pause between two DAC
+ * samples of a drum.  Both are worked out instead of run, to the T-state:
+ *
+ *  - `djnz $`: B-1 more passes at 13 each, as many as the slice holds; the
+ *    last one is executed as ever, so B, the cycles and the pitch are the same.
+ *  - `ld a,(hl) / or a / jp|jr cc,$` with HL in the Z80's own RAM: nothing
+ *    in a slice can change that byte - the 68000 runs between slices, and an
+ *    interrupt only arrives at a line's edge - so if the loop goes round once
+ *    it goes round for the rest of the slice, 21 (or 22) T-states a pass.
+ *    The same with `ld a,(nn)`, and with `and a` or `cp n` for the test.
+ *  - `jp`/`jr` back to itself or over NOPs, and HALT: a wait for an
+ *    interrupt (md_z80_skip_idle, md_z80_skip_halt) - and whole slices of it
+ *    are counted out without the interpreter (md_z80_idle_pass).
+ *
+ * Nothing is skipped while an interrupt is waiting to be taken.
+ * R advances as if each instruction had run.  PicoDrive skips the 68000's
+ * waits the same way (md_idle_branch is this build's).
+ */
+/*
+ * A conditional jump's target and its cycles when taken, for the jumps a
+ * wait loop ends in: jp nz/z/p/m,nn and jr nz/z,e, the jump's opcode at `p`.
+ * 0 if it is none of them.
+ */
+static inline __attribute__((always_inline)) uint32_t
+md_z80_wait_jump(uint32_t p, uint8_t *jp, uint32_t *target)
+{
+	*jp = cpu_readop_arg(p & 0xffffu);
+	if (*jp == 0xc2 || *jp == 0xca || *jp == 0xf2 || *jp == 0xfa)
+	{
+		*target = cpu_readop_arg((p + 1u) & 0xffffu) |
+		          ((uint32_t)cpu_readop_arg((p + 2u) & 0xffffu) << 8);
+		return 10u;
+	}
+	if (*jp == 0x20 || *jp == 0x28)
+	{
+		*target = (p + 2u + (uint32_t)(int8_t)cpu_readop_arg((p + 1u) & 0xffffu)) & 0xffffu;
+		return 12u;
+	}
+	return 0u;
+}
+
+/*
+ * A byte the loop keeps reading, tested by `or a` / `and a` (B7/A7) or by
+ * `cp n` (FE n) at `p`, then a jump back to the loop's start: if the jump is
+ * taken now it is taken for the rest of the slice.  The passes that fit are
+ * skipped; `load` is the load's cycles, `ins` the instructions a pass.
+ */
+static inline __attribute__((always_inline)) void
+md_z80_skip_poll(uint8_t v, uint32_t p, uint32_t load)
+{
+	const uint8_t t = cpu_readop_arg(p & 0xffffu);
+	uint32_t      test;
+	uint8_t       r; /* the result the flags are of */
+	if (t == 0xb7 || t == 0xa7)
+	{
+		test = 4u;
+		r = v;
+		p += 1u;
+	}
+	else if (t == 0xfe)
+	{
+		test = 7u;
+		r = (uint8_t)(v - cpu_readop_arg((p + 1u) & 0xffffu));
+		p += 2u;
+	}
+	else
+		return;
+	uint8_t        jp;
+	uint32_t       target;
+	const uint32_t jcyc = md_z80_wait_jump(p, &jp, &target);
+	if (jcyc == 0u || target != PRVPC)
+		return;
+	const int round = (jp == 0xc2 || jp == 0x20) ? (r != 0)
+	                : (jp == 0xca || jp == 0x28) ? (r == 0)
+	                : (jp == 0xf2)               ? !(r & 0x80)
+	                                             : (r & 0x80) != 0;
+	if (!round)
+		return;
+	const uint32_t pass = load + test + jcyc;
+	const uint32_t n = ((uint32_t)Z80.icount - 1u) / pass;
+	if (n == 0u)
+		return;
+	Z80.icount -= (int32_t)(pass * n);
+	Z80.r = (uint8_t)(Z80.r + 3u * n);
+	WZ = (uint16_t)PRVPC; /* where the passes' jump left it */
+}
+
+/*
+ * jp nn / jr e back to itself, or over nothing but NOPs: a loop that does
+ * nothing until an interrupt (Alex Kidd's driver sat at `ei / nop / jp $-1`
+ * for nine slices in ten, 30 Oct 2026).  In flash: it is met once a slice,
+ * and the rest of the slice goes with it.
+ */
+/* The idle loop last seen (md_z80_skip_idle): its bytes from lo to the jump
+ * at hi, a pass's T-states and R steps.  s_idle_op 0: none. */
+static uint16_t s_idle_lo, s_idle_hi;
+static uint8_t  s_idle_op, s_idle_pass, s_idle_r;
+
+__attribute__((noinline)) static void md_z80_skip_idle(uint8_t opcode)
+{
+	const uint32_t at = PRVPC;
+	uint32_t       target;
+	uint32_t       jcyc;
+	if (opcode == 0xc3)
+	{
+		target = cpu_readop_arg(PCD) |
+		         ((uint32_t)cpu_readop_arg((PCD + 1u) & 0xffffu) << 8);
+		jcyc = 10u;
+	}
+	else
+	{
+		target = (PCD + 1u + (uint32_t)(int8_t)cpu_readop_arg(PCD)) & 0xffffu;
+		jcyc = 12u;
+	}
+	if (target > at || at - target > 8u)
+		return;
+	for (uint32_t a = target; a < at; a++)
+	{
+		if (cpu_readop_arg(a) != 0x00)
+			return;
+	}
+	const uint32_t pass = 4u * (at - target) + jcyc;
+	s_idle_lo = (uint16_t)target;
+	s_idle_hi = (uint16_t)at;
+	s_idle_op = opcode;
+	s_idle_pass = (uint8_t)pass;
+	s_idle_r = (uint8_t)(at - target + 1u);
+	const uint32_t n = ((uint32_t)Z80.icount - 1u) / pass;
+	if (n == 0u)
+		return;
+	Z80.icount -= (int32_t)(pass * n);
+	Z80.r = (uint8_t)(Z80.r + (at - target + 1u) * n);
+	WZ = (uint16_t)target;
+}
+
+/*
+ * Whole slices of waiting, without the interpreter (md_z80.c, z80_run).
+ *
+ * Skipped inside the interpreter, an idle loop still cost a way in and out
+ * of it every line - the NOP and the jump before the skip, from flash: Alex
+ * Kidd's Z80 at 255 ms of the system core's second, its driver in the loop
+ * nearly all of it (30 Oct 2026).  So a slice the Z80 can only spend waiting
+ * - halted, or anywhere in the idle loop last seen, its bytes unchanged, no
+ * interrupt waiting - is counted out here in whole passes; what is less than
+ * a pass is left over for the next slice, a few T-states late at most.
+ *
+ * The T-states a pass, 0 if the slice is not one to count out.
+ */
+int md_z80_idle_pass(void)
+{
+#ifdef MD_NO_ZSKIP
+	return 0;
+#endif
+	if (Z80.nmi_pending || (Z80.irq_state != CLEAR_LINE && Z80.iff1) || Z80.after_ei)
+		return 0;
+	if (Z80.halt)
+		return 4;
+	if (s_idle_op == 0)
+		return 0;
+	const uint32_t pc = PCD;
+	if (pc < s_idle_lo || pc > s_idle_hi)
+		return 0;
+	for (uint32_t a = s_idle_lo; a < s_idle_hi; a++)
+	{
+		if (cpu_readop_arg(a) != 0x00)
+			return 0;
+	}
+	const uint32_t at = s_idle_hi;
+	if (cpu_readop_arg(at) != s_idle_op)
+		return 0;
+	const uint32_t target = (s_idle_op == 0xc3)
+		? (cpu_readop_arg((at + 1u) & 0xffffu) | ((uint32_t)cpu_readop_arg((at + 2u) & 0xffffu) << 8))
+		: ((at + 2u + (uint32_t)(int8_t)cpu_readop_arg((at + 1u) & 0xffffu)) & 0xffffu);
+	if (target != s_idle_lo)
+		return 0;
+	return s_idle_pass;
+}
+
+/* T-states run so far in the slice running now (0 outside one). */
+MD_HOT int md_z80_slice_done(void)
+{
+	return z80_exec ? (int)(z80_requested_cycles - Z80.icount) : 0;
+}
+
+/* `n` passes of it gone by: R as if they had run. */
+void md_z80_idle_advance(int n)
+{
+	Z80.r = (uint8_t)(Z80.r + (uint32_t)(Z80.halt ? 1u : s_idle_r) * (uint32_t)n);
+	if (!Z80.halt && n > 0)
+		WZ = s_idle_lo;
+}
+
+/*
+ * Any wait loop, whatever it is made of.
+ *
+ * The drivers wait in loops of their own: GEMS (Comix Zone, Spinball) in
+ * `bit 0,(hl) / jp z`, Streets of Rage in `ld a,(hl) / cp n / jp c`, Sonic 2
+ * in `ld a,d / or e / jr z` - 400-540 thousand instructions a second of the
+ * Z80's ~500 thousand, against Alex Kidd's 114 (host harness, 31 Oct 2026).
+ * Matching them one by one would never end.
+ *
+ * But a pass that wrote nothing, read nothing that time changes, and came
+ * back to where it started with every register as it was, will be the same
+ * pass again - and again, until the slice ends or an interrupt comes, since
+ * nothing else can reach the Z80 inside a slice (the 68000's writes come
+ * between slices, md_snd_async.c).  So at each jump back, the registers are
+ * kept; at the next arrival at the same place with nothing touched and the
+ * same registers, the passes that fit in the slice are counted out.  R moves
+ * as if they had run; what is less than a pass runs.
+ */
+static uint16_t s_spin_pc;
+static uint8_t  s_spin_ok, s_spin_r;
+static uint32_t s_spin_touch;
+static int32_t  s_spin_icount;
+static uint32_t s_spin_w[8];
+/* A read whose answer holds only for a while - the YM's status, held until a
+ * timer's next overflow (md_z80.c): passes counted out end before it. */
+static uint32_t s_vreads, s_spin_vreads;
+static int32_t  s_spin_floor; /* the icount at which the last one may change */
+
+void md_z80_spin_until(int tstates)
+{
+	if (tstates > (1 << 24))
+		tstates = 1 << 24;
+	s_vreads++;
+	s_spin_floor = Z80.icount - tstates;
+}
+
+/* every register and the interrupt state, eight words: compared and kept
+ * without a call (memcmp and memcpy made a check ~670 cycles, 31 Oct 2026) */
+static inline __attribute__((always_inline)) void md_spin_regs(uint32_t *w)
+{
+	w[0] = Z80.af.w.l | ((uint32_t)Z80.bc.w.l << 16);
+	w[1] = Z80.de.w.l | ((uint32_t)Z80.hl.w.l << 16);
+	w[2] = Z80.ix.w.l | ((uint32_t)Z80.iy.w.l << 16);
+	w[3] = Z80.sp.w.l | ((uint32_t)Z80.wz.w.l << 16);
+	w[4] = Z80.af2.w.l | ((uint32_t)Z80.bc2.w.l << 16);
+	w[5] = Z80.de2.w.l | ((uint32_t)Z80.hl2.w.l << 16);
+	w[6] = Z80.iff1 | ((uint32_t)Z80.iff2 << 8) | ((uint32_t)Z80.im << 16) | ((uint32_t)Z80.i << 24);
+	w[7] = Z80.halt;
+}
+
+#ifdef MD_Z80PROF
+static void md_z80_spin_body(void);
+uint32_t md_zp_spin_n, md_zp_spin_cyc;
+__attribute__((noinline)) static void md_z80_spin(void)
+{
+	uint32_t c0, c1;
+	__asm__ volatile("rsr %0, ccount" : "=r"(c0));
+	md_z80_spin_body();
+	__asm__ volatile("rsr %0, ccount" : "=r"(c1));
+	md_zp_spin_n++;
+	md_zp_spin_cyc += c1 - c0;
+}
+MD_HOT __attribute__((noinline)) static void md_z80_spin_body(void)
+#else
+MD_HOT __attribute__((noinline)) static void md_z80_spin(void)
+#endif
+{
+	uint32_t w[8];
+	md_spin_regs(w);
+	if (s_spin_ok && s_spin_pc == (uint16_t)PCD && s_spin_touch == md_z80_touch &&
+	    ((w[0] ^ s_spin_w[0]) | (w[1] ^ s_spin_w[1]) | (w[2] ^ s_spin_w[2]) |
+	     (w[3] ^ s_spin_w[3]) | (w[4] ^ s_spin_w[4]) | (w[5] ^ s_spin_w[5]) |
+	     (w[6] ^ s_spin_w[6]) | (w[7] ^ s_spin_w[7])) == 0u &&
+	    !Z80.nmi_pending && !(Z80.irq_state != CLEAR_LINE && Z80.iff1))
+	{
+		const int32_t pass = s_spin_icount - Z80.icount;
+		int32_t       room = Z80.icount;
+		if (s_vreads != s_spin_vreads && room > Z80.icount - s_spin_floor - 1)
+			room = Z80.icount - s_spin_floor - 1;
+		if (pass > 0 && room > pass)
+		{
+			const int32_t n = room / pass;
+			Z80.icount -= n * pass;
+			Z80.r = (uint8_t)(Z80.r + (uint8_t)(Z80.r - s_spin_r) * (uint32_t)n);
+		}
+	}
+	s_spin_ok = 1;
+	s_spin_pc = (uint16_t)PCD;
+	s_spin_touch = md_z80_touch;
+	s_spin_vreads = s_vreads;
+	s_spin_icount = Z80.icount;
+	s_spin_r = Z80.r;
+	for (int k = 0; k < 8; k++)
+		s_spin_w[k] = w[k];
+}
+
+/* after an instruction: a jump back by a little (or to itself) - a loop */
+#if defined(MD_NO_SPIN) || defined(MD_NO_ZSKIP)
+#define MD_SPIN_CHECK() ((void)0)
+#else
+#define MD_SPIN_CHECK() do { \
+	if (PCD <= PRVPC && PRVPC - PCD < 64u) \
+		md_z80_spin(); \
+} while (0)
+#endif
+
+/*
+ * Could the instruction just fetched (PC past its opcode) close a pass of a
+ * wait loop md_z80_skip_waits counts out?  The few bytes it would look at
+ * first - so that a driver's ordinary jumps and loads, thousands a second,
+ * do not go to flash for it.
+ */
+static inline __attribute__((always_inline)) int md_z80_wait_candidate(uint32_t op)
+{
+	if (op == 0x10)
+	{
+		const uint32_t d = cpu_readop_arg(PCD);
+		return d >= 0xf6u && d <= 0xfeu;
+	}
+	if (op == 0x7e || op == 0x3a)
+	{
+		const uint32_t t = cpu_readop_arg((PCD + (op == 0x3a ? 2u : 0u)) & 0xffffu);
+		return t == 0xb7u || t == 0xa7u || t == 0xfeu;
+	}
+	if (op == 0xc3 || op == 0x18)
+	{
+		const uint32_t target = (op == 0xc3)
+			? (cpu_readop_arg(PCD) | ((uint32_t)cpu_readop_arg((PCD + 1u) & 0xffffu) << 8))
+			: ((PCD + 1u + (uint32_t)(int8_t)cpu_readop_arg(PCD)) & 0xffffu);
+		return target <= PRVPC && PRVPC - target <= 8u;
+	}
+	return 0;
+}
+
+/* noinline: one copy, not one in md_z80_fast's flattened body as well */
+/* in flash: md_z80_wait_candidate lets through only what may be a wait loop */
+__attribute__((noinline)) static void md_z80_skip_waits(uint8_t opcode)
+{
+#ifdef MD_NO_ZSKIP
+	return;
+#endif
+	/*
+	 * Called with the instruction that closes a pass fetched but not run: the
+	 * passes counted out must leave it a T-state, or it runs past the slice's
+	 * end where the interpreter would have stopped before it (Road Rash II's
+	 * DAC writes came 4 T-states early, 31 Oct 2026).
+	 */
+	if (Z80.icount <= 0)
+		return;
+	/* an interrupt waiting ends any wait at the next instruction */
+	if (Z80.nmi_pending || (Z80.irq_state != CLEAR_LINE && Z80.iff1))
+		return;
+	if (opcode == 0x10)
+	{
+		/* djnz $, or back over nothing but NOPs: a delay counted in B (Road
+		 * Rash II times its samples by `ld b,12 / nop / djnz`, 31 Oct 2026) */
+		const uint32_t d = cpu_readop_arg(PCD);
+		if (d < 0xf6u || d > 0xfeu)
+			return;
+		const uint32_t nops = 0xfeu - d; /* the bytes between target and djnz */
+		for (uint32_t k = 1u; k <= nops; k++)
+		{
+			if (cpu_readop_arg((PRVPC - k) & 0xffffu) != 0x00)
+				return;
+		}
+		const uint32_t pass = 13u + 4u * nops;
+		const uint32_t b = B ? B : 256u;
+		uint32_t n = ((uint32_t)Z80.icount - 1u) / pass;
+		if (n > b - 1u)
+			n = b - 1u;
+		if (n == 0u)
+			return;
+		B = (uint8_t)(b - n);
+		Z80.icount -= (int32_t)(pass * n);
+		Z80.r = (uint8_t)(Z80.r + (1u + nops) * n);
+		WZ = (uint16_t)(PRVPC - nops);
+		return;
+	}
+	if (opcode == 0x7e)
+	{
+		/* ld a,(hl) in the Z80's own RAM (or its mirror) */
+		if (HL < 0x4000u)
+			md_z80_skip_poll(rm(HL), PCD, 7u);
+		return;
+	}
+	if (opcode == 0x3a)
+	{
+		/* ld a,(nn) in the Z80's own RAM (or its mirror) */
+		const uint32_t nn = cpu_readop_arg(PCD) |
+		                    ((uint32_t)cpu_readop_arg((PCD + 1u) & 0xffffu) << 8);
+		if (nn < 0x4000u)
+			md_z80_skip_poll(rm(nn), PCD + 2u, 13u);
+		return;
+	}
+	if (opcode == 0xc3 || opcode == 0x18)
+	{
+		/* only a jump back by at most 8 goes on to flash to be looked at:
+		 * a driver's ordinary jumps are met thousands of times a second */
+		const uint32_t target = (opcode == 0xc3)
+			? (cpu_readop_arg(PCD) | ((uint32_t)cpu_readop_arg((PCD + 1u) & 0xffffu) << 8))
+			: ((PCD + 1u + (uint32_t)(int8_t)cpu_readop_arg(PCD)) & 0xffffu);
+		if (target <= PRVPC && PRVPC - target <= 8u)
+			md_z80_skip_idle(opcode);
+	}
+}
+
+/*
+ * HALT: the core runs a NOP in place until an interrupt, four T-states a
+ * pass, each through the whole loop - from flash, some 400 host cycles for
+ * every four of the Z80's.  The passes but the last are worked out (from
+ * flash too: once a slice).
+ */
+__attribute__((noinline)) static void md_z80_skip_halt(void)
+{
+#ifdef MD_NO_ZSKIP
+	return;
+#endif
+	if (Z80.icount <= 4)
+		return;
+	const uint32_t n = ((uint32_t)Z80.icount - 1u) / 4u;
+	Z80.icount -= (int32_t)(4u * n);
+	Z80.r = (uint8_t)(Z80.r + n);
+}
+#endif
+
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+/*
+ * The CYD: the instructions a sound driver's loop is made of, from the hot
+ * part, as many in a row as come - the rest, and anything an interrupt is
+ * waiting on, go back to the loop below.
+ *
+ * The whole interpreter is 16 KB of code and IRAM has none to spare; from
+ * flash it cost Sonic's drums ~7 ms of every frame, some 400 cycles an
+ * instruction (30 Oct 2026).  Its DAC loop is two dozen kinds of instruction
+ * (ld a,(de) / and n / rrca / add a,n / ld l,a / ld a,(hl) / exx / add a,d
+ * / ld d,a / ld (hl),r / ld (ix+d),r / ld b,c / djnz / ld a,(nn) / bit 7,a
+ * / jp nz / inc de / dec bc / ld a,c / or b / jp / or a / jp p), and these
+ * are them: each through the core's own handler, the same flags, the cycles
+ * the core's tables give (checked against cc_op/cc_xy/cc_cb).
+ */
+/* the opcodes md_z80_fast takes: every one but HALT, IN, OUT and the ED and
+ * FD prefixes (CB and DD for their one or two kinds) */
+static const uint32_t md_fast_ops[8] = {
+	0xffffffffu, 0xffffff7fu, 0xffffffffu, 0xffbfffffu,
+	0xffffffffu, 0xffffffffu, 0xf7f7ffffu, 0xdfffdff7u,
+};
+
+/* the eight registers of an opcode's three-bit fields; 6 is (HL) */
+static uint8_t *const md_reg8[8] = {
+	&Z80.bc.b.h, &Z80.bc.b.l, &Z80.de.b.h, &Z80.de.b.l,
+	&Z80.hl.b.h, &Z80.hl.b.l, NULL, &Z80.af.b.h,
+};
+/* PUSH / POP: BC DE HL AF; the 16-bit loads and arithmetic: BC DE HL SP */
+static PAIR *const md_pair[4] = { &Z80.bc, &Z80.de, &Z80.hl, &Z80.af };
+static PAIR *const md_pair16[4] = { &Z80.bc, &Z80.de, &Z80.hl, &Z80.sp };
+/* the flag a condition tests: NZ/Z, NC/C, PO/PE, P/M */
+static const uint8_t md_cc_flag[4] = { ZF, CF, PF, SF };
+
+/* a condition's three bits: even ones are "flag clear", odd "flag set" */
+static inline __attribute__((always_inline)) uint32_t md_cond(uint32_t c)
+{
+	const uint32_t f = F & md_cc_flag[c >> 1];
+	return (c & 1u) ? (f != 0u) : (f == 0u);
+}
+
+static inline __attribute__((always_inline)) uint8_t md_r8_get(uint32_t i)
+{
+	return (i == 6u) ? rm(HL) : *md_reg8[i];
+}
+
+MD_HOT __attribute__((noinline)) static void md_r8_set(uint32_t i, uint8_t v)
+{
+	if (i == 6u)
+		wm(HL, v);
+	else
+		*md_reg8[i] = v;
+}
+
+MD_HOT __attribute__((noinline)) static void md_alu(uint32_t k, uint8_t v)
+{
+	switch (k)
+	{
+	case 0: add_a(v); break;
+	case 1: adc_a(v); break;
+	case 2: sub(v); break;
+	case 3: sbc_a(v); break;
+	case 4: and_a(v); break;
+	case 5: xor_a(v); break;
+	case 6: or_a(v); break;
+	default: cp(v); break;
+	}
+}
+
+MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
+{
+	while (Z80.icount > 0)
+	{
+		if (Z80.nmi_pending || Z80.halt ||
+		    (Z80.irq_state != CLEAR_LINE && Z80.iff1 && !Z80.after_ei))
+			return;
+		const uint32_t pc = PCD;
+		const uint32_t op = md_z80_rd(pc);
+		if (!((md_fast_ops[op >> 5] >> (op & 31u)) & 1u))
+			return;
+		if (op == 0xdd)
+		{
+			const uint8_t op2 = md_z80_rd((pc + 1u) & 0xffffu);
+			if (op2 != 0x72 && op2 != 0x73)
+				return;
+			Z80.after_ei = 0;
+			Z80.after_ldair = 0;
+			PRVPC = pc;
+			PC += 2;
+			Z80.r += 2;
+			Z80.icount -= 19;
+			if (op2 == 0x72)
+				dd_72();
+			else
+				dd_73();
+			MD_SPIN_CHECK();
+			continue;
+		}
+		if (op == 0xcb)
+		{
+			if (md_z80_rd((pc + 1u) & 0xffffu) != 0x7f)
+				return;
+			Z80.after_ei = 0;
+			Z80.after_ldair = 0;
+			PRVPC = pc;
+			PC += 2;
+			Z80.r += 2;
+			Z80.icount -= 8;
+			cb_7f();
+			MD_SPIN_CHECK();
+			continue;
+		}
+		Z80.after_ei = 0;
+		Z80.after_ldair = 0;
+		PRVPC = pc;
+		PC++;
+		Z80.r++;
+#ifdef MD_Z80PROF
+		{ extern uint32_t md_zp_fast_n; md_zp_fast_n++; }
+#endif
+		if ((op == 0x10 || op == 0x7e || op == 0x3a || op == 0xc3 || op == 0x18) &&
+		    md_z80_wait_candidate(op))
+			md_z80_skip_waits((uint8_t)op);
+		Z80.icount -= CC_OF(Z80_TABLE_op, op);
+		/* by the opcode's fields: its quadrant, then its low three bits */
+		switch (op >> 6)
+		{
+		case 1: /* LD r,r' / LD r,(HL) / LD (HL),r (HALT went back) */
+			md_r8_set((op >> 3) & 7u, md_r8_get(op & 7u));
+			break;
+		case 2:
+			md_alu((op >> 3) & 7u, md_r8_get(op & 7u));
+			break;
+		case 0:
+			switch (op & 7u)
+			{
+			case 0:
+				if (op >= 0x20u)
+					jr_cond(md_cond(((op >> 3) & 7u) - 4u), (uint8_t)op);
+				else if (op == 0x10u)
+					op_10();
+				else if (op == 0x18u)
+					op_18();
+				else if (op == 0x08u)
+					op_08();
+				break;
+			case 1:
+				if (op & 8u)
+				{
+					PAIR *const p = md_pair16[(op >> 4) & 3u];
+					add16(Z80.hl, (*p));
+				}
+				else
+					md_pair16[(op >> 4) & 3u]->w.l = arg16();
+				break;
+			case 2:
+				switch (op)
+				{
+				case 0x02: op_02(); break;
+				case 0x0a: op_0a(); break;
+				case 0x12: op_12(); break;
+				case 0x1a: op_1a(); break;
+				case 0x22: op_22(); break;
+				case 0x2a: op_2a(); break;
+				case 0x32: op_32(); break;
+				default: op_3a(); break;
+				}
+				break;
+			case 3:
+				if (op & 8u)
+					md_pair16[(op >> 4) & 3u]->w.l--;
+				else
+					md_pair16[(op >> 4) & 3u]->w.l++;
+				break;
+			case 4:
+			{
+				const uint32_t d = (op >> 3) & 7u;
+				md_r8_set(d, inc(md_r8_get(d)));
+				break;
+			}
+			case 5:
+			{
+				const uint32_t d = (op >> 3) & 7u;
+				md_r8_set(d, dec(md_r8_get(d)));
+				break;
+			}
+			case 6:
+				md_r8_set((op >> 3) & 7u, arg());
+				break;
+			default:
+				switch (op)
+				{
+				case 0x07: op_07(); break;
+				case 0x0f: op_0f(); break;
+				case 0x17: op_17(); break;
+				case 0x1f: op_1f(); break;
+				case 0x2f: op_2f(); break;
+				case 0x37: op_37(); break;
+				default: op_3f(); break; /* (27, DAA, went back) */
+				}
+				break;
+			}
+			break;
+		default: /* quadrant 3 */
+			switch (op & 7u)
+			{
+			case 0:
+				ret_cond(md_cond((op >> 3) & 7u), (uint8_t)op);
+				break;
+			case 1:
+				if (!(op & 8u))
+				{
+					PAIR *const p = md_pair[(op >> 4) & 3u];
+					pop((*p));
+				}
+				else if (op == 0xc9u)
+					op_c9();
+				else if (op == 0xd9u)
+					op_d9();
+				else if (op == 0xe9u)
+					op_e9();
+				else
+					op_f9();
+				break;
+			case 2:
+				jp_cond(md_cond((op >> 3) & 7u));
+				break;
+			case 3: /* (CB, D3, DB and E3 went elsewhere) */
+				if (op == 0xc3u)
+					op_c3();
+				else if (op == 0xebu)
+					op_eb();
+				else if (op == 0xf3u)
+					op_f3();
+				else
+					op_fb();
+				break;
+			case 4:
+				call_cond(md_cond((op >> 3) & 7u), (uint8_t)op);
+				break;
+			case 5: /* (DD, ED and FD went elsewhere) */
+				if (!(op & 8u))
+				{
+					PAIR *const p = md_pair[(op >> 4) & 3u];
+					push((*p));
+				}
+				else
+					op_cd();
+				break;
+			case 6:
+				md_alu((op >> 3) & 7u, arg());
+				break;
+			default:
+				rst((uint16_t)(op & 0x38u));
+				break;
+			}
+			break;
+		}
+		MD_SPIN_CHECK();
+	}
+}
+#endif
+
 /****************************************************************************
  * Execute 'cycles' T-states. Return number of T-states really executed
  ****************************************************************************/
 int32_t z80_execute(int32_t cycles)
 {
+#ifdef MD_Z80PROF
+	uint32_t md_zp_c0;
+	__asm__ volatile("rsr %0, ccount" : "=r"(md_zp_c0));
+#endif
 	Z80.icount = cycles;
 	z80_requested_cycles = Z80.icount;
 	z80_exec = 1;
+#ifdef ARGON_MD_Z80
+	s_spin_ok = 0;
+#endif
 	do
 	{
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL) && !defined(MD_HOST_ZCOUNT) && !defined(MD_NOFAST)
+		/* into the fast loop only for an opcode it takes: a call that came
+		 * straight back cost 65 cycles of every other instruction (`z80bench`) */
+		{
+			const uint32_t peek = md_z80_rd(PCD);
+			if ((md_fast_ops[peek >> 5] >> (peek & 31u)) & 1u)
+			{
+				md_z80_fast();
+				if (Z80.icount <= 0)
+					break;
+			}
+		}
+#endif
 		/*
 		if (Z80.wait_state)
 		{
@@ -3571,18 +4506,41 @@ int32_t z80_execute(int32_t cycles)
 
 		PRVPC = PCD;
 		Z80.r++;
+#ifdef MD_Z80PROF
+		{ extern uint32_t md_zp_slow_n; md_zp_slow_n++; }
+#endif
 		uint8_t opcode = rop();
 		/* when in HALT state, the fetched opcode is not dispatched (aka a NOP) */
 		if (Z80.halt)
 		{
 			PC--;
 			opcode = 0;
+#ifdef ARGON_MD_Z80
+			md_z80_skip_halt();
+#endif
 		}
+#ifdef ARGON_MD_Z80
+		else if ((opcode == 0x10 || opcode == 0x7e || opcode == 0x3a ||
+		          opcode == 0xc3 || opcode == 0x18) && md_z80_wait_candidate(opcode))
+			md_z80_skip_waits(opcode);
+#endif
 		EXEC(op,opcode);
+#ifdef ARGON_MD_Z80
+		MD_SPIN_CHECK();
+#endif
 	} while (Z80.icount > 0);
 
 	z80_exec = 0;
 	z80_cycle_count += (cycles - Z80.icount);
+#ifdef MD_Z80PROF
+	{
+		extern uint32_t md_zp_exec_cyc, md_zp_exec_n;
+		uint32_t c1;
+		__asm__ volatile("rsr %0, ccount" : "=r"(c1));
+		md_zp_exec_cyc += c1 - md_zp_c0;
+		md_zp_exec_n++;
+	}
+#endif
 	
 	return cycles - Z80.icount;
 }

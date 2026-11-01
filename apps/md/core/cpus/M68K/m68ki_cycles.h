@@ -3,6 +3,9 @@
  * needs that room for the SMS Z80 core, so these sit in ordinary .rodata
  * (PSRAM) again until the arena grows or hot_text lands.
  */
+#ifdef ARGON_MD_SMALL
+__attribute__((used, aligned(4), section(".hot_rodata")))
+#endif
 static const unsigned char m68ki_cycles[] =
 {
     8*7,   8*7,   8*7,   8*7,   8*7,   8*7,   8*7,   8*7,   0*7,   0*7,   0*7,   0*7,   0*7,   0*7,   0*7,   0*7, 

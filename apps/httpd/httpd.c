@@ -26,7 +26,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef HTTPD_HEAP_KB
+/* A board without PSRAM (the CYD) gives an unsized application no arena at
+ * all; the server needs 2.5 KB of buffers, so it says how much. */
+AG_APP_SIZED("HTTPD", "1.0", "argon", AG_AXE_NEEDS_NET, 0, HTTPD_HEAP_KB * 1024);
+#else
 AG_APP("HTTPD", "1.0", "argon", AG_AXE_NEEDS_NET);
+#endif
 
 #define HTTPD_HDR_MAX 1024
 #define HTTPD_FILE_BUF 1536

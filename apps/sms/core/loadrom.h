@@ -28,6 +28,9 @@
 /* Function prototypes */
 uint32_t load_rom(char *filename);
 uint32_t load_rom_mem(const char *data, size_t size);
+#ifdef ARGON_SMS_SMALL
+uint32_t load_rom_mapped(const uint8_t *data, size_t size);
+#endif
 void free_rom(void);
 
 #ifndef NGC

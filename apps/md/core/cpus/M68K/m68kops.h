@@ -125,6 +125,10 @@ INLINE void UseMulsCycles(sint16 src)
 /* ======================================================================== */
 
 
+#ifndef MD_68K_COLD
+#include "md_hot.h"
+#endif
+
 static void m68k_op_1010(void)
 {
   m68ki_exception_1010();
@@ -4202,6 +4206,9 @@ static void m68k_op_bne_8(void)
   if(COND_NE())
   {
     m68ki_branch_8(MASK_OUT_ABOVE_8(REG_IR));
+#ifdef ARGON_MD_SMALL
+    md_idle_branch(MASK_OUT_ABOVE_8(REG_IR));
+#endif
     return;
   }
   USE_CYCLES(CYC_BCC_NOTAKE_B);
@@ -4213,6 +4220,9 @@ static void m68k_op_beq_8(void)
   if(COND_EQ())
   {
     m68ki_branch_8(MASK_OUT_ABOVE_8(REG_IR));
+#ifdef ARGON_MD_SMALL
+    md_idle_branch(MASK_OUT_ABOVE_8(REG_IR));
+#endif
     return;
   }
   USE_CYCLES(CYC_BCC_NOTAKE_B);
@@ -5096,6 +5106,9 @@ static void m68k_op_bclr_8_s_al(void)
 static void m68k_op_bra_8(void)
 {
   m68ki_branch_8(MASK_OUT_ABOVE_8(REG_IR));
+#ifdef ARGON_MD_SMALL
+  md_idle_branch(MASK_OUT_ABOVE_8(REG_IR));
+#endif
 }
 
 
@@ -23673,7 +23686,14 @@ static void m68k_op_unlk_32(void)
 #ifndef BUILD_TABLES
 
   #ifndef TABLES_FULL
+    #ifdef ARGON_MD_SMALL
+    #include "m68ki_jump_small.h"
+    #define MD_DISPATCH(op) (MD_OP(op)->fn())
+    static unsigned int md_cyc_of(unsigned int op) { return MD_OP(op)->cyc; }
+#else
     #include "m68ki_instruction_jump_table.h"
+    #define MD_DISPATCH(op) (m68ki_instruction_jump_table[(op)]())
+#endif
   #else
     #include "m68ki_instruction_jump_table_full.h"
   #endif

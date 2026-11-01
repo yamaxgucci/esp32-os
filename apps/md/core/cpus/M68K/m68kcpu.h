@@ -214,6 +214,14 @@
 #endif
 
 #define CYC_INSTRUCTION   m68ki_cycles
+#ifdef ARGON_MD_SMALL
+/* The cycles are carried by the handler's own entry (m68ki_jump_small.h,
+ * which comes after the handlers that use this; m68kops.h defines it). */
+static unsigned int md_cyc_of(unsigned int op);
+#define CYC_OF(i) md_cyc_of(i)
+#else
+#define CYC_OF(i) (CYC_INSTRUCTION[(i)])
+#endif
 #define CYC_EXCEPTION     m68ki_exception_cycle_table
 #define CYC_BCC_NOTAKE_B  ( -2 * MUL)
 #define CYC_BCC_NOTAKE_W  (  2 * MUL)
@@ -564,7 +572,21 @@ void gwenesis_m68k_load_state();
 /* ======================================================================== */
 
 /* Used by shift & rotate instructions */
-static const uint8 m68ki_shift_8_table[65] =
+/*
+ * The CYD: these tables go to flash with the code, which the ESP32 reads only
+ * by whole words - so there they are kept as words, whatever their width.
+ */
+#if defined(ARGON_MD_SMALL) && !defined(AG_BUILTIN)
+#define MD_FLASH_TABLE __attribute__((aligned(4), section(MD_TABLE_SECTION)))
+typedef uint md_tab8;
+typedef uint md_tab16;
+#else
+#define MD_FLASH_TABLE
+typedef uint8 md_tab8;
+typedef uint16 md_tab16;
+#endif
+
+static MD_FLASH_TABLE const md_tab8 m68ki_shift_8_table[65] =
 {
   0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe, 0xff, 0xff, 0xff, 0xff,
   0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -574,7 +596,7 @@ static const uint8 m68ki_shift_8_table[65] =
   0xff, 0xff, 0xff, 0xff, 0xff
 };
 
-static const uint16 m68ki_shift_16_table[65] =
+static MD_FLASH_TABLE const md_tab16 m68ki_shift_16_table[65] =
 {
   0x0000, 0x8000, 0xc000, 0xe000, 0xf000, 0xf800, 0xfc00, 0xfe00, 0xff00,
   0xff80, 0xffc0, 0xffe0, 0xfff0, 0xfff8, 0xfffc, 0xfffe, 0xffff, 0xffff,
@@ -586,7 +608,7 @@ static const uint16 m68ki_shift_16_table[65] =
   0xffff, 0xffff
 };
 
-static const uint m68ki_shift_32_table[65] =
+static MD_FLASH_TABLE const uint m68ki_shift_32_table[65] =
 {
   0x00000000, 0x80000000, 0xc0000000, 0xe0000000, 0xf0000000, 0xf8000000,
   0xfc000000, 0xfe000000, 0xff000000, 0xff800000, 0xffc00000, 0xffe00000,
@@ -605,7 +627,7 @@ static const uint m68ki_shift_32_table[65] =
 /* Number of clock cycles to use for exception processing.
  * I used 4 for any vectors that are undocumented for processing times.
  */
-static const uint16 m68ki_exception_cycle_table[256] =
+static MD_FLASH_TABLE const md_tab16 m68ki_exception_cycle_table[256] =
 {
      40*MUL, /*  0: Reset - Initial Stack Pointer                      */
       4*MUL, /*  1: Reset - Initial Program Counter                    */
@@ -1230,6 +1252,86 @@ INLINE void m68ki_branch_8(uint offset)
   REG_PC += MAKE_INT_8(offset);
 }
 
+#ifdef ARGON_MD_SMALL
+/*
+ * Waiting, recognised.  A game waits for the next frame by reading one place
+ * in memory until the interrupt changes it:
+ *
+ *     loop: move.b ($F62A).w,d0     tst.w (a0)      btst #0,($C00004)...
+ *           bne.s  loop
+ *
+ * Alex Kidd spends 99% of its instructions in such a loop on a quiet screen
+ * and 55% on a busy one, and each costs the CYD some 200 cycles - 12 ms of a
+ * 16.7 ms frame spent finding out, eleven thousand times, that nothing has
+ * changed.  Nothing can: interrupts are raised between lines, never inside
+ * m68k_run, and a read of ROM or work RAM changes nothing.  So when a short
+ * branch is taken back onto the one read before it, and that read is of ROM
+ * or work RAM - not the VDP, the I/O ports or the Z80's window, where a read
+ * can mean something - the rest of the line is spent at once.  PicoDrive
+ * does the same.  The Z80 could write 68000 RAM through its bank window; no
+ * game is known to poll on that, and with `noz80` it does not run at all.
+ */
+extern unsigned int md_idle_skips;
+
+INLINE int md_quiet_addr(uint a)
+{
+  a &= 0xFFFFFFu;
+  return a < 0x400000u || a >= 0xE00000u;
+}
+
+INLINE void md_idle_branch(uint disp8)
+{
+#ifdef MD_NO_IDLE
+  return;
+#endif
+  const int d = MAKE_INT_8(disp8);
+  if (d != -4 && d != -6 && d != -8) {
+    return;
+  }
+  const uint t = REG_PC;                        /* the branch's target */
+  const uint op = m68k_read_immediate_16(t);
+  uint addr;
+  int  len;
+  if ((op & 0xFF38u) == 0x4A10u || (op & 0xFF38u) == 0x4A50u ||
+      (op & 0xFF38u) == 0x4A90u ||              /* tst (An) */
+      (op & 0xF1F8u) == 0x1010u || (op & 0xF1F8u) == 0x3010u ||
+      (op & 0xF1F8u) == 0x2010u ||              /* move (An),Dn */
+      (op & 0xF1F8u) == 0xB010u || (op & 0xF1F8u) == 0xB050u ||
+      (op & 0xF1F8u) == 0xB090u) {              /* cmp (An),Dn */
+    len = 2;
+    addr = REG_A[op & 7u];
+  } else if (op == 0x4A38u || op == 0x4A78u || op == 0x4AB8u ||
+             (op & 0xF1FFu) == 0x1038u || (op & 0xF1FFu) == 0x3038u ||
+             (op & 0xF1FFu) == 0x2038u ||
+             (op & 0xF1FFu) == 0xB038u || (op & 0xF1FFu) == 0xB078u ||
+             (op & 0xF1FFu) == 0xB0B8u ||
+             (op & 0xF1FFu) == 0x0138u) {       /* tst/move/cmp/btst (xxx).w */
+    len = 4;
+    addr = MAKE_INT_16(m68k_read_immediate_16(t + 2u));
+  } else if (op == 0x4A39u || op == 0x4A79u || op == 0x4AB9u ||
+             (op & 0xF1FFu) == 0x1039u || (op & 0xF1FFu) == 0x3039u ||
+             (op & 0xF1FFu) == 0x2039u ||
+             (op & 0xF1FFu) == 0xB039u || (op & 0xF1FFu) == 0xB079u ||
+             (op & 0xF1FFu) == 0xB0B9u) {       /* the same, (xxx).l */
+    len = 6;
+    addr = (m68k_read_immediate_16(t + 2u) << 16) |
+           m68k_read_immediate_16(t + 4u);
+  } else if (op == 0x0838u) {                   /* btst #n,(xxx).w */
+    len = 6;
+    addr = MAKE_INT_16(m68k_read_immediate_16(t + 4u));
+  } else {
+    return;
+  }
+  if (len + 2 != -d || !md_quiet_addr(addr)) {
+    return;
+  }
+  if (m68ki_cpu.cycles < m68ki_cpu.cycle_end) {
+    m68ki_cpu.cycles = m68ki_cpu.cycle_end;
+    md_idle_skips++;
+  }
+}
+#endif
+
 INLINE void m68ki_branch_16(uint offset)
 {
   REG_PC += MAKE_INT_16(offset);
@@ -1385,7 +1487,7 @@ static void m68ki_exception_privilege_violation(void)
   m68ki_jump_vector(EXCEPTION_PRIVILEGE_VIOLATION);
 
   /* Use up some clock cycles and undo the instruction's cycles */
-  USE_CYCLES(CYC_EXCEPTION[EXCEPTION_PRIVILEGE_VIOLATION] - CYC_INSTRUCTION[REG_IR]);
+  USE_CYCLES(CYC_EXCEPTION[EXCEPTION_PRIVILEGE_VIOLATION] - CYC_OF(REG_IR));
 }
 
 /* Exception for A-Line instructions */
@@ -1396,7 +1498,7 @@ INLINE void m68ki_exception_1010(void)
   m68ki_jump_vector(EXCEPTION_1010);
 
   /* Use up some clock cycles and undo the instruction's cycles */
-  USE_CYCLES(CYC_EXCEPTION[EXCEPTION_1010] - CYC_INSTRUCTION[REG_IR]);
+  USE_CYCLES(CYC_EXCEPTION[EXCEPTION_1010] - CYC_OF(REG_IR));
 }
 
 /* Exception for F-Line instructions */
@@ -1407,7 +1509,7 @@ INLINE void m68ki_exception_1111(void)
   m68ki_jump_vector(EXCEPTION_1111);
 
   /* Use up some clock cycles and undo the instruction's cycles */
-  USE_CYCLES(CYC_EXCEPTION[EXCEPTION_1111] - CYC_INSTRUCTION[REG_IR]);
+  USE_CYCLES(CYC_EXCEPTION[EXCEPTION_1111] - CYC_OF(REG_IR));
 }
 
 /* Exception for illegal instructions */
@@ -1423,7 +1525,7 @@ INLINE void m68ki_exception_illegal(void)
   m68ki_jump_vector(EXCEPTION_ILLEGAL_INSTRUCTION);
 
   /* Use up some clock cycles and undo the instruction's cycles */
-  USE_CYCLES(CYC_EXCEPTION[EXCEPTION_ILLEGAL_INSTRUCTION] - CYC_INSTRUCTION[REG_IR]);
+  USE_CYCLES(CYC_EXCEPTION[EXCEPTION_ILLEGAL_INSTRUCTION] - CYC_OF(REG_IR));
 }
 
 
@@ -1440,7 +1542,7 @@ INLINE void m68ki_exception_address_error(void)
   if(CPU_RUN_MODE == RUN_MODE_BERR_AERR_RESET)
   {
     CPU_STOPPED = STOP_LEVEL_HALT;
-    SET_CYCLES(m68ki_cpu.cycle_end - CYC_INSTRUCTION[REG_IR]);
+    SET_CYCLES(m68ki_cpu.cycle_end - CYC_OF(REG_IR));
     return;
   }
   CPU_RUN_MODE = RUN_MODE_BERR_AERR_RESET;
@@ -1451,7 +1553,7 @@ INLINE void m68ki_exception_address_error(void)
   m68ki_jump_vector(EXCEPTION_ADDRESS_ERROR);
 
   /* Use up some clock cycles and undo the instruction's cycles */
-  USE_CYCLES(CYC_EXCEPTION[EXCEPTION_ADDRESS_ERROR] - CYC_INSTRUCTION[REG_IR]);
+  USE_CYCLES(CYC_EXCEPTION[EXCEPTION_ADDRESS_ERROR] - CYC_OF(REG_IR));
 }
 #endif
 

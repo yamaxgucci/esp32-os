@@ -31,11 +31,13 @@
 
 int32_t text_counter;               /* Text offset counter */
 
+#ifndef ARGON_SMS_SMALL
 static uint8_t tms_lookup[16][256][2];   /* Expand BD, PG data into 8-bit pixels (G1,G2) */
 static uint8_t mc_lookup[16][256][8];    /* Expand BD, PG data into 8-bit pixels (MC) */
 static uint8_t txt_lookup[256][2];       /* Expand BD, PG data into 8-bit pixels (TX) */
 static uint8_t bp_expand[256][8];        /* Expand PG data into 8-bit pixels */
 static uint8_t tms_obj_lut[16*256];      /* Look up priority between SG and display pixels */
+#endif
 
 static const uint8_t diff_mask[]  = {0x07, 0x07, 0x0F, 0x0F};
 static const uint8_t name_mask[]  = {0xFF, 0xFF, 0xFC, 0xFC};
@@ -136,6 +138,14 @@ parse_end:
     vdp.status = (vdp.status & 0xE0) | (i & 0x1F);
 }
 
+#ifdef ARGON_SMS_SMALL
+/*
+ * ArgonOS, small build: the TMS9918 modes (SG-1000, ColecoVision, and a Master
+ * System game that leaves mode 4) are not drawn - their 45 KB of expansion
+ * tables do not fit beside a Master System on the CYD.  The line is backdrop.
+ */
+void render_obj_tms(int32_t line) { (void)line; }
+#else
 void render_obj_tms(int32_t line)
 {
     int32_t i, x = 0;
@@ -238,6 +248,7 @@ void render_obj_tms(int32_t line)
         }
     }
 }
+#endif
 
 /****
 1.) NOTE: xpos can be negative, but the 'start' value that is added
@@ -295,6 +306,15 @@ void render_obj_tms(int32_t line)
         *lb++ = 0x10 | *mcex++; \
         *lb++ = 0x10 | *mcex++;
 
+#ifdef ARGON_SMS_SMALL
+void make_tms_tables(void) {}
+
+void render_bg_tms(int32_t line)
+{
+    (void)line;
+    memset(linebuf, BACKDROP_COLOR, 256);
+}
+#else
 void make_tms_tables(void)
 {
     int32_t i, j, x;
@@ -573,4 +593,5 @@ static void render_bg_m2(int32_t line)
         RENDER_GR_LINE
     }
 }
+#endif /* ARGON_SMS_SMALL */
 
