@@ -1022,6 +1022,17 @@ static int md_line_alloc(void)
 
 static void md_clear_glass(void)
 {
+    if (s_gi.fb != NULL) {
+        /* a screen with a framebuffer (the S3-CAM): black into it - pixels
+         * presented past it are painted over by its own refresh, and the
+         * game window's rows above and below the picture stayed (3 Nov 2026) */
+        for (uint32_t y = 0; y < s_gi.height; y++) {
+            memset((uint8_t *)s_gi.fb + (size_t)y * s_gi.stride, 0,
+                   (size_t)s_gi.width * sizeof(uint16_t));
+        }
+        ag_gfx_flush(0, 0, s_gi.width, s_gi.height);
+        return;
+    }
     /* one black row, repeated down the glass by a stride of zero */
     unsigned short *const row = (s_ring_n > 0) ? s_ring[0] : s_line;
     memset(row, 0, MD_WIDTH * sizeof(uint16_t));
