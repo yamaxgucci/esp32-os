@@ -1033,15 +1033,23 @@ static void md_clear_glass(void)
         ag_gfx_flush(0, 0, s_gi.width, s_gi.height);
         return;
     }
-    /* one black row, repeated down the glass by a stride of zero */
+    /*
+     * One black row, sent down the glass a row at a time.  It used to go as
+     * one call with a stride of zero, and gfx_present refuses a stride under
+     * the row's width - the glass was never cleared, and the game window's
+     * rows stayed above and below every game (3 Nov 2026).
+     */
     unsigned short *const row = (s_ring_n > 0) ? s_ring[0] : s_line;
+    const uint16_t w = (s_gi.width < MD_WIDTH) ? (uint16_t)s_gi.width : (uint16_t)MD_WIDTH;
     memset(row, 0, MD_WIDTH * sizeof(uint16_t));
-    const ag_blit_t b = {
-        .px = row, .stride = 0,
-        .surf_w = s_gi.width, .surf_h = s_gi.height,
-        .x = 0, .y = 0, .w = s_gi.width, .h = s_gi.height,
-    };
-    (void)ag_gfx_present(&b);
+    for (uint16_t y = 0; y < s_gi.height; y++) {
+        const ag_blit_t b = {
+            .px = row, .stride = (uint32_t)w * sizeof(uint16_t),
+            .surf_w = s_gi.width, .surf_h = s_gi.height,
+            .x = 0, .y = y, .w = w, .h = 1,
+        };
+        (void)ag_gfx_present(&b);
+    }
 }
 
 /*
@@ -2786,6 +2794,12 @@ md_next_game:
         ag_printf("md: profile = m68k/z80/snd/vdp us per frame\n");
     }
 
+    if (!s_headless) {
+        /* black once more just before the first frame: what was printed
+         * while the game started had reached the S3-CAM's rows above and
+         * below the picture, which the game never draws (3 Nov 2026) */
+        md_clear_glass();
+    }
     uint64_t  work_sum = 0;
     uint64_t  emu_sum = 0;
     uint64_t  present_sum = 0;
