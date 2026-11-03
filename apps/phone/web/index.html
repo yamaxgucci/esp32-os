@@ -1548,7 +1548,7 @@ function setPad(on) {
   document.getElementById("app").classList.toggle("pad", on);
   for (const id of [...pad.touches.keys()]) padTouch(id, []);
   clearInterval(pad.timer);
-  pad.timer = on ? setInterval(padSendHeld, 60) : 0;
+  pad.timer = on ? setInterval(padSendHeld, 40) : 0;
   send([IN_PADONLY, on ? 1 : 0]);
   try { localStorage.setItem("argon.pad", on ? "1" : "0"); } catch (_) {}
   if (on && screen.orientation && screen.orientation.lock) {

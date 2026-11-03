@@ -269,10 +269,13 @@ DAC/PCM on ch6 is a separate path. PSG matches SMS.
 
 ### The game list, the pause menu and the phone pad (S3-CAM, 2 Nov 2026)
 
-- `run c:\mdmenu.axe` lists the `*.SWP` cartridges beside it and in its
-  `GAMES` folder on the console and starts the Mega Drive image next to it
-  (`MDS3.AXE`, `MD-NO-PSRAM.AXE` or `MD.AXE`); quitting the game brings the
-  list back. A game with a save state beside it is marked `*`.
+- `run c:\mdmenu.axe`: a main screen (LOAD GAME, CONTINUE the last game,
+  EXIT) and behind LOAD GAME a window over the drives and folders. A
+  cartridge is a `.SWP` or a plain `.BIN`/`.MD`/`.GEN`: a dump with "SEGA" at
+  0x100 is swapped into a `.SWP` beside it the first time, one already swapped
+  ("ESAG") plays as it is. The game runs with the Mega Drive image next to the
+  menu (`MDS3.AXE`, `MD-NO-PSRAM.AXE` or `MD.AXE`); QUIT TO LIST brings the
+  menu back. The folder and the last game are kept in `C:\MDMENU.CFG`.
 - Esc (the phone pad's MENU, a keyboard's Esc, a pad's quit) pauses the game
   and shows RESUME / SAVE STATE / LOAD STATE / QUIT TO LIST. The state goes
   beside the cartridge as `NAME.sav`, PackBits-compressed: Alex Kidd's is
