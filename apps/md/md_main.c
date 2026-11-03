@@ -1169,6 +1169,27 @@ static unsigned heap_pages(unsigned char **pages, unsigned got, unsigned count,
     }
     size_t size = (size_t)(count - got) * MD_PAGE;
     while (got < count && size >= least) {
+#ifdef MD_PSRAM_PAGES
+        if (caps == AG_MEM_FAST) {
+            /*
+             * Internal memory is the system's on a board with PSRAM for the
+             * rest: with the pages in it the S3-CAM had 14 KB left, and the
+             * phone's driver turned the pad away on a reconnect (its floor is
+             * 16 KB) - the game window after LOAD GAME took no presses
+             * (3 Nov 2026).
+             */
+            ag_meminfo_t mi;
+            ag_meminfo(&mi);
+            const size_t keep = 48u * 1024u;
+            const size_t room = (mi.fast_free > keep) ? mi.fast_free - keep : 0u;
+            if (size > room) {
+                size = (room / MD_PAGE) * MD_PAGE;
+                if (size < least) {
+                    break;
+                }
+            }
+        }
+#endif
         unsigned char *b = (unsigned char *)ag_malloc_caps(size, caps);
         if (b == NULL) {
             size -= MD_PAGE;
@@ -1909,6 +1930,21 @@ static void md_wait_drawer_idle(void)
 /* the ring lent as scratch: two rows and more, idle between passes */
 static void *ui_scratch(size_t *len)
 {
+#ifdef MD_PSRAM_PAGES
+    /*
+     * Internal memory there is to lend, and the card's reads land in the
+     * buffer by DMA: the ring's rows, wherever they were, read back as
+     * nonsense on the S3-CAM (3 Nov 2026).
+     */
+    static void *s_own;
+    if (s_own == NULL) {
+        s_own = ag_malloc_caps(MD_STATE_SCRATCH, AG_MEM_FAST | AG_MEM_DMA);
+    }
+    if (s_own != NULL) {
+        *len = MD_STATE_SCRATCH;
+        return s_own;
+    }
+#endif
     if (s_ring_n < 2) {
         *len = 0;
         return NULL;
@@ -1973,9 +2009,9 @@ static void md_pause_menu(void)
             if (had_raster) {
                 md_raster_on = md_raster_init(md_crumb_alloc);
             }
-            ag_printf("md: %s %s: %d (open %d, %u free)\n",
+            ag_printf("md: %s %s: %d (%s %d, %u free)\n",
                       (act == 1) ? "save to" : "load from", s_save_path, r,
-                      md_state_err, (unsigned)mi.fast_free);
+                      md_state_why, md_state_err, (unsigned)mi.fast_free);
             if (act == 2 && r == MD_STATE_OK) {
                 break;
             }
@@ -2564,9 +2600,14 @@ md_next_game:
     rom_data = (rom != NULL) ? map_rom(rom, &rom_size) : make_tiny_rom(&rom_size);
 #ifdef MD_MENU
     md_save_path_for(rom);
+#ifndef MD_PSRAM_PAGES
+    /* before the machine takes the memory: the CYD cannot open it mid-game.
+     * A PSRAM board opens it for each save and load - kept open on the
+     * S3-CAM's FAT card, a load read back BAD (3 Nov 2026, not run down) */
     if (rom_data != NULL && rom != NULL) {
-        (void)md_state_keep(s_save_path); /* before the machine takes the memory */
+        (void)md_state_keep(s_save_path);
     }
+#endif
 #ifndef MD_PSRAM_PAGES
     /*
      * The CYD: the cartridge is in flash now, and the card's 44 KB are the

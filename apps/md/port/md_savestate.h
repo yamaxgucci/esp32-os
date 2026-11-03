@@ -23,6 +23,7 @@ int md_state_load(const char *path, void *scratch, size_t len);
  * then not opened again), while there is memory to open one. */
 int  md_state_keep(const char *path);
 void md_state_unkeep(void);
-extern int md_state_err; /* the open's error, with MD_STATE_NO_FILE */
+extern int md_state_err;
+extern const char *md_state_why; /* the open's error, with MD_STATE_NO_FILE */
 
 #endif /* MD_SAVESTATE_H */

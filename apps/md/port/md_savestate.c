@@ -29,6 +29,7 @@
 #define MD_STATE_TAG_MAX 40
 
 int                md_state_err; /* why the file did not open */
+const char        *md_state_why = ""; /* where a load went wrong */
 static ag_handle_t s_f = AG_INVALID_HANDLE;
 static int         s_writing;
 static int         s_bad;     /* a write short, or a tag out of step on load */
@@ -79,6 +80,10 @@ static uint8_t io_in(void)
     if (s_io_at == s_io_n) {
         const int32_t r = s_bad ? 0 : ag_read(s_f, s_io, MD_STATE_IO);
         if (r <= 0) {
+            if (!s_bad) {
+                md_state_why = "read";
+                md_state_err = (int)r;
+            }
             s_bad = 1;
             return 0;
         }
@@ -132,6 +137,10 @@ static void get(void *p, size_t n)
         if (h < 128u) {
             const size_t k = (size_t)h + 1u;
             if (i + k > n) {
+                if (!s_bad) {
+                    md_state_why = "literal past the call";
+                    md_state_err = (int)n;
+                }
                 s_bad = 1;
                 return;
             }
@@ -141,6 +150,10 @@ static void get(void *p, size_t n)
         } else if (h > 128u) {
             const size_t k = 257u - h;
             if (i + k > n) {
+                if (!s_bad) {
+                    md_state_why = "run past the call";
+                    md_state_err = (int)n;
+                }
                 s_bad = 1;
                 return;
             }
@@ -184,6 +197,10 @@ static int get_tag(const char *tag, uint32_t len)
     get(&l, sizeof(l));
     if (s_bad || n != tag_len(tag) || memcmp(t, tag, n) != 0 ||
         l != len) {
+        if (!s_bad) {
+            md_state_why = tag;
+            md_state_err = (int)l;
+        }
         s_bad = 1;
         return 0;
     }
@@ -334,6 +351,8 @@ static int run(const char *path, int writing, void *scratch, size_t len)
         return MD_STATE_NO_FILE;
     }
     s_written = 0;
+    md_state_why = "";
+    md_state_err = 0;
     s_writing = writing;
     s_bad = 0;
     /* the caller's scratch: the CYD has no memory to lend while it plays */
@@ -346,6 +365,7 @@ static int run(const char *path, int writing, void *scratch, size_t len)
     } else {
         get(magic, 4);
         if (!s_bad && memcmp(magic, MD_STATE_MAGIC, 4) != 0) {
+            md_state_why = "magic";
             s_bad = 1;
         }
     }
