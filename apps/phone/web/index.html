@@ -733,12 +733,14 @@ function connect() {
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
   st.ws = ws;
+  st.heard = Date.now();   /* the connect itself is timed too, see below */
 
   ws.onopen = () => {
     if (ws !== st.ws) { ws.close(); return; }
     ui.dot.classList.add("on");
     ui.note.textContent = BOARD;
     setBar("");
+    st.heard = Date.now();
     ws.send(new Uint8Array([IN_HELLO]));
     if (pad.on) ws.send(new Uint8Array([IN_PADONLY, 1]));
   };
@@ -790,9 +792,27 @@ function connect() {
   ws.onerror = () => ws.close();
   ws.onmessage = (ev) => {
     if (ws !== st.ws) return;
+    st.heard = Date.now();
     onMessage(new DataView(ev.data));
   };
 }
+
+/*
+ * A game pad hears the board once a second (OP_ALIVE).  Quiet for 3 s and the
+ * link is dead though the socket says open - the board restarted under it, and
+ * the keys were going nowhere while the dot stayed green (3 Nov 2026).
+ */
+setInterval(() => {
+  const ws = st.ws;
+  if (!pad.on || !ws || ws.readyState > 1) return;
+  /* open and quiet 3 s, or still connecting after 6 s (seen: 25 s) */
+  if (Date.now() - (st.heard || 0) < (ws.readyState === 1 ? 3000 : 6000)) return;
+  st.ws = null;
+  ui.dot.classList.remove("on");
+  try { ws.close(); } catch (e) { /* already gone */ }
+  setBar("connecting…");
+  connect();
+}, 1000);
 
 function onMessage(v) {
   if (v.byteLength < 1) return;

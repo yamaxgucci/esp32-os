@@ -207,6 +207,7 @@ AG_DRV("PHONE", "1.1", "argon");
 #define OP_SCROLL 'S'
 #define OP_AUTH 'A'
 #define OP_QUIT 'Q'
+#define OP_ALIVE 'L' /* a game pad's heartbeat: the page knows the link is live */
 
 #define IN_HELLO 'H'
 #define IN_KEY 'K'
@@ -1601,7 +1602,22 @@ static bool service_client(void)
     }
 
     if (s.pad_only) {
-        return true; /* a game pad: keys come in, nothing goes out */
+        /*
+         * A game pad: keys come in, and only a heartbeat goes out.  Without
+         * it a page whose board had restarted still said "connected" and
+         * its keys went nowhere - nothing ever came back to tell it the
+         * link was dead (3 Nov 2026).  The page reconnects after 3 s quiet.
+         */
+        static uint64_t s_alive_at;
+        const uint64_t now = ag_micros();
+        if (now - s_alive_at >= 1000000ull) {
+            uint8_t buf[WS_SLACK + 1];
+            s_alive_at = now;
+            if (ws_send(OP_ALIVE, buf + WS_SLACK, 0u, SEND_IDLE_MS, 200u) == WIRE_GONE) {
+                return false;
+            }
+        }
+        return true;
     }
 
     if (s.owe_info && !s.owe_everything) {

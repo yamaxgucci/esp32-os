@@ -134,6 +134,11 @@ static volatile uint32_t s_drawer_stack_left; /* bytes of its stack never used *
 static volatile uint32_t s_help_sent;   /* rows the application core sent      */
 static int      s_sysdraw = 1;  /* the system core draws the lines (md_drawer) */
 static volatile uint32_t s_frames_done; /* frames the emulating core finished */
+/* the front end owns the glass: the drawer opens no pass until the next
+ * frame, and says it is waiting (s_drawer_parked) */
+static volatile int      s_draw_hold, s_drawer_parked;
+/* the screen came back from the console: the front end paints again */
+static volatile int      s_ui_lost;
 static volatile uint32_t s_last_work_us; /* how long the last one took */
 #define MD_INFRAME_LINES 28     /* lines a frame may draw while it emulates */
 static int      s_inframe_left;
@@ -913,11 +918,13 @@ static void md_drawer(void)
             const uint32_t wait = (s_last_work_us > 16683u) ? 2u : 1u;
             const ag_time_t g0 = ag_micros();
             ag_delay(1);             /* the system core's own tasks */
-            while (s_ring_run && s_frames_done - pass_seen < wait) {
+            s_drawer_parked = 1;
+            while (s_ring_run && (s_draw_hold || s_frames_done - pass_seen < wait)) {
                 if (!md_snd_core0_poll()) {
                     ag_delay(1);
                 }
             }
+            s_drawer_parked = 0;
             pass_seen = s_frames_done;
             const ag_time_t g1 = ag_micros();
             s_gate_us += (uint32_t)(g1 - g0);
@@ -964,6 +971,16 @@ static void md_presenter(void *arg)
  */
 static void md_ring_start(int rows)
 {
+    if (s_ring_n > 0 && s_ring_sem != NULL) {
+        /* the ring kept from the last game: only its thread again */
+        s_ring_run = 1;
+        s_presenter = ag_thread_create(md_presenter, NULL, "mdglass", 2560, 4,
+                                       AG_THREAD_SYS_CORE);
+        if (s_presenter == NULL) {
+            s_ring_run = 0;
+        }
+        return;
+    }
     s_ring_sem = ag_sem_create(0, 4);
     if (s_ring_sem == NULL) {
         return;
@@ -1426,6 +1443,7 @@ static int handle_session_ev(const ag_event_t *ev)
          * sent again, since the console was drawn over them.
          */
         if (!s_headless && ag_gfx_acquire(&s_gi) == AG_OK) {
+            s_ui_lost = 1;
             if (s_ring_n > 0) {
                 s_glass_lost = 1; /* the drawer's, between its passes */
             } else {
@@ -1760,6 +1778,7 @@ resume_m68k:
 
 static char s_save_path[96]; /* where SAVE STATE writes */
 static int  s_to_pick;       /* LOAD GAME: back to the window after the loop */
+static int  s_open_pick;     /* ...with the game window open at once */
 
 #define UI_BG   0x0841u
 #define UI_EDGE 0x52aau
@@ -1939,9 +1958,20 @@ static unsigned ui_press(unsigned *held, uint32_t *since)
 
 static void md_wait_drawer_idle(void)
 {
-    /* the pass under way finishes: the drawer draws nothing more until
-     * another frame is made, and none is */
-    for (int i = 0; i < 500 && s_pass_h != 0; i++) {
+    /*
+     * The pass under way finishes, and the drawer waits for the next frame.
+     * Without the hold a frame finished just before the game stopped was
+     * drawn after this returned - over the city's top rows (3 Nov 2026).
+     */
+    s_draw_hold = 1;
+    if (!s_sysdraw) {
+        for (int i = 0; i < 500 && s_pass_h != 0; i++) {
+            ag_delay(2);
+        }
+        return;
+    }
+    for (int i = 0, calm = 0; i < 500 && calm < 3; i++) {
+        calm = (s_pass_h == 0 && s_drawer_parked) ? calm + 1 : 0;
         ag_delay(2);
     }
 }
@@ -2039,11 +2069,11 @@ static void md_pause_menu(void)
             }
             note = (act == 1) ? ((r == MD_STATE_OK) ? "SAVED" : "COULD NOT SAVE")
                    : (r == MD_STATE_NO_FILE) ? "NO SAVE YET" : "COULD NOT LOAD";
-        } else if (act == 3) {
+        } else if (act == 3 || act == 4) {
+            /* LOAD GAME: the main screen with the game window open; EXIT:
+             * the main screen - MD itself is left from there (MENU) */
             s_to_pick = 1;
-            s_quit = 1;
-            return;
-        } else if (act == 4) {
+            s_open_pick = (act == 3);
             s_quit = 1;
             return;
         }
@@ -2091,7 +2121,6 @@ static void md_save_path_for(const char *rom)
 
 #define PK_PATH 160
 #define PK_NAME 48
-#define PK_ROWS 11                 /* list rows on a 240-line glass */
 
 static char s_pk_dir[PK_PATH];     /* "" is the list of drives */
 static char s_pk_rom[PK_PATH];     /* what was chosen */
@@ -2211,50 +2240,6 @@ static int pk_entry(int want, char *name, bool *dir)
     return n;
 }
 
-/* one 16-row text line of the window at text row `tr` */
-static void pk_line(int tr, const char *s, uint16_t fg, uint16_t bg)
-{
-    uint16_t *const row = ui_row();
-    if (row == NULL) {
-        return;
-    }
-    const int w = ((int)s_gi.width < MD_WIDTH) ? (int)s_gi.width : MD_WIDTH;
-    for (int gy = 0; gy < AG_FONT8X16_H; gy++) {
-        for (int x = 0; x < w; x++) {
-            row[x] = bg;
-        }
-        ui_text(row, w, 4, gy, s, fg);
-        ui_send(row, tr * AG_FONT8X16_H + gy, w);
-    }
-}
-
-/* list row `r` (entry top + r) */
-static void pk_item(int r, int top, int sel, int count)
-{
-    char buf[PK_NAME + 8];
-    const int i = top + r;
-    char name[PK_NAME];
-    bool dir = false;
-    if (i >= count || pk_entry(i, name, &dir) != i) {
-        pk_line(2 + r, "", UI_FG, UI_BG);
-        return;
-    }
-    (void)snprintf(buf, sizeof(buf), dir ? " [%s]" : " %s", name);
-    pk_line(2 + r, buf, (i == sel) ? UI_FG : dir ? UI_DIR : UI_FG,
-            (i == sel) ? UI_SEL : UI_BG);
-}
-
-static void pk_draw(int sel, int top, int count, const char *note)
-{
-    pk_line(0, "MEGA DRIVE - LOAD GAME", UI_NOTE, UI_BAR);
-    pk_line(1, s_pk_dir[0] ? s_pk_dir : "(drives)", UI_FG, UI_BG);
-    for (int r = 0; r < PK_ROWS; r++) {
-        pk_item(r, top, sel, count);
-    }
-    pk_line(13, note ? note : "", UI_NOTE, UI_BG);
-    pk_line(14, "A/START: OPEN  B: UP  MENU: EXIT", UI_FG, UI_BAR);
-}
-
 /*
  * A plain cartridge made ready: "SEGA" at 0x100 is a dump as it comes and is
  * swapped into the .SWP beside it once (MD reads the cartridge out of flash
@@ -2312,11 +2297,6 @@ static bool pk_ready(const char *src, char *out, size_t cap)
         }
         ok = ag_write(o, buf, (size_t)n) == n;
         done += (uint32_t)n;
-        if ((done & 0x1ffffu) == 0u) {
-            char msg[40];
-            (void)snprintf(msg, sizeof(msg), "PREPARING... %u KB", (unsigned)(done / 1024u));
-            pk_line(13, msg, UI_NOTE, UI_BG);
-        }
     }
     if (buf != NULL) {
         ag_free(buf);
@@ -2333,33 +2313,165 @@ static bool pk_ready(const char *src, char *out, size_t cap)
     return ok;
 }
 
-/* The window: 1 with a cartridge in s_pk_rom, 0 to leave MD. */
+/* ---- the city, and windows over it ----------------------------------- */
+
+/*
+ * A city at night (tools/gen_md_city.py: 16 colours, 7.6 KB packed, in flash
+ * via --code-rodata .rodata.k_city and read by words as the font is) behind
+ * everything the front end shows outside a game: unpacked a row at a time
+ * into the ring's first row, something drawn over the row, and sent.
+ */
+#include "md_city.h"
+
+static inline uint8_t city_byte(uint32_t i)
+{
+    const uint32_t w = ((const uint32_t *)(const void *)k_city)[i >> 2];
+    return (uint8_t)(w >> ((i & 3u) * 8u));
+}
+
+/* the city's rows y0..y1-1 to the glass, `over` drawing on each first */
+static void city_paint(int y0, int y1, void (*over)(uint16_t *row, int y))
+{
+    uint16_t *const row = ui_row();
+    if (row == NULL) {
+        return;
+    }
+    uint32_t pos = 0;
+    for (int y = 0; y < MD_CITY_H_ && y < y1; y++) {
+        int x = 0;
+        while (x < MD_CITY_W) {
+            const uint8_t h = city_byte(pos++);
+            const int n = (h < 0x80u) ? h + 1 : h - 0x7f;
+            const uint8_t rep = (h < 0x80u) ? 0u : city_byte(pos++);
+            for (int k = 0; k < n && x < MD_CITY_W; k++) {
+                const uint8_t p = (h < 0x80u) ? city_byte(pos++) : rep;
+                row[x++] = k_city_pal[p >> 4];
+                row[x++] = k_city_pal[p & 15u];
+            }
+        }
+        if (y >= y0) {
+            if (over != NULL) {
+                over(row, y);
+            }
+            ui_send(row, y, MD_CITY_W);
+        }
+    }
+    if (y0 == 0 && s_gi.fb != NULL) {
+        /* the whole picture to the panel once more, in one piece: after a
+         * game the S3-CAM's ST7789 kept a quarter of the game's last frame
+         * over the city's top though the framebuffer had the city (3 Nov) */
+        ag_gfx_flush((uint16_t)((s_gi.width - MD_CITY_W) / 2), 0,
+                     MD_CITY_W, (uint32_t)(y1 < MD_CITY_H_ ? y1 : MD_CITY_H_));
+    }
+}
+
+/*
+ * A window over the city, the pause menu's look: a title, up to WIN_LINES
+ * lines with one lit, and a line for a note or a hint.
+ */
+#define WIN_X0    24
+#define WIN_W     272
+#define WIN_Y0    28
+#define WIN_LINES 9
+#define WIN_COLS  (WIN_W / 8 - 2)
+#define WIN_H     (4 + (WIN_LINES + 2) * 16 + 4)
+
+static struct {
+    char        title[WIN_COLS + 1];
+    char        line[WIN_LINES][WIN_COLS + 1];
+    uint8_t     dir[WIN_LINES];
+    int         n, sel;              /* lines in use, the lit one (-1 none) */
+    const char *foot;
+} s_win;
+
+static void win_over(uint16_t *row, int y)
+{
+    if (y < WIN_Y0 || y >= WIN_Y0 + WIN_H) {
+        return;
+    }
+    uint16_t *const r = row + WIN_X0;
+    const int wy = y - WIN_Y0;
+    const bool edge = (wy < 2 || wy >= WIN_H - 2);
+    for (int x = 0; x < WIN_W; x++) {
+        r[x] = (edge || x < 2 || x >= WIN_W - 2) ? UI_EDGE : UI_BG;
+    }
+    if (edge || wy < 4) {
+        return;
+    }
+    const int line = (wy - 4) / 16, gy = (wy - 4) % 16;
+    if (line == 0) {
+        ui_text(r, WIN_W, 8, gy, s_win.title, UI_NOTE);
+    } else if (line <= WIN_LINES && line - 1 < s_win.n) {
+        const int i = line - 1;
+        if (i == s_win.sel) {
+            for (int x = 4; x < WIN_W - 4; x++) {
+                r[x] = UI_SEL;
+            }
+        }
+        ui_text(r, WIN_W, 8, gy, s_win.line[i],
+                (i == s_win.sel) ? UI_FG : s_win.dir[i] ? UI_DIR : UI_FG);
+    } else if (line == WIN_LINES + 1 && s_win.foot != NULL) {
+        ui_text(r, WIN_W, 8, gy, s_win.foot, UI_NOTE);
+    }
+}
+
+/* the whole window, or only line `i`'s rows */
+static void win_paint(void)
+{
+    city_paint(WIN_Y0, WIN_Y0 + WIN_H, win_over);
+}
+
+static void win_paint_line(int i)
+{
+    const int y = WIN_Y0 + 4 + (i + 1) * 16;
+    city_paint(y, y + 16, win_over);
+}
+
+static void win_paint_foot(void)
+{
+    win_paint_line(WIN_LINES);
+}
+
+/* ---- the game window over the city ------------------------------------- */
+
+/* the window's lines for entries top..top+WIN_LINES-1 */
+static void pk_fill(int top, int count, int sel)
+{
+    (void)snprintf(s_win.title, sizeof(s_win.title), "LOAD GAME %s",
+                   s_pk_dir[0] ? s_pk_dir : "(drives)");
+    s_win.n = 0;
+    for (int r = 0; r < WIN_LINES && top + r < count; r++) {
+        char name[PK_NAME];
+        bool dir = false;
+        if (pk_entry(top + r, name, &dir) != top + r) {
+            break;
+        }
+        (void)snprintf(s_win.line[r], sizeof(s_win.line[r]), dir ? "[%s]" : "%s", name);
+        s_win.dir[r] = dir ? 1u : 0u;
+        s_win.n++;
+    }
+    s_win.sel = sel - top;
+}
+
+/* The window: 1 with a cartridge in s_pk_rom, 0 back to the main screen. */
 static int md_pick(void)
 {
     if (ui_row() == NULL) {
         return 0;
     }
-    md_clear_glass();
     if (s_pk_dir[0] == '\0') {
-        /* the card, when there is one: that is where the cartridges are */
         const ag_handle_t h = ag_opendir("A:\\");
         if (h >= 0) {
             (void)ag_closedir(h);
             (void)snprintf(s_pk_dir, sizeof(s_pk_dir), "A:\\");
         }
     }
-    int sel = 0, top = 0;
+    static const char k_hint[] = "A:OPEN  B:UP  MENU:BACK";
+    int sel = 0, top = 0, count = 0, shown_sel = -1, shown_top = -1;
+    bool fresh = true;
     unsigned held = menu_buttons();
     uint32_t since = ag_millis();
-    {
-        ag_event_t ev;   /* the press that brought the window is not one in it */
-        while (ag_poll_event(&ev, 0)) {
-            (void)handle_session_ev(&ev);
-        }
-    }
-    const char *note = NULL;
-    int count = 0, shown_sel = -1, shown_top = -1;
-    bool fresh = true;   /* a folder entered: counted and drawn whole */
+    s_win.foot = k_hint;
     for (;;) {
         char name[PK_NAME];
         bool dir = false;
@@ -2371,27 +2483,33 @@ static int md_pick(void)
         }
         if (sel < top) {
             top = sel;
-        } else if (sel >= top + PK_ROWS) {
-            top = sel - PK_ROWS + 1;
+        } else if (sel >= top + WIN_LINES) {
+            top = sel - WIN_LINES + 1;
         }
         if (fresh || top != shown_top) {
-            pk_draw(sel, top, count, note);
-        } else {
-            /* a move inside the page: the two rows it changed */
-            if (shown_sel != sel) {
-                pk_item(shown_sel - top, top, sel, count);
-                pk_item(sel - top, top, sel, count);
-            }
-            pk_line(13, note ? note : "", UI_NOTE, UI_BG);
+            pk_fill(top, count, sel);
+            win_paint();
+        } else if (sel != shown_sel) {
+            s_win.sel = sel - top;      /* a move inside the page: two lines */
+            win_paint_line(shown_sel - top);
+            win_paint_line(sel - top);
+        }
+        if (s_win.foot != k_hint) {
+            win_paint_foot();
+            s_win.foot = k_hint;        /* a note stays until the next press */
         }
         fresh = false;
         shown_sel = sel;
         shown_top = top;
-        note = NULL;
         unsigned p = 0;
         while ((p = ui_press(&held, &since)) == 0u) {
             if (s_quit) {
                 return 0;
+            }
+            if (s_ui_lost) {
+                s_ui_lost = 0;
+                city_paint(0, MD_CITY_H_, NULL);
+                win_paint();
             }
             ag_delay(20);
         }
@@ -2427,17 +2545,137 @@ static int md_pick(void)
             }
             char rom[PK_PATH];
             pk_join(rom, sizeof(rom), s_pk_dir, name);
+            s_win.foot = pk_raw(name) ? "PREPARING..." : "LOADING...";
+            win_paint_foot();
             if (pk_raw(name)) {
-                pk_line(13, "PREPARING...", UI_NOTE, UI_BG);
                 if (!pk_ready(rom, s_pk_rom, sizeof(s_pk_rom))) {
-                    note = "NOT A CARTRIDGE, OR THE CARD IS FULL";
+                    s_win.foot = "NOT A CARTRIDGE, OR CARD FULL";
                     continue;
                 }
             } else {
                 (void)snprintf(s_pk_rom, sizeof(s_pk_rom), "%s", rom);
             }
-            pk_line(13, "LOADING...", UI_NOTE, UI_BG);
             return 1;
+        }
+    }
+}
+
+/* ---- the main screen --------------------------------------------------- */
+
+#define HOME_ITEMS 2
+static const char *const k_home_items[HOME_ITEMS] = {"LOAD GAME", "SETTINGS"};
+#define HOME_Y0    194             /* the first item's top row */
+#define HOME_STEP  20
+static int s_home_sel;
+
+static void home_over(uint16_t *row, int y)
+{
+    for (int i = 0; i < HOME_ITEMS; i++) {
+        const int gy = y - (HOME_Y0 + i * HOME_STEP);
+        if (gy >= 0 && gy < AG_FONT8X16_H) {
+            char buf[24];
+            (void)snprintf(buf, sizeof(buf), (i == s_home_sel) ? "> %s <" : "%s",
+                           k_home_items[i]);
+            const int x = (MD_CITY_W - (int)strlen(buf) * 8) / 2;
+            ui_text(row, MD_CITY_W, x + 1, gy, buf, 0x0000u);
+            ui_text(row, MD_CITY_W, x, gy, buf,
+                    (i == s_home_sel) ? 0x07ffu : 0xbdf7u);
+        }
+    }
+}
+
+static void md_settings(void)
+{
+    (void)snprintf(s_win.title, sizeof(s_win.title), "SETTINGS");
+    (void)snprintf(s_win.line[0], sizeof(s_win.line[0]), "NOTHING TO SET YET");
+    s_win.dir[0] = 0;
+    s_win.n = 1;
+    s_win.sel = -1;
+    s_win.foot = "B OR MENU: BACK";
+    win_paint();
+    unsigned held = menu_buttons();
+    uint32_t since = ag_millis();
+    for (;;) {
+        const unsigned p = ui_press(&held, &since);
+        if ((p & (MB_BACK | MB_MENU | MB_PICK)) || s_quit) {
+            return;
+        }
+        if (s_ui_lost) {
+            s_ui_lost = 0;
+            city_paint(0, MD_CITY_H_, NULL);
+            win_paint();
+        }
+        ag_delay(20);
+    }
+}
+
+/* The main screen: 1 with a cartridge in s_pk_rom, 0 to leave MD (MENU). */
+static int md_home(void)
+{
+    if (ui_row() == NULL) {
+        return 0;
+    }
+    unsigned held = menu_buttons();
+    uint32_t since = ag_millis();
+    {
+        ag_event_t ev;
+        while (ag_poll_event(&ev, 0)) {
+            (void)handle_session_ev(&ev);
+        }
+    }
+    ag_printf("md: home\n");
+    s_ui_lost = 0;
+    bool whole = true;
+    for (;;) {
+        if (s_open_pick) {
+            s_open_pick = 0;
+            s_home_sel = 0;
+            city_paint(0, MD_CITY_H_, NULL);
+            if (md_pick()) {
+                return 1;
+            }
+            whole = true;
+            held = menu_buttons();
+            continue;
+        }
+        if (whole) {
+            city_paint(0, MD_CITY_H_, home_over);
+            whole = false;
+            ag_printf("md: home painted\n");
+        } else {
+            city_paint(HOME_Y0, HOME_Y0 + HOME_ITEMS * HOME_STEP, home_over);
+        }
+        unsigned p = 0;
+        while ((p = ui_press(&held, &since)) == 0u) {
+            if (s_quit) {
+                return 0;
+            }
+            if (s_ui_lost) {
+                s_ui_lost = 0;
+                whole = true;
+                break;
+            }
+            ag_delay(20);
+        }
+        ag_printf("md: home press %x\n", p);   /* what reached it, for a test */
+        if (p & (MB_UP | MB_DOWN)) {
+            s_home_sel ^= 1;
+        } else if (p & MB_MENU) {
+            return 0;
+        } else if (p & MB_PICK) {
+            if (s_home_sel == 0) {
+                city_paint(0, MD_CITY_H_, NULL);   /* the items out from under */
+                if (md_pick()) {
+                    return 1;
+                }
+            } else {
+                md_settings();
+            }
+            if (s_quit) {
+                return 0;
+            }
+            held = menu_buttons();
+            whole = true;
         }
     }
 }
@@ -2608,7 +2846,7 @@ md_next_game:
             ag_printf("md: no glass for the game window\n");
             return 1;
         }
-        if (!md_pick()) {
+        if (!md_home()) {
             md_ring_stop();
             ag_gfx_release();
             return 0;
@@ -2846,6 +3084,7 @@ md_next_game:
         run_frame(show);
 #endif
         s_last_work_us = (uint32_t)(ag_micros() - f0);
+        s_draw_hold = 0;
         s_frames_done++;
         s_frame_no = (uint32_t)ran + 1u;
 
@@ -2937,7 +3176,11 @@ md_next_game:
 #ifdef MD_MENU
     md_wait_drawer_idle();
     if (s_to_pick) {
-        /* LOAD GAME: everything this cartridge took, back */
+        /* LOAD GAME: everything this cartridge took, back - and the drawer
+         * thread gone, so nothing of the game reaches the glass over the
+         * city (a frame it drew late stayed on the S3-CAM's top quarter) */
+        md_ring_stop();
+        s_ring_go = 0;           /* a new thread waits for the next machine */
         s_to_pick = 0;
         s_quit = 0;
         md_state_unkeep();
