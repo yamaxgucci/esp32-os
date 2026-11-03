@@ -1762,7 +1762,7 @@ static void ui_text(uint16_t *row, int width, int x, int glyph_row, const char *
     for (; *s != '\0' && x + 8 <= width; s++, x += 8) {
         const uint8_t bits = font_row((uint8_t)*s, glyph_row);
         for (int b = 0; b < 8; b++) {
-            if (bits & (0x80u >> b)) {
+            if (bits & (1u << b)) { /* bit 0 is the leftmost pixel (font8x16.h) */
                 row[x + b] = fg;
             }
         }
