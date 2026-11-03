@@ -784,8 +784,10 @@ unsigned int m68k_read_disassembler_32(unsigned int address)
 void gwenesis_bus_save_state() {
   SaveState* state;
   state = saveGwenesisStateOpenForWrite("bus");
+#ifndef ARGON_MD_SMALL /* in pages there: md_savestate.c */
   saveGwenesisStateSetBuffer(state, "M68K_RAM", M68K_RAM, MAX_RAM_SIZE);
   saveGwenesisStateSetBuffer(state, "ZRAM", ZRAM, MAX_Z80_RAM_SIZE);
+#endif
   saveGwenesisStateSetBuffer(state, "TMSS", TMSS, sizeof(TMSS));
   saveGwenesisStateSet(state, "tmss_state", tmss_state);
   saveGwenesisStateSet(state, "tmss_count", tmss_count);
@@ -793,8 +795,10 @@ void gwenesis_bus_save_state() {
 
 void gwenesis_bus_load_state() {
     SaveState* state = saveGwenesisStateOpenForRead("bus");
+#ifndef ARGON_MD_SMALL /* in pages there: md_savestate.c */
     saveGwenesisStateGetBuffer(state, "M68K_RAM", M68K_RAM, MAX_RAM_SIZE);
     saveGwenesisStateGetBuffer(state, "ZRAM", ZRAM, MAX_Z80_RAM_SIZE);
+#endif
     saveGwenesisStateGetBuffer(state, "TMSS", TMSS, sizeof(TMSS));
     tmss_state = saveGwenesisStateGet(state, "tmss_state");
     tmss_count = saveGwenesisStateGet(state, "tmss_count");

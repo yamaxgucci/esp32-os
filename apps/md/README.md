@@ -88,7 +88,7 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   --libs c -o build/apps/MD.AXE `
   apps/md/md_main.c `
   apps/md/port/md_z80.c apps/md/port/md_ym_ag_fm.c apps/md/port/md_psg.c `
-  apps/md/port/md_sound_out.c apps/md/port/md_savestate_stub.c `
+  apps/md/port/md_sound_out.c apps/md/port/md_savestate.c `
   apps/common/libc/libc_shim.c apps/common/fm/ag_fm.c apps/common/dsp/ag_dsp.c `
   apps/sms/core/z80/z80.c apps/sms/core/sound/sn76489.c `
   apps/md/core/bus/gwenesis_bus.c apps/md/core/cpus/M68K/m68kcpu.c `
@@ -119,7 +119,7 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   apps/md/md_main.c `
   apps/md/port/md_z80.c apps/md/port/md_ym_native.c apps/md/port/md_psg.c `
   apps/md/port/md_sound_out.c apps/md/port/md_snd_async.c apps/md/port/md_raster.c `
-  apps/md/port/md_savestate_stub.c apps/common/libc/libc_shim.c `
+  apps/md/port/md_savestate.c apps/common/libc/libc_shim.c `
   apps/sms/core/z80/z80.c apps/sms/core/sound/sn76489.c `
   apps/md/core/sound/ym2612.c `
   apps/md/core/bus/gwenesis_bus.c apps/md/core/cpus/M68K/m68kcpu.c `
@@ -181,7 +181,7 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc --no-stage --keep
   apps/md/md_main.c `
   apps/md/port/md_z80.c apps/md/port/md_ym_native.c apps/md/core/sound/ym2612.c apps/md/port/md_psg.c `
   apps/md/port/md_sound_out.c apps/md/port/md_snd_async.c apps/md/port/md_raster.c `
-  apps/md/port/md_savestate_stub.c apps/common/libc/libc_shim.c `
+  apps/md/port/md_savestate.c apps/common/libc/libc_shim.c `
   apps/sms/core/z80/z80.c apps/sms/core/sound/sn76489.c `
   apps/md/core/bus/gwenesis_bus.c apps/md/core/cpus/M68K/m68kcpu.c `
   apps/md/core/vdp/gwenesis_vdp_gfx.c apps/md/core/vdp/gwenesis_vdp_mem.c `
@@ -266,3 +266,20 @@ EG (no DT/LFO/SSG), pitch matched to `MDYM.AXE` by ear, −6 dB mix pad.
 `MDYM.AXE` remains the chip-accurate A/B reference (`net` +
 `pcmplay.py --record`). FM drums should stay percussive rather than a squeak;
 DAC/PCM on ch6 is a separate path. PSG matches SMS.
+
+### The game list, the pause menu and the phone pad (S3-CAM, 2 Nov 2026)
+
+- `run c:\mdmenu.axe` lists the `*.SWP` cartridges beside it and in its
+  `GAMES` folder on the console and starts the Mega Drive image next to it
+  (`MDS3.AXE`, `MD-NO-PSRAM.AXE` or `MD.AXE`); quitting the game brings the
+  list back. A game with a save state beside it is marked `*`.
+- Esc (the phone pad's MENU, a keyboard's Esc, a pad's quit) pauses the game
+  and shows RESUME / SAVE STATE / LOAD STATE / QUIT TO LIST. The state goes
+  beside the cartridge as `NAME.sav`, PackBits-compressed: Alex Kidd's is
+  36 KB of 144 (md_savestate.c). Only the PSRAM build has the menu
+  (`MD_MENU`): on the CYD its font's 4 KB put the machine a page short, and
+  Esc still ends the game there.
+- The pad: `drv load c:\phone.sys`, then `http://<board>:8765/#pad` on the
+  phone (or the 🎮 button on the page). The page asks the board for no
+  picture (`IN_PADONLY`), and its buttons go as keys - arrows, Z X C for
+  A B C, Enter for Start, Esc for MENU - which the pad layer already reads.

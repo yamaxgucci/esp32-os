@@ -24,6 +24,12 @@
   "apps": [
     { "out": "HELLO.AXE", "group": "core", "src": ["apps/hello/hello.c"] },
     {
+      "out": "MDMENU.AXE", "group": "core",
+      "_note": "the Mega Drive's game list on the console: *.SWP beside it and in GAMES, started with the MD image next to it, back when the game quits (apps/mdmenu).",
+      "include": ["apps/common/libc"],
+      "src": ["apps/mdmenu/mdmenu.c", "apps/common/libc/libc_shim.c"]
+    },
+    {
       "out": "STORE.AXE", "group": "core",
       "_note": "the program shop (docs/plans/app-store.md).  Fetches INDEX.TXT and INDEX.SIG over net->http_request, checks the size and SHA-256 of what arrives, checks the image's own header, checks the chain root -> shop -> developer -> image, and only then replaces the old file.  The maths behind those signatures is the kernel's (api->crypto, ABI 0.71): this image used to carry 11 KB of Monocypher of its own and no longer does.  The root public key is compiled in from tools/store-root.pub.  No libc, so the catalogue parser, the version compare, the build chooser, the registry and the certificate code are the same sources the host tests run.",
       "include": ["apps/store"],

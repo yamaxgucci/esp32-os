@@ -106,6 +106,15 @@ static void md_z80bench_sys(void *arg)
 }
 #endif
 static int s_quit;
+/*
+ * The pause menu and save states (md_pause_menu): on a board with PSRAM.  On
+ * the CYD its font's 4 KB are data, and the machine is a page short without
+ * them - there Esc still ends the game.
+ */
+#if defined(ARGON_MD_SMALL) && defined(MD_PSRAM_PAGES)
+#define MD_MENU 1
+#endif
+static volatile int s_menu_req; /* Esc seen: the main loop opens the pause menu */
 static ag_gfxinfo_t s_gi;
 
 /* run_frame's phases summed over the stats window (us), with `profile`. */
@@ -1397,8 +1406,19 @@ static void poll_pad_live(void)
         }
     }
     /* Old 3-byte hosts only have sys.pause; btnp(START) already ORs that in. */
-    if (ag_btnp(0, AG_BTN_QUIT)) {
-        s_quit = 1;
+    {
+        static int was;
+        const int q = ag_btnp(0, AG_BTN_QUIT) ? 1 : 0;
+#ifdef MD_MENU
+        if (q && !was) {
+            s_menu_req = 1;   /* the pause menu: quitting is one of its items */
+        }
+#else
+        if (q) {
+            s_quit = 1;
+        }
+#endif
+        was = q;
     }
 }
 
@@ -1416,6 +1436,14 @@ static void poll_pad_serial(void)
             continue;
         }
         if (ev.key.keycode == AG_KEY_ESC || ev.key.keycode == AG_KEY_Q) {
+#ifdef MD_MENU
+            if (ev.key.keycode == AG_KEY_ESC) {
+                if (ev.type == AG_EV_KEY_DOWN) {
+                    s_menu_req = 1;
+                }
+                continue;
+            }
+#endif
             s_quit = 1;
             continue;
         }
@@ -1639,6 +1667,199 @@ resume_m68k:
     frame_counter++;
 }
 
+/*
+ * The pause menu: Esc (the phone pad's MENU, a keyboard's Esc, a pad's quit)
+ * stops the game and shows a box over it - resume, save, load, quit to the
+ * list.  It is drawn a row at a time through the row the drawer is not using
+ * between passes and sent the way the game's rows are, so it costs no memory
+ * of its own; the rows under it go to the glass again once the game is back.
+ */
+#ifdef MD_MENU
+#include "font8x16.h"
+#include "md_savestate.h"
+
+static char         s_save_path[96]; /* the cartridge's, with .sav */
+
+#define MENU_W     232
+#define MENU_ITEMS 4
+#define MENU_ROWH  18
+#define MENU_H     (MENU_ROWH * (MENU_ITEMS + 2) + 8)
+#define MENU_BG    0x0841u
+#define MENU_EDGE  0x52aau
+#define MENU_FG    0xdefbu
+#define MENU_SEL   0x2b3du
+#define MENU_NOTE  0xfd20u
+
+static const char *const k_menu_items[MENU_ITEMS] = {
+    "RESUME", "SAVE STATE", "LOAD STATE", "QUIT TO LIST",
+};
+
+static void menu_text(uint16_t *row, int x, int glyph_row, const char *s,
+                      uint16_t fg)
+{
+    for (; *s != '\0' && x + 8 <= MENU_W; s++, x += 8) {
+        const uint8_t bits = k_font8x16[(uint8_t)*s][glyph_row];
+        for (int b = 0; b < 8; b++) {
+            if (bits & (0x80u >> b)) {
+                row[x + b] = fg;
+            }
+        }
+    }
+}
+
+/* One row of the box, `y` from its top. */
+static void menu_row(uint16_t *row, int y, int sel, const char *note)
+{
+    const bool edge = (y < 2 || y >= MENU_H - 2);
+    for (int x = 0; x < MENU_W; x++) {
+        row[x] = (edge || x < 2 || x >= MENU_W - 2) ? MENU_EDGE : MENU_BG;
+    }
+    if (edge) {
+        return;
+    }
+    const int slot = (y - 4) / MENU_ROWH;   /* 0: the title, then the items */
+    const int gy = (y - 4) % MENU_ROWH - 1;
+    if (slot >= 1 && slot <= MENU_ITEMS && slot - 1 == sel) {
+        for (int x = 4; x < MENU_W - 4; x++) {
+            row[x] = MENU_SEL;
+        }
+    }
+    if (gy < 0 || gy >= AG_FONT8X16_H) {
+        return;
+    }
+    if (slot == 0) {
+        menu_text(row, 12, gy, "PAUSED", MENU_NOTE);
+    } else if (slot <= MENU_ITEMS) {
+        menu_text(row, 20, gy, k_menu_items[slot - 1], MENU_FG);
+    } else if (note != NULL) {
+        menu_text(row, 12, gy, note, MENU_NOTE);
+    }
+}
+
+static void menu_draw(int sel, const char *note)
+{
+    if (s_ring_n == 0 || s_headless) {
+        return;
+    }
+    uint16_t *const row = (uint16_t *)s_ring[0];
+    const int top = (screen_height - MENU_H) / 2;
+    for (int y = 0; y < MENU_H; y++) {
+        menu_row(row, y, sel, note);
+        md_present_rows(row, top + y, 1, MENU_W, screen_height);
+        s_line_hash[top + y] = 0xffffffffu; /* the game's row goes again */
+    }
+}
+
+/* The buttons the menu answers, as a mask of what is held. */
+static unsigned menu_buttons(void)
+{
+    static const int k_ids[] = {AG_BTN_UP, AG_BTN_DOWN, AG_BTN_B1, AG_BTN_C,
+                                AG_BTN_START, AG_BTN_B2, AG_BTN_QUIT};
+    unsigned m = 0;
+    for (unsigned i = 0; i < sizeof(k_ids) / sizeof(k_ids[0]); i++) {
+        if (ag_btnp(0, k_ids[i])) {
+            m |= 1u << i;
+        }
+    }
+    return m;
+}
+#define MB_UP     0x01u
+#define MB_DOWN   0x02u
+#define MB_PICK   (0x04u | 0x08u | 0x10u)
+#define MB_BACK   (0x20u | 0x40u)
+
+static void md_pause_menu(void)
+{
+    /* the pass under way finishes: the drawer draws nothing more until
+     * another frame is made, and none is */
+    for (int i = 0; i < 500 && s_pass_h != 0; i++) {
+        ag_delay(2);
+    }
+    ag_printf("md: paused\n");
+    int         sel = 0;
+    const char *note = NULL;
+    unsigned    held = menu_buttons(); /* what opened it is not a press */
+    menu_draw(sel, note);
+    for (;;) {
+        ag_event_t ev;
+        while (ag_poll_event(&ev, 0)) {
+            (void)handle_session_ev(&ev);
+        }
+        if (s_quit) {
+            return;
+        }
+        const unsigned now = menu_buttons();
+        const unsigned press = now & ~held;
+        held = now;
+        int act = -1;
+        if (press & MB_UP) {
+            sel = (sel + MENU_ITEMS - 1) % MENU_ITEMS;
+            note = NULL;
+        } else if (press & MB_DOWN) {
+            sel = (sel + 1) % MENU_ITEMS;
+            note = NULL;
+        } else if (press & MB_BACK) {
+            act = 0;
+        } else if (press & MB_PICK) {
+            act = sel;
+        }
+        if (act == 0) {
+            break;
+        }
+        if (act == 1) {
+            const int r = md_state_save(s_save_path);
+            note = (r == MD_STATE_OK) ? "SAVED" : "COULD NOT SAVE";
+            ag_printf("md: save to %s: %d\n", s_save_path, r);
+        } else if (act == 2) {
+            const int r = md_state_load(s_save_path);
+            ag_printf("md: load from %s: %d\n", s_save_path, r);
+            if (r == MD_STATE_OK) {
+                break;
+            }
+            if (r == MD_STATE_BAD) {
+                reset_emulation(); /* half loaded is no machine at all */
+            }
+            note = (r == MD_STATE_NO_FILE) ? "NO SAVE YET" : "COULD NOT LOAD";
+        } else if (act == 3) {
+            s_quit = 1;
+            return;
+        }
+        if (press != 0u) {
+            menu_draw(sel, note);
+        }
+        ag_delay(20);
+    }
+    /* the game's own rows over the box, and its sound from now */
+    memset(s_line_hash, 0xff, sizeof(s_line_hash));
+    ag_printf("md: resumed\n");
+}
+
+/* the save beside the cartridge: its name with .sav */
+static void md_save_path_for(const char *rom)
+{
+    if (rom == NULL) {
+        s_save_path[0] = '\0';
+        return;
+    }
+    size_t n = strlen(rom);
+    if (n > sizeof(s_save_path) - 5u) {
+        n = sizeof(s_save_path) - 5u;
+    }
+    memcpy(s_save_path, rom, n);
+    s_save_path[n] = '\0';
+    char *dot = strrchr(s_save_path, '.');
+    char *sep = strrchr(s_save_path, '\\');
+    char *sep2 = strrchr(s_save_path, '/');
+    if (sep2 > sep) {
+        sep = sep2;
+    }
+    if (dot != NULL && (sep == NULL || dot > sep)) {
+        *dot = '\0';
+    }
+    strcat(s_save_path, ".sav");
+}
+#endif
+
 int ag_main(int argc, char **argv)
 {
     const char *rom = NULL;
@@ -1787,6 +2008,9 @@ int ag_main(int argc, char **argv)
      */
     unsigned char *rom_data = (rom != NULL) ? map_rom(rom, &rom_size)
                                             : make_tiny_rom(&rom_size);
+#ifdef MD_MENU
+    md_save_path_for(rom);
+#endif
     /*
      * `waitcard`: the cartridge now reads out of flash, and the card's file
      * system holds 11 KB the machine needs.  An application cannot release the
@@ -1954,6 +2178,16 @@ int ag_main(int argc, char **argv)
             ag_delay(50);
             continue;
         }
+#ifdef MD_MENU
+        if (s_menu_req) {
+            s_menu_req = 0;
+            md_pause_menu();
+            next_frame = window_t0 = ag_micros();
+            work_sum = emu_sum = present_sum = work_max = 0;
+            window = 0;
+            continue;
+        }
+#endif
 
         const ag_time_t f0 = ag_micros();
 

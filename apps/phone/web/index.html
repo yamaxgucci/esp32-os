@@ -172,6 +172,61 @@
     white-space: pre-line;
   }
   #splash[hidden] { display: none; }
+
+  /*
+   * The game pad (the 🎮 button, or #pad in the address).  The game is on the
+   * board's own screen, so the phone shows only the controls and tells the
+   * board to send it no picture (IN_PADONLY) - a picture nobody looks at
+   * would be the drawing application waiting on Wi-Fi.  Keys go as the
+   * keyboard's: arrows, Z X C, Enter for Start, Esc for the game's menu, which
+   * the board's pad layer already reads as the pad.
+   */
+  #pad {
+    flex: 1 1 auto; display: none; position: relative; overflow: hidden;
+    background: #14171c; user-select: none; -webkit-user-select: none;
+  }
+  #app.pad #pad { display: block; }
+  #app.pad #screen, #app.pad #keys, #app.pad #kbd, #app.pad #bar { display: none; }
+  #app.pad #kb, #app.pad #native { display: none; }
+  #dpad {
+    position: absolute; left: 4%; top: 50%; transform: translateY(-50%);
+    width: min(44vmin, 46vw); height: min(44vmin, 46vw); border-radius: 50%;
+    background: radial-gradient(circle, #242832 0 30%, #1c2028 31% 100%);
+    border: 1px solid #2c3240;
+  }
+  #dpad .arm {
+    position: absolute; background: #2c3240; border-radius: 8px;
+  }
+  #dpad .arm.on { background: #5d6b80; }
+  #dpad .u { left: 34%; top: 4%; width: 32%; height: 34%; }
+  #dpad .d { left: 34%; bottom: 4%; width: 32%; height: 34%; }
+  #dpad .l { top: 34%; left: 4%; width: 34%; height: 32%; }
+  #dpad .r { top: 34%; right: 4%; width: 34%; height: 32%; }
+  .pb {
+    position: absolute; border-radius: 50%; display: flex;
+    align-items: center; justify-content: center; font-weight: 700;
+    font-size: min(6vmin, 26px); color: #d8dee9; background: #2c3240;
+    border: 1px solid #39414f; width: min(18vmin, 19vw); height: min(18vmin, 19vw);
+  }
+  .pb.on { background: #5d6b80; }
+  .pb.a { right: calc(4% + 2 * min(19vmin, 20vw)); top: 52%; }
+  .pb.b { right: calc(4% + min(19vmin, 20vw)); top: 40%; }
+  .pb.c { right: 4%; top: 28%; }
+  .pb.small {
+    border-radius: 14px; width: min(20vmin, 22vw); height: min(9vmin, 10vw);
+    font-size: min(3.6vmin, 15px); font-weight: 600;
+  }
+  .pb.start { left: 50%; transform: translateX(-50%); bottom: 8%; }
+  .pb.menu { left: 50%; transform: translateX(-50%); top: 6%; }
+  @media (orientation: portrait) {
+    #dpad { top: auto; bottom: 16%; transform: none; width: 50vw; height: 50vw; }
+    .pb { width: 19vw; height: 19vw; font-size: 6vw; }
+    .pb.a { right: 50vw; top: 36%; }
+    .pb.b { right: 27vw; top: 29%; }
+    .pb.c { right: 4vw; top: 22%; }
+    .pb.small { width: 26vw; height: 10vw; font-size: 3.6vw; }
+    .pb.start { bottom: 5%; }
+  }
 </style>
 
 <div id="app">
@@ -179,6 +234,7 @@
     <span id="dot"></span>
     <span id="name">ArgonOS</span>
     <span id="note">connecting…</span>
+    <button id="padbtn">🎮</button>
     <button id="kb">⌨</button>
     <button id="native">abc</button>
   </header>
@@ -199,6 +255,14 @@
   </div>
   <div id="keys"></div>
   <div id="kbd"></div>
+  <div id="pad">
+    <div id="dpad"><div class="arm u"></div><div class="arm d"></div><div class="arm l"></div><div class="arm r"></div></div>
+    <div class="pb a" data-hid="29">A</div>
+    <div class="pb b" data-hid="27">B</div>
+    <div class="pb c" data-hid="6">C</div>
+    <div class="pb small start" data-hid="40">START</div>
+    <div class="pb small menu" data-hid="41">MENU</div>
+  </div>
 </div>
 <textarea id="sink" autocapitalize="off" autocorrect="off" autocomplete="off"
           spellcheck="false"></textarea>
@@ -676,6 +740,7 @@ function connect() {
     ui.note.textContent = BOARD;
     setBar("");
     ws.send(new Uint8Array([IN_HELLO]));
+    if (pad.on) ws.send(new Uint8Array([IN_PADONLY, 1]));
   };
   ws.onclose = (ev) => {
     /*
@@ -1381,7 +1446,124 @@ document.addEventListener("visibilitychange", () => {
   if (st.ws.readyState === 1) send([IN_HELLO]);
 });
 
+
+/* ---- the game pad ------------------------------------------------------ */
+
+const IN_PADONLY = 0x4a;
+const pad = {
+  on: false,
+  held: new Map(),      /* hid -> how many touches hold it */
+  touches: new Map(),   /* pointerId -> hids it holds */
+  timer: 0,
+};
+
+function padSendHeld() {
+  /* the board's pad layer forgets a key not heard of for 150 ms */
+  for (const hid of pad.held.keys()) {
+    send([IN_KEY, 1, 0, hid & 255, hid >> 8, 0, 0, 1]);
+  }
+}
+
+function padHold(hid, down) {
+  const n = pad.held.get(hid) || 0;
+  if (down) {
+    pad.held.set(hid, n + 1);
+    if (n === 0) {
+      send([IN_KEY, 1, 0, hid & 255, hid >> 8, 0, 0, 0]);
+      if (navigator.vibrate) navigator.vibrate(8);
+    }
+  } else if (n > 0) {
+    if (n === 1) {
+      pad.held.delete(hid);
+      send([IN_KEY, 2, 0, hid & 255, hid >> 8, 0, 0, 0]);
+    } else {
+      pad.held.set(hid, n - 1);
+    }
+  }
+}
+
+const PAD_UP = 82, PAD_DOWN = 81, PAD_LEFT = 80, PAD_RIGHT = 79;
+
+/* the directions a touch on the cross means: eight of them, by its angle
+ * from the middle, nothing in the middle itself */
+function dpadDirs(el, x, y) {
+  const r = el.getBoundingClientRect();
+  const dx = x - (r.left + r.width / 2), dy = y - (r.top + r.height / 2);
+  if (Math.hypot(dx, dy) < r.width * 0.12) return [];
+  const a = Math.atan2(dy, dx) * 180 / Math.PI;   /* 0 = right, 90 = down */
+  const out = [];
+  if (a > -67.5 && a < 67.5) out.push(PAD_RIGHT);
+  if (a > 22.5 && a < 157.5) out.push(PAD_DOWN);
+  if (a > 112.5 || a < -112.5) out.push(PAD_LEFT);
+  if (a > -157.5 && a < -22.5) out.push(PAD_UP);
+  return out;
+}
+
+function padShowDirs() {
+  const map = {u: PAD_UP, d: PAD_DOWN, l: PAD_LEFT, r: PAD_RIGHT};
+  for (const k in map) {
+    document.querySelector("#dpad ." + k).classList.toggle("on", pad.held.has(map[k]));
+  }
+  for (const b of document.querySelectorAll("#pad .pb")) {
+    b.classList.toggle("on", pad.held.has(+b.dataset.hid));
+  }
+}
+
+function padTouch(id, hids) {
+  const before = pad.touches.get(id) || [];
+  for (const h of before) if (!hids.includes(h)) padHold(h, false);
+  for (const h of hids) if (!before.includes(h)) padHold(h, true);
+  if (hids.length) pad.touches.set(id, hids); else pad.touches.delete(id);
+  padShowDirs();
+}
+
+function padTarget(x, y) {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return [];
+  const dp = el.closest("#dpad");
+  if (dp) return dpadDirs(dp, x, y);
+  const b = el.closest(".pb");
+  return b ? [+b.dataset.hid] : [];
+}
+
+(() => {
+  const area = document.getElementById("pad");
+  const at = (e) => padTouch(e.pointerId, padTarget(e.clientX, e.clientY));
+  area.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    try { area.setPointerCapture(e.pointerId); } catch (_) {}
+    at(e);
+  });
+  area.addEventListener("pointermove", (e) => {
+    if (pad.touches.has(e.pointerId) || e.buttons) at(e);
+  });
+  const up = (e) => padTouch(e.pointerId, []);
+  area.addEventListener("pointerup", up);
+  area.addEventListener("pointercancel", up);
+  area.addEventListener("contextmenu", (e) => e.preventDefault());
+})();
+
+function setPad(on) {
+  pad.on = on;
+  document.getElementById("app").classList.toggle("pad", on);
+  for (const id of [...pad.touches.keys()]) padTouch(id, []);
+  clearInterval(pad.timer);
+  pad.timer = on ? setInterval(padSendHeld, 60) : 0;
+  send([IN_PADONLY, on ? 1 : 0]);
+  try { localStorage.setItem("argon.pad", on ? "1" : "0"); } catch (_) {}
+  if (on && screen.orientation && screen.orientation.lock) {
+    screen.orientation.lock("landscape").catch(() => {});
+  }
+}
+
+document.getElementById("padbtn").onclick = () => setPad(!pad.on);
+
 resizeText();
 setBar("connecting…");
 connect();
+{
+  let want = location.hash === "#pad";
+  try { want = want || localStorage.getItem("argon.pad") === "1"; } catch (_) {}
+  if (want) setPad(true);
+}
 </script>

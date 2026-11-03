@@ -213,6 +213,10 @@ AG_DRV("PHONE", "1.1", "argon");
 #define IN_PTR 'P'
 #define IN_TEXT 'T'
 #define IN_AUTH 'A'
+/* 'J' 1|0: the client is a game pad and wants no picture (the game is on the
+ * board's own screen) - nothing is encoded or sent for it, so the drawing
+ * application does not wait on the wire for a phone nobody looks at */
+#define IN_PADONLY 'J'
 
 #define INFO_HAS_TEXT 0x01u
 /*
@@ -392,6 +396,7 @@ static struct {
     uint64_t    last_life_us;
     volatile bool     up;
     volatile bool     owe_everything;
+    volatile bool     pad_only; /* IN_PADONLY: keys in, nothing out */
     /*
      * The row the repair sweep will send next, whether or not it changed.
      *
@@ -970,6 +975,7 @@ static void drop_conn_reason(const char *why, bool gone)
 {
     /* A new client is not the old one's shut window. */
     s.hush_until = 0u;
+    s.pad_only = false;
     /*
      * The picture buffers are NOT freed here, and that is a fix, not an
      * oversight.
@@ -1594,6 +1600,10 @@ static bool service_client(void)
         return true;
     }
 
+    if (s.pad_only) {
+        return true; /* a game pad: keys come in, nothing goes out */
+    }
+
     if (s.owe_info && !s.owe_everything) {
         const wire_t r = send_info(3000u);
         if (r == WIRE_GONE) {
@@ -1986,6 +1996,17 @@ static void handle_message(const uint8_t *p, uint32_t len)
         ag_log(AG_LOG_INFO, "phone", "client authenticated");
         break;
     }
+
+    case IN_PADONLY:
+        if (n >= 1u) {
+            s.pad_only = (body[0] != 0u);
+            ag_log(AG_LOG_INFO, "phone", "client is %s",
+                   s.pad_only ? "a game pad: no picture sent" : "a screen again");
+            if (!s.pad_only) {
+                s.owe_everything = true;
+            }
+        }
+        break;
 
     case IN_HELLO: {
         char b[40];
@@ -3369,6 +3390,9 @@ static void phone_blit_rect(ag_handle_t h, const ag_blit_t *b)
     (void)h;
     if (b == NULL || b->px == NULL || b->w == 0u || b->h == 0u) {
         return;
+    }
+    if (s.pad_only) {
+        return; /* the phone is a game pad; the picture is on the board */
     }
 
     /*
