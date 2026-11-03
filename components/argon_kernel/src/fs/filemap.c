@@ -203,6 +203,16 @@ ag_err_t ag_filemap_open(const char *path, const char *cwd, const void **out,
 
     ag_appfs_slot_t *slot = NULL;
     err = ag_appfs_reserve_data((size_t)st.size, &slot);
+    if (err == -AG_ENOSPC && ag_filemap_forget() > 0u) {
+        /*
+         * The room is wanted now, and copies nobody holds are what the cache
+         * keeps it with: give them back and ask again.  free_entry only does
+         * this when the table is full - the Mega Drive's second cartridge on
+         * the CYD found the flash full of its first (3 Nov 2026).  `e` stays
+         * valid: forgetting only clears entries.
+         */
+        err = ag_appfs_reserve_data((size_t)st.size, &slot);
+    }
     if (err != AG_OK) {
         ag_log(AG_LOG_ERROR, TAG, "%s: no room in appfs for %u KB (%d)", path,
                (unsigned)(st.size / 1024u), (int)err);

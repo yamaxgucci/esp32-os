@@ -45,6 +45,8 @@
 #include <argon/shell.h>
 #include <argon/filemap.h>
 #include <argon/vfs.h>
+#include <argon/memshape.h>
+#include "fs/storage.h"
 
 #include "core/sysconfig.h"
 
@@ -873,6 +875,19 @@ static ag_err_t api_unmap(const void *ptr)
     return ag_filemap_close(ptr);
 }
 
+/* ABI 0.77: what `eject` and `mount a:` do, for an application */
+static ag_err_t api_media(bool present)
+{
+    if (present) {
+        return ag_storage_mount_media();
+    }
+    const ag_err_t err = ag_storage_eject_media();
+    if (err == AG_OK) {
+        (void)ag_mem_reshape("card out");
+    }
+    return err;
+}
+
 static const ag_fs_api_t k_fs = {
     .size = sizeof(ag_fs_api_t),
     .open = api_open,
@@ -895,6 +910,7 @@ static const ag_fs_api_t k_fs = {
     .mountinfo = api_mountinfo,
     .map = api_map,
     .unmap = api_unmap,
+    .media = api_media,
 };
 
 /* ---------------------------------------------------------------------- */

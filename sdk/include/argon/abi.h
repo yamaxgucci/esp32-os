@@ -529,9 +529,13 @@ extern "C" {
  *
  *      Merged 1 Nov 2026 at 0.73: every addition above is in its own table or
  *      a flag of its own, so nothing moved for either line's images.
+ *
+ * 0.77 fs->media (3 Nov 2026): an application lets the card go and mounts it
+ *      again - the Mega Drive picks a game from the card and then needs the
+ *      card's memory for the machine.  APPENDED past unmap.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 76u
+#define AG_ABI_MINOR 77u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -870,6 +874,16 @@ typedef struct ag_fs_api {
      */
     ag_err_t (*map)(const char *path, const void **out, uint64_t *out_len);
     ag_err_t (*unmap)(const void *ptr);
+
+    /*
+     * ABI 0.77: the removable card let go (false) or mounted again (true), as
+     * the shell's `eject` and `mount a:` do.  For an application that needs
+     * the card's memory back once it has what it wanted from it - the Mega
+     * Drive on the CYD, whose cartridge is staged into flash by map() and
+     * whose machine does not fit beside the card's 44 KB.  -AG_ENODEV with no
+     * card.
+     */
+    ag_err_t (*media)(bool present);
 } ag_fs_api_t;
 
 /* ------------------------------------------------------------------------ */

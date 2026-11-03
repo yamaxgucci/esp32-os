@@ -363,6 +363,15 @@ static inline ag_err_t ag_map(const char *p, const void **out, uint64_t *len)
     return g_ag_api->fs->map(p, out, len);
 }
 
+/* The card let go (false) or mounted again (true); -AG_ENOSYS before 0.77. */
+static inline ag_err_t ag_media(bool present)
+{
+    if (!AG_HAS(g_ag_api->fs, media)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->fs->media(present);
+}
+
 static inline ag_err_t ag_unmap(const void *p)
 {
     return g_ag_api->fs->unmap(p);
