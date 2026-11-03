@@ -112,7 +112,6 @@ set(ARGON_INCLUDES
     "${ARGON_ROOT}/apps/common/kvm"
     "${ARGON_ROOT}/apps/common/pixband"
     "${ARGON_ROOT}/apps/common/ws"
-    "${ARGON_ROOT}/apps/store"
     "${ARGON_ROOT}/apps/cktbench")
 
 # The NAM player has to agree with the reference implementation to the last bit -
@@ -194,30 +193,7 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/esp8266/ag_espldr.c"
     test_stm32ldr.c
     "${ARGON_ROOT}/apps/common/stm32/ag_stm32ldr.c"
-    # The shop's own half: a catalogue, a version, a choice of build and the
-    # registry of what is installed.  Compiled here and into STORE.AXE from the
-    # same sources, so these are the tests of the code that ships.
-    test_store.c
-    "${ARGON_ROOT}/apps/store/store_text.c"
-    "${ARGON_ROOT}/apps/store/store_ver.c"
-    "${ARGON_ROOT}/apps/store/store_index.c"
-    "${ARGON_ROOT}/apps/store/store_pick.c"
-    "${ARGON_ROOT}/apps/store/store_db.c"
-    # The signatures: certificates, the AXS1 tail, the catalogue's AGS1.  The
-    # maths is the kernel's crypto library now (ABI 0.71): api_stub.c is the
-    # piece of a kernel that hands it to store_sig.c, so what is tested is the
-    # call an application makes rather than a shortcut around it.
-    api_stub.c
-    test_store_sig.c
-    "${ARGON_ROOT}/apps/store/store_sig.c"
     ${ARGON_CRYPTO_SRCS}
-    # AGX1: the frames a program arrives in, checked against the same
-    # vectors as the Python sender and the site.
-    test_agx.c
-    "${ARGON_ROOT}/apps/store/agx.c"
-    # `store -web`: the hello the board MACs and the reply it reads.
-    test_store_web.c
-    "${ARGON_ROOT}/apps/store/store_web.c"
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
     test_rv32.c
@@ -259,23 +235,6 @@ if(NOT MSVC)
         "${ARGON_ROOT}/components/argon_crypto/vendor/monocypher.c"
         "${ARGON_ROOT}/components/argon_crypto/vendor/monocypher-ed25519.c"
         PROPERTIES COMPILE_OPTIONS "-w")
-endif()
-
-# Checks a signed image or a signed catalogue exactly as STORE.AXE does, so
-# that store/tests/test_argonsign.py can point it at what Python signed.  Two
-# implementations of RFC 8032 agreeing on the same bytes is the evidence.
-add_executable(storeverify
-    storeverify.c
-    api_stub.c
-    "${ARGON_ROOT}/apps/store/store_sig.c"
-    ${ARGON_CRYPTO_SRCS})
-target_include_directories(storeverify PRIVATE
-    "${ARGON_ROOT}/sdk/include"
-    "${ARGON_ROOT}/components/argon_crypto/include"
-    "${ARGON_ROOT}/components/argon_crypto/vendor"
-    "${ARGON_ROOT}/apps/store")
-if(NOT MSVC)
-    target_link_libraries(storeverify PRIVATE m)
 endif()
 
 # Renders a raw serial transcript into the screen it produces, using the

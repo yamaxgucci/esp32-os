@@ -13,11 +13,9 @@
  * they pass each other: a change here that changes a layout is a compile error
  * in this file, not a wrong digest on a board.
  *
- * SHA-512 and Ed25519 are Monocypher (vendor/), which is why the vetting of
- * the curve lives in one place: host-tests/test_store_sig.c signs the standard
- * test vectors and compares them byte for byte, through the same API an
- * application uses.  SHA-256 is ours (src/sha256.c), carried over from the shop
- * that used to keep its own copy.
+ * SHA-512 and Ed25519 are Monocypher (vendor/), vetted once, against the
+ * standard's test vectors, through the same API an application uses.  SHA-256
+ * is ours (src/sha256.c).
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
@@ -34,9 +32,8 @@ _Static_assert(sizeof(ag_sha512_t) == sizeof(crypto_sha512_ctx),
 
 /* ---- SHA-256 ------------------------------------------------------------ */
 /*
- * It lives in src/sha256.c, written in the shop and moved here: FIPS 180-4 in
- * a hundred lines, with the standard's vectors in host-tests/test_store.c.  Its
- * functions are the ABI's, so there is nothing to wrap.
+ * It lives in src/sha256.c: FIPS 180-4 in a hundred lines.  Its functions
+ * are the ABI's, so there is nothing to wrap.
  */
 
 /* ---- SHA-512 ------------------------------------------------------------ */

@@ -1,10 +1,8 @@
 /*
  * ArgonOS - SHA-256 (FIPS 180-4), streaming - the kernel's copy.
  *
- * Written in the shop, moved here when the maths became a kernel
- * library (ABI 0.71): an image cannot afford its own, and this one is
- * reached through api->crypto.  FIPS 180-4, with the standard's own
- * test vectors in host-tests/test_store.c.
+ * A kernel library since ABI 0.71: an image cannot afford its own, and
+ * this one is reached through api->crypto.  FIPS 180-4.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
