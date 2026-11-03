@@ -158,6 +158,7 @@ int md_raster_on;
 static void *(*s_alloc)(size_t);
 static uint8_t *s_cut, *s_cut_end;
 unsigned md_raster_blocks, md_raster_bytes; /* what it got (the stats) */
+static void *s_blk[24]; /* the blocks it was cut from, for md_raster_free */
 
 static void *carve(size_t n)
 {
@@ -173,6 +174,9 @@ static void *carve(size_t n)
             if (b != NULL) {
                 s_cut = b;
                 s_cut_end = b + k_sizes[i];
+                if (md_raster_blocks < sizeof(s_blk) / sizeof(s_blk[0])) {
+                    s_blk[md_raster_blocks] = b;
+                }
                 md_raster_blocks++;
                 md_raster_bytes += k_sizes[i];
                 break;
@@ -216,6 +220,36 @@ static int alloc_hs(uint16_t **t)
  * writes (without them nothing is followed), the scroll tables, the palette,
  * and only then more pieces.
  */
+/*
+ * Everything it took given back, for another cartridge: the CYD's game menu
+ * needs the memory to mount the card again.  The drawer is between passes.
+ */
+void md_raster_free(void (*release)(void *))
+{
+    md_raster_on = 0;
+    md_ras_hs_lo = 0x80000000u;
+    md_vr_hs = NULL;
+    for (unsigned i = 0; i < md_raster_blocks && i < sizeof(s_blk) / sizeof(s_blk[0]); i++) {
+        release(s_blk[i]);
+        s_blk[i] = NULL;
+    }
+    md_raster_blocks = md_raster_bytes = 0;
+    s_cut = s_cut_end = NULL;
+    s_rec[0] = s_rec[1] = NULL;
+    s_cp = NULL;
+    s_cp_rec = NULL;
+    s_cram565 = NULL;
+    s_hs_ok = s_hs_run_ok = 0;
+    s_cap = 0;
+    s_pub = -1;
+    s_pub_seq = s_took_seq = 0;
+    s_hs_busy = 0;
+    s_rec_k = 0;
+    md_vr_regs = gwenesis_vdp_regs;
+    md_vr_vsram = VSRAM;
+    md_vr_cram565 = CRAM565;
+}
+
 int md_raster_init(void *(*alloc)(size_t))
 {
     s_alloc = alloc;

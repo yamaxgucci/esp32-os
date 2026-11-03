@@ -19,6 +19,8 @@
 
 /* Its memory, from `alloc` once the machine's pages are cut; 0 if short. */
 int md_raster_init(void *(*alloc)(size_t));
+/* ...and given back, for another cartridge */
+void md_raster_free(void (*release)(void *));
 
 /* The 68000's side (the frame loop and the VDP's write paths). */
 extern int md_raster_on;

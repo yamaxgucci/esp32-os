@@ -496,27 +496,30 @@ typedef struct {
     int      zclk, bus_ack, reset, reset_once, bank, timeslice, bus_ack68, reset68;
 } md_z80_saved_t;
 
-void md_z80_state(void *buf, size_t *len, int load)
+size_t md_z80_state_size(void)
 {
-    md_z80_saved_t *const s = (md_z80_saved_t *)buf;
-    *len = sizeof(*s);
-    if (s == NULL) {
-        return;
-    }
+    return sizeof(md_z80_saved_t);
+}
+
+void md_z80_state_io(void (*io)(void *p, size_t n), int load)
+{
+    md_z80_saved_t s;
     if (!load) {
-        memcpy(&s->regs, &Z80, sizeof(Z80));
-        s->zclk = zclk;
-        s->bus_ack = s_bus_ack;
-        s->reset = s_reset;
-        s->reset_once = s_reset_once;
-        s->bank = s_z80_bank;
-        s->timeslice = s_timeslice;
-        s->bus_ack68 = s_bus_ack68;
-        s->reset68 = s_reset68;
+        memcpy(&s.regs, &Z80, sizeof(Z80));
+        s.zclk = zclk;
+        s.bus_ack = s_bus_ack;
+        s.reset = s_reset;
+        s.reset_once = s_reset_once;
+        s.bank = s_z80_bank;
+        s.timeslice = s_timeslice;
+        s.bus_ack68 = s_bus_ack68;
+        s.reset68 = s_reset68;
+        io(&s, sizeof(s));
         return;
     }
+    io(&s, sizeof(s));
     Z80_Regs keep = Z80;
-    memcpy(&Z80, &s->regs, sizeof(Z80));
+    memcpy(&Z80, &s.regs, sizeof(Z80));
     Z80.cc_op = keep.cc_op;
     Z80.cc_cb = keep.cc_cb;
     Z80.cc_ed = keep.cc_ed;
@@ -524,12 +527,12 @@ void md_z80_state(void *buf, size_t *len, int load)
     Z80.cc_xycb = keep.cc_xycb;
     Z80.cc_ex = keep.cc_ex;
     Z80.irq_callback = keep.irq_callback;
-    zclk = s->zclk;
-    s_bus_ack = s->bus_ack;
-    s_reset = s->reset;
-    s_reset_once = s->reset_once;
-    s_z80_bank = s->bank;
-    s_timeslice = s->timeslice;
-    s_bus_ack68 = s->bus_ack68;
-    s_reset68 = s->reset68;
+    zclk = s.zclk;
+    s_bus_ack = s.bus_ack;
+    s_reset = s.reset;
+    s_reset_once = s.reset_once;
+    s_z80_bank = s.bank;
+    s_timeslice = s.timeslice;
+    s_bus_ack68 = s.bus_ack68;
+    s_reset68 = s.reset68;
 }

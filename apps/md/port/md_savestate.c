@@ -28,12 +28,21 @@
 #define MD_STATE_IO      256
 #define MD_STATE_TAG_MAX 40
 
+int                md_state_err; /* why the file did not open */
 static ag_handle_t s_f = AG_INVALID_HANDLE;
 static int         s_writing;
 static int         s_bad;     /* a write short, or a tag out of step on load */
 static uint8_t    *s_bounce;  /* a page's worth, for the pages that take words */
 static uint8_t    *s_io;      /* the file's bytes, a buffer at a time */
 static size_t      s_io_n, s_io_at;
+static uint32_t    s_written; /* bytes out, for the truncate of a kept file */
+/*
+ * The file held open from before the machine took the memory: on the CYD a
+ * file opened mid-game finds no 512 bytes in one piece for littlefs's buffer
+ * (-AG_EINVAL, 5 KB free in crumbs), so the game's save file is opened at its
+ * start and kept (md_state_keep).
+ */
+static ag_handle_t s_keep = AG_INVALID_HANDLE;
 
 /* any non-NULL pointer: the cores only hand it back */
 SaveState *saveGwenesisStateOpenForRead(const char *fileName)
@@ -53,6 +62,7 @@ static void io_flush(void)
     if (s_io_n != 0u && !s_bad && ag_write(s_f, s_io, s_io_n) != (int32_t)s_io_n) {
         s_bad = 1;
     }
+    s_written += (uint32_t)s_io_n;
     s_io_n = 0;
 }
 
@@ -218,32 +228,29 @@ void saveGwenesisStateGetBuffer(SaveState *state, const char *tagName,
 }
 
 #ifdef ARGON_MD_SMALL
-/* the port's own parts (md_z80.c, md_psg.c, ym2612.c) */
-extern void md_z80_state(void *buf, size_t *len, int load);
-extern void md_psg_state(void *buf, size_t *len, int load);
-extern void md_ym_state(void *buf, size_t *len, int load);
+/* the port's own parts (md_z80.c, md_psg.c, ym2612.c), streamed */
+extern size_t md_z80_state_size(void);
+extern void   md_z80_state_io(void (*io)(void *, size_t), int load);
+extern size_t md_psg_state_size(void);
+extern void   md_psg_state_io(void (*io)(void *, size_t), int load);
+extern size_t md_ym_state_size(void);
+extern void   md_ym_state_io(void (*io)(void *, size_t), int load);
 
-/* One part of the port through a scratch block: its size asked first. */
-static void port_part(const char *tag, void (*fn)(void *, size_t *, int))
+static void io_put(void *p, size_t n)
 {
-    size_t n = 0;
-    fn(NULL, &n, 0);
-    void *b = ag_malloc(n);
-    if (b == NULL) {
-        s_bad = 1;
-        return;
-    }
+    put(p, n);
+}
+
+static void part(const char *tag, size_t (*size)(void),
+                 void (*io)(void (*)(void *, size_t), int))
+{
+    const size_t n = size();
     if (s_writing) {
-        fn(b, &n, 0);
         put_tag(tag, (uint32_t)n);
-        put(b, n);
+        io(io_put, 0);
     } else if (get_tag(tag, (uint32_t)n)) {
-        get(b, n);
-        if (!s_bad) {
-            fn(b, &n, 1);
-        }
+        io(get, 1);
     }
-    ag_free(b);
 }
 
 static void pages(const char *tag, unsigned char **pg, unsigned count)
@@ -298,30 +305,41 @@ static void whole_machine(void)
     /* without the Z80 its pages are one page many times: once is enough */
     pages("ZRAMP", md_zram, (md_zram[1] == md_zram[0]) ? 1u : MD_ZRAM_PAGES);
     vram_pages();
-    port_part("z80", md_z80_state);
-    port_part("ym", md_ym_state);
-    port_part("psg", md_psg_state);
+    part("z80", md_z80_state_size, md_z80_state_io);
+    part("ym", md_ym_state_size, md_ym_state_io);
+    part("psg", md_psg_state_size, md_psg_state_io);
 #endif
 }
 
-static int run(const char *path, int writing)
+static int run(const char *path, int writing, void *scratch, size_t len)
 {
-    s_f = ag_open(path, writing ? (AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC)
-                                : AG_O_RDONLY);
+    if (scratch == NULL || len < MD_STATE_SCRATCH) {
+        return MD_STATE_NO_MEMORY;
+    }
+    const bool kept = s_keep >= 0;
+    if (kept) {
+        s_f = s_keep;
+        if (!writing && ag_seek(s_f, 0, AG_SEEK_END) <= 0) {
+            s_f = AG_INVALID_HANDLE;
+            return MD_STATE_NO_FILE; /* made empty at the game's start */
+        }
+        (void)ag_seek(s_f, 0, AG_SEEK_SET);
+    } else {
+        s_f = ag_open(path, writing ? (AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC)
+                                    : AG_O_RDONLY);
+    }
     if (s_f < 0) {
+        md_state_err = (int)s_f;
         s_f = AG_INVALID_HANDLE;
         return MD_STATE_NO_FILE;
     }
+    s_written = 0;
     s_writing = writing;
     s_bad = 0;
-    s_bounce = (uint8_t *)ag_malloc(MD_STATE_BOUNCE + MD_STATE_IO);
+    /* the caller's scratch: the CYD has no memory to lend while it plays */
+    s_bounce = (uint8_t *)scratch;
     s_io = s_bounce + MD_STATE_BOUNCE;
     s_io_n = s_io_at = 0;
-    if (s_bounce == NULL) {
-        (void)ag_close(s_f);
-        s_f = AG_INVALID_HANDLE;
-        return MD_STATE_NO_MEMORY;
-    }
     char magic[4];
     if (writing) {
         put(MD_STATE_MAGIC, 4);
@@ -336,20 +354,45 @@ static int run(const char *path, int writing)
     }
     if (writing) {
         io_flush();
+        if (kept) {
+            (void)g_ag_api->fs->truncate(s_f, s_written);
+            (void)ag_sync(s_f);
+        }
     }
-    ag_free(s_bounce);
     s_bounce = NULL;
-    (void)ag_close(s_f);
+    if (!kept) {
+        (void)ag_close(s_f);
+    }
     s_f = AG_INVALID_HANDLE;
     return s_bad ? MD_STATE_BAD : MD_STATE_OK;
 }
 
-int md_state_save(const char *path)
+int md_state_keep(const char *path)
 {
-    return run(path, 1);
+    md_state_unkeep();
+    s_keep = ag_open(path, AG_O_RDWR | AG_O_CREATE);
+    if (s_keep < 0) {
+        md_state_err = (int)s_keep;
+        s_keep = AG_INVALID_HANDLE;
+        return MD_STATE_NO_FILE;
+    }
+    return MD_STATE_OK;
 }
 
-int md_state_load(const char *path)
+void md_state_unkeep(void)
 {
-    return run(path, 0);
+    if (s_keep >= 0) {
+        (void)ag_close(s_keep);
+        s_keep = AG_INVALID_HANDLE;
+    }
+}
+
+int md_state_save(const char *path, void *scratch, size_t len)
+{
+    return run(path, 1, scratch, len);
+}
+
+int md_state_load(const char *path, void *scratch, size_t len)
+{
+    return run(path, 0, scratch, len);
 }

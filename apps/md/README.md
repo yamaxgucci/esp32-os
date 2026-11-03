@@ -176,7 +176,7 @@ python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32-elf-gcc --no-stage --keep
   --include apps/sms/core/z80 --include apps/sms/core/sound --include apps/common/fm --include apps/common/dsp `
   --cflags "-Os -DMD_SPLIT -ffunction-sections -fdata-sections -fno-builtin -include md_cfg.h -DARGON_MD_Z80 -DARGON_MD_SMALL -DARGON_SMS_SMALL -DLSB_FIRST -Wno-unused -Wno-sign-compare" `
   --code-rodata .rodata.op_cb --code-rodata .rodata.op_dd --code-rodata .rodata.op_ed --code-rodata .rodata.op_fd `
-  --code-rodata .rodata.dd_cb --code-rodata .rodata.fd_cb --code-rodata .rodata.sms_z80_execute `
+  --code-rodata .rodata.dd_cb --code-rodata .rodata.fd_cb --code-rodata .rodata.sms_z80_execute --code-rodata .rodata.k_font8x16 `
   --libs c --split-hot -o build/apps/MD-NO-PSRAM.AXE `
   apps/md/md_main.c `
   apps/md/port/md_z80.c apps/md/port/md_ym_native.c apps/md/core/sound/ym2612.c apps/md/port/md_psg.c `
@@ -267,22 +267,29 @@ EG (no DT/LFO/SSG), pitch matched to `MDYM.AXE` by ear, −6 dB mix pad.
 `pcmplay.py --record`). FM drums should stay percussive rather than a squeak;
 DAC/PCM on ch6 is a separate path. PSG matches SMS.
 
-### The game list, the pause menu and the phone pad (S3-CAM, 2 Nov 2026)
+### The game window, the pause menu and the phone pad (3 Nov 2026)
 
-- `run c:\mdmenu.axe`: a main screen (LOAD GAME, CONTINUE the last game,
-  EXIT) and behind LOAD GAME a window over the drives and folders. A
-  cartridge is a `.SWP` or a plain `.BIN`/`.MD`/`.GEN`: a dump with "SEGA" at
-  0x100 is swapped into a `.SWP` beside it the first time, one already swapped
-  ("ESAG") plays as it is. The game runs with the Mega Drive image next to the
-  menu (`MDS3.AXE`, `MD-NO-PSRAM.AXE` or `MD.AXE`); QUIT TO LIST brings the
-  menu back. The folder and the last game are kept in `C:\MDMENU.CFG`.
-- Esc (the phone pad's MENU, a keyboard's Esc, a pad's quit) pauses the game
-  and shows RESUME / SAVE STATE / LOAD STATE / QUIT TO LIST. The state goes
-  beside the cartridge as `NAME.sav`, PackBits-compressed: Alex Kidd's is
-  36 KB of 144 (md_savestate.c). Only the PSRAM build has the menu
-  (`MD_MENU`): on the CYD its font's 4 KB put the machine a page short, and
-  Esc still ends the game there.
+- Started with no cartridge (`run a:\md.axe`), MD shows its own window on
+  the glass: the card's folders and cartridges (or the drives), A/C/START
+  to open, B for the folder above, MENU to leave. A cartridge is a `.SWP` or
+  a plain `.BIN`/`.MD`/`.GEN`: a dump with "SEGA" at 0x100 is swapped into a
+  `.SWP` beside it the first time, one already swapped ("ESAG") plays as it
+  is. Nothing is held while the window is up but a row of the ring, and the
+  listing is read from the folder for each row drawn.
+- On the CYD the cartridge is staged into flash and the card let go
+  (`ag_media(false)`, ABI 0.77) before the machine takes its memory; LOAD
+  GAME gives all of it back (`md_pages_free`, `md_raster_free`, the map) and
+  mounts the card again for the window.
+- Esc (the phone pad's MENU, a keyboard's Esc, a pad's quit) pauses the game:
+  RESUME / SAVE STATE / LOAD STATE / LOAD GAME / EXIT. A state is
+  PackBits-compressed (Alex Kidd: 36 KB of 144, md_savestate.c), beside the
+  cartridge on a PSRAM board and in `C:\` on the CYD, whose card is out while
+  it plays. Its file is opened when the game starts and kept: mid-game the
+  CYD has no 512 bytes in one piece for littlefs's buffer. The front end's
+  font is in flash (`--code-rodata .rodata.k_font8x16`), read by words.
 - The pad: `drv load c:\phone.sys`, then `http://<board>:8765/#pad` on the
   phone (or the 🎮 button on the page). The page asks the board for no
   picture (`IN_PADONLY`), and its buttons go as keys - arrows, Z X C for
   A B C, Enter for Start, Esc for MENU - which the pad layer already reads.
+  Not on the CYD while MD runs: Wi-Fi costs 30 KB and PHONE.SYS 20 more,
+  and the machine leaves a couple of kilobytes.

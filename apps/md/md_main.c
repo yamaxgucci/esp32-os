@@ -107,11 +107,10 @@ static void md_z80bench_sys(void *arg)
 #endif
 static int s_quit;
 /*
- * The pause menu and save states (md_pause_menu): on a board with PSRAM.  On
- * the CYD its font's 4 KB are data, and the machine is a page short without
- * them - there Esc still ends the game.
+ * The front end - the game window, the pause menu, save states - in the
+ * small build (the CYD and the S3-CAM): its font is in flash.
  */
-#if defined(ARGON_MD_SMALL) && defined(MD_PSRAM_PAGES)
+#if defined(ARGON_MD_SMALL)
 #define MD_MENU 1
 #endif
 static volatile int s_menu_req; /* Esc seen: the main loop opens the pause menu */
@@ -610,6 +609,9 @@ uint32_t         *md_sync = s_sync_words; /* md_raster.c takes its lock here */
 
 static void md_sync_internal(void)
 {
+    if (md_sync != s_sync_words) {
+        return; /* moved already */
+    }
 #ifdef MD_PSRAM_PAGES
     uint32_t *const p = (uint32_t *)ag_malloc_caps(sizeof(s_sync_words), AG_MEM_FAST);
     if (p != NULL) {
@@ -1146,6 +1148,19 @@ static void *md_crumb_alloc(size_t n)
  * 24 of them on the CYD - the raster record, which lives in the holes the
  * pages leave, then found no resource left for itself (1 Nov 2026).
  */
+/* the blocks the pages came from, and the ring as it was, for md_pages_free */
+static void           *s_page_blk[48];
+static int             s_page_blk_n;
+static int             s_ring_n0;
+static unsigned short *s_ring_end0;
+
+static void page_block(void *b)
+{
+    if (s_page_blk_n < (int)(sizeof(s_page_blk) / sizeof(s_page_blk[0]))) {
+        s_page_blk[s_page_blk_n++] = b;
+    }
+}
+
 static unsigned heap_pages(unsigned char **pages, unsigned got, unsigned count,
                            unsigned caps, size_t least)
 {
@@ -1159,6 +1174,7 @@ static unsigned heap_pages(unsigned char **pages, unsigned got, unsigned count,
             size -= MD_PAGE;
             continue;
         }
+        page_block(b);
         s_blocks++;
         for (size_t o = 0; o < size; o += MD_PAGE) {
             pages[got++] = b + o;
@@ -1217,6 +1233,7 @@ static unsigned fill_pages(unsigned char **pages, unsigned count, int iram)
         if (b == NULL) {
             break;
         }
+        page_block(b);
         for (size_t o = 0; o < size; o += MD_PAGE) {
             pages[got++] = b + o;
         }
@@ -1256,8 +1273,24 @@ static unsigned ring_pages(unsigned char **out, unsigned want)
     return got;
 }
 
+/* the machine's memory given back, the ring's rows with it */
+static void md_pages_free(void)
+{
+    for (int i = 0; i < s_page_blk_n; i++) {
+        ag_free(s_page_blk[i]);
+    }
+    s_page_blk_n = 0;
+    s_blocks = 0;
+    if (s_ring_n0 > 0) {
+        s_ring_n = s_ring_n0;
+        s_ring_end = s_ring_end0;
+    }
+}
+
 static int md_small_alloc(void)
 {
+    s_ring_n0 = s_ring_n;
+    s_ring_end0 = s_ring_end;
     const unsigned in_iram = fill_pages(md_vram, MD_VRAM_PAGES, 1);
     unsigned ram = fill_pages(md_ram, MD_RAM_PAGES, 0);
     /*
@@ -1667,38 +1700,46 @@ resume_m68k:
     frame_counter++;
 }
 
-/*
- * The pause menu: Esc (the phone pad's MENU, a keyboard's Esc, a pad's quit)
- * stops the game and shows a box over it - resume, save, load, quit to the
- * list.  It is drawn a row at a time through the row the drawer is not using
- * between passes and sent the way the game's rows are, so it costs no memory
- * of its own; the rows under it go to the glass again once the game is back.
- */
 #ifdef MD_MENU
+/*
+ * The Mega Drive's own front end, drawn on the glass a row at a time through
+ * the ring's first row - the row the drawer is not using between passes - and
+ * sent the way the game's rows are, so it costs no memory of its own.
+ *
+ * Started with no cartridge, MD shows a window over the drives and folders
+ * (md_pick); Esc in a game (the phone pad's MENU, a keyboard's Esc, a pad's
+ * quit) pauses it and shows RESUME / SAVE STATE / LOAD STATE / LOAD GAME /
+ * EXIT (md_pause_menu).  LOAD GAME gives the machine's memory back and goes to
+ * the window again: on the CYD that is what lets the card be mounted again.
+ *
+ * The font is in flash (--code-rodata .rodata.k_font8x16) and read by words,
+ * as the CYD's other tables are: 4 KB of data was the machine a page short.
+ */
 #include "font8x16.h"
 #include "md_savestate.h"
 
-static char         s_save_path[96]; /* the cartridge's, with .sav */
+static char s_save_path[96]; /* where SAVE STATE writes */
+static int  s_to_pick;       /* LOAD GAME: back to the window after the loop */
 
-#define MENU_W     232
-#define MENU_ITEMS 4
-#define MENU_ROWH  18
-#define MENU_H     (MENU_ROWH * (MENU_ITEMS + 2) + 8)
-#define MENU_BG    0x0841u
-#define MENU_EDGE  0x52aau
-#define MENU_FG    0xdefbu
-#define MENU_SEL   0x2b3du
-#define MENU_NOTE  0xfd20u
+#define UI_BG   0x0841u
+#define UI_EDGE 0x52aau
+#define UI_FG   0xdefbu
+#define UI_SEL  0x2b3du
+#define UI_NOTE 0xfd20u
+#define UI_DIR  0xffe0u
+#define UI_BAR  0x0010u
 
-static const char *const k_menu_items[MENU_ITEMS] = {
-    "RESUME", "SAVE STATE", "LOAD STATE", "QUIT TO LIST",
-};
-
-static void menu_text(uint16_t *row, int x, int glyph_row, const char *s,
-                      uint16_t fg)
+static inline uint8_t font_row(uint8_t ch, int r)
 {
-    for (; *s != '\0' && x + 8 <= MENU_W; s++, x += 8) {
-        const uint8_t bits = k_font8x16[(uint8_t)*s][glyph_row];
+    const uint32_t w = ((const uint32_t *)(const void *)k_font8x16[ch])[r >> 2];
+    return (uint8_t)(w >> ((r & 3) * 8));
+}
+
+static void ui_text(uint16_t *row, int width, int x, int glyph_row, const char *s,
+                    uint16_t fg)
+{
+    for (; *s != '\0' && x + 8 <= width; s++, x += 8) {
+        const uint8_t bits = font_row((uint8_t)*s, glyph_row);
         for (int b = 0; b < 8; b++) {
             if (bits & (0x80u >> b)) {
                 row[x + b] = fg;
@@ -1707,12 +1748,35 @@ static void menu_text(uint16_t *row, int x, int glyph_row, const char *s,
     }
 }
 
+/* the row buffer the front end draws in: the ring's first row */
+static uint16_t *ui_row(void)
+{
+    return (s_ring_n > 0 && !s_headless) ? (uint16_t *)s_ring[0] : NULL;
+}
+
+/* one glass row `y` (from the glass's top), `w` wide, centred */
+static void ui_send(uint16_t *row, int y, int w)
+{
+    md_present_rows(row, y, 1, w, s_gi.height);
+}
+
+/* ---- the pause menu ---------------------------------------------------- */
+
+#define MENU_W     232
+#define MENU_ITEMS 5
+#define MENU_ROWH  18
+#define MENU_H     (MENU_ROWH * (MENU_ITEMS + 2) + 8)
+
+static const char *const k_menu_items[MENU_ITEMS] = {
+    "RESUME", "SAVE STATE", "LOAD STATE", "LOAD GAME", "EXIT",
+};
+
 /* One row of the box, `y` from its top. */
 static void menu_row(uint16_t *row, int y, int sel, const char *note)
 {
     const bool edge = (y < 2 || y >= MENU_H - 2);
     for (int x = 0; x < MENU_W; x++) {
-        row[x] = (edge || x < 2 || x >= MENU_W - 2) ? MENU_EDGE : MENU_BG;
+        row[x] = (edge || x < 2 || x >= MENU_W - 2) ? UI_EDGE : UI_BG;
     }
     if (edge) {
         return;
@@ -1721,36 +1785,46 @@ static void menu_row(uint16_t *row, int y, int sel, const char *note)
     const int gy = (y - 4) % MENU_ROWH - 1;
     if (slot >= 1 && slot <= MENU_ITEMS && slot - 1 == sel) {
         for (int x = 4; x < MENU_W - 4; x++) {
-            row[x] = MENU_SEL;
+            row[x] = UI_SEL;
         }
     }
     if (gy < 0 || gy >= AG_FONT8X16_H) {
         return;
     }
     if (slot == 0) {
-        menu_text(row, 12, gy, "PAUSED", MENU_NOTE);
+        ui_text(row, MENU_W, 12, gy, "PAUSED", UI_NOTE);
     } else if (slot <= MENU_ITEMS) {
-        menu_text(row, 20, gy, k_menu_items[slot - 1], MENU_FG);
+        ui_text(row, MENU_W, 20, gy, k_menu_items[slot - 1], UI_FG);
     } else if (note != NULL) {
-        menu_text(row, 12, gy, note, MENU_NOTE);
+        ui_text(row, MENU_W, 12, gy, note, UI_NOTE);
     }
 }
 
 static void menu_draw(int sel, const char *note)
 {
-    if (s_ring_n == 0 || s_headless) {
+    uint16_t *const row = ui_row();
+    if (row == NULL) {
         return;
     }
-    uint16_t *const row = (uint16_t *)s_ring[0];
-    const int top = (screen_height - MENU_H) / 2;
+    const int top = ((int)s_gi.height - MENU_H) / 2;
+    const int game_top = ((int)s_gi.height - screen_height) / 2;
     for (int y = 0; y < MENU_H; y++) {
         menu_row(row, y, sel, note);
-        md_present_rows(row, top + y, 1, MENU_W, screen_height);
-        s_line_hash[top + y] = 0xffffffffu; /* the game's row goes again */
+        ui_send(row, top + y, MENU_W);
+        const int line = top + y - game_top;
+        if (line >= 0 && line < MD_HASH_LINES) {
+            s_line_hash[line] = 0xffffffffu; /* the game's row goes again */
+        }
     }
 }
 
-/* The buttons the menu answers, as a mask of what is held. */
+/* The buttons the front end answers, as a mask of what is held. */
+#define MB_UP   0x01u
+#define MB_DOWN 0x02u
+#define MB_PICK (0x04u | 0x08u | 0x10u)
+#define MB_BACK 0x20u
+#define MB_MENU 0x40u
+
 static unsigned menu_buttons(void)
 {
     static const int k_ids[] = {AG_BTN_UP, AG_BTN_DOWN, AG_BTN_B1, AG_BTN_C,
@@ -1763,34 +1837,106 @@ static unsigned menu_buttons(void)
     }
     return m;
 }
-#define MB_UP     0x01u
-#define MB_DOWN   0x02u
-#define MB_PICK   (0x04u | 0x08u | 0x10u)
-#define MB_BACK   (0x20u | 0x40u)
 
-static void md_pause_menu(void)
+/* the next press; up and down repeat while held */
+/* a key as the front end reads it (the pad layer's keys, and Backspace) */
+static unsigned ui_key(uint16_t k)
+{
+    switch (k) {
+    case AG_KEY_UP:
+        return MB_UP;
+    case AG_KEY_DOWN:
+        return MB_DOWN;
+    case AG_KEY_ENTER:
+    case AG_KEY_Z:
+    case AG_KEY_C:
+        return MB_PICK;
+    case AG_KEY_X:
+    case AG_KEY_BACKSPACE:
+        return MB_BACK;
+    case AG_KEY_ESC:
+        return MB_MENU;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * The presses from the event queue as well as from the pad layer: a key held
+ * shorter than a redraw is gone from the pad layer by the time it is asked
+ * (150 ms), and the window lost every few presses that way on the CYD.  A
+ * repeat (the phone pad resending a held button) is not a press.
+ */
+static unsigned ui_press(unsigned *held, uint32_t *since)
+{
+    ag_event_t ev;
+    unsigned   queued = 0;
+    while (ag_poll_event(&ev, 0)) {
+        if (handle_session_ev(&ev)) {
+            continue;
+        }
+        if (ev.type == AG_EV_KEY_DOWN && !ev.key.repeat) {
+            queued |= ui_key(ev.key.keycode);
+        }
+    }
+    const unsigned now = menu_buttons();
+    const unsigned press = (now & ~*held) | queued;
+    const uint32_t t = ag_millis();
+    *held = now;
+    if (press != 0u) {
+        *since = t;
+        return press;
+    }
+    if ((now & (MB_UP | MB_DOWN)) && t - *since > 350u) {
+        *since = t - 250u;            /* then every 100 ms */
+        return now & (MB_UP | MB_DOWN);
+    }
+    if (now == 0u) {
+        *since = t;
+    }
+    return 0;
+}
+
+static void md_wait_drawer_idle(void)
 {
     /* the pass under way finishes: the drawer draws nothing more until
      * another frame is made, and none is */
     for (int i = 0; i < 500 && s_pass_h != 0; i++) {
         ag_delay(2);
     }
+}
+
+/* the ring lent as scratch: two rows and more, idle between passes */
+static void *ui_scratch(size_t *len)
+{
+    if (s_ring_n < 2) {
+        *len = 0;
+        return NULL;
+    }
+    *len = (size_t)((uint8_t *)s_ring_end - (uint8_t *)s_ring[0]);
+    return s_ring[0];
+}
+
+static void md_pause_menu(void)
+{
+    md_wait_drawer_idle();
     ag_printf("md: paused\n");
     int         sel = 0;
     const char *note = NULL;
     unsigned    held = menu_buttons(); /* what opened it is not a press */
-    menu_draw(sel, note);
-    for (;;) {
-        ag_event_t ev;
+    {
+        ag_event_t ev;   /* nor is its key, still in the queue */
         while (ag_poll_event(&ev, 0)) {
             (void)handle_session_ev(&ev);
         }
+    }
+    uint32_t    since = ag_millis();
+    menu_draw(sel, note);
+    for (;;) {
         if (s_quit) {
             return;
         }
-        const unsigned now = menu_buttons();
-        const unsigned press = now & ~held;
-        held = now;
+        const unsigned press = ui_press(&held, &since);
         int act = -1;
         if (press & MB_UP) {
             sel = (sel + MENU_ITEMS - 1) % MENU_ITEMS;
@@ -1798,7 +1944,7 @@ static void md_pause_menu(void)
         } else if (press & MB_DOWN) {
             sel = (sel + 1) % MENU_ITEMS;
             note = NULL;
-        } else if (press & MB_BACK) {
+        } else if (press & (MB_BACK | MB_MENU)) {
             act = 0;
         } else if (press & MB_PICK) {
             act = sel;
@@ -1806,21 +1952,43 @@ static void md_pause_menu(void)
         if (act == 0) {
             break;
         }
-        if (act == 1) {
-            const int r = md_state_save(s_save_path);
-            note = (r == MD_STATE_OK) ? "SAVED" : "COULD NOT SAVE";
-            ag_printf("md: save to %s: %d\n", s_save_path, r);
-        } else if (act == 2) {
-            const int r = md_state_load(s_save_path);
-            ag_printf("md: load from %s: %d\n", s_save_path, r);
-            if (r == MD_STATE_OK) {
+        if (act == 1 || act == 2) {
+            size_t len = 0;
+            void *const scratch = ui_scratch(&len);
+            /*
+             * The file system wants a buffer for the file, and the CYD has a
+             * couple of kilobytes free while it plays: the raster record's
+             * are lent for the length of it and the record made again after.
+             */
+            const int had_raster = md_raster_on;
+            if (had_raster) {
+                md_raster_free(ag_free);
+            }
+            md_sound_close(); /* the converter's buffers, whole blocks */
+            ag_meminfo_t mi;
+            ag_meminfo(&mi);
+            const int r = (act == 1) ? md_state_save(s_save_path, scratch, len)
+                                     : md_state_load(s_save_path, scratch, len);
+            md_sound_init();
+            if (had_raster) {
+                md_raster_on = md_raster_init(md_crumb_alloc);
+            }
+            ag_printf("md: %s %s: %d (open %d, %u free)\n",
+                      (act == 1) ? "save to" : "load from", s_save_path, r,
+                      md_state_err, (unsigned)mi.fast_free);
+            if (act == 2 && r == MD_STATE_OK) {
                 break;
             }
-            if (r == MD_STATE_BAD) {
+            if (act == 2 && r == MD_STATE_BAD) {
                 reset_emulation(); /* half loaded is no machine at all */
             }
-            note = (r == MD_STATE_NO_FILE) ? "NO SAVE YET" : "COULD NOT LOAD";
+            note = (act == 1) ? ((r == MD_STATE_OK) ? "SAVED" : "COULD NOT SAVE")
+                   : (r == MD_STATE_NO_FILE) ? "NO SAVE YET" : "COULD NOT LOAD";
         } else if (act == 3) {
+            s_to_pick = 1;
+            s_quit = 1;
+            return;
+        } else if (act == 4) {
             s_quit = 1;
             return;
         }
@@ -1829,34 +1997,394 @@ static void md_pause_menu(void)
         }
         ag_delay(20);
     }
-    /* the game's own rows over the box, and its sound from now */
+    /* the game's own rows over the box */
     memset(s_line_hash, 0xff, sizeof(s_line_hash));
     ag_printf("md: resumed\n");
 }
 
-/* the save beside the cartridge: its name with .sav */
+/*
+ * Where the state goes: beside the cartridge where there is memory to keep
+ * the card mounted (PSRAM boards); C:\ on the CYD, whose card is let go
+ * while the machine runs.  The cartridge's name with .sav.
+ */
 static void md_save_path_for(const char *rom)
 {
+    s_save_path[0] = '\0';
     if (rom == NULL) {
-        s_save_path[0] = '\0';
         return;
     }
-    size_t n = strlen(rom);
-    if (n > sizeof(s_save_path) - 5u) {
-        n = sizeof(s_save_path) - 5u;
+    const char *base = rom;
+    for (const char *p = rom; *p != '\0'; p++) {
+        if (*p == '\\' || *p == '/' || *p == ':') {
+            base = p + 1;
+        }
     }
-    memcpy(s_save_path, rom, n);
-    s_save_path[n] = '\0';
+#ifdef MD_PSRAM_PAGES
+    (void)snprintf(s_save_path, sizeof(s_save_path) - 5u, "%s", rom);
+#else
+    (void)snprintf(s_save_path, sizeof(s_save_path) - 5u, "C:\\%s", base);
+#endif
     char *dot = strrchr(s_save_path, '.');
     char *sep = strrchr(s_save_path, '\\');
-    char *sep2 = strrchr(s_save_path, '/');
-    if (sep2 > sep) {
-        sep = sep2;
-    }
     if (dot != NULL && (sep == NULL || dot > sep)) {
         *dot = '\0';
     }
     strcat(s_save_path, ".sav");
+}
+
+/* ---- the window over the drives ---------------------------------------- */
+
+#define PK_PATH 160
+#define PK_NAME 48
+#define PK_ROWS 11                 /* list rows on a 240-line glass */
+
+static char s_pk_dir[PK_PATH];     /* "" is the list of drives */
+static char s_pk_rom[PK_PATH];     /* what was chosen */
+
+static char pk_up(char c)
+{
+    return (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+}
+
+static bool pk_ends(const char *s, const char *ext)
+{
+    const size_t n = strlen(s), e = strlen(ext);
+    if (n < e) {
+        return false;
+    }
+    for (size_t i = 0; i < e; i++) {
+        if (pk_up(s[n - e + i]) != ext[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool pk_raw(const char *n)
+{
+    return pk_ends(n, ".BIN") || pk_ends(n, ".MD") || pk_ends(n, ".GEN");
+}
+
+static bool pk_rom(const char *n)
+{
+    return pk_ends(n, ".SWP") || pk_raw(n);
+}
+
+static void pk_join(char *out, size_t cap, const char *dir, const char *name)
+{
+    const size_t d = strlen(dir);
+    const bool sep = d > 0 && dir[d - 1] != '\\' && dir[d - 1] != '/';
+    (void)snprintf(out, cap, "%s%s%s", dir, sep ? "\\" : "", name);
+}
+
+static void pk_parent(char *dir)
+{
+    size_t n = strlen(dir);
+    if (n <= 3) {
+        dir[0] = '\0';
+        return;
+    }
+    if (dir[n - 1] == '\\') {
+        dir[--n] = '\0';
+    }
+    while (n > 0 && dir[n - 1] != '\\') {
+        n--;
+    }
+    dir[n] = '\0';
+    if (n == 2) {
+        dir[2] = '\\';
+        dir[3] = '\0';
+    }
+}
+
+/*
+ * Entry `want` of the window (folders first, then cartridges, as the folder
+ * lists them - nothing is held, so nothing is sorted), or the count with
+ * want < 0.  Index 0 is "..".
+ */
+static int pk_entry(int want, char *name, bool *dir)
+{
+    int n = 0;
+    if (s_pk_dir[0] == '\0') {
+        for (char d = 'A'; d <= 'Z'; d++) {
+            if (d == 'D' || d == 'T') {
+                continue;        /* devices and memory, not files */
+            }
+            char root[4] = {d, ':', '\\', 0};
+            const ag_handle_t h = ag_opendir(root);
+            if (h < 0) {
+                continue;
+            }
+            (void)ag_closedir(h);
+            if (n == want) {
+                (void)snprintf(name, PK_NAME, "%s", root);
+                *dir = true;
+                return n;
+            }
+            n++;
+        }
+        return n;
+    }
+    if (want == 0) {
+        (void)snprintf(name, PK_NAME, "..");
+        *dir = true;
+        return 0;
+    }
+    n = 1;
+    for (int pass = 0; pass < 2; pass++) {
+        const ag_handle_t h = ag_opendir(s_pk_dir);
+        if (h < 0) {
+            return n;
+        }
+        ag_dirent_t e;
+        while (ag_readdir(h, &e) == AG_OK) {
+            const bool d = (e.st.attr & AG_A_DIR) != 0;
+            if (e.name[0] == '.' || (pass == 0) != d || (!d && !pk_rom(e.name)) ||
+                strcmp(e.name, "System Volume Information") == 0) {
+                continue;
+            }
+            if (n == want) {
+                (void)snprintf(name, PK_NAME, "%s", e.name);
+                *dir = d;
+                (void)ag_closedir(h);
+                return n;
+            }
+            n++;
+        }
+        (void)ag_closedir(h);
+    }
+    return n;
+}
+
+/* one 16-row text line of the window at text row `tr` */
+static void pk_line(int tr, const char *s, uint16_t fg, uint16_t bg)
+{
+    uint16_t *const row = ui_row();
+    if (row == NULL) {
+        return;
+    }
+    const int w = ((int)s_gi.width < MD_WIDTH) ? (int)s_gi.width : MD_WIDTH;
+    for (int gy = 0; gy < AG_FONT8X16_H; gy++) {
+        for (int x = 0; x < w; x++) {
+            row[x] = bg;
+        }
+        ui_text(row, w, 4, gy, s, fg);
+        ui_send(row, tr * AG_FONT8X16_H + gy, w);
+    }
+}
+
+/* list row `r` (entry top + r) */
+static void pk_item(int r, int top, int sel, int count)
+{
+    char buf[PK_NAME + 8];
+    const int i = top + r;
+    char name[PK_NAME];
+    bool dir = false;
+    if (i >= count || pk_entry(i, name, &dir) != i) {
+        pk_line(2 + r, "", UI_FG, UI_BG);
+        return;
+    }
+    (void)snprintf(buf, sizeof(buf), dir ? " [%s]" : " %s", name);
+    pk_line(2 + r, buf, (i == sel) ? UI_FG : dir ? UI_DIR : UI_FG,
+            (i == sel) ? UI_SEL : UI_BG);
+}
+
+static void pk_draw(int sel, int top, int count, const char *note)
+{
+    pk_line(0, "MEGA DRIVE - LOAD GAME", UI_NOTE, UI_BAR);
+    pk_line(1, s_pk_dir[0] ? s_pk_dir : "(drives)", UI_FG, UI_BG);
+    for (int r = 0; r < PK_ROWS; r++) {
+        pk_item(r, top, sel, count);
+    }
+    pk_line(13, note ? note : "", UI_NOTE, UI_BG);
+    pk_line(14, "A/START: OPEN  B: UP  MENU: EXIT", UI_FG, UI_BAR);
+}
+
+/*
+ * A plain cartridge made ready: "SEGA" at 0x100 is a dump as it comes and is
+ * swapped into the .SWP beside it once (MD reads the cartridge out of flash
+ * in place, a word at a time); "ESAG" is swapped already and plays as it is
+ * - swapped twice it was UGSNAT REHORSE and did not start (3 Nov 2026).
+ */
+static bool pk_ready(const char *src, char *out, size_t cap)
+{
+    {
+        const ag_handle_t h = ag_open(src, AG_O_RDONLY);
+        if (h < 0) {
+            return false;
+        }
+        uint8_t hdr[4] = {0};
+        const bool got = ag_seek(h, 0x100, AG_SEEK_SET) >= 0 && ag_read(h, hdr, 4) == 4;
+        (void)ag_close(h);
+        if (!got) {
+            return false;
+        }
+        (void)snprintf(out, cap, "%s", src);
+        if (memcmp(hdr, "ESAG", 4) == 0) {
+            return true;
+        }
+        if (memcmp(hdr, "SEGA", 4) != 0) {
+            return false;
+        }
+    }
+    char *dot = strrchr(out, '.');
+    if (dot == NULL || (size_t)(dot - out) + 5u > cap) {
+        return false;
+    }
+    memcpy(dot, ".SWP", 5);
+    {
+        const ag_handle_t h = ag_open(out, AG_O_RDONLY);
+        if (h >= 0) {
+            (void)ag_close(h);
+            return true;   /* made before */
+        }
+    }
+    const ag_handle_t in = ag_open(src, AG_O_RDONLY);
+    const ag_handle_t o = ag_open(out, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    uint8_t *buf = (uint8_t *)ag_malloc(2048);
+    bool ok = in >= 0 && o >= 0 && buf != NULL;
+    uint32_t done = 0;
+    while (ok) {
+        const int32_t n = ag_read(in, buf, 2048);
+        if (n <= 0) {
+            ok = (n == 0);
+            break;
+        }
+        for (int32_t k = 0; k + 1 < n; k += 2) {
+            const uint8_t t = buf[k];
+            buf[k] = buf[k + 1];
+            buf[k + 1] = t;
+        }
+        ok = ag_write(o, buf, (size_t)n) == n;
+        done += (uint32_t)n;
+        if ((done & 0x1ffffu) == 0u) {
+            char msg[40];
+            (void)snprintf(msg, sizeof(msg), "PREPARING... %u KB", (unsigned)(done / 1024u));
+            pk_line(13, msg, UI_NOTE, UI_BG);
+        }
+    }
+    if (buf != NULL) {
+        ag_free(buf);
+    }
+    if (in >= 0) {
+        (void)ag_close(in);
+    }
+    if (o >= 0) {
+        (void)ag_close(o);
+    }
+    if (!ok) {
+        (void)ag_unlink(out);
+    }
+    return ok;
+}
+
+/* The window: 1 with a cartridge in s_pk_rom, 0 to leave MD. */
+static int md_pick(void)
+{
+    if (ui_row() == NULL) {
+        return 0;
+    }
+    md_clear_glass();
+    if (s_pk_dir[0] == '\0') {
+        /* the card, when there is one: that is where the cartridges are */
+        const ag_handle_t h = ag_opendir("A:\\");
+        if (h >= 0) {
+            (void)ag_closedir(h);
+            (void)snprintf(s_pk_dir, sizeof(s_pk_dir), "A:\\");
+        }
+    }
+    int sel = 0, top = 0;
+    unsigned held = menu_buttons();
+    uint32_t since = ag_millis();
+    {
+        ag_event_t ev;   /* the press that brought the window is not one in it */
+        while (ag_poll_event(&ev, 0)) {
+            (void)handle_session_ev(&ev);
+        }
+    }
+    const char *note = NULL;
+    int count = 0, shown_sel = -1, shown_top = -1;
+    bool fresh = true;   /* a folder entered: counted and drawn whole */
+    for (;;) {
+        char name[PK_NAME];
+        bool dir = false;
+        if (fresh) {
+            count = pk_entry(-1, name, &dir);
+        }
+        if (sel >= count) {
+            sel = count ? count - 1 : 0;
+        }
+        if (sel < top) {
+            top = sel;
+        } else if (sel >= top + PK_ROWS) {
+            top = sel - PK_ROWS + 1;
+        }
+        if (fresh || top != shown_top) {
+            pk_draw(sel, top, count, note);
+        } else {
+            /* a move inside the page: the two rows it changed */
+            if (shown_sel != sel) {
+                pk_item(shown_sel - top, top, sel, count);
+                pk_item(sel - top, top, sel, count);
+            }
+            pk_line(13, note ? note : "", UI_NOTE, UI_BG);
+        }
+        fresh = false;
+        shown_sel = sel;
+        shown_top = top;
+        note = NULL;
+        unsigned p = 0;
+        while ((p = ui_press(&held, &since)) == 0u) {
+            if (s_quit) {
+                return 0;
+            }
+            ag_delay(20);
+        }
+        if (p & MB_UP) {
+            sel = count ? (sel + count - 1) % count : 0;
+        } else if (p & MB_DOWN) {
+            sel = count ? (sel + 1) % count : 0;
+        } else if (p & MB_MENU) {
+            return 0;
+        } else if ((p & (MB_BACK | MB_PICK)) && count > 0) {
+            if (pk_entry(sel, name, &dir) != sel) {
+                continue;
+            }
+            if ((p & MB_BACK) || strcmp(name, "..") == 0) {
+                if (s_pk_dir[0] != '\0') {
+                    pk_parent(s_pk_dir);
+                    sel = top = 0;
+                    fresh = true;
+                }
+                continue;
+            }
+            if (dir) {
+                char next[PK_PATH];
+                if (s_pk_dir[0] == '\0') {
+                    (void)snprintf(next, sizeof(next), "%s", name);
+                } else {
+                    pk_join(next, sizeof(next), s_pk_dir, name);
+                }
+                (void)snprintf(s_pk_dir, sizeof(s_pk_dir), "%s", next);
+                sel = top = 0;
+                fresh = true;
+                continue;
+            }
+            char rom[PK_PATH];
+            pk_join(rom, sizeof(rom), s_pk_dir, name);
+            if (pk_raw(name)) {
+                pk_line(13, "PREPARING...", UI_NOTE, UI_BG);
+                if (!pk_ready(rom, s_pk_rom, sizeof(s_pk_rom))) {
+                    note = "NOT A CARTRIDGE, OR THE CARD IS FULL";
+                    continue;
+                }
+            } else {
+                (void)snprintf(s_pk_rom, sizeof(s_pk_rom), "%s", rom);
+            }
+            pk_line(13, "LOADING...", UI_NOTE, UI_BG);
+            return 1;
+        }
+    }
 }
 #endif
 
@@ -2006,10 +2534,51 @@ int ag_main(int argc, char **argv)
      * own memory (the map table, the flash driver), which is gone once the
      * machine's RAM is allocated.
      */
-    unsigned char *rom_data = (rom != NULL) ? map_rom(rom, &rom_size)
-                                            : make_tiny_rom(&rom_size);
+    unsigned char *rom_data = NULL;
+#ifdef MD_MENU
+    int ejected = 0;
+md_next_game:
+    /*
+     * No cartridge named: the window over the drives, on a glass taken now -
+     * the ring and the screen before the machine, which comes once a
+     * cartridge is chosen (and, on the CYD, once the card has let go).
+     */
+    if (rom == NULL && !s_headless) {
+        gwenesis_vdp_set_buffer_stride(0);
+        md_sync_internal();
+        if (s_presenter == NULL && ring_rows > 0) {
+            md_ring_start(ring_rows);
+        }
+        if (s_ring_n == 0 || ag_gfx_acquire(&s_gi) != AG_OK) {
+            ag_printf("md: no glass for the game window\n");
+            return 1;
+        }
+        if (!md_pick()) {
+            md_ring_stop();
+            ag_gfx_release();
+            return 0;
+        }
+        rom = s_pk_rom;
+    }
+#endif
+    rom_data = (rom != NULL) ? map_rom(rom, &rom_size) : make_tiny_rom(&rom_size);
 #ifdef MD_MENU
     md_save_path_for(rom);
+    if (rom_data != NULL && rom != NULL) {
+        (void)md_state_keep(s_save_path); /* before the machine takes the memory */
+    }
+#ifndef MD_PSRAM_PAGES
+    /*
+     * The CYD: the cartridge is in flash now, and the card's 44 KB are the
+     * machine's - let it go (ABI 0.77), and mount it again for the next game.
+     */
+    if (rom_data != NULL && rom != NULL && !wait_card &&
+        (rom[0] == 'a' || rom[0] == 'A') && rom[1] == ':' &&
+        ag_media(false) == AG_OK) {
+        ejected = 1;
+        ag_printf("md: the card let go for the machine\n");
+    }
+#endif
 #endif
     /*
      * `waitcard`: the cartridge now reads out of flash, and the card's file
@@ -2045,7 +2614,7 @@ int ag_main(int argc, char **argv)
      * display costs internal memory too, and it is the one that can be had
      * last. */
     md_sync_internal();
-    if (!s_headless && ring_rows > 0) {
+    if (!s_headless && ring_rows > 0 && s_presenter == NULL) {
         md_ring_start(ring_rows);
     }
     if (s_ring_n == 0 && !md_line_alloc()) {
@@ -2113,14 +2682,20 @@ int ag_main(int argc, char **argv)
         return 0;
     }
 #endif
-    md_sound_init();
+    {
+        static int sound_up;
+        if (!sound_up) {
+            md_sound_init();
+            sound_up = 1;
+        }
+    }
 #ifdef ARGON_MD_SMALL
     /* the Z80 and the chips on the system core, in the picture's thread,
      * when there is a Z80 to run - without one the YM fits beside the 68000
      * here (Sonic: 68000 11 ms + YM 4 of 16.7) and the picture keeps its core.
      * `sndhere` keeps them here anyway. */
     if (s_sysdraw && s_ring_n > 0 && !s_headless && !s_snd_here &&
-        s_run_z80_cpu) {
+        s_run_z80_cpu && !md_snd_async) {
         md_snd_async_start(s_run_z80_cpu, s_run_sound);
         ag_printf("md: the Z80 and the sound chips on the system core\n");
     }
@@ -2293,6 +2868,28 @@ int ag_main(int argc, char **argv)
                      emu_sum, present_sum, work_max);
     }
     ag_printf("md: %d frames\n", ran);
+#ifdef MD_MENU
+    md_wait_drawer_idle();
+    if (s_to_pick) {
+        /* LOAD GAME: everything this cartridge took, back */
+        s_to_pick = 0;
+        s_quit = 0;
+        md_state_unkeep();
+        md_raster_free(ag_free);
+        md_pages_free();
+        (void)ag_unmap(rom_data);
+        if (ejected) {
+            (void)ag_media(true);
+            ejected = 0;
+        }
+        rom = NULL;
+        goto md_next_game;
+    }
+    md_state_unkeep();
+    if (ejected) {
+        (void)ag_media(true);
+    }
+#endif
 #ifdef ARGON_MD_SMALL
     md_snd_async_stop();
     if (s_ring_n) {

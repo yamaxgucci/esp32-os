@@ -94,15 +94,13 @@ void gwenesis_sn76489_save_state(void) {}
 void gwenesis_sn76489_load_state(void) {}
 
 /* The chip for a save state (md_savestate.c): it holds no pointers. */
-void md_psg_state(void *buf, size_t *len, int load)
+size_t md_psg_state_size(void)
 {
-    *len = sizeof(s_psg);
-    if (buf == NULL) {
-        return;
-    }
-    if (load) {
-        memcpy(&s_psg, buf, sizeof(s_psg));
-    } else {
-        memcpy(buf, &s_psg, sizeof(s_psg));
-    }
+    return sizeof(s_psg);
+}
+
+void md_psg_state_io(void (*io)(void *p, size_t n), int load)
+{
+    (void)load;
+    io(&s_psg, sizeof(s_psg));
 }

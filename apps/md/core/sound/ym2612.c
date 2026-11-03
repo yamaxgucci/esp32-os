@@ -2610,38 +2610,32 @@ void gwenesis_ym2612_load_state() {
  * point at and are put back on load: the image is loaded somewhere else next
  * time.
  */
-typedef struct {
-  YM2612 chip;
-  INT32  mem;
-  UINT32 bitmask;
-  uint8  dt[6][4];
-} md_ym_saved_t;
-
-void md_ym_state(void *buf, size_t *len, int load)
+size_t md_ym_state_size(void)
 {
-  md_ym_saved_t *const s = (md_ym_saved_t *)buf;
-  *len = sizeof(*s);
-  if (s == NULL) {
-    return;
-  }
+  return sizeof(ym2612) + sizeof(mem) + sizeof(bitmask) + 24;
+}
+
+/* streamed in place: no copy of a 3 KB chip is held anywhere */
+void md_ym_state_io(void (*io)(void *p, size_t n), int load)
+{
+  uint8 dt[6][4];
   if (!load) {
-    memcpy(&s->chip, &ym2612, sizeof(ym2612));
-    s->mem = mem;
-    s->bitmask = bitmask;
     for (int c = 0; c < 6; c++) {
       for (int k = 0; k < 4; k++) {
-        s->dt[c][k] = (uint8)((ym2612.CH[c].SLOT[k].DT - ym2612.OPN.ST.dt_tab[0]) >> 5);
+        dt[c][k] = (uint8)((ym2612.CH[c].SLOT[k].DT - ym2612.OPN.ST.dt_tab[0]) >> 5);
       }
     }
-    return;
   }
-  memcpy(&ym2612, &s->chip, sizeof(ym2612));
-  mem = s->mem;
-  bitmask = s->bitmask;
-  for (int c = 0; c < 6; c++) {
-    for (int k = 0; k < 4; k++) {
-      ym2612.CH[c].SLOT[k].DT = ym2612.OPN.ST.dt_tab[s->dt[c][k] & 7];
+  io(&ym2612, sizeof(ym2612));
+  io(&mem, sizeof(mem));
+  io(&bitmask, sizeof(bitmask));
+  io(dt, sizeof(dt));
+  if (load) {
+    for (int c = 0; c < 6; c++) {
+      for (int k = 0; k < 4; k++) {
+        ym2612.CH[c].SLOT[k].DT = ym2612.OPN.ST.dt_tab[dt[c][k] & 7];
+      }
+      setup_connection(&ym2612.CH[c], c);
     }
-    setup_connection(&ym2612.CH[c], c);
   }
 }
