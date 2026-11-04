@@ -1,0 +1,8 @@
+/build/
+sdkconfig
+sdkconfig.old
+# copied in from apps/common/segapad (single source of truth)
+main/ag_segapad.c
+main/ag_segapad.h
+# the home network, if this module is to join it: never in the tree
+main/wifi_secret.h

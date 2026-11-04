@@ -376,6 +376,12 @@
     },
     { "out": "XPT2046.SYS", "group": "board", "src": ["apps/xpt2046/xpt2046.c"] },
     { "out": "CST816.SYS", "group": "board", "src": ["apps/cst816/cst816.c"] },
+    {
+      "out": "SEGAPAD.SYS", "group": "board",
+      "_note": "A Mega Drive pad (3 or 6 buttons) on a PCF8574 I2C expander: the pad's seven lines on P0..P6, the expander on [i2c0]. Reads it every 8 ms on the system core and gives keys - arrows, Z X C Enter for A B C Start, A S D for X Y Z, Esc for Mode - repeating a held one inside the console's 150 ms. Wiring in apps/common/segapad/ag_segapad.h.",
+      "include": ["apps/common/segapad"],
+      "src": ["apps/segapad/segapad.c", "apps/common/segapad/ag_segapad.c"]
+    },
 
     {
       "out": "AGVM.AXE", "group": "core",

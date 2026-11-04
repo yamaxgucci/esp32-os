@@ -1,0 +1,10 @@
+# Two app slots in 1 MB, so the module can be updated over Wi-Fi (POST /ota)
+# instead of a GPIO0 jumper and a power cycle each time.  The SDK's own
+# 1 MB layout: the second slot must start on a 512 KB boundary, so each slot
+# is 448 KB and the image must stay under that (0x88000 failed, 4 Nov 2026).
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x4000
+otadata,  data, ota,     0xd000,  0x2000
+phy_init, data, phy,     0xf000,  0x1000
+ota_0,    app,  ota_0,   0x10000, 0x70000
+ota_1,    app,  ota_1,   0x80000, 0x70000

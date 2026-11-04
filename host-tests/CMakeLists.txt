@@ -193,6 +193,8 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/esp8266/ag_espldr.c"
     test_stm32ldr.c
     "${ARGON_ROOT}/apps/common/stm32/ag_stm32ldr.c"
+    test_segapad.c
+    "${ARGON_ROOT}/apps/common/segapad/ag_segapad.c"
     ${ARGON_CRYPTO_SRCS}
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"

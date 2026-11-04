@@ -28,6 +28,7 @@ void run_axesig_tests(void);
 void run_licence_tests(void);
 void run_codepage_tests(void);
 void run_hidrep_tests(void);
+void run_segapad_tests(void);
 void run_reslist_tests(void);
 void run_arena_tests(void);
 void run_twoend_tests(void);
@@ -101,6 +102,7 @@ int main(void)
     run_phonelink_tests();
     run_espldr_tests();
     run_stm32ldr_tests();
+    run_segapad_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);
     return ag_test_failures == 0 ? 0 : 1;

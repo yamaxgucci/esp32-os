@@ -263,6 +263,19 @@ ag_err_t ag_port_i2c_open(int bus, int sda, int scl, uint32_t khz, bool pullups)
         return err;
     }
 
+    /*
+     * The driver's own text, off for good.  Every failure it logs also comes
+     * back as the return code, which is what the caller acts on; the text is
+     * three to five lines per failed transfer ("hardware timeout", then a bus
+     * reset that says "GPIO 21 is not usable" for each pin).  A pad read 125
+     * times a second through an expander that misses one transfer in four
+     * hundred printed enough of it to hold the console in text_row for four
+     * minutes and wedge the CYD, 4 November 2026 - and a pad pulled out is a
+     * failed transfer every read.
+     */
+    esp_log_level_set("i2c.master", ESP_LOG_NONE);
+    esp_log_level_set("i2c.common", ESP_LOG_NONE);
+
     s_i2c[bus].khz = khz;
     s_i2c[bus].up = true;
     return AG_OK;
@@ -341,21 +354,11 @@ ag_err_t ag_port_i2c_probe(int bus, uint8_t addr, uint32_t timeout_ms)
         return -AG_ENODEV;
     }
 
-    /*
-     * Silence the driver for the duration.  An address with nothing on it times
-     * out, and the driver logs that as an error - which is right when a driver
-     * is talking to a chip it expects to be there, and wrong a hundred and
-     * twelve times over when the whole point is to find out which addresses are
-     * empty.  A scan of an empty bus filled the screen with ESP-IDF error text
-     * and buried its own result.
-     */
-    const esp_log_level_t was = esp_log_level_get("i2c.master");
-    esp_log_level_set("i2c.master", ESP_LOG_NONE);
-
+    /* An address with nothing on it times out, which the driver would log as
+     * an error a hundred and twelve times over in a scan of an empty bus; it
+     * is silent since the bus opened (ag_port_i2c_open). */
     const esp_err_t rc = i2c_master_probe(s_i2c[bus].bus, addr,
                                           (int)timeout_ms);
-
-    esp_log_level_set("i2c.master", was);
 
     if (rc == ESP_OK) {
         return AG_OK;
