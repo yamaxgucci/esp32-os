@@ -74,6 +74,15 @@ if ($Relay) {
 Write-Host '[4/4] flash-drive image (build\usbdisk.img) with the agent on it'
 New-Item -ItemType Directory -Force build\usbdisk | Out-Null
 Copy-Item build\kvmagent.exe build\usbdisk\KVMAGENT.EXE -Force
+# The agents for the other systems, whichever have been built: Linux on the
+# VPS (tools\kvmagent\kvmagent_posix.c, gcc), macOS on a Mac (build-mac.sh).
+# Windows' one 32-bit exe covers 98 to 11.
+foreach ($a in 'kvmagent-linux', 'kvmagent-mac') {
+    Remove-Item "build\usbdisk\$a" -ErrorAction SilentlyContinue
+    if (Test-Path "build\$a") { Copy-Item "build\$a" "build\usbdisk\$a" -Force }
+}
+Copy-Item tools\kvmagent\99-argon-kvm.rules build\usbdisk\ -Force
+Copy-Item tools\kvmagent\README-LINUX-MAC.txt build\usbdisk\ -Force
 # The agent prints a "reachable from anywhere" URL when a RELAY.TXT sits beside
 # it, holding just the relay's public host (the first line of the -Relay file -
 # never the port or the secret, which belong only on the board's C:).

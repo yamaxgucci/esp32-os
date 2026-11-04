@@ -165,6 +165,7 @@ static const uint8_t k_desc_abs[] = {
     0x05, 0x01,       /* Usage Page (Generic Desktop)                        */
     0x09, 0x02,       /* Usage (Mouse)                                       */
     0xA1, 0x01,       /* Collection (Application)                            */
+    0x85, 0x01,       /*   Report ID (1) - the pointer                      */
     0x09, 0x01,       /*   Usage (Pointer)                                  */
     0xA1, 0x00,       /*   Collection (Physical)                            */
     0x05, 0x09,       /*     Usage Page (Button)                            */
@@ -193,6 +194,34 @@ static const uint8_t k_desc_abs[] = {
     0x95, 0x01,       /*     Report Count (1)                               */
     0x81, 0x06,       /*     Input (Data,Var,Rel) - wheel                   */
     0xC0,             /*   End Collection                                    */
+    0xC0,             /* End Collection                                      */
+
+    /*
+     * The pipe again, as HID: the one class every host since Windows 98 SE,
+     * Linux and macOS drives with no driver and no administrator.  The agent
+     * uses it where WinUSB is not there (Windows before 8.1, Linux, macOS).
+     * Report 2 carries pipe bytes either way, [len][up to 62 bytes]; report 3,
+     * in only, is flow control - how many bytes the board has taken so far -
+     * because an interrupt OUT endpoint cannot be held off the way bulk is.
+     * It shares this interface's endpoints because the S3 has no IN endpoint
+     * left to give it one of its own.
+     */
+    0x06, 0x00, 0xFF, /* Usage Page (Vendor 0xFF00)                          */
+    0x09, 0x01,       /* Usage (1)                                           */
+    0xA1, 0x01,       /* Collection (Application)                            */
+    0x15, 0x00,       /*   Logical Minimum (0)                              */
+    0x26, 0xFF, 0x00, /*   Logical Maximum (255)                            */
+    0x75, 0x08,       /*   Report Size (8)                                  */
+    0x85, 0x02,       /*   Report ID (2) - pipe bytes                       */
+    0x95, 0x3F,       /*   Report Count (63)                                */
+    0x09, 0x02,       /*   Usage (2)                                        */
+    0x81, 0x02,       /*   Input (Data,Var,Abs)                             */
+    0x09, 0x03,       /*   Usage (3)                                        */
+    0x91, 0x02,       /*   Output (Data,Var,Abs)                            */
+    0x85, 0x03,       /*   Report ID (3) - credit                           */
+    0x95, 0x3F,       /*   Report Count (63)                                */
+    0x09, 0x04,       /*   Usage (4)                                        */
+    0x81, 0x02,       /*   Input (Data,Var,Abs)                             */
     0xC0,             /* End Collection                                      */
 };
 
@@ -302,8 +331,8 @@ static const char *k_desc_str[] = {
 #endif
 
 #define CFG_TOTAL_LEN                                                        \
-    (TUD_CONFIG_DESC_LEN + 2 * TUD_HID_DESC_LEN + VENDOR_DESC_BYTES +        \
-     MSC_DESC_BYTES)
+    (TUD_CONFIG_DESC_LEN + 2 * TUD_HID_DESC_LEN +       \
+     VENDOR_DESC_BYTES + MSC_DESC_BYTES)
 
 /* One interrupt IN endpoint each, polled every millisecond - the fastest a
  * full-speed interrupt endpoint is allowed to be asked, and what every keyboard
@@ -311,6 +340,12 @@ static const char *k_desc_str[] = {
 #define EP_KBD 0x81
 #define EP_ABS 0x82
 #define EP_SIZE 16
+#define EP_ABS_SIZE 64  /* report ID + 63: the HID pipe rides this endpoint */
+/* No interrupt OUT for the HID pipe: the S3 has six endpoints past EP0 and the
+ * keyboard, pointer, vendor pipe and drive use all six (four IN, two OUT).  A
+ * seventh is accepted by the descriptor and never answers - the host's first
+ * write hangs.  Without one, every host sends output reports as SET_REPORT on
+ * EP0, which tud_hid_set_report_cb already takes. */
 #define EP_INTERVAL_MS 1
 
 /* The vendor pipe: a single bulk pair, no notification endpoint (that was
@@ -332,7 +367,7 @@ static const uint8_t k_desc_cfg[] = {
     TUD_HID_DESCRIPTOR(ITF_KBD, STR_KBD, HID_ITF_PROTOCOL_KEYBOARD,
                        sizeof(k_desc_kbd), EP_KBD, EP_SIZE, EP_INTERVAL_MS),
     TUD_HID_DESCRIPTOR(ITF_ABS, STR_ABS, HID_ITF_PROTOCOL_NONE,
-                       sizeof(k_desc_abs), EP_ABS, EP_SIZE, EP_INTERVAL_MS),
+                       sizeof(k_desc_abs), EP_ABS, EP_ABS_SIZE, EP_INTERVAL_MS),
 #if AG_PORT_HAS_USB_CDC
     TUD_VENDOR_DESCRIPTOR(ITF_VENDOR, STR_VENDOR, EP_VENDOR_OUT, EP_VENDOR_IN,
                           EP_VENDOR_SIZE),
@@ -550,16 +585,50 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
  * signal that says the far machine is listening, and Caps Lock in particular
  * decides whether the letters we send arrive in the case we meant.
  */
+#if AG_PORT_HAS_USB_CDC
+static void hidpipe_rx(const uint8_t *payload, uint16_t n);
+static void hidpipe_pump(void);
+#endif
+
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                            hid_report_type_t report_type,
                            uint8_t const *buffer, uint16_t bufsize)
 {
-    (void)report_id;
     if (instance == ITF_KBD && report_type == HID_REPORT_TYPE_OUTPUT &&
         bufsize >= 1) {
         s_leds = buffer[0];
+        return;
+    }
+#if AG_PORT_HAS_USB_CDC
+    if (instance == ITF_ABS) {
+        /* From the interrupt OUT endpoint TinyUSB hands the raw report, its ID
+         * first; from a control SET_REPORT it has already taken the ID off. */
+        if (report_type == HID_REPORT_TYPE_INVALID && bufsize >= 1) {
+            report_id = buffer[0];
+            buffer++;
+            bufsize--;
+        }
+        if (report_id == 2 && bufsize >= 1) {
+            hidpipe_rx(buffer, bufsize);
+        }
+    }
+#endif
+}
+
+#if AG_PORT_HAS_USB_CDC
+/* The endpoint is free again: the next pipe report, if any, can go. */
+void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report,
+                                uint16_t len)
+{
+    (void)report;
+    (void)len;
+    if (instance == ITF_ABS && s_lock != NULL &&
+        xSemaphoreTake(s_lock, 0) == pdTRUE) {
+        hidpipe_pump(); /* busy lock: whoever holds it pumps on their way out */
+        xSemaphoreGive(s_lock);
     }
 }
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* The port contract                                                        */
@@ -751,7 +820,8 @@ ag_err_t ag_port_usbdev_send(ag_usbhid_kind_t kind, const uint8_t *rep,
          */
         s_dropped++;
         rc = -AG_EAGAIN;
-    } else if (!tud_hid_n_report(instance, 0, rep, (uint16_t)len)) {
+    } else if (!tud_hid_n_report(instance, instance == ITF_ABS ? 1 : 0, rep,
+                                 (uint16_t)len)) {
         s_dropped++;
         rc = -AG_EIO;
     } else {
@@ -771,6 +841,99 @@ ag_err_t ag_port_usbdev_send(ag_usbhid_kind_t kind, const uint8_t *rep,
 static volatile uint32_t s_cdc_rx;
 static volatile uint32_t s_cdc_tx;
 
+/*
+ * The pipe over HID (see the report descriptor).  Two byte rings: what the
+ * agent sent (filled from the OUT endpoint, drained by cdc_read) and what the
+ * board sends back (filled by cdc_write, drained one report at a time as the IN
+ * endpoint frees up).  Whichever transport the agent last wrote on is the one
+ * answers go back on.
+ *
+ * Flow control is credit: an interrupt OUT endpoint is re-armed whether or not
+ * there is room, so the agent must not send more than the board has taken plus
+ * HIDPIPE_RX_SIZE - margin.  The board reports what it has taken (a running
+ * byte count) in report 3, on a change of a quarter of the ring or so.
+ */
+#define HIDPIPE_RX_SIZE 4096u /* the agent's window is 3/4 of this */
+#define HIDPIPE_TX_SIZE 1024u
+static uint8_t           s_hrx[HIDPIPE_RX_SIZE];
+static uint8_t           s_htx[HIDPIPE_TX_SIZE];
+static volatile uint32_t s_hrx_head, s_hrx_tail; /* running counts */
+static volatile uint32_t s_htx_head, s_htx_tail;
+static volatile uint32_t s_hrx_credit_sent;      /* tail last reported */
+static volatile bool     s_hid_mode;              /* answers go over HID */
+static volatile uint32_t s_hrx_overrun;
+static volatile bool     s_credit_req; /* an agent asked where the counts are */
+
+static void hidpipe_rx(const uint8_t *payload, uint16_t n)
+{
+    uint32_t len = payload[0];
+    if (len > (uint32_t)(n - 1u)) {
+        len = (uint32_t)(n - 1u);
+    }
+    s_hid_mode = true;
+    if (len == 0) {
+        /* An agent starting up: it needs both counts to know its window. */
+        s_credit_req = true;
+        if (xSemaphoreTake(s_lock, 0) == pdTRUE) {
+            hidpipe_pump();
+            xSemaphoreGive(s_lock);
+        }
+        return;
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        if (s_hrx_head - s_hrx_tail >= HIDPIPE_RX_SIZE) {
+            s_hrx_overrun++; /* the agent ignored its credit */
+            break;
+        }
+        s_hrx[s_hrx_head % HIDPIPE_RX_SIZE] = payload[1 + i];
+        s_hrx_head++;
+    }
+}
+
+/* Send what is due on the IN endpoint, if it is free: a credit report when the
+ * board has taken a fair amount since the last one, else pipe bytes. */
+static void hidpipe_pump(void)
+{
+    if (!s_running || !tud_mounted() || !tud_hid_n_ready(ITF_ABS)) {
+        return;
+    }
+    uint8_t rep[63];
+    const uint32_t tail = s_hrx_tail;
+    if (s_credit_req || tail - s_hrx_credit_sent >= HIDPIPE_RX_SIZE / 4u ||
+        (tail != s_hrx_credit_sent && s_hrx_head == tail)) {
+        /* [taken u32][received u32]: the agent's window is received-taken
+         * plus what it has sent since, and both counts run from boot. */
+        const uint32_t head = s_hrx_head;
+        memset(rep, 0, sizeof(rep));
+        rep[0] = (uint8_t)tail;
+        rep[1] = (uint8_t)(tail >> 8);
+        rep[2] = (uint8_t)(tail >> 16);
+        rep[3] = (uint8_t)(tail >> 24);
+        rep[4] = (uint8_t)head;
+        rep[5] = (uint8_t)(head >> 8);
+        rep[6] = (uint8_t)(head >> 16);
+        rep[7] = (uint8_t)(head >> 24);
+        if (tud_hid_n_report(ITF_ABS, 3, rep, sizeof(rep))) {
+            s_hrx_credit_sent = tail;
+            s_credit_req = false;
+        }
+        return;
+    }
+    const uint32_t have = s_htx_head - s_htx_tail;
+    if (have == 0) {
+        return;
+    }
+    const uint32_t take = (have < 62u) ? have : 62u;
+    memset(rep, 0, sizeof(rep));
+    rep[0] = (uint8_t)take;
+    for (uint32_t i = 0; i < take; i++) {
+        rep[1 + i] = s_htx[(s_htx_tail + i) % HIDPIPE_TX_SIZE];
+    }
+    if (tud_hid_n_report(ITF_ABS, 2, rep, sizeof(rep))) {
+        s_htx_tail += take;
+    }
+}
+
 int32_t ag_port_usbdev_cdc_read(void *buf, uint32_t len)
 {
     if (buf == NULL || len == 0) {
@@ -780,11 +943,34 @@ int32_t ag_port_usbdev_cdc_read(void *buf, uint32_t len)
         return -AG_ENODEV;
     }
 
+    /* HID first: bytes there mean the agent is on HID right now. */
+    const uint32_t hhave = s_hrx_head - s_hrx_tail;
+    if (hhave > 0) {
+        const uint32_t take = (hhave < len) ? hhave : len;
+        uint8_t       *out = (uint8_t *)buf;
+        for (uint32_t i = 0; i < take; i++) {
+            out[i] = s_hrx[(s_hrx_tail + i) % HIDPIPE_RX_SIZE];
+        }
+        s_hrx_tail += take;
+        s_cdc_rx += take;
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5)) == pdTRUE) {
+            hidpipe_pump(); /* maybe a credit report now */
+            xSemaphoreGive(s_lock);
+        }
+        return (int32_t)take;
+    }
+
     const uint32_t have = tud_vendor_available();
     if (have == 0) {
+        if (s_hrx_tail != s_hrx_credit_sent &&
+            xSemaphoreTake(s_lock, pdMS_TO_TICKS(5)) == pdTRUE) {
+            hidpipe_pump(); /* drained: tell the agent it may send again */
+            xSemaphoreGive(s_lock);
+        }
         return -AG_EAGAIN;
     }
 
+    s_hid_mode = false; /* the agent is on WinUSB */
     const uint32_t take = (have < len) ? have : len;
     const uint32_t got = tud_vendor_read(buf, take);
     s_cdc_rx += got;
@@ -806,6 +992,29 @@ int32_t ag_port_usbdev_cdc_write(const void *buf, uint32_t len)
          * So mounted is the only gate here.
          */
         return -AG_ENODEV;
+    }
+
+    if (s_hid_mode) {
+        const uint32_t room = HIDPIPE_TX_SIZE - (s_htx_head - s_htx_tail);
+        if (room == 0) {
+            if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5)) == pdTRUE) {
+                hidpipe_pump();
+                xSemaphoreGive(s_lock);
+            }
+            return -AG_EAGAIN;
+        }
+        const uint8_t *in = (const uint8_t *)buf;
+        const uint32_t take = (room < len) ? room : len;
+        for (uint32_t i = 0; i < take; i++) {
+            s_htx[(s_htx_head + i) % HIDPIPE_TX_SIZE] = in[i];
+        }
+        s_htx_head += take;
+        s_cdc_tx += take;
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5)) == pdTRUE) {
+            hidpipe_pump();
+            xSemaphoreGive(s_lock);
+        }
+        return (int32_t)take;
     }
 
     const uint32_t room = tud_vendor_write_available();

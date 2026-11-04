@@ -44,14 +44,68 @@
 /* winusb.h pulls in winusbio.h (the pipe-policy constants and PIPE_INFORMATION)
  * and needs windows.h ahead of it; include it last so those are in scope. */
 #include <winusb.h>
+#include <hidsdi.h>
+#include <hidpi.h>
 
-#include <ctype.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+/* No C runtime: the few library calls come from compat.c, on Win32 alone, so
+ * one 32-bit executable runs on every Windows from 98 to 11 (see build.cmd). */
+#include "compat.h"
 
 #include "miniz.h"
+
+/*
+ * WinUSB is looked up at run time, not linked: winusb.dll is in Windows only
+ * from Vista on, and binds to the board without a driver only from 8.1 on.  An
+ * import of it would stop the program from starting at all on 98 and XP; a
+ * lookup lets it start and use HID there instead.  The same for the one call
+ * that does not exist before Vista, SetProcessDPIAware.
+ */
+typedef BOOL(WINAPI *pfn_WinUsb_Initialize)(HANDLE, PWINUSB_INTERFACE_HANDLE);
+typedef BOOL(WINAPI *pfn_WinUsb_Free)(WINUSB_INTERFACE_HANDLE);
+typedef BOOL(WINAPI *pfn_WinUsb_QueryInterfaceSettings)(
+    WINUSB_INTERFACE_HANDLE, UCHAR, PUSB_INTERFACE_DESCRIPTOR);
+typedef BOOL(WINAPI *pfn_WinUsb_QueryPipe)(WINUSB_INTERFACE_HANDLE, UCHAR,
+                                           UCHAR, PWINUSB_PIPE_INFORMATION);
+typedef BOOL(WINAPI *pfn_WinUsb_SetPipePolicy)(WINUSB_INTERFACE_HANDLE, UCHAR,
+                                               ULONG, ULONG, PVOID);
+typedef BOOL(WINAPI *pfn_WinUsb_ReadPipe)(WINUSB_INTERFACE_HANDLE, UCHAR, PUCHAR,
+                                          ULONG, PULONG, LPOVERLAPPED);
+typedef BOOL(WINAPI *pfn_WinUsb_WritePipe)(WINUSB_INTERFACE_HANDLE, UCHAR,
+                                           PUCHAR, ULONG, PULONG, LPOVERLAPPED);
+static pfn_WinUsb_Initialize             p_WinUsb_Initialize;
+static pfn_WinUsb_Free                   p_WinUsb_Free;
+static pfn_WinUsb_QueryInterfaceSettings p_WinUsb_QueryInterfaceSettings;
+static pfn_WinUsb_QueryPipe              p_WinUsb_QueryPipe;
+static pfn_WinUsb_SetPipePolicy          p_WinUsb_SetPipePolicy;
+static pfn_WinUsb_ReadPipe               p_WinUsb_ReadPipe;
+static pfn_WinUsb_WritePipe              p_WinUsb_WritePipe;
+#define WinUsb_Initialize p_WinUsb_Initialize
+#define WinUsb_Free p_WinUsb_Free
+#define WinUsb_QueryInterfaceSettings p_WinUsb_QueryInterfaceSettings
+#define WinUsb_QueryPipe p_WinUsb_QueryPipe
+#define WinUsb_SetPipePolicy p_WinUsb_SetPipePolicy
+#define WinUsb_ReadPipe p_WinUsb_ReadPipe
+#define WinUsb_WritePipe p_WinUsb_WritePipe
+
+static int winusb_load(void)
+{
+    static int tried, ok;
+    if (tried) {
+        return ok;
+    }
+    tried = 1;
+    HMODULE m = LoadLibraryA("winusb.dll");
+    if (m == NULL) {
+        return 0;
+    }
+#define WU(name) (p_##name = (pfn_##name)(void *)GetProcAddress(m, #name))
+    ok = WU(WinUsb_Initialize) && WU(WinUsb_Free) &&
+         WU(WinUsb_QueryInterfaceSettings) && WU(WinUsb_QueryPipe) &&
+         WU(WinUsb_SetPipePolicy) && WU(WinUsb_ReadPipe) &&
+         WU(WinUsb_WritePipe);
+#undef WU
+    return ok;
+}
 
 /* ------------------------------------------------------------------------ */
 /* The wire format, which is apps/common/kvm/ag_vid.h seen from this side.   */
@@ -75,7 +129,7 @@
 /* The board's VID/PID.  Matches ARGON_USB_VID/PID in usbdev_hw.c; a product
  * with its own pair changes both places. */
 #define ARGON_VID 0x303A
-#define ARGON_PID 0x4020
+#define ARGON_PID 0x4021
 
 /* The DeviceInterfaceGUID the board's WinUSB vendor interface advertises - it
  * must match the GUID in the device's registry (set by the WinUSB/WCID
@@ -97,7 +151,201 @@ typedef struct {
     UCHAR                  pipe_out; /* bulk OUT endpoint (host->device)       */
     HANDLE                 h;    /* legacy/unused; kept INVALID_HANDLE_VALUE   */
     SOCKET                 s;    /* the socket, or INVALID_SOCKET              */
+    HANDLE                 hid;  /* the HID pipe collection, or INVALID_...    */
 } link_t;
+
+/*
+ * The pipe over HID, for every Windows that has no driverless WinUSB (98, ME,
+ * 2000, XP, 7).  The board's mouse interface carries a vendor collection:
+ * report 2 is [len][up to 62 bytes] each way, report 3 (board to us) is
+ * [taken u32][received u32] - credit, because an interrupt OUT endpoint has no
+ * flow control of its own and we must not send more than the board can hold.
+ * A reader thread takes reports as they come (ReadFile on HID blocks, and there
+ * is no overlapped I/O on 98 worth relying on) into a ring link_read drains.
+ */
+static int g_trace; /* --trace, defined with the other options below */
+static HANDLE s_hread = INVALID_HANDLE_VALUE; /* the reader thread's handle */
+
+#define HID_REP 64        /* report ID + 63 */
+#define HID_WINDOW 3072u  /* the board's ring is 4096 */
+static uint8_t           s_hring[1u << 16];
+static volatile uint32_t s_hhead, s_htail;
+static volatile uint32_t s_htaken, s_hrecv; /* the board's counts */
+static volatile LONG     s_hcredits;        /* credit reports seen */
+static volatile LONG     s_hid_alive;
+static uint32_t          s_hsent;           /* in the board's numbering */
+
+static DWORD WINAPI hid_reader(LPVOID arg)
+{
+    HANDLE  h = (HANDLE)arg;
+    uint8_t rep[HID_REP];
+    while (s_hid_alive) {
+        DWORD got = 0;
+        if (!ReadFile(h, rep, HID_REP, &got, NULL) || got < 2) {
+            s_hid_alive = 0;
+            break;
+        }
+        if (rep[0] == 2) {
+            uint32_t n = rep[1] > 62 ? 62 : rep[1];
+            for (uint32_t i = 0; i < n; i++) {
+                if (s_hhead - s_htail >= sizeof(s_hring)) {
+                    break; /* we are not reading: drop, the stream is lost */
+                }
+                s_hring[s_hhead % sizeof(s_hring)] = rep[2 + i];
+                s_hhead++;
+            }
+        } else if (rep[0] == 3 && got >= 9) {
+            s_htaken = (uint32_t)rep[1] | ((uint32_t)rep[2] << 8) |
+                       ((uint32_t)rep[3] << 16) | ((uint32_t)rep[4] << 24);
+            s_hrecv = (uint32_t)rep[5] | ((uint32_t)rep[6] << 8) |
+                      ((uint32_t)rep[7] << 16) | ((uint32_t)rep[8] << 24);
+            InterlockedIncrement(&s_hcredits);
+        }
+    }
+    return 0;
+}
+
+static int hid_send(HANDLE h, const uint8_t *p, uint32_t n)
+{
+    uint8_t rep[HID_REP];
+    memset(rep, 0, sizeof(rep));
+    rep[0] = 2;
+    rep[1] = (uint8_t)n;
+    if (n > 0) {
+        memcpy(rep + 2, p, n);
+    }
+    DWORD w = 0;
+    return WriteFile(h, rep, HID_REP, &w, NULL) && w == HID_REP;
+}
+
+/*
+ * Find the board's pipe collection among the HID devices: our VID/PID, usage
+ * page 0xFF00.  Windows makes each top-level collection its own device path, so
+ * this is the vendor one and not the mouse beside it.  Then ask the board for
+ * its counts (an empty report) - an older board without the pipe never answers,
+ * and the link is not taken.
+ */
+static int find_hid_device(link_t *l, int list_only)
+{
+    GUID g;
+    HidD_GetHidGuid(&g);
+    HDEVINFO info = SetupDiGetClassDevsA(&g, NULL, NULL,
+                                         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (info == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    SP_DEVICE_INTERFACE_DATA iface;
+    iface.cbSize = sizeof(iface);
+    int found = 0;
+    for (DWORD i = 0; !found &&
+         SetupDiEnumDeviceInterfaces(info, NULL, &g, i, &iface); i++) {
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailA(info, &iface, NULL, 0, &need, NULL);
+        if (need == 0) {
+            continue;
+        }
+        SP_DEVICE_INTERFACE_DETAIL_DATA_A *d =
+            (SP_DEVICE_INTERFACE_DETAIL_DATA_A *)malloc(need);
+        if (d == NULL) {
+            continue;
+        }
+        d->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+        if (!SetupDiGetDeviceInterfaceDetailA(info, &iface, d, need, NULL,
+                                              NULL)) {
+            free(d);
+            continue;
+        }
+        if (g_trace) {
+            printf("hid: try %s\n", d->DevicePath);
+        }
+        HANDLE h = CreateFileA(d->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                               OPEN_EXISTING, 0, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            free(d);
+            continue; /* a keyboard or mouse the system holds, most likely */
+        }
+        HIDD_ATTRIBUTES a;
+        a.Size = sizeof(a);
+        PHIDP_PREPARSED_DATA pp = NULL;
+        HIDP_CAPS            caps;
+        int                  ours = 0;
+        if (HidD_GetAttributes(h, &a) && a.VendorID == ARGON_VID &&
+            a.ProductID == ARGON_PID && HidD_GetPreparsedData(h, &pp)) {
+            if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS &&
+                caps.UsagePage == 0xFF00 && caps.Usage == 1 &&
+                caps.InputReportByteLength == HID_REP) {
+                ours = 1;
+            }
+            HidD_FreePreparsedData(pp);
+        }
+        if (!ours) {
+            CloseHandle(h);
+            free(d);
+            continue;
+        }
+        if (list_only) {
+            printf("%s   <- the board (HID)\n", d->DevicePath);
+            CloseHandle(h);
+            free(d);
+            found = 1;
+            break;
+        }
+        /*
+         * A second handle for writing.  I/O on a synchronous handle is done one
+         * call at a time, and the reader thread sits in ReadFile on the first
+         * for as long as the board is quiet - a WriteFile on the same handle
+         * would wait behind it for ever.
+         */
+        HANDLE hw = CreateFileA(d->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                OPEN_EXISTING, 0, NULL);
+        free(d);
+        if (hw == INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+            continue;
+        }
+        s_hhead = s_htail = 0;
+        s_hcredits = 0;
+        s_hid_alive = 1;
+        HANDLE t = CreateThread(NULL, 0, hid_reader, (LPVOID)h, 0, NULL);
+        if (t == NULL) {
+            s_hid_alive = 0;
+            CloseHandle(h);
+            CloseHandle(hw);
+            continue;
+        }
+        CloseHandle(t);
+        s_hread = h;
+        h = hw;
+        if (g_trace) {
+            printf("hid: ours, asking for credit\n");
+        }
+        const int sent0 = hid_send(h, NULL, 0); /* where are your counts? */
+        if (g_trace) {
+            printf("hid: empty report %s (err %lu)\n", sent0 ? "sent" : "FAILED",
+                   (unsigned long)GetLastError());
+        }
+        for (int w = 0; w < 150 && s_hcredits == 0 && s_hid_alive; w++) {
+            Sleep(10);
+        }
+        if (g_trace) {
+            printf("hid: credits %ld alive %ld\n", (long)s_hcredits, (long)s_hid_alive);
+        }
+        if (s_hcredits == 0) {
+            s_hid_alive = 0;
+            CloseHandle(h);
+            CloseHandle(s_hread); /* unblocks the reader on NT; on 9x it exits with us */
+            s_hread = INVALID_HANDLE_VALUE;
+            continue;
+        }
+        s_hsent = s_hrecv;
+        l->hid = h;
+        found = 1;
+    }
+    SetupDiDestroyDeviceInfoList(info);
+    return found;
+}
 
 static int link_write(link_t *l, const void *buf, size_t len)
 {
@@ -105,6 +353,28 @@ static int link_write(link_t *l, const void *buf, size_t len)
     size_t      off = 0;
 
     while (off < len) {
+        if (l->hid != INVALID_HANDLE_VALUE) {
+            /* Within the board's window: what it has received but not yet
+             * taken, plus what we sent that has not arrived, stays under
+             * HID_WINDOW.  Waiting here is the same back-pressure a stalled
+             * bulk write gives on WinUSB. */
+            uint32_t n = (uint32_t)(len - off);
+            if (n > 62) {
+                n = 62;
+            }
+            while ((uint32_t)(s_hsent + n - s_htaken) > HID_WINDOW) {
+                if (!s_hid_alive) {
+                    return 0;
+                }
+                Sleep(1);
+            }
+            if (!hid_send(l->hid, (const uint8_t *)(p + off), n)) {
+                return 0;
+            }
+            s_hsent += n;
+            off += n;
+            continue;
+        }
         if (l->winusb != NULL) {
             /* Synchronous bulk OUT: WinUsb_WritePipe without an OVERLAPPED
              * blocks until the transfer completes, which is what we want - a
@@ -136,6 +406,23 @@ static int link_write(link_t *l, const void *buf, size_t len)
  * has gone. */
 static int link_read(link_t *l, void *buf, size_t len)
 {
+    if (l->hid != INVALID_HANDLE_VALUE) {
+        if (!s_hid_alive) {
+            return -1;
+        }
+        uint32_t have = s_hhead - s_htail;
+        if (have > len) {
+            have = (uint32_t)len;
+        }
+        for (uint32_t i = 0; i < have; i++) {
+            ((uint8_t *)buf)[i] = s_hring[(s_htail + i) % sizeof(s_hring)];
+        }
+        s_htail += have;
+        if (have == 0) {
+            Sleep(1); /* what the WinUSB read's short timeout gave */
+        }
+        return (int)have;
+    }
     if (l->winusb != NULL) {
         /* The IN pipe carries a PIPE_TRANSFER_TIMEOUT, so this returns soon
          * even when the board has nothing to say.  A timeout is not a dead
@@ -356,28 +643,37 @@ static SOCKET open_tcp(const char *hostport)
         return INVALID_SOCKET;
     }
 
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, port, &hints, &res) != 0 || res == NULL) {
-        fprintf(stderr, "cannot resolve %s:%s\n", host, port);
-        return INVALID_SOCKET;
+    /* gethostbyname, not getaddrinfo: the latter is not in the Winsock that
+     * Windows 98 and 2000 have, and importing it would stop the program
+     * starting there at all. */
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((u_short)atoi(port));
+    sa.sin_addr.s_addr = inet_addr(host);
+    if (sa.sin_addr.s_addr == INADDR_NONE) {
+        struct hostent *he = gethostbyname(host);
+        if (he == NULL || he->h_addr_list[0] == NULL) {
+            fprintf(stderr, "cannot resolve %s:%s\n", host, port);
+            return INVALID_SOCKET;
+        }
+        memcpy(&sa.sin_addr, he->h_addr_list[0], sizeof(sa.sin_addr));
     }
 
-    SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s != INVALID_SOCKET &&
-        connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
+        connect(s, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         closesocket(s);
         s = INVALID_SOCKET;
     }
-    freeaddrinfo(res);
     return s;
 }
 
 /* Where to find the link, remembered from argv so the reconnect loop can go
  * looking again: the --tcp target, or NULL for the WinUSB board. */
 static const char *g_tcp = NULL;
+static int         g_force_hid = 0;
+static int         g_trace = 0; /* --trace: say what the link setup is doing */ /* --hid: skip WinUSB even where it works */
 
 /*
  * Bring the link up, from nothing to ready-to-stream: for a board, find its
@@ -396,12 +692,18 @@ static int link_open(link_t *l)
     l->pipe_out = 0;
     l->h       = INVALID_HANDLE_VALUE;
     l->s       = INVALID_SOCKET;
+    l->hid     = INVALID_HANDLE_VALUE;
 
     if (g_tcp != NULL) {
         l->s = open_tcp(g_tcp);
         return l->s != INVALID_SOCKET;
     }
-    return find_winusb_device(l, 0);
+    /* WinUSB where Windows binds it by itself (8.1 on) - it is ~15x faster -
+     * and HID everywhere else. */
+    if (!g_force_hid && winusb_load() && find_winusb_device(l, 0)) {
+        return 1;
+    }
+    return find_hid_device(l, 0);
 }
 
 /* Drop the link and return l to the "nothing open" state, so link_open can run
@@ -410,6 +712,15 @@ static int link_open(link_t *l)
  * and a reconnect simply opens another socket.) */
 static void link_close(link_t *l)
 {
+    if (l->hid != INVALID_HANDLE_VALUE) {
+        s_hid_alive = 0;
+        CloseHandle(l->hid);
+        l->hid = INVALID_HANDLE_VALUE;
+        if (s_hread != INVALID_HANDLE_VALUE) {
+            CloseHandle(s_hread);
+            s_hread = INVALID_HANDLE_VALUE;
+        }
+    }
     if (l->winusb != NULL) {
         WinUsb_Free(l->winusb);
         l->winusb = NULL;
@@ -858,7 +1169,9 @@ static void tray_add(void)
         return;
     }
     memset(&g_nid, 0, sizeof(g_nid));
-    g_nid.cbSize = sizeof(g_nid);
+    /* The first, smallest layout: the only one the 98 shell accepts, and
+     * every later one still takes it. */
+    g_nid.cbSize = NOTIFYICONDATAA_V1_SIZE;
     g_nid.hWnd = g_tray_wnd;
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
@@ -999,7 +1312,14 @@ int main(int argc, char **argv)
      * smaller logical screen, so the picture loses its bottom-right and the
      * composited cursor lands short of where Windows actually drew it.  Make
      * the agent see physical pixels, so one pixel is one pixel end to end. */
-    SetProcessDPIAware();
+    {
+        typedef BOOL(WINAPI * pfn_dpi)(void);
+        pfn_dpi dpi = (pfn_dpi)(void *)GetProcAddress(
+            GetModuleHandleA("user32.dll"), "SetProcessDPIAware");
+        if (dpi != NULL) { /* Vista on; before it there is no scaling to undo */
+            dpi();
+        }
+    }
 
     const char *tcp = NULL;
     int         fps = 15;
@@ -1007,7 +1327,11 @@ int main(int argc, char **argv)
     int         list_only = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--list") == 0) {
+        if (strcmp(argv[i], "--hid") == 0) {
+            g_force_hid = 1;
+        } else if (strcmp(argv[i], "--trace") == 0) {
+            g_trace = 1;
+        } else if (strcmp(argv[i], "--list") == 0) {
             list_only = 1;
         } else if (strcmp(argv[i], "--setup") == 0) {
             /* Force the wizard the next time the board reports its config
@@ -1052,9 +1376,13 @@ int main(int argc, char **argv)
     link.pipe_out = 0;
     link.h = INVALID_HANDLE_VALUE;
     link.s = INVALID_SOCKET;
+    link.hid = INVALID_HANDLE_VALUE;
 
     if (list_only) {
-        find_winusb_device(&link, 1);
+        if (winusb_load()) {
+            find_winusb_device(&link, 1);
+        }
+        find_hid_device(&link, 1);
         return 0;
     }
 
@@ -1081,7 +1409,14 @@ int main(int argc, char **argv)
     /* The tray lives on a hidden message-only window; create it before the
      * loop so the icon and its menu are ready the moment we fold away.  If it
      * cannot be made we simply never hide the console - the agent still runs. */
-    g_console = GetConsoleWindow();
+    {
+        /* Windows 2000 on; on 98 there is no console window to fold into the
+         * tray, and the console just stays. */
+        typedef HWND(WINAPI * pfn_gcw)(void);
+        pfn_gcw gcw = (pfn_gcw)(void *)GetProcAddress(
+            GetModuleHandleA("kernel32.dll"), "GetConsoleWindow");
+        g_console = (gcw != NULL) ? gcw() : NULL;
+    }
     tray_window_create();
 
     uint8_t *scratch = (uint8_t *)malloc((size_t)tile * tile * 3);
@@ -1147,6 +1482,9 @@ int main(int argc, char **argv)
             waiting_said = 0;
             if (g_tcp != NULL) {
                 printf("connected to %s\n", g_tcp);
+            } else if (link.hid != INVALID_HANDLE_VALUE) {
+                printf("connected over HID (no driver needed; slower than "
+                       "WinUSB)\n");
             } else {
                 printf("connected over WinUSB (IN 0x%02X, OUT 0x%02X)\n",
                        link.pipe_in, link.pipe_out);

@@ -1,0 +1,3 @@
+# ArgonOS KVM dongle: let the logged-in user open its HID pipe without sudo.
+# sudo cp 99-argon-kvm.rules /etc/udev/rules.d/ && sudo udevadm control --reload && replug
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="4021", MODE="0660", TAG+="uaccess"
