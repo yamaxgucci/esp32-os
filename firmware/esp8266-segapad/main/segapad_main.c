@@ -60,8 +60,24 @@
 #define WAIT_CYC (CPU_MHZ * 2000u) /* 2 ms: a master that stopped mid-byte */
 #define HELD_MS  1000u             /* a page that went quiet lets go        */
 
+#define STATE_MS 48u /* each state the page reported, at least this long: the
+                      * CYD reads every 12 ms and believes two reads alike */
+#define STATES   16u
+
 static ag_segapad_model_t s_pad;
 static volatile uint16_t  s_held;
+/* States the page reported, played in order: the httpd task adds at the head,
+ * the main task takes from the tail.  While one plays the pad the CYD reads is
+ * s_play; once they are all played it is s_held. */
+static uint16_t           s_states[STATES];
+static volatile unsigned  s_st_head, s_st_tail;
+static volatile uint16_t  s_play;
+static volatile bool      s_playing;
+
+static inline uint16_t IRAM_ATTR pad_now(void)
+{
+    return s_playing ? s_play : s_held;
+}
 static volatile uint32_t  s_heard_ms;
 static uint32_t           s_us, s_cc;
 static uint8_t            s_latch = 0xff;
@@ -178,7 +194,7 @@ static bool IRAM_ATTR tx_byte(uint8_t b)
 static void IRAM_ATTR port_write(uint8_t v)
 {
     s_latch = v;
-    s_pad.held = s_held;
+    s_pad.held = pad_now();
     ag_segapad_model_select(&s_pad, (v & AG_SEGAPAD_SELECT) != 0u, now_us());
     s_writes++;
 }
@@ -186,7 +202,7 @@ static void IRAM_ATTR port_write(uint8_t v)
 /* A read is the pins: the pad's six lines, and the latch where it drives. */
 static uint8_t IRAM_ATTR port_read(void)
 {
-    s_pad.held = s_held;
+    s_pad.held = pad_now();
     s_reads++;
     return (uint8_t)(ag_segapad_model_read(&s_pad) & (s_latch | 0x3fu));
 }
@@ -291,13 +307,34 @@ static esp_err_t get_page(httpd_req_t *req)
     return httpd_resp_send(req, k_page, strlen(k_page));
 }
 
-/* /p?m=HEX: what is held now, as AG_SP_* bits. */
+/*
+ * /p?m=HEX[&e=HEX,HEX...]: what is held now, as AG_SP_* bits, and the states
+ * the buttons went through since the last request, each played for STATE_MS
+ * before m holds - a tap too quick for a request of its own still reaches the
+ * CYD, with its release.
+ */
 static esp_err_t get_press(httpd_req_t *req)
 {
-    char q[24], v[8];
+    char q[96], v[8], e[72];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
         httpd_query_key_value(q, "m", v, sizeof(v)) == ESP_OK) {
-        s_held = (uint16_t)(strtoul(v, NULL, 16) & AG_SP_ALL);
+        const uint16_t m = (uint16_t)(strtoul(v, NULL, 16) & AG_SP_ALL);
+        if (httpd_query_key_value(q, "e", e, sizeof(e)) == ESP_OK) {
+            for (char *p = e; *p != '\0';) {
+                char *end = p;
+                const uint16_t t = (uint16_t)(strtoul(p, &end, 16) & AG_SP_ALL);
+                if (end == p) {
+                    break;
+                }
+                const unsigned h = s_st_head;
+                if (h - s_st_tail < STATES) {
+                    s_states[h % STATES] = t;
+                    s_st_head = h + 1u;
+                }
+                p = (*end == ',') ? end + 1 : end;
+            }
+        }
+        s_held = m;
         s_heard_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     }
     char out[128];
@@ -445,11 +482,23 @@ void app_main(void)
     bus_init();
     wifi_start();
     http_start();
+    uint32_t play_end = 0;
     for (;;) {
-        vTaskDelay(200 / portTICK_PERIOD_MS);
+        vTaskDelay(1); /* a tick, 10 ms */
         const uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if (s_held != 0u && now - s_heard_ms > HELD_MS) {
             s_held = 0;
+        }
+        if (s_playing && (int32_t)(now - play_end) < 0) {
+            continue;
+        }
+        if (s_st_tail != s_st_head) {
+            s_play = s_states[s_st_tail % STATES];
+            s_st_tail = s_st_tail + 1u;
+            s_playing = true;
+            play_end = now + STATE_MS;
+        } else {
+            s_playing = false;
         }
     }
 }

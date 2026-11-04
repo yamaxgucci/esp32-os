@@ -2,7 +2,14 @@
  * The pad page: a 6-button pad drawn for a thumb on each side.  It sends what
  * is held (AG_SP_* bits, hex) whenever that changes and every 300 ms while
  * anything is held, one request at a time; the module lets go after a second
- * of silence.  The line at the top is the module's answer: what it holds, and
+ * of silence.  Each request also carries every state the buttons went through
+ * since the one before (&e=, up to eight), and the module plays them in order
+ * before it settles on m.  What is held alone cannot carry a tap that began
+ * and ended while a request was out: 12 of 20 quick taps never went out
+ * against a module that answers in 100 ms (4 Nov 2026).  Nor can a request a
+ * state (two a tap fall behind), a press kept for the next request (taps in a
+ * row run together), or the presses alone (17 of 20: a tap begun before the
+ * last one's release went out had no release before it).  The line at the top is the module's answer: what it holds, and
  * how many writes and reads the CYD has made of it - the proof the bus is
  * alive, on the phone itself.
  */
@@ -25,19 +32,22 @@ static const char k_page[] =
 "['X',256,64,40],['Y',512,77,30],['Z',1024,90,20],"
 "['START',128,46,82,1],['MODE',2048,46,18,1]];"
 "var pad=document.getElementById('pad'),st=document.getElementById('st'),"
-"held=0,sent=-1,busy=0,touch={},last=0;"
+"held=0,sent=-1,busy=0,touch={},last=0,evs=[],prev=0;"
 "B.forEach(function(b){var e=document.createElement('div');e.className='b'+(b[4]?' s':'');"
 "e.textContent=b[0];e.dataset.m=b[1];var w=b[4]?22:15;"
 "e.style.cssText='left:'+(b[2]-w/2)+'vw;top:'+(b[3]-7)+'vh;width:'+w+'vw;height:'+(b[4]?8:14)+'vh';"
 "pad.appendChild(e)});"
 "function at(x,y){var e=document.elementFromPoint(x,y);return e&&e.dataset.m?+e.dataset.m:0}"
 "function redo(){held=0;for(var k in touch)held|=touch[k];"
-"[].forEach.call(pad.children,function(e){e.classList.toggle('on',(held&e.dataset.m)!=0)});send()}"
-"function send(){if(busy||(held==sent&&(held==0||Date.now()-last<300)))return;"
-"busy=1;var m=held;last=Date.now();"
-"fetch('/p?m='+m.toString(16)).then(function(r){return r.text()}).then(function(t){"
+"[].forEach.call(pad.children,function(e){e.classList.toggle('on',(held&e.dataset.m)!=0)});"
+"if(held!=prev)evs.push(held);prev=held;send()}"
+"function hx(x){return x.toString(16)}"
+"function send(){if(busy)return;var e=evs.splice(0,8),m=held;"
+"if(!e.length&&m==sent&&(m==0||Date.now()-last<300))return;"
+"busy=1;last=Date.now();"
+"fetch('/p?m='+hx(m)+(e.length?'&e='+e.map(hx).join(','):'')).then(function(r){return r.text()}).then(function(t){"
 "var p=t.split(' ');st.textContent='held '+p[0]+'  CYD wrote '+p[1]+', read '+p[2]+', lost '+p[3];"
-"sent=m}).catch(function(){st.textContent='no answer';sent=-1})"
+"sent=m}).catch(function(){st.textContent='no answer';sent=-1;evs=e.concat(evs)})"
 ".then(function(){busy=0;send()})}"
 "function ev(e){e.preventDefault();for(var i=0;i<e.changedTouches.length;i++){var t=e.changedTouches[i];"
 "if(e.type=='touchend'||e.type=='touchcancel')delete touch[t.identifier];"

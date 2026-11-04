@@ -70,9 +70,23 @@ has it on IO35.
 `POST /ota` with the application image as the body is meant to update the
 module without the jumper:
 `curl --data-binary @build\segapad8266.bin http://<module>/ota`. It does not
-work yet: on 4 November 2026 it answered 500 after the whole image, with the
-1 MB layout in `partitions.csv` flashed. The build after that names the step
-that failed in the answer; it has not been on the module.
+work yet: on 4 November 2026 the whole image went in and was written to the
+second slot (0x80000), and `esp_ota_end` refused it -
+`ota: end (image check) failed (5379 / 0x1503)`, ESP_ERR_OTA_VALIDATE_FAILED.
+The same file boots when it is written to 0x10000 through the CYD, so the
+image is sound and the check is about the second slot; not looked into
+further, because the stand-in goes when the PCF8574 comes.
+
+## The page and the module talk in states
+
+`/p?m=HEX&e=HEX,...`: `m` is what is held now, `e` every state the buttons went
+through since the last request, and the module plays each for 48 ms before it
+settles on `m`. Only what is held, one request at a time, lost quick taps: a
+tap that began and ended while a request was out never went out. Measured on
+4 November 2026 with the page against a stand-in module and a CYD that reads
+like `SEGAPAD.SYS`, and then on the board through MD: 20 taps of 60 ms with
+80 ms between them reached MD as 20 presses (the page before: 12 of 20 at a
+100 ms module, 6 of 20 at 250 ms).
 
 ## The bus speed
 
