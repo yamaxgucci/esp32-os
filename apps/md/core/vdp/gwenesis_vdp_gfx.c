@@ -581,9 +581,11 @@ static inline __attribute__((always_inline)) uint32_t nz_mask(uint32_t v)
 static inline __attribute__((always_inline)) void
 cell_put(uint8_t *scr, uint32_t lo, uint32_t hi)
 {
-  if (((unsigned long)scr & 3u) == 0u) {
-    ((uint32_t *)(void *)scr)[0] = lo;
-    ((uint32_t *)(void *)scr)[1] = hi;
+  const unsigned int off = (unsigned int)((unsigned long)scr & 3u);
+  uint32_t *const w = (uint32_t *)(void *)(scr - off);
+  if (off == 0u) {
+    w[0] = lo;
+    w[1] = hi;
     return;
   }
   scr[0] = (uint8_t)lo;
@@ -596,18 +598,44 @@ cell_put(uint8_t *scr, uint32_t lo, uint32_t hi)
   scr[7] = (uint8_t)(hi >> 24);
 }
 
+/*
+ * The same over eight bytes cell_get has just read: off a word, the three
+ * words they straddle written whole.  For plane A, which reads its cell
+ * first - 5705 -> 5175 cycles a line; for plane B, which only writes, eight
+ * byte stores are cheaper than two loads more (S3-CAM, 5 Nov 2026).
+ * Little-endian: byte k of a word is bits 8k..8k+7.
+ */
+static inline __attribute__((always_inline)) void
+cell_put_rmw(uint8_t *scr, uint32_t lo, uint32_t hi)
+{
+  const unsigned int off = (unsigned int)((unsigned long)scr & 3u);
+  uint32_t *const w = (uint32_t *)(void *)(scr - off);
+  if (off == 0u) {
+    w[0] = lo;
+    w[1] = hi;
+    return;
+  }
+  const unsigned int sh = off * 8u;
+  const uint32_t keep = (1u << sh) - 1u;
+  w[0] = (w[0] & keep) | (lo << sh);
+  w[1] = (lo >> (32u - sh)) | (hi << sh);
+  w[2] = (w[2] & ~keep) | (hi >> (32u - sh));
+}
+
 static inline __attribute__((always_inline)) void
 cell_get(const uint8_t *scr, uint32_t *lo, uint32_t *hi)
 {
-  if (((unsigned long)scr & 3u) == 0u) {
-    *lo = ((const uint32_t *)(const void *)scr)[0];
-    *hi = ((const uint32_t *)(const void *)scr)[1];
+  const unsigned int off = (unsigned int)((unsigned long)scr & 3u);
+  const uint32_t *const w = (const uint32_t *)(const void *)(scr - off);
+  if (off == 0u) {
+    *lo = w[0];
+    *hi = w[1];
     return;
   }
-  *lo = (uint32_t)scr[0] | ((uint32_t)scr[1] << 8) | ((uint32_t)scr[2] << 16) |
-        ((uint32_t)scr[3] << 24);
-  *hi = (uint32_t)scr[4] | ((uint32_t)scr[5] << 8) | ((uint32_t)scr[6] << 16) |
-        ((uint32_t)scr[7] << 24);
+  const unsigned int sh = off * 8u;
+  const uint32_t w1 = w[1];
+  *lo = (w[0] >> sh) | (w1 << (32u - sh));
+  *hi = (w1 >> sh) | (w[2] << (32u - sh));
 }
 
 /* A name-table entry: one word read where FETCH16VRAM reads two bytes, each
@@ -721,7 +749,7 @@ void draw_pattern_planeA(uint8_t *scr, uint16_t name, int paty) {
       ml &= ~((xl << 8) - xl);
       mh &= ~((xh << 8) - xh);
     }
-    cell_put(scr, (ml & (lo | at)) | (~ml & olo), (mh & (hi | at)) | (~mh & ohi));
+    cell_put_rmw(scr, (ml & (lo | at)) | (~ml & olo), (mh & (hi | at)) | (~mh & ohi));
     return;
   }
 #endif

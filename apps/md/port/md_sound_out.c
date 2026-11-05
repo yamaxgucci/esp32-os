@@ -5,6 +5,7 @@
 #include "md_sound.h"
 
 #include <argon/argon.h>
+#include <string.h>
 
 #include "audio_out.h"
 
@@ -186,6 +187,13 @@ void md_sound_init(void)
             }
         }
         s_active = 1;
+#ifdef ARGON_MD_SMALL
+        {
+            /* heard nowhere: the FM channels need not be computed (ym2612.c) */
+            extern int md_ym_silent;
+            md_ym_silent = (strcmp(s_path, "/dev/pcmnull") == 0);
+        }
+#endif
         ag_printf("md: sound = %s @ %u Hz, chips at %u\n", s_path,
                   (unsigned)MD_SOUND_RATE, (unsigned)md_sound_synth_rate());
         return;

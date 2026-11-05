@@ -661,6 +661,7 @@ static volatile int      s_fb_sending = -1;          /* the sender's, or -1  */
 static int               s_fb_w, s_fb_h;             /* the one being sent's */
 static ag_sem_t          s_fb_sem;
 static ag_thread_t       s_fb_sender;
+static unsigned short   *s_fb_line[2];               /* a core's line, internal */
 static inline int md_frames(void) { return s_fb[1] != NULL; }
 #else
 static inline int md_frames(void) { return 0; }
@@ -741,8 +742,15 @@ static void draw_line(int line)
 {
     const int slot = line % s_ring_n;
 #ifdef MD_PSRAM_PAGES
+    /*
+     * Into a line of internal memory, one for each core, and from there into
+     * the picture in PSRAM in one copy: drawn straight into PSRAM a line's
+     * colours took 6400 cycles where they took 2800 in internal memory
+     * (S3-CAM, 5 Nov 2026).
+     */
     unsigned short *const row =
-        md_frames() ? s_fb[s_fb_draw] + (size_t)line * MD_WIDTH : s_ring[slot];
+        (md_frames() && s_fb_line[md_core()] != NULL) ? s_fb_line[md_core()]
+        : md_frames() ? s_fb[s_fb_draw] + (size_t)line * MD_WIDTH : s_ring[slot];
 #else
     unsigned short *const row = s_ring[slot];
 #endif
@@ -785,6 +793,10 @@ static void draw_line(int line)
     }
 #ifdef MD_PSRAM_PAGES
     if (md_frames()) {
+        unsigned short *const dst = s_fb[s_fb_draw] + (size_t)line * MD_WIDTH;
+        if (row != dst) {
+            memcpy(dst, row, (size_t)MD_WIDTH * sizeof(uint16_t));
+        }
         s_fl_hash[s_fb_draw][line] = hash;
         __sync_synchronize();
         s_fl_ready[line] = 1;
@@ -1158,6 +1170,12 @@ static void md_frames_start(void)
             s_fb[0] = s_fb[1] = NULL;
             ag_printf("md: no room for two whole pictures - rows as they are drawn\n");
             return;
+        }
+    }
+    for (int c = 0; c < 2; c++) {
+        if (s_fb_line[c] == NULL) {
+            s_fb_line[c] = (unsigned short *)ag_malloc_caps(MD_WIDTH * sizeof(uint16_t),
+                                                            AG_MEM_FAST);
         }
     }
     s_fb_sending = -1;

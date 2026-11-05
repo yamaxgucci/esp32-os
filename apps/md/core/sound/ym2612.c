@@ -2159,8 +2159,38 @@ void ym2612_dac_settle(void)
 #define YM_DAC_DUE(i)
 #endif
 
+#ifdef ARGON_MD_SMALL
+/*
+ * Nobody hears it: the sound goes to /dev/pcmnull (md_sound_out.c), as on a
+ * board with no converter.  The timers, CSM and the DAC's queue run as
+ * always - a game may count on them - and the channels are not computed:
+ * on the S3-CAM the chips took 550 ms a second of the system core with the
+ * picture's drawing on it too (5 Nov 2026).
+ */
+int md_ym_silent;
+#endif
+
 static void YM2612Update(int16_t *buffer, int length)
 {
+#ifdef ARGON_MD_SMALL
+  if (md_ym_silent) {
+    for (int i = 0; i < length; i++) {
+      YM_DAC_DUE(i)
+      *buffer++ = 0;
+      ym2612.OPN.SL3.key_csm <<= 1;
+      INTERNAL_TIMER_A();
+      if (ym2612.OPN.SL3.key_csm & 2) {
+        FM_KEYOFF_CSM(&ym2612.CH[2],SLOT1);
+        FM_KEYOFF_CSM(&ym2612.CH[2],SLOT2);
+        FM_KEYOFF_CSM(&ym2612.CH[2],SLOT3);
+        FM_KEYOFF_CSM(&ym2612.CH[2],SLOT4);
+        ym2612.OPN.SL3.key_csm = 0;
+      }
+    }
+    INTERNAL_TIMER_B(length);
+    return;
+  }
+#endif
   int i;
   int lt;
 
