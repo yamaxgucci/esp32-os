@@ -71,6 +71,14 @@ extern unsigned short *md_vr_cram565;
 #define gwenesis_vdp_regs md_vr_regs
 #define VSRAM md_vr_vsram
 #define CRAM565 md_vr_cram565
+#ifdef MD_FLAT_VRAM
+/* and VRAM and the sprite cache too: the frame's own copy where a board has
+ * the memory for one (md_raster.c, md_raster_snap) */
+extern unsigned char *md_vr_vram;
+extern unsigned char *md_vr_sat;
+#define VRAM md_vr_vram
+#define SAT_CACHE md_vr_sat
+#endif
 #endif
 
 // Define screen buffers: original and scaled for host RGB
@@ -621,8 +629,12 @@ static inline __attribute__((always_inline)) unsigned int vram_name(unsigned int
 static inline __attribute__((always_inline)) const volatile unsigned int *
 name_row(unsigned int a)
 {
+#ifdef MD_FLAT_VRAM
+  return (const volatile unsigned int *)(void *)VRAM + ((a & VRAM_MASK) >> 2);
+#else
   return (const volatile unsigned int *)(void *)md_vram[(a & VRAM_MASK) >> MD_PAGE_SHIFT] +
          ((a & MD_PAGE_MASK) >> 2);
+#endif
 }
 
 static inline __attribute__((always_inline)) unsigned int

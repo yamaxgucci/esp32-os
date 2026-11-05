@@ -44,7 +44,7 @@
 #ifdef MD_PSRAM_PAGES
 /* a board with PSRAM: the machine's pages that internal memory cannot give
  * come from the process's arena, which is PSRAM there - room for all of them */
-AG_APP_SIZED("MD", "0.1", "argon", 0, 5 * 1024, 512 * 1024);
+AG_APP_SIZED("MD", "0.1", "argon", 0, 5 * 1024, 768 * 1024);
 #else
 AG_APP_SIZED("MD", "0.1", "argon", 0, 5 * 1024, 4 * 1024);
 #endif
@@ -1636,6 +1636,12 @@ static int md_small_alloc(void)
     M68K_RAM = md_ram[MD_RAM_PAGES - 1];
     ZRAM = md_zram[MD_ZRAM_PAGES - 1];
     VRAM = md_vram[0];
+#ifdef MD_FLAT_VRAM
+    {
+        extern unsigned char *md_vr_vram;
+        md_vr_vram = VRAM; /* the renderer's, until a pass takes a frame's copy */
+    }
+#endif
     ag_printf("md: 68000 RAM 64 KB, Z80 RAM %s, VRAM 64 KB (%u KB in IRAM) - "
               "%u-byte pages from %d blocks; %d rows of ring\n",
               s_run_z80_cpu ? "8 KB" : "one page (no Z80)", MD_PAGES_KB(in_iram),

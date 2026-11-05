@@ -363,6 +363,14 @@ static inline __attribute__((always_inline))
 void gwenesis_vdp_vram_write(unsigned int address, unsigned int value)
 {
   VRAM_WR8(address, value);
+#ifdef MD_FLAT_VRAM
+  {
+    /* the page changed since the frame's copy was last made (md_raster.c) */
+    extern uint32_t md_vram_dirty[];
+    const unsigned int pg = (address & VRAM_MASK) >> MD_PAGE_SHIFT;
+    md_vram_dirty[pg >> 5] |= 1u << (pg & 31u);
+  }
+#endif
 
   // Update internal SAT Cache
   // used in Castlevania Bloodlines

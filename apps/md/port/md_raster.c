@@ -85,6 +85,31 @@ unsigned char  *md_vr_regs = gwenesis_vdp_regs;
 unsigned short *md_vr_vsram = VSRAM;
 unsigned short *md_vr_cram565 = CRAM565;
 
+#ifdef MD_FLAT_VRAM
+#include <argon/argon.h>
+/*
+ * A board with PSRAM: the frame's VRAM, sprite cache and palette copied when
+ * it is published, and the pass drawn from the copy.  Drawn from the live
+ * VDP, a pass that took three frames had the name tables the game rewrote for
+ * where the camera went next: when Sonic jumped the bottom rows of the
+ * picture were the backdrop, the sprite another frame's (he saw it; host
+ * harness MD_LAG=2, frame 1839 of the attract mode, 5 Nov 2026).
+ */
+extern unsigned char  SAT_CACHE[];
+extern unsigned char *VRAM;
+unsigned char        *md_vr_vram;
+unsigned char        *md_vr_sat = SAT_CACHE;
+/*
+ * The pages written since the copy was last brought up to date
+ * (gwenesis_vdp_vram_write): copying all 64 KB at every frame published cost
+ * the 68000's core 1.3-2 ms a frame and Gunstar Heroes 42.7 -> 38.2 pictures a
+ * second; a frame writes a few kilobytes.
+ */
+uint32_t              md_vram_dirty[MD_VRAM_PAGES / 32];
+static unsigned char *s_snap_vram, *s_snap_sat;
+static uint16_t      *s_snap_cram;
+#endif
+
 /* the writes a record holds, in pieces */
 #define MD_RAS_PIECE  32
 #ifndef MD_RAS_PIECES
@@ -248,10 +273,29 @@ void md_raster_free(void (*release)(void *))
     md_vr_regs = gwenesis_vdp_regs;
     md_vr_vsram = VSRAM;
     md_vr_cram565 = CRAM565;
+#ifdef MD_FLAT_VRAM
+    ag_free(s_snap_vram);
+    ag_free(s_snap_sat);
+    ag_free(s_snap_cram);
+    s_snap_vram = s_snap_sat = NULL;
+    s_snap_cram = NULL;
+    md_vr_vram = VRAM;
+    md_vr_sat = SAT_CACHE;
+#endif
 }
 
 int md_raster_init(void *(*alloc)(size_t))
 {
+#ifdef MD_FLAT_VRAM
+    md_vr_vram = VRAM;
+    memset(md_vram_dirty, 0xff, sizeof(md_vram_dirty)); /* the first copy is whole */
+    if (s_snap_vram == NULL) {
+        /* PSRAM: internal memory is the system's on such a board */
+        s_snap_vram = (unsigned char *)ag_malloc(0x10000u);
+        s_snap_sat = (unsigned char *)ag_malloc(SAT_CACHE_MAX_SIZE);
+        s_snap_cram = (uint16_t *)ag_malloc(MD_RAS_CRAM * 4 * sizeof(uint16_t));
+    }
+#endif
     s_alloc = alloc;
     /* in the order that wastes least of 256-byte holes, which is what the
      * CYD has left (six of them, measured 1 Nov 2026): a record and the copy
@@ -483,6 +527,22 @@ void md_raster_visible(void)
                 hs_words(l, &s_hs[l / MD_RAS_HS_PIECE][(l % MD_RAS_HS_PIECE) * 2]);
             }
         }
+#ifdef MD_FLAT_VRAM
+        if (s_snap_vram != NULL && s_snap_sat != NULL && s_snap_cram != NULL) {
+            for (unsigned w = 0; w < MD_VRAM_PAGES / 32; w++) {
+                uint32_t bits = md_vram_dirty[w];
+                md_vram_dirty[w] = 0;
+                while (bits != 0u) {
+                    const unsigned b = (unsigned)__builtin_ctz(bits);
+                    bits &= bits - 1u;
+                    const size_t off = (size_t)(w * 32u + b) * MD_PAGE;
+                    memcpy(s_snap_vram + off, VRAM + off, MD_PAGE);
+                }
+            }
+            memcpy(s_snap_sat, SAT_CACHE, SAT_CACHE_MAX_SIZE);
+            memcpy(s_snap_cram, CRAM565, MD_RAS_CRAM * 4 * sizeof(uint16_t));
+        }
+#endif
         s_pub = s_rec_k;
         s_rec_k ^= 1;
         s_pub_seq++;
@@ -519,8 +579,17 @@ int md_raster_take(void)
     }
     md_vr_regs = s_cp->regs;
     md_vr_vsram = s_cp->vsram;
+    const uint16_t *pal = CRAM565;
+#ifdef MD_FLAT_VRAM
+    if (s_snap_vram != NULL && s_snap_sat != NULL && s_snap_cram != NULL) {
+        md_vr_vram = s_snap_vram;
+        md_vr_sat = s_snap_sat;
+        pal = s_snap_cram;
+        md_vr_cram565 = s_snap_cram;
+    }
+#endif
     if (cram && s_cram565 != NULL) {
-        memcpy(s_cram565, CRAM565, MD_RAS_CRAM * 4 * sizeof(uint16_t));
+        memcpy(s_cram565, pal, MD_RAS_CRAM * 4 * sizeof(uint16_t));
         md_vr_cram565 = s_cram565;
     }
     return 1;
@@ -563,6 +632,10 @@ void md_raster_done(void)
     md_vr_regs = gwenesis_vdp_regs;
     md_vr_vsram = VSRAM;
     md_vr_cram565 = CRAM565;
+#ifdef MD_FLAT_VRAM
+    md_vr_vram = VRAM;
+    md_vr_sat = SAT_CACHE;
+#endif
 }
 
 #ifdef MD_HOST_RASDUMP
