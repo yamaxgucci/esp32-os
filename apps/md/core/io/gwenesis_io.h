@@ -30,6 +30,11 @@ unsigned int gwenesis_io_read_ctrl(unsigned int address);
 void gwenesis_io_set_reg(unsigned int reg, unsigned int value);
 void gwenesis_io_get_buttons();
 
+/* ArgonOS: the 6-button pad (on unless 0), and its counter's timer, called
+ * once a scan line. */
+void gwenesis_io_set_six(int on);
+void gwenesis_io_line(void);
+
 void gwenesis_io_save_state();
 void gwenesis_io_load_state();
 

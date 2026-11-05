@@ -195,6 +195,8 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/stm32/ag_stm32ldr.c"
     test_segapad.c
     "${ARGON_ROOT}/apps/common/segapad/ag_segapad.c"
+    # MD's pad port: the file itself, #included (its save state is stubbed)
+    test_mdpad.c
     ${ARGON_CRYPTO_SRCS}
     "${ARGON_ROOT}/tools/nam.c"
     "${ARGON_ROOT}/apps/cc/cc_compile.c"
@@ -203,6 +205,10 @@ add_executable(argon_tests
     ${ARGON_DSP_SRCS}
     ${ARGON_KVM_SRCS}
     ${ARGON_PORTABLE_SRCS})
+
+# test_mdpad.c #includes MD's pad port, which finds its save state by name.
+set_source_files_properties(test_mdpad.c PROPERTIES INCLUDE_DIRECTORIES
+    "${ARGON_ROOT}/apps/md/core/savestate")
 
 # host_stub first, for the same reason as the smoke tools below: ag_ir asks
 # the kernel for memory, and there is no kernel here.

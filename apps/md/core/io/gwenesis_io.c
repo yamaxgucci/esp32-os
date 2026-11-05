@@ -30,6 +30,44 @@ Start A B C R L D U
 */
 static unsigned char gwenesis_io_pad_state[3] = {0x33,0x33,0x33};
 
+/*
+ * ArgonOS: the 6-button pad.  X Y Z and Mode, low when held, as bits 0..3:
+ * Z Y X Mode, the order the pad shows them in.  The pad counts TH rising
+ * (two at a time, so the count and TH together name the step, as Genesis
+ * Plus GX does it) and forgets the count when TH has been still for about
+ * 1.5 ms - SIX_LINES scan lines of 64 us.  A game that knows the pad reads it
+ * high-low four times back to back:
+ *
+ *   step (count|TH)  1,3,5 high: up down left right B C (as a 3-button pad)
+ *                    0,2   low:  up down 0 0 A Start
+ *                    4     low:  0 0 0 0 A Start     (the 6-button mark)
+ *                    7     high: Z Y X Mode B C
+ *                    6     low:  1 1 1 1 A Start
+ *
+ * A game that does not reads it once a frame and only ever sees steps 0 and
+ * 1.  The button state is the host's, so it is not in a save state.
+ */
+#define SIX_LINES 24
+static unsigned char button_six[3] = {0x0f, 0x0f, 0x0f};
+static unsigned char pad_count[3];
+static unsigned char pad_still[3];
+static int           pad_six = 1;
+
+void gwenesis_io_set_six(int on)
+{
+    pad_six = on != 0;
+    memset(pad_count, 0, sizeof(pad_count));
+}
+
+void gwenesis_io_line(void)
+{
+    for (int i = 0; i < 3; i++) {
+        if (pad_count[i] != 0 && ++pad_still[i] > SIX_LINES) {
+            pad_count[i] = 0;
+        }
+    }
+}
+
 #define GWENESIS_IO_VERSION 0x81 /* oversea NTSC model version 81 */
 /*
 $A10003	:	MODE 	VMOD 	DISK 	RSV 	VER3 	VER2 	VER1 	VER0
@@ -135,21 +173,36 @@ unsigned char io_reg[16] = {GWENESIS_IO_VERSION, /* 0x1 Version */
 
 void gwenesis_io_pad_release_button(int pad, int button)
 {
+    if (button >= 8) {
+        button_six[pad] |= (unsigned char)(1 << (button - 8));
+        return;
+    }
     button_state[pad] |= (1 << button);
 }
 
 void gwenesis_io_pad_press_button(int pad, int button)
 {
+    if (button >= 8) {
+        button_six[pad] &= (unsigned char)~(1 << (button - 8));
+        return;
+    }
     button_state[pad] &= ~(1 << button);
 }
 
 static inline void gwenesis_io_pad_write(int pad, int value)
 {
+ 
     unsigned char mask = io_reg[pad + 4];
+    const unsigned char was = gwenesis_io_pad_state[pad];
 
      gwenesis_io_pad_state[pad] &= ~mask;
     gwenesis_io_pad_state[pad] |= value & mask;
- 
+    if (pad_six && pad < 2 && !(was & 0x40) &&
+        (gwenesis_io_pad_state[pad] & 0x40)) {
+        pad_count[pad] = (unsigned char)((pad_count[pad] + 2) & 7);
+        pad_still[pad] = 0;
+    }
+
 }
 
 static inline  unsigned char gwenesis_io_pad_read(int pad)
@@ -162,6 +215,19 @@ static inline  unsigned char gwenesis_io_pad_read(int pad)
     value = gwenesis_io_pad_state[pad] & 0x40;
     value |= 0x3f;
 
+    if (pad_six && pad < 2 && pad_count[pad] >= 4)
+    {
+        const unsigned char b = button_state[pad];
+        if (value & 0x40) {       /* step 7, or 5 */
+            value &= (pad_count[pad] == 6) ? ((button_six[pad] & 0x0f) | (b & 0x30))
+                                           : (b & 0x3f);
+        } else if (pad_count[pad] == 4) {
+            value &= (b >> 2) & 0x30;              /* step 4: all four low */
+        } else {
+            value &= ((b >> 2) & 0x30) | 0x0f;     /* step 6: all four high */
+        }
+        return value;
+    }
     if (value & 0x40)
     {
         value &= (button_state[pad] & 0x3f);

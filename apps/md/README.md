@@ -236,6 +236,7 @@ python tools/pcmplay.py --save build\md_only.wav     # save, no speakers
 | `fps30` | emulate all 60 frames, rasterise and show every second one |
 | `fps60` | show every frame (default) |
 | `livepad` / `nolivepad` | live pad via `inp->btnp` (HostFS PADPUSH), or serial sticky only |
+| `pad3` | a 3-button pad; the default is a 6-button one (X Y Z Mode) |
 | `mock` / `wav` / path | sound sink: discard, `a:\md.wav`, or an explicit path |
 | `net` / `net:PORT` | stream stereo s16 PCM over TCP (WAV header); host: `tools/pcmplay.py` |
 | `audio` / `i2s` | kernel `api->audio` — real I2S when `[audio]` pins are set, else stub |
@@ -248,7 +249,14 @@ of m68k time), not because something waits on the Z80 — confirmed with
 `profile` vs `noz80 nosound`. It settles on its own after a couple of seconds.
 
 Keys (with `-HostFs` and `sms.cfg`): arrows, `Z` = A, `X` = B, `C` = C,
-Enter = Start, Esc quits. That path is real level state from a Win32 keyboard
+Enter = Start, `A` `S` `D` = X Y Z, `M` = Mode, Esc is the pause menu.
+
+The pad is a 6-button one (5 Nov 2026), counted the way Genesis Plus GX counts
+it: TH rising moves the count, about 1.5 ms (24 lines) still forgets it.  Mode
+is the game's button (The Lost Vikings uses it); the pause menu is Esc (Start
+and Mode together on SEGAPAD.SYS, the phone pad's MENU) or a touch on the
+glass, for a pad that has no Mode.  `pad3` gives a 3-button
+pad, for the few old games that read a 6-button one wrongly. That path is real level state from a Win32 keyboard
 hook, so directions and buttons can be held. `nolivepad` forces serial sticky
 keys: the terminal has no key-up, so a held button expires quickly — a degraded
 reserve, not for play.

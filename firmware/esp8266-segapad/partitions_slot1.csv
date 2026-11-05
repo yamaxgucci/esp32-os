@@ -1,0 +1,10 @@
+# Not flashed: only for linking the image that goes to the second slot.  On a
+# 1 MB ESP8266 an image runs only from the slot it was linked for, and the SDK
+# links for the first app partition in the table - so this table has just the
+# second slot, and build.ps1 builds once with each table.  partitions.csv is
+# the table on the module.
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x4000
+otadata,  data, ota,     0xd000,  0x2000
+phy_init, data, phy,     0xf000,  0x1000
+ota_1,    app,  ota_1,   0x80000, 0x70000

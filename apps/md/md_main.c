@@ -148,7 +148,7 @@ unsigned int md_cp_fetch, md_cp_decode, md_cp_exec, md_cp_n, md_cp_mem, md_cp_me
 #endif
 
 #define PAD_HOLD_MS 150u /* matches console sticky TTL; serial has no key-up */
-#define MD_BUTTONS 8
+#define MD_BUTTONS 12 /* PAD_UP..PAD_M */
 static uint32_t s_pad_until[MD_BUTTONS];
 
 static const struct {
@@ -159,6 +159,9 @@ static const struct {
     {AG_BTN_LEFT, PAD_LEFT}, {AG_BTN_RIGHT, PAD_RIGHT},
     {AG_BTN_B1, PAD_A}, {AG_BTN_B2, PAD_B}, {AG_BTN_C, PAD_C},
     {AG_BTN_START, PAD_S},
+    /* the 6-button pad's: Mode is the game's, the pause menu is QUIT (Esc) */
+    {AG_BTN_X, PAD_X}, {AG_BTN_Y, PAD_Y}, {AG_BTN_Z, PAD_Z},
+    {AG_BTN_MODE, PAD_M},
 };
 
 static int key_to_pad(uint16_t keycode)
@@ -180,6 +183,14 @@ static int key_to_pad(uint16_t keycode)
         return PAD_C;
     case AG_KEY_ENTER:
         return PAD_S;
+    case AG_KEY_A:
+        return PAD_X;
+    case AG_KEY_S:
+        return PAD_Y;
+    case AG_KEY_D:
+        return PAD_Z;
+    case AG_KEY_M:
+        return PAD_M;
     default:
         return -1;
     }
@@ -1480,7 +1491,16 @@ static void poll_pad_live(void)
 {
     ag_event_t ev;
     while (ag_poll_event(&ev, 0)) {
-        (void)handle_session_ev(&ev);
+        if (handle_session_ev(&ev)) {
+            continue;
+        }
+#ifdef MD_MENU
+        /* A touch on the glass is the pause menu, for a pad that has no
+         * Mode to make Start and Mode of (SEGAPAD.SYS). */
+        if (ev.type == AG_EV_POINTER_DOWN && ag_focused()) {
+            s_menu_req = 1;
+        }
+#endif
     }
     if (!ag_focused()) {
         for (unsigned i = 0; i < sizeof(k_live_map) / sizeof(k_live_map[0]);
@@ -1709,6 +1729,7 @@ resume_m68k:
         }
 
         scan_line++;
+        gwenesis_io_line();   /* the 6-button pad's count runs out */
 
         /* Vblank starts at the end of the last displayed line. */
         if (scan_line == screen_height) {
@@ -1766,7 +1787,7 @@ resume_m68k:
  *
  * Started with no cartridge, MD shows a window over the drives and folders
  * (md_pick); Esc in a game (the phone pad's MENU, a keyboard's Esc, a pad's
- * quit) pauses it and shows RESUME / SAVE STATE / LOAD STATE / LOAD GAME /
+ * Start and Mode together) or a touch on the glass pauses it and shows RESUME / SAVE STATE / LOAD STATE / LOAD GAME /
  * EXIT (md_pause_menu).  LOAD GAME gives the machine's memory back and goes to
  * the window again: on the CYD that is what lets the card be mounted again.
  *
@@ -2779,6 +2800,9 @@ int ag_main(int argc, char **argv)
             want_livepad = 0;
         } else if (arg_eq(argv[i], "livepad")) {
             want_livepad = 1;
+        } else if (arg_eq(argv[i], "pad3")) {
+            /* a 3-button pad, for the few old games a 6-button one upsets */
+            gwenesis_io_set_six(0);
         } else if (arg_eq(argv[i], "mock") || arg_eq(argv[i], "pcmnull")) {
             sound_path = "pcmnull";
         } else if (arg_eq(argv[i], "wav")) {

@@ -82,7 +82,12 @@ enum gwenesis_bus_pad_button
     PAD_B,
     PAD_C,
     PAD_A,
-    PAD_S
+    PAD_S,
+    /* the 6-button pad's, in the order its fourth TH-high step shows them */
+    PAD_Z,
+    PAD_Y,
+    PAD_X,
+    PAD_M
 };
 
 #if GNW_TARGET_MARIO != 0 | GNW_TARGET_ZELDA != 0

@@ -11,7 +11,8 @@
  * row run together), or the presses alone (17 of 20: a tap begun before the
  * last one's release went out had no release before it).  The line at the top is the module's answer: what it holds, and
  * how many writes and reads the CYD has made of it - the proof the bus is
- * alive, on the phone itself.
+ * alive, on the phone itself.  MENU is not a button of the pad: it holds
+ * Start and Mode together, which is what SEGAPAD.SYS opens a menu on.
  */
 #ifndef SEGAPAD_PAGE_H
 #define SEGAPAD_PAGE_H
@@ -30,7 +31,7 @@ static const char k_page[] =
 "var B=[['U',1,20,30],['D',2,20,70],['L',4,9,50],['R',8,31,50],"
 "['A',16,64,72],['B',32,77,62],['C',64,90,52],"
 "['X',256,64,40],['Y',512,77,30],['Z',1024,90,20],"
-"['START',128,46,82,1],['MODE',2048,46,18,1]];"
+"['START',128,46,82,1],['MODE',2048,46,18,1],['MENU',2176,20,10,1]];"
 "var pad=document.getElementById('pad'),st=document.getElementById('st'),"
 "held=0,sent=-1,busy=0,touch={},last=0,evs=[],prev=0;"
 "B.forEach(function(b){var e=document.createElement('div');e.className='b'+(b[4]?' s':'');"

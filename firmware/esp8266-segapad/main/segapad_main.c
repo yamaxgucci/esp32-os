@@ -60,8 +60,19 @@
 #define WAIT_CYC (CPU_MHZ * 2000u) /* 2 ms: a master that stopped mid-byte */
 #define HELD_MS  1000u             /* a page that went quiet lets go        */
 
-#define STATE_MS 48u /* each state the page reported, at least this long: the
-                      * CYD reads every 12 ms and believes two reads alike */
+/* Each state the page reported plays until the CYD has read it SCANS times
+ * whole - eight steps with no lost answer, and the step where a 6-button pad
+ * shows Z Y X Mode among them - and for at least STATE_MS so a game
+ * sees it for a few frames.  Counting by the clock alone lost taps: while the
+ * request that brought a state comes in, this module drops most of its
+ * answers on the bus, and at 48 ms 7 of 10 taps reached the CYD's driver, at
+ * 100 ms 8 of 10, and at three reads of eight steps 7 of 10 (5 Nov 2026):
+ * a step that comes late resets the pad's count like a real one's, and that
+ * read has no X Y Z in it though nothing on the bus was lost.  STATE_MAX_MS lets a state go when no CYD
+ * reads at all. */
+#define STATE_MS     50u
+#define STATE_MAX_MS 500u
+#define SCANS        3u
 #define STATES   16u
 
 static ag_segapad_model_t s_pad;
@@ -82,6 +93,14 @@ static volatile uint32_t  s_heard_ms;
 static uint32_t           s_us, s_cc;
 static uint8_t            s_latch = 0xff;
 static volatile uint32_t  s_reads, s_writes, s_lost;
+/* Whole reads of the pad: the CYD writes SELECT high twice in a row (its idle
+ * byte, then step 0) to begin one, then reads eight steps; a lost answer
+ * spoils the read it was in.  s_scans counts those, s_sixes the ones that
+ * also reached the 6-button step. */
+static volatile uint32_t  s_scans, s_sixes;
+static int                s_run = -1;
+static bool               s_six_seen;
+static uint8_t            s_last_write;
 /* What the bus looked like from here: interrupts taken, address bytes read
  * (and the last one), and STARTs that came too late to follow. */
 static volatile uint32_t  s_irqs, s_addrs, s_late;
@@ -193,6 +212,11 @@ static bool IRAM_ATTR tx_byte(uint8_t b)
 /* A write sets the port; SELECT is the pad's input. */
 static void IRAM_ATTR port_write(uint8_t v)
 {
+    if (v == 0xffu && s_last_write == 0xffu) {
+        s_run = 0;
+        s_six_seen = false;
+    }
+    s_last_write = v;
     s_latch = v;
     s_pad.held = pad_now();
     ag_segapad_model_select(&s_pad, (v & AG_SEGAPAD_SELECT) != 0u, now_us());
@@ -204,6 +228,16 @@ static uint8_t IRAM_ATTR port_read(void)
 {
     s_pad.held = pad_now();
     s_reads++;
+    if (s_pad.sel && s_pad.falls == 3u) {
+        s_six_seen = true;
+    }
+    if (s_run >= 0 && ++s_run == 8) {
+        s_scans++;
+        if (s_six_seen) {
+            s_sixes++;
+        }
+        s_run = -1;
+    }
     return (uint8_t)(ag_segapad_model_read(&s_pad) & (s_latch | 0x3fu));
 }
 
@@ -227,6 +261,7 @@ static void IRAM_ATTR transaction(void)
         }
         if (!ack()) {
             s_lost++;
+            s_run = -1;
             return;
         }
         if (a & 1) {
@@ -240,11 +275,13 @@ static void IRAM_ATTR transaction(void)
                 break; /* the read half of a write-then-read */
             }
             if (d < 0) {
+                s_run = -1;
                 return;
             }
             port_write((uint8_t)d);
             if (!ack()) {
                 s_lost++;
+                s_run = -1;
                 return;
             }
         }
@@ -309,9 +346,9 @@ static esp_err_t get_page(httpd_req_t *req)
 
 /*
  * /p?m=HEX[&e=HEX,HEX...]: what is held now, as AG_SP_* bits, and the states
- * the buttons went through since the last request, each played for STATE_MS
- * before m holds - a tap too quick for a request of its own still reaches the
- * CYD, with its release.
+ * the buttons went through since the last request, each played until the CYD
+ * has read it (see SCANS) before m holds - a tap too quick for a request of
+ * its own still reaches the CYD, with its release.
  */
 static esp_err_t get_press(httpd_req_t *req)
 {
@@ -337,13 +374,14 @@ static esp_err_t get_press(httpd_req_t *req)
         s_held = m;
         s_heard_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     }
-    char out[128];
+    char out[160];
     const int n = snprintf(out, sizeof(out),
-                           "%x %u %u %u irq %u addr %u last %02x late %u",
+                           "%x %u %u %u irq %u addr %u last %02x late %u scans %u six %u",
                            (unsigned)s_held, (unsigned)s_writes,
                            (unsigned)s_reads, (unsigned)s_lost,
                            (unsigned)s_irqs, (unsigned)s_addrs,
-                           (unsigned)s_last_addr, (unsigned)s_late);
+                           (unsigned)s_last_addr, (unsigned)s_late,
+                           (unsigned)s_scans, (unsigned)s_sixes);
     httpd_resp_set_type(req, "text/plain");
     return httpd_resp_send(req, out, n);
 }
@@ -414,6 +452,19 @@ static esp_err_t post_ota(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* GET /ota: the slot running, "slot 0" or "slot 1" - ota.ps1 sends the image
+ * linked for the other one. */
+static esp_err_t get_ota(httpd_req_t *req)
+{
+    const esp_partition_t *p = esp_ota_get_running_partition();
+    char msg[32];
+    const int n = snprintf(msg, sizeof(msg), "slot %d at 0x%x\n",
+                           p != NULL && p->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                           p != NULL ? (unsigned)p->address : 0u);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, msg, n);
+}
+
 static void http_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -426,9 +477,11 @@ static void http_start(void)
     static const httpd_uri_t page = {"/", HTTP_GET, get_page, NULL};
     static const httpd_uri_t press = {"/p", HTTP_GET, get_press, NULL};
     static const httpd_uri_t ota = {"/ota", HTTP_POST, post_ota, NULL};
+    static const httpd_uri_t slot = {"/ota", HTTP_GET, get_ota, NULL};
     httpd_register_uri_handler(h, &page);
     httpd_register_uri_handler(h, &press);
     httpd_register_uri_handler(h, &ota);
+    httpd_register_uri_handler(h, &slot);
 }
 
 /* ---- the radio --------------------------------------------------------- */
@@ -482,21 +535,23 @@ void app_main(void)
     bus_init();
     wifi_start();
     http_start();
-    uint32_t play_end = 0;
+    uint32_t play_at = 0, scans_at = 0;
     for (;;) {
         vTaskDelay(1); /* a tick, 10 ms */
         const uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if (s_held != 0u && now - s_heard_ms > HELD_MS) {
             s_held = 0;
         }
-        if (s_playing && (int32_t)(now - play_end) < 0) {
+        if (s_playing && now - play_at < STATE_MAX_MS &&
+            (now - play_at < STATE_MS || s_sixes - scans_at < SCANS)) {
             continue;
         }
         if (s_st_tail != s_st_head) {
             s_play = s_states[s_st_tail % STATES];
             s_st_tail = s_st_tail + 1u;
+            scans_at = s_sixes;
             s_playing = true;
-            play_end = now + STATE_MS;
+            play_at = now;
         } else {
             s_playing = false;
         }

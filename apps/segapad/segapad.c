@@ -13,12 +13,20 @@
  * knowing about it:
  *
  *   d-pad  arrows       A  Z       B  X       C  C       Start  Enter
- *   X  A                Y  S       Z  D       Mode  Esc (MD's pause menu)
+ *   X  A                Y  S       Z  D       Mode  M
+ *   Start and Mode together  Esc (MD's pause menu), and neither of them
  *
- * X, Y and Z are the keys the input layer's own pad table gives them
+ * X, Y, Z and Mode are the keys the input layer's own pad table gives them
  * (components/argon_kernel/src/dev/input.c), so a program that reads buttons
- * rather than keys finds them where it looks.  MD emulates a 3-button pad, so
- * a game there does not see them yet.
+ * rather than keys finds them where it looks: MD's 6-button pad does.  Mode
+ * was Esc until 5 Nov 2026, and a game that plays with Mode (The Lost
+ * Vikings) could not have it - so the menu is the two together, which no
+ * game asks for.  A pad without Mode opens MD's menu by a touch on the glass.
+ *
+ * Start goes out START_HOLD_MS late, so that Start and Mode pressed together
+ * by a thumb that is a little early with Start do not pause the game on the
+ * way to the menu.  A tap of Start shorter than that still goes out, as a
+ * press and a release.
  *
  * A key held is sent again every REPEAT_MS, marked as a repeat, because the
  * console forgets a key 150 ms after it last heard of it (AG_KEY_STICKY_MS):
@@ -53,6 +61,8 @@ AG_DRV("SEGAPAD", "0.1", "argon");
 #define REPEAT_MS 60u  /* inside the console's 150 ms                       */
 #define BUS_MS    20u  /* the longest one transfer may take                 */
 #define GONE_READS 4   /* this many empty reads in a row and the pad is gone */
+#define START_HOLD_MS 80u /* Start waits this long for Mode (the menu)      */
+#define SP_MENU 0x1000u   /* Start and Mode together: not a line of the pad  */
 
 static const struct {
     uint16_t bit;
@@ -63,7 +73,8 @@ static const struct {
     {AG_SP_A, AG_KEY_Z},         {AG_SP_B, AG_KEY_X},
     {AG_SP_C, AG_KEY_C},         {AG_SP_START, AG_KEY_ENTER},
     {AG_SP_X, AG_KEY_A},         {AG_SP_Y, AG_KEY_S},
-    {AG_SP_Z, AG_KEY_D},         {AG_SP_MODE, AG_KEY_ESC},
+    {AG_SP_Z, AG_KEY_D},         {AG_SP_MODE, AG_KEY_M},
+    {SP_MENU, AG_KEY_ESC},
 };
 
 static struct {
@@ -71,12 +82,16 @@ static struct {
     uint8_t           addr;
     volatile int      stop;
     uint16_t          held;
+    uint16_t          out;   /* the keys that went out: keys_of(held)     */
     uint16_t          raw;   /* the last read, before it is believed */
     uint16_t          six;   /* X Y Z Mode as the last 6-button read had them */
     uint32_t          blips; /* changes one read alone reported      */
     int               kind;
     int               empty;
     uint32_t          repeat_at;
+    uint32_t          start_at; /* Start went down here, not yet sent; 0 none */
+    int               start_out; /* Start has gone out                       */
+    int               menu;      /* Start and Mode were held together        */
     uint32_t          errs;
 } s;
 
@@ -90,10 +105,43 @@ static void send_key(uint16_t key, int down, int repeat)
     (void)ag_inject_event(&ev);
 }
 
-/* What changed since the last read, as presses and releases. */
-static void apply(uint16_t now)
+/* What the pad holds to what goes out: Start and Mode together are the
+ * menu until both are let go, and Start waits START_HOLD_MS to see whether
+ * Mode is coming. */
+static uint16_t keys_of(uint16_t now)
 {
-    const uint16_t was = s.held;
+    const uint16_t sm = AG_SP_START | AG_SP_MODE;
+    const uint32_t t = ag_millis() | 1u;
+    if (s.menu || (now & sm) == sm) {
+        s.menu = (now & sm) != 0u;
+        s.start_at = 0;
+        s.start_out = 0;
+        return s.menu ? (uint16_t)((now & ~sm) | SP_MENU) : now;
+    }
+    if (!(now & AG_SP_START)) {
+        if (s.start_at != 0u && !s.start_out) {
+            s.start_at = 0;
+            return (uint16_t)(now | AG_SP_START); /* the tap; let go next read */
+        }
+        s.start_at = 0;
+        s.start_out = 0;
+        return now;
+    }
+    if (s.start_at == 0u) {
+        s.start_at = t;
+    }
+    if (!s.start_out && t - s.start_at < START_HOLD_MS) {
+        return (uint16_t)(now & ~AG_SP_START);
+    }
+    s.start_out = 1;
+    return now;
+}
+
+/* What changed since the last read, as presses and releases. */
+static void apply(uint16_t pad)
+{
+    const uint16_t now = keys_of(pad);
+    const uint16_t was = s.out;
     for (unsigned i = 0; i < sizeof(k_keys) / sizeof(k_keys[0]); i++) {
         const uint16_t b = k_keys[i].bit;
         if ((now & b) && !(was & b)) {
@@ -102,7 +150,8 @@ static void apply(uint16_t now)
             send_key(k_keys[i].key, 0, 0);
         }
     }
-    s.held = now;
+    s.held = pad;
+    s.out = now;
 
     const uint32_t t = ag_millis();
     if (now != was) {
