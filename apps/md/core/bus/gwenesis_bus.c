@@ -41,7 +41,12 @@ __license__ = "GPLv3"
 #define MD_YM_READ(t) (md_snd_async ? md_snd_68k_ym_status() : YM2612Read(t))
 #define MD_PSG_WRITE(v, t) \
   do { if (md_snd_async) md_snd_68k_psg(v); else gwenesis_SN76489_Write((v), (t)); } while (0)
+/* counted: a game that polls the Z80's RAM cannot wait for a Z80 a frame
+ * behind (md_snd_async.c, md_snd_68k_frame_end) */
+#define MD_ZRAM_READ(a) \
+  (md_snd_zram_reads++, md_snd_fresh ? md_snd_68k_zram_fresh() : (void)0, MD_ZRAM(a))
 #else
+#define MD_ZRAM_READ(a) MD_ZRAM(a)
 #define MD_YM_WRITE(a, v, t) YM2612Write((a), (v), (t))
 #define MD_YM_READ(t) YM2612Read(t)
 #define MD_PSG_WRITE(v, t) gwenesis_SN76489_Write((v), (t))
@@ -483,7 +488,7 @@ MD_HOT static inline unsigned int gwenesis_bus_read_memory_8(unsigned int addres
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
-    return MD_ZRAM(address);
+    return MD_ZRAM_READ(address);
 
   case Z80_YM2612_ADDR:
     return MD_YM_READ(m68k_cycles_master());
@@ -534,7 +539,7 @@ MD_HOT static inline unsigned int gwenesis_bus_read_memory_16(unsigned int addre
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
-    return MD_ZRAM(address) | (MD_ZRAM(address) << 8);
+    return MD_ZRAM_READ(address) | (MD_ZRAM(address) << 8);
 
   case Z80_YM2612_ADDR:
     ret_value = MD_YM_READ(m68k_cycles_master());

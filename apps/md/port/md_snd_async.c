@@ -67,6 +67,27 @@ extern int scan_line;
 
 int md_snd_async;
 
+/*
+ * A game that waits on the Z80 cannot have one a frame behind.  The Lost
+ * Vikings (Rus) loads a driver into the Z80, lets it go, and reads back at
+ * once where its mailbox is - which the driver has not written yet when the
+ * Z80 runs a frame late - and then polls the wrong byte for good, on a black
+ * screen (5 Nov 2026; host harness: the box at 0xA01110 instead of 0xA00F58).
+ * Noticed later the wrong address is already read, so it is noticed at the
+ * read: one of the Z80's RAM within MD_FRESH_FRAMES of the 68000 letting a
+ * Z80 go from reset brings the Z80 and the chips back to the 68000's core
+ * there and then (md_snd_68k_zram_fresh), as `sndhere` has them.  A wait that
+ * comes later shows as thousands of reads a frame where a driver that only
+ * checks the Z80 reads a few: past MD_ZPOLL_READS a frame for MD_ZPOLL_FRAMES
+ * frames in a row does the same.  Either is for good.
+ */
+#define MD_FRESH_FRAMES 2
+#define MD_ZPOLL_READS  256u
+#define MD_ZPOLL_FRAMES 3u
+unsigned int     md_snd_zram_reads;
+int              md_snd_fresh; /* frames left since a Z80 was let go */
+static unsigned  s_zpoll_frames;
+
 /* A log: the events, and the lines of a frame they cover. */
 typedef struct {
     uint16_t ev[MD_EV_MAX];
@@ -105,6 +126,8 @@ void md_snd_async_start(int z80_on, int sound_on)
     log_reset(&s_log[0], 0);
     log_reset(&s_log[1], 0);
     s_ready[0] = s_ready[1] = 0;
+    md_snd_zram_reads = 0;
+    s_zpoll_frames = 0;
     __sync_synchronize();
     md_snd_async = 1;
 }
@@ -134,6 +157,19 @@ static void hand_over(int to, int ends)
     log_reset(next, ends ? 0 : to);
     next->lines = lines;
     next->vis = vis;
+}
+
+/* Everything handed over played - the Z80 is where the 68000 is - and the
+ * sound side this core's from now on. */
+static void come_home(void)
+{
+    while (s_ready[0] || s_ready[1]) {
+        ag_delay(1);
+    }
+    md_snd_async = 0;
+    md_snd_fresh = 0;
+    s_zpoll_frames = 0;
+    __sync_synchronize();
 }
 
 static void put(uint32_t kind, uint32_t payload)
@@ -171,6 +207,9 @@ void md_snd_68k_psg(unsigned int value)
 void md_snd_68k_zctl(unsigned int address, unsigned int value)
 {
     put(EV_ZCTL, ((address == 0x1200u) ? 0x100u : 0u) | (value ? 1u : 0u));
+    if (address == 0x1200u && value) {
+        md_snd_fresh = MD_FRESH_FRAMES; /* a Z80 let go from reset */
+    }
 }
 
 void md_snd_68k_frame_end(int lines, int visible)
@@ -179,6 +218,38 @@ void md_snd_68k_frame_end(int lines, int visible)
     l->lines = (uint16_t)lines;
     l->vis = (uint16_t)visible;
     hand_over(lines, 1);
+
+    if (md_snd_fresh > 0) {
+        md_snd_fresh--;
+    }
+    const unsigned reads = md_snd_zram_reads;
+    md_snd_zram_reads = 0;
+    s_zpoll_frames = (reads >= MD_ZPOLL_READS) ? s_zpoll_frames + 1u : 0u;
+    if (s_zpoll_frames >= MD_ZPOLL_FRAMES) {
+        come_home();
+        ag_printf("md: the game waits on the Z80 (%u reads of its RAM a frame) - "
+                  "the Z80 and the sound chips back on this core\n", reads);
+    }
+}
+
+/*
+ * The 68000 reads the Z80's RAM soon after letting a Z80 go: the log so far
+ * played - the Z80 run to the end of this line - and the rest of the frame
+ * on this core (run_frame asks md_snd_async at every line).
+ */
+void md_snd_68k_zram_fresh(void)
+{
+    if (!md_snd_async) {
+        md_snd_fresh = 0;
+        return;
+    }
+    const int line = (scan_line < 0) ? 0 : scan_line;
+    if (line < (int)s_log[s_fill].lines) {
+        hand_over(line + 1, 0);
+    }
+    come_home();
+    ag_printf("md: the game reads the Z80 it has just started - "
+              "the Z80 and the sound chips back on this core\n");
 }
 
 /* One event, at `clock` - the start of its line. */

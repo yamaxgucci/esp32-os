@@ -12,6 +12,11 @@
 /* Nonzero while the Z80 and the chips run on the system core. */
 #ifdef ARGON_MD_SMALL
 extern int md_snd_async;
+/* the 68000's reads of the Z80's RAM this frame (gwenesis_bus.c), and the
+ * frames left in which one brings the sound side back (md_snd_async.c) */
+extern unsigned int md_snd_zram_reads;
+extern int          md_snd_fresh;
+void md_snd_68k_zram_fresh(void);
 #else
 /* the CYD's alone: elsewhere the sound side never leaves the 68000's core,
  * and md_snd_async.c is not built */
