@@ -77,6 +77,12 @@ in `port/md_ym_native.c`.
 
 ## Build
 
+For a board, as a user builds it: `.\apps\md\build.ps1 -Chip esp32` (the CYD)
+or `-Chip esp32s3` (an S3 with PSRAM) - see
+[docs/user/08-mega-drive.md](../../docs/user/08-mega-drive.md).  The command
+below is the original full build, with the lite FM, for a board with 5 MB of
+PSRAM to spare.
+
 ```
 python tools/mkaxe.py --arch xtensa --gcc xtensa-esp32s3-elf-gcc `
   --include sdk/include --include apps/common --include apps/common/libc --include apps/md `

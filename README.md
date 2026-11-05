@@ -89,6 +89,8 @@ programming it: [docs/user/01-shell.md](docs/user/01-shell.md),
 [docs/user/03-host-share.md](docs/user/03-host-share.md) (QEMU folder sync) and
 [docs/user/04-network.md](docs/user/04-network.md) (fetching and serving files)
 and [docs/user/05-desktop.md](docs/user/05-desktop.md) (the graphical shell).
+Playing Mega Drive games - building, installing (also from the ArgonOS app
+shop), pads: [docs/user/08-mega-drive.md](docs/user/08-mega-drive.md).
 The SDK docs are in
 Russian, like the rest of the design notes.
 
