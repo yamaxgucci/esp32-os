@@ -27,3 +27,12 @@ endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(argonos VERSION ${ARGON_VERSION})
+
+# espressif/mdns 1.15.0 copies a 262-byte name into a 64-byte buffer with
+# strncpy, on purpose, and GCC 14 calls that stringop-truncation - an error
+# under IDF's -Werror=all.  Whether it fires depends on what got inlined, so
+# one board's build passed and the next one's stopped there (5 Nov 2026).
+# Theirs to fix; here it stays a warning, for that component only.
+if(TARGET __idf_espressif__mdns)
+    target_compile_options(__idf_espressif__mdns PRIVATE -Wno-error=stringop-truncation)
+endif()
