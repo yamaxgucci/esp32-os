@@ -207,6 +207,14 @@ beside a ROM. Measured 1 Nov 2026 with Alex Kidd from C: on the ST7789:
 in PSRAM stopped the 68000's loop), and the system shell gets little time
 while it runs.
 
+Since 5 Nov 2026 the PSRAM build draws whole pictures: two of them in PSRAM,
+both cores drawing a pass into one while a thread of its own sends the other
+(md_frames in md_main.c) - no bands, and drawing no longer waits for the
+wire.  VRAM there is one block read without the page table (MD_FLAT_VRAM,
+gwenesis_vdp.h).  With ST7789S3.SYS sending out of DMA bands of its own
+(st7789.c, s_band) Sonic on the S3-CAM went from 12.9 to 19.9 whole pictures
+a second at 40 MHz.
+
 ```
 run c:\mds3.axe c:\alex.swp 0 stats
 ```

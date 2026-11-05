@@ -44,7 +44,7 @@
 #ifdef MD_PSRAM_PAGES
 /* a board with PSRAM: the machine's pages that internal memory cannot give
  * come from the process's arena, which is PSRAM there - room for all of them */
-AG_APP_SIZED("MD", "0.1", "argon", 0, 5 * 1024, 192 * 1024);
+AG_APP_SIZED("MD", "0.1", "argon", 0, 5 * 1024, 512 * 1024);
 #else
 AG_APP_SIZED("MD", "0.1", "argon", 0, 5 * 1024, 4 * 1024);
 #endif
@@ -643,6 +643,28 @@ static volatile int      s_pass_h;   /* the pass's lines while one is open, else
 static volatile uint8_t  s_row_ready[MD_RING_MAX];
 static volatile uint32_t s_row_hash[MD_RING_MAX];
 static int               s_help = 1; /* `nohelp`: the system core alone         */
+#ifdef MD_PSRAM_PAGES
+/*
+ * A board with PSRAM draws whole pictures (md_frames): both cores draw a
+ * pass into one of two pictures in PSRAM, and only once all its lines are
+ * there does it go to the glass, from a thread of its own (md_fb_sender),
+ * while the next pass is drawn into the other.  Sent row by row as they
+ * were drawn, a busy scene came out in bands - the top of one frame over
+ * the bottom of the one before - and drawing waited for the wire, which at
+ * 40 MHz is two thirds of a picture's time on the S3-CAM (5 Nov 2026).
+ */
+static unsigned short   *s_fb[2];
+static int               s_fb_draw;                 /* the one being drawn   */
+static volatile uint8_t  s_fl_ready[MD_HASH_LINES];  /* its lines drawn      */
+static volatile uint32_t s_fl_hash[2][MD_HASH_LINES];
+static volatile int      s_fb_sending = -1;          /* the sender's, or -1  */
+static int               s_fb_w, s_fb_h;             /* the one being sent's */
+static ag_sem_t          s_fb_sem;
+static ag_thread_t       s_fb_sender;
+static inline int md_frames(void) { return s_fb[1] != NULL; }
+#else
+static inline int md_frames(void) { return 0; }
+#endif
 /* the pass draws from the last frame's raster record (md_raster.c): a
  * line with writes before it (s_ras_gate) is claimed only once every line
  * above it is drawn, and its claimer puts the writes in */
@@ -672,6 +694,16 @@ static int md_core(void)
  */
 static bool drawn_above(int line)
 {
+#ifdef MD_PSRAM_PAGES
+    if (md_frames()) {
+        for (int l = 0; l < line; l++) {
+            if (!s_fl_ready[l]) {
+                return false;
+            }
+        }
+        return true;
+    }
+#endif
     const int n = s_ring_n;
     for (int l = s_sent; l < line; l++) {
         if (!s_row_ready[l % n]) {
@@ -686,7 +718,7 @@ static int claim_line(void)
 {
     uint32_t c = s_next;
     for (;;) {
-        if ((int)c >= s_pass_h || (int)c >= s_sent + s_ring_n) {
+        if ((int)c >= s_pass_h || (!md_frames() && (int)c >= s_sent + s_ring_n)) {
             return -1;
         }
         const int gate = s_ras_gate;
@@ -708,7 +740,13 @@ static int claim_line(void)
 static void draw_line(int line)
 {
     const int slot = line % s_ring_n;
-    gwenesis_vdp_set_buffer(s_ring[slot]);
+#ifdef MD_PSRAM_PAGES
+    unsigned short *const row =
+        md_frames() ? s_fb[s_fb_draw] + (size_t)line * MD_WIDTH : s_ring[slot];
+#else
+    unsigned short *const row = s_ring[slot];
+#endif
+    gwenesis_vdp_set_buffer(row);
 #ifdef MD_VDPPROF
     if ((line & 31) == 7) {
         /* the same line twice: the second with the code just run */
@@ -725,9 +763,9 @@ static void draw_line(int line)
     } else
 #endif
     gwenesis_vdp_render_line(line);
-    s_row_hash[slot] = md_row_hash(s_ring[slot], screen_width);
+    const uint32_t hash = md_row_hash(row, screen_width);
     if (s_shot_now) {
-        const uint16_t *px = s_ring[slot];
+        const uint16_t *px = row;
         for (int x = 0; x < screen_width; x += 16) {
             char hex[16 * 4 + 1]; /* small: the drawer's stack has ~500 bytes spare */
             for (int k = 0; k < 16; k++) {
@@ -745,6 +783,15 @@ static void draw_line(int line)
             ag_delay(8);
         }
     }
+#ifdef MD_PSRAM_PAGES
+    if (md_frames()) {
+        s_fl_hash[s_fb_draw][line] = hash;
+        __sync_synchronize();
+        s_fl_ready[line] = 1;
+        return;
+    }
+#endif
+    s_row_hash[slot] = hash;
     __sync_synchronize();
     s_row_ready[slot] = 1;
 }
@@ -757,6 +804,9 @@ static void draw_line(int line)
  */
 static bool md_send(void)
 {
+    if (md_frames()) {
+        return false; /* whole pictures go from md_fb_sender */
+    }
     if (__atomic_exchange_n((uint32_t *)&s_sender, 1u, __ATOMIC_ACQUIRE) != 0u) {
         return false;
     }
@@ -834,6 +884,14 @@ static void md_help_draw(ag_time_t until)
 static void md_open_pass(void)
 {
     const int h = (screen_height < MD_HASH_LINES) ? screen_height : MD_HASH_LINES;
+#ifdef MD_PSRAM_PAGES
+    /* the glass is the sender's while it sends */
+    while (s_glass_lost && s_fb_sending >= 0 && s_ring_run) {
+        if (!md_snd_core0_poll()) {
+            ag_delay(1);
+        }
+    }
+#endif
     if (s_glass_lost) {
         /* between passes nothing is in the ring: its first row is free */
         s_glass_lost = 0;
@@ -859,11 +917,103 @@ static void md_open_pass(void)
                   s_pass_raster, screen_width);
         ag_delay(50);
     }
+#ifdef MD_PSRAM_PAGES
+    if (md_frames()) {
+        for (int l = 0; l < h; l++) {
+            s_fl_ready[l] = 0;
+        }
+    }
+#endif
     s_next = 0;
     s_sent = 0;
     __sync_synchronize();
     s_pass_h = h;
 }
+
+#ifdef MD_PSRAM_PAGES
+/* Every line of the pass drawn into its picture: the other core's too. */
+static bool md_frame_done(void)
+{
+    if ((int)s_next < s_pass_h) {
+        return false;
+    }
+    for (int l = 0; l < s_pass_h; l++) {
+        if (!s_fl_ready[l]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * The drawn picture to the sender, once it has let the last one go, and the
+ * next pass into the other.
+ */
+static void md_frame_hand_over(void)
+{
+    const ag_time_t t0 = ag_micros();
+    while (s_ring_run && s_fb_sending >= 0) {
+        if (!md_snd_core0_poll()) {
+            ag_delay(1);
+        }
+    }
+    s_help_wait_us += (uint32_t)(ag_micros() - t0);
+    s_fb_w = screen_width;
+    s_fb_h = s_pass_h;
+    __sync_synchronize();
+    s_fb_sending = s_fb_draw;
+    s_fb_draw ^= 1;
+    ag_sem_give(s_fb_sem);
+}
+
+/*
+ * The sender: a whole picture to the glass, the rows that changed since the
+ * glass last had it, in one rectangle.  On the system core beside the
+ * drawer, which runs while this waits for the wire.
+ */
+static void md_fb_sender(void *arg)
+{
+    (void)arg;
+    while (s_ring_run) {
+        (void)ag_sem_take(s_fb_sem, 50);
+        const int b = s_fb_sending;
+        if (b < 0) {
+            continue;
+        }
+        __sync_synchronize();
+        const int h = s_fb_h;
+        int first = -1, last = -1;
+        for (int l = 0; l < h; l++) {
+            if (s_fl_hash[b][l] != s_line_hash[l]) {
+                if (first < 0) {
+                    first = l;
+                }
+                last = l;
+            }
+        }
+        if (first >= 0) {
+            const ag_time_t t0 = ag_micros();
+            /*
+             * The changed rows in one rectangle, straight from the picture:
+             * the panel's driver reads them as it fills its own DMA bands
+             * (st7789.c, s_band), so a copy here into internal memory first
+             * changed nothing (S3-CAM, 5 Nov 2026).
+             */
+            md_present_rows(s_fb[b] + (size_t)first * MD_WIDTH, first,
+                            last - first + 1, s_fb_w, screen_height);
+            s_glass_us += (uint32_t)(ag_micros() - t0);
+            s_ring_got += (uint32_t)(last - first + 1);
+            for (int l = first; l <= last; l++) {
+                s_line_hash[l] = s_fl_hash[b][l];
+            }
+        }
+        s_lines_same += (uint32_t)(h - (first < 0 ? 0 : last - first + 1));
+        __sync_synchronize();
+        s_fb_sending = -1;
+    }
+    ag_thread_exit();
+}
+#endif
 
 static void md_drawer(void)
 {
@@ -885,6 +1035,16 @@ static void md_drawer(void)
             s_draw_us += (uint32_t)(ag_micros() - d0);
             continue;
         }
+#ifdef MD_PSRAM_PAGES
+        if (md_frames()) {
+            if (!md_frame_done()) {
+                /* the other core is drawing one of its lines */
+                (void)md_snd_core0_poll();
+                continue;
+            }
+            md_frame_hand_over();
+        } else
+#endif
         if (s_sent < s_pass_h) {
             /* the other core is drawing the line the glass needs next */
             const ag_time_t t0 = ag_micros();
@@ -980,6 +1140,40 @@ static void md_presenter(void *arg)
  * The batch and its thread, taken before the machine's memory: they need whole
  * blocks, which the machine's pages - cut out of anything - leave none of.
  */
+#ifdef MD_PSRAM_PAGES
+/* The two pictures and their sender, beside the ring: without them the
+ * pictures go row by row as before. */
+static void md_frames_start(void)
+{
+    if (s_fb[1] == NULL) {
+        const size_t bytes = (size_t)MD_WIDTH * MD_HASH_LINES * sizeof(uint16_t);
+        s_fb[0] = (unsigned short *)ag_malloc(bytes);
+        s_fb[1] = (unsigned short *)ag_malloc(bytes);
+        if (s_fb_sem == NULL) {
+            s_fb_sem = ag_sem_create(0, 1);
+        }
+        if (s_fb[0] == NULL || s_fb[1] == NULL || s_fb_sem == NULL) {
+            ag_free(s_fb[0]);
+            ag_free(s_fb[1]);
+            s_fb[0] = s_fb[1] = NULL;
+            ag_printf("md: no room for two whole pictures - rows as they are drawn\n");
+            return;
+        }
+    }
+    s_fb_sending = -1;
+    s_fb_draw = 0;
+    s_fb_sender = ag_thread_create(md_fb_sender, NULL, "mdsend", 2560, 4,
+                                   AG_THREAD_SYS_CORE);
+    if (s_fb_sender == NULL) {
+        ag_free(s_fb[0]);
+        ag_free(s_fb[1]);
+        s_fb[0] = s_fb[1] = NULL;
+        return;
+    }
+    ag_printf("md: whole pictures, two in PSRAM, sent by a thread of their own\n");
+}
+#endif
+
 static void md_ring_start(int rows)
 {
     if (s_ring_n > 0 && s_ring_sem != NULL) {
@@ -990,6 +1184,11 @@ static void md_ring_start(int rows)
         if (s_presenter == NULL) {
             s_ring_run = 0;
         }
+#ifdef MD_PSRAM_PAGES
+        if (s_ring_run) {
+            md_frames_start();
+        }
+#endif
         return;
     }
     s_ring_sem = ag_sem_create(0, 4);
@@ -1019,6 +1218,9 @@ static void md_ring_start(int rows)
             s_ring_end = b + (size_t)n * MD_WIDTH;
             __sync_synchronize();
             s_ring_n = n;
+#ifdef MD_PSRAM_PAGES
+            md_frames_start();
+#endif
             return;
         }
     }
@@ -1033,6 +1235,14 @@ static void md_ring_stop(void)
         (void)ag_thread_join(s_presenter, 1000);
         s_presenter = NULL;
     }
+#ifdef MD_PSRAM_PAGES
+    if (s_fb_sender != NULL) {
+        s_ring_run = 0;
+        ag_sem_give(s_fb_sem);
+        (void)ag_thread_join(s_fb_sender, 1000);
+        s_fb_sender = NULL;
+    }
+#endif
 }
 
 /* Black over the rows the picture does not cover, once: the console's text. */
@@ -1359,7 +1569,33 @@ static int md_small_alloc(void)
 {
     s_ring_n0 = s_ring_n;
     s_ring_end0 = s_ring_end;
+#ifdef MD_FLAT_VRAM
+    /*
+     * A board with PSRAM: VRAM in one block of memory that takes byte
+     * accesses, read by the renderer without the page table (gwenesis_vdp.h)
+     * - 16200 cycles a line against 14600 on the S3-CAM (5 Nov 2026).  The
+     * block is the only way here: VRAM_W reads it as one.
+     */
+    unsigned in_iram = 0;
+    {
+        unsigned char *flat = (unsigned char *)ag_malloc_caps(0x10000u, AG_MEM_FAST);
+        if (flat == NULL) {
+            flat = (unsigned char *)ag_malloc(0x10000u);
+        }
+        if (flat != NULL) {
+            page_block(flat);
+            for (unsigned i = 0; i < MD_VRAM_PAGES; i++) {
+                md_vram[i] = flat + i * MD_PAGE;
+            }
+            in_iram = MD_VRAM_PAGES;
+        } else {
+            ag_printf("md: short of memory - no 64 KB block for VRAM\n");
+            return 0;
+        }
+    }
+#else
     const unsigned in_iram = fill_pages(md_vram, MD_VRAM_PAGES, 1);
+#endif
     unsigned ram = fill_pages(md_ram, MD_RAM_PAGES, 0);
     /*
      * The Z80's first page is the image's own: allocated with it at load,
@@ -1992,7 +2228,11 @@ static void md_wait_drawer_idle(void)
         return;
     }
     for (int i = 0, calm = 0; i < 500 && calm < 3; i++) {
+#ifdef MD_PSRAM_PAGES
+        calm = (s_pass_h == 0 && s_drawer_parked && s_fb_sending < 0) ? calm + 1 : 0;
+#else
         calm = (s_pass_h == 0 && s_drawer_parked) ? calm + 1 : 0;
+#endif
         ag_delay(2);
     }
 }

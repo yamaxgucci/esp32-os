@@ -246,10 +246,32 @@ static uint16_t s_row[LCD_W * CELL_H];
 static const ag_io_api_t *io;
 static bool               s_up;
 
+/*
+ * Pictures at 1:1 out of two bands of internal memory the DMA engine reads as
+ * it is (io->spi_write_start, ABI 0.73): one band on the wire while the next
+ * is filled.  s_row cannot be that: a driver's statics are in PSRAM on the
+ * S3, the port copied every band out of it with the processor, and the
+ * S3-CAM's Mega Drive sent a row in 190 us of which 64 are the wire's at
+ * 80 MHz (5 Nov 2026).  NULL - no such memory, or a kernel without the call -
+ * and pictures go through s_row as before.
+ */
+static uint16_t *s_band;      /* two bands of LCD_W * CELL_H */
+static bool      s_band_out;  /* a write out of s_band may be on the wire */
+
+/* Whatever was queued out of s_band has gone. */
+static void settle(void)
+{
+    if (s_band_out) {
+        (void)io->spi_write_wait(LCD_BUS);
+        s_band_out = false;
+    }
+}
+
 /* ---- the wire ---------------------------------------------------------- */
 
 static void cmd(uint8_t c)
 {
+    settle(); /* a queued write goes out with D/C as it is */
     io->gpio_write(LCD_DC, 0);
     (void)io->spi_xfer(LCD_BUS, LCD_CS, &c, NULL, 1);
 }
@@ -265,6 +287,7 @@ static size_t s_chunk = 4096;
 static void data(const void *buf, size_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
+    settle();
     io->gpio_write(LCD_DC, 1);
     while (len > 0) {
         const size_t chunk = (len > s_chunk) ? s_chunk : len;
@@ -629,6 +652,43 @@ static void lcd_blit_rect(ag_handle_t h, const ag_blit_t *b)
     window_for((uint16_t)(s_off_x + ox0), (uint16_t)(s_off_y + oy0),
                (uint16_t)(s_off_x + ox1 - 1), (uint16_t)(s_off_y + oy1 - 1));
 
+    /*
+     * 1:1 from word-aligned rows: the bytes swapped two pixels at a time into
+     * one band of s_band while the other is on the wire.  Returns with the
+     * last band still going; whoever touches the bus next settles.
+     */
+    if (s_band != NULL && s_num == s_den && ox0 == x && (ow & 1u) == 0u &&
+        ((uintptr_t)b->px & 3u) == 0u && (b->stride & 3u) == 0u) {
+        const uint16_t per = (uint16_t)((LCD_W * CELL_H) / ow);
+        io->gpio_write(LCD_DC, 1); /* window_for settled: nothing is queued */
+        unsigned half = 0;
+        for (uint16_t j = oy0; j < oy1;) {
+            const uint16_t n = (uint16_t)((oy1 - j < per) ? oy1 - j : per);
+            uint16_t *const band = s_band + (size_t)half * LCD_W * CELL_H;
+            uint32_t *out = (uint32_t *)(void *)band;
+            for (uint16_t r = 0; r < n; r++) {
+                const uint32_t *in = (const uint32_t *)(const void *)(
+                    (const uint8_t *)b->px + (size_t)(j + r - y) * b->stride);
+                for (uint16_t i = 0; i < ow / 2u; i++) {
+                    const uint32_t v = in[i];
+                    *out++ = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+                }
+            }
+            settle(); /* the other band is ours again */
+            const size_t len = (size_t)n * ow * sizeof(uint16_t);
+            if (io->spi_write_start(LCD_BUS, LCD_CS, band, len) == AG_OK) {
+                s_band_out = true;
+            } else {
+                data(band, len);
+                io->gpio_write(LCD_DC, 1);
+            }
+            window_advance(n);
+            half ^= 1u;
+            j = (uint16_t)(j + n);
+        }
+        return;
+    }
+
     /* Output rows that fit the row buffer at this width; never zero. */
     uint16_t cap = (uint16_t)((sizeof(s_row) / sizeof(s_row[0])) / ow);
     if (cap == 0) {
@@ -846,6 +906,10 @@ ag_err_t ag_driver_init(void)
         return -AG_EBUSY;
     }
     s_up = true;
+    if (AG_HAS(io, spi_write_start) && AG_HAS(io, spi_write_wait)) {
+        s_band = (uint16_t *)ag_malloc_caps((size_t)2 * LCD_W * CELL_H * sizeof(uint16_t),
+                                            AG_MEM_FAST | AG_MEM_DMA);
+    }
 
     const ag_dev_add_t desc = {
         .name = "lcd0",

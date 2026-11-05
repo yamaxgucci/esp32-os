@@ -94,8 +94,18 @@ __license__ = "GPLv3"
 #include "md_pages.h"
 /* volatile: GCC otherwise turns "a word, then one byte of it" back into a
  * byte load or store - l8ui into IRAM, a LoadStoreError on the first frame. */
+#if defined(MD_PSRAM_PAGES) && !defined(MD_FLAT_VRAM)
+#define MD_FLAT_VRAM 1
+#endif
+#ifdef MD_FLAT_VRAM
+/* A board with PSRAM: VRAM is one block in memory that takes byte accesses
+ * (md_small_alloc), so neither the page table nor volatile. */
+extern unsigned char *VRAM;
+#define VRAM_W(A)   (((unsigned int *)(void *)VRAM)[((A) & VRAM_MASK) >> 2])
+#else
 #define VRAM_W(A)   (((volatile unsigned int *)(void *)md_vram[((A) & VRAM_MASK) >> MD_PAGE_SHIFT]) \
                      [((A) & MD_PAGE_MASK) >> 2])
+#endif
 #define VRAM_RD8(A) ((unsigned char)(VRAM_W(A) >> (((A) & 3u) << 3)))
 #define VRAM_WR8(A, V) do { unsigned int a_ = (A), s_ = (a_ & 3u) << 3;      \
     VRAM_W(a_) = (VRAM_W(a_) & ~(0xFFu << s_)) |                              \
