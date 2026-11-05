@@ -248,7 +248,7 @@ python tools/pcmplay.py --save build\md_only.wav     # save, no speakers
 | `audio` / `i2s` | kernel `api->audio` — real I2S when `[audio]` pins are set, else stub |
 | `profile` | print m68k/z80/snd/vdp µs for the first 120 frames |
 | `noz80` | advance Z80 clock only (no CPU execute; BUSREQ still live) |
-| `sndhere` | the CYD: the Z80 and the sound chips on the 68000's core, not a frame behind on the system core. A game that waits on its Z80 - reads its RAM just after starting it, or polls one byte - has the Z80 caught up to the moment instead, and keeps it on the system core: The Lost Vikings (Rus) waits for its driver's mailbox, stood on a black screen without that, and plays at 52-58 fps with it (38 with `sndhere`, 5 Nov 2026). Only a game that still polls hundreds of times a frame gets `sndhere` by itself |
+| `sndhere` | the CYD: the Z80 and the sound chips on the 68000's core, not a frame behind on the system core. Not needed for a game that reads the Z80's RAM just after starting it: that read has the Z80 caught up to the moment, and the Z80 stays on the system core - The Lost Vikings (Rus) reads its driver's mailbox that way and stood on a black screen without it (5 Nov 2026); 52-58 fps on the CYD, 38 with `sndhere` |
 | `nosound` | skip sample mix |
 
 Startup frames on Alex Kidd are slow because the **68000** is busy (~35 ms/frame

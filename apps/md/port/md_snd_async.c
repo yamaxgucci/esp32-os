@@ -82,29 +82,19 @@ int md_snd_async;
  * once where its mailbox is - which the driver has not written yet when the
  * Z80 runs a frame late - and then polls the wrong byte for good, on a black
  * screen (5 Nov 2026; host harness: the box at 0xA01110 instead of 0xA00F58).
- * Later it puts each sound command in the box and polls until the driver has
- * taken it.
  *
- * So when the 68000 reads the Z80's RAM and means to wait - any read within
- * MD_FRESH_FRAMES of letting a Z80 go from reset, or the same address read
- * twice running - the log so far is played at once and the Z80 is where the
- * 68000 is (catch_up), once a line at most.  The Lost Vikings polls about
- * once a frame (host harness, 2809 catch-ups in 3600 frames), and the Z80
- * stays on the system core: 52-58 fps on the CYD, where the Z80 on the
- * 68000's core gave 37-40.
- * Should a game still wait - past MD_ZPOLL_READS reads a frame for
- * MD_ZPOLL_FRAMES frames in a row - the Z80 and the chips come back to the
- * 68000's core for good, as `sndhere` has them.
+ * So a read of the Z80's RAM within MD_FRESH_FRAMES of the 68000 letting a
+ * Z80 go from reset plays the log so far at once, and the Z80 is where the
+ * 68000 is (catch_up), once a line at most.  Only then: after the driver is
+ * up the game's commands wait for a Z80 a frame late as well as any other
+ * game's - one or two reads of its RAM a frame, the longest run of one byte
+ * 57 (host harness, 1800 frames) - and catching up on every read of the same
+ * byte twice cost the games that only check theirs: on the S3-CAM Gunstar
+ * Heroes fell from 59 to 50 fps, and Sonic, polling 239 times running, was
+ * sent to the 68000's core and its frame took 12.5 ms instead of 7.2.
  */
 #define MD_FRESH_FRAMES 2
-#define MD_ZPOLL_READS  256u
-#define MD_ZPOLL_FRAMES 3u
-static unsigned  s_zram_reads;   /* this frame's */
 static int       s_fresh;        /* frames left since a Z80 was let go */
-static unsigned  s_zpoll_frames;
-#define MD_POLL_LINES   8
-static unsigned  s_last_zread = 0xffffffffu;
-static int       s_last_zline;
 static int       s_caught_line = -1;
 
 /* A log: the events, and the lines of a frame they cover. */
@@ -145,10 +135,7 @@ void md_snd_async_start(int z80_on, int sound_on)
     log_reset(&s_log[0], 0);
     log_reset(&s_log[1], 0);
     s_ready[0] = s_ready[1] = 0;
-    s_zram_reads = 0;
-    s_zpoll_frames = 0;
     s_fresh = 0;
-    s_last_zread = 0xffffffffu;
     s_caught_line = -1;
     __sync_synchronize();
     md_snd_async = 1;
@@ -181,19 +168,6 @@ static void hand_over(int to, int ends)
     next->vis = vis;
 }
 
-/* Everything handed over played - the Z80 is where the 68000 is - and the
- * sound side this core's from now on. */
-static void come_home(void)
-{
-    while (s_ready[0] || s_ready[1]) {
-        ag_delay(1);
-    }
-    md_snd_async = 0;
-    s_fresh = 0;
-    s_zpoll_frames = 0;
-    __sync_synchronize();
-}
-
 /* The log up to this line handed over and played: the Z80 is where the 68000
  * is.  The rest of the line comes in the next piece. */
 static void catch_up(void)
@@ -211,17 +185,11 @@ static void catch_up(void)
     }
 }
 
-void md_snd_68k_zram_read(unsigned int address)
+void md_snd_68k_zram_read(void)
 {
-    s_zram_reads++;
-    const int line = (scan_line < 0) ? 0 : scan_line;
-    /* a poll: the same byte again within a few lines - a driver's box looked
-     * at once a frame is not one */
-    if (s_fresh > 0 || (address == s_last_zread && line - s_last_zline < MD_POLL_LINES)) {
+    if (s_fresh > 0) {
         catch_up();
     }
-    s_last_zread = address;
-    s_last_zline = line;
 }
 
 static void put_at(uint32_t kind, uint32_t payload, int at)
@@ -286,15 +254,6 @@ void md_snd_68k_frame_end(int lines, int visible)
         s_fresh--;
     }
     s_caught_line = -1;
-    s_last_zread = 0xffffffffu; /* a poll is within a frame */
-    const unsigned reads = s_zram_reads;
-    s_zram_reads = 0;
-    s_zpoll_frames = (reads >= MD_ZPOLL_READS) ? s_zpoll_frames + 1u : 0u;
-    if (s_zpoll_frames >= MD_ZPOLL_FRAMES) {
-        come_home();
-        ag_printf("md: the game waits on the Z80 (%u reads of its RAM a frame) - "
-                  "the Z80 and the sound chips back on this core\n", reads);
-    }
 }
 
 /* One event, at `clock` - the start of its line. */
