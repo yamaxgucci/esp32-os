@@ -1629,10 +1629,7 @@ static void run_frame(int render)
     scan_line = 0;
     rendered = -1;
 #ifdef ARGON_MD_SMALL
-    /* the sound side on this core; it may come back in the middle of a frame
-     * (md_snd_68k_zram_fresh), and it survives the address error's longjmp */
-    static int here;
-    here = !md_snd_async;
+    const int here = !md_snd_async; /* the sound side on this core */
 #else
     const int here = 1;
 #endif
@@ -1683,9 +1680,6 @@ resume_m68k:
 #endif
         }
         m68k_run(system_clock);
-#ifdef ARGON_MD_SMALL
-        here = !md_snd_async; /* the 68000 may have brought it back just now */
-#endif
         if (profile) {
             t1 = ag_micros();
             m68k_us += (uint64_t)(t1 - t0);

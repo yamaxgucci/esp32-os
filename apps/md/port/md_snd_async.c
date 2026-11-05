@@ -48,10 +48,19 @@ extern int scan_line;
  * not have.
  */
 #define EV_KIND_SHIFT 14
-#define EV_LINE 0u /* the line the next events belong to */
+#define EV_LINE 0u /* the line the next events belong to; with EV_AT, a time */
 #define EV_YM   1u /* (port << 8) | value */
 #define EV_PSG  2u /* value */
 #define EV_ZCTL 3u /* (bit 8: reset, else the bus request) | value */
+/*
+ * An EV_LINE with this bit is not a line but the clocks into the line where
+ * the events after it came.  The bus request and the reset carry one: the
+ * Z80 runs only while the 68000 has not got the bus, and a game may take it
+ * and give it back several times a line - played at the line's start, the
+ * Z80 had the bus only from the line's last write on, and a driver started
+ * and asked within one line never ran in between.
+ */
+#define EV_AT   0x2000u
 
 /*
  * Events a log carries.  A frame with more - a game setting the YM's every
@@ -73,20 +82,30 @@ int md_snd_async;
  * once where its mailbox is - which the driver has not written yet when the
  * Z80 runs a frame late - and then polls the wrong byte for good, on a black
  * screen (5 Nov 2026; host harness: the box at 0xA01110 instead of 0xA00F58).
- * Noticed later the wrong address is already read, so it is noticed at the
- * read: one of the Z80's RAM within MD_FRESH_FRAMES of the 68000 letting a
- * Z80 go from reset brings the Z80 and the chips back to the 68000's core
- * there and then (md_snd_68k_zram_fresh), as `sndhere` has them.  A wait that
- * comes later shows as thousands of reads a frame where a driver that only
- * checks the Z80 reads a few: past MD_ZPOLL_READS a frame for MD_ZPOLL_FRAMES
- * frames in a row does the same.  Either is for good.
+ * Later it puts each sound command in the box and polls until the driver has
+ * taken it.
+ *
+ * So when the 68000 reads the Z80's RAM and means to wait - any read within
+ * MD_FRESH_FRAMES of letting a Z80 go from reset, or the same address read
+ * twice running - the log so far is played at once and the Z80 is where the
+ * 68000 is (catch_up), once a line at most.  The Lost Vikings polls about
+ * once a frame (host harness, 2809 catch-ups in 3600 frames), and the Z80
+ * stays on the system core: 52-58 fps on the CYD, where the Z80 on the
+ * 68000's core gave 37-40.
+ * Should a game still wait - past MD_ZPOLL_READS reads a frame for
+ * MD_ZPOLL_FRAMES frames in a row - the Z80 and the chips come back to the
+ * 68000's core for good, as `sndhere` has them.
  */
 #define MD_FRESH_FRAMES 2
 #define MD_ZPOLL_READS  256u
 #define MD_ZPOLL_FRAMES 3u
-unsigned int     md_snd_zram_reads;
-int              md_snd_fresh; /* frames left since a Z80 was let go */
+static unsigned  s_zram_reads;   /* this frame's */
+static int       s_fresh;        /* frames left since a Z80 was let go */
 static unsigned  s_zpoll_frames;
+#define MD_POLL_LINES   8
+static unsigned  s_last_zread = 0xffffffffu;
+static int       s_last_zline;
+static int       s_caught_line = -1;
 
 /* A log: the events, and the lines of a frame they cover. */
 typedef struct {
@@ -126,8 +145,11 @@ void md_snd_async_start(int z80_on, int sound_on)
     log_reset(&s_log[0], 0);
     log_reset(&s_log[1], 0);
     s_ready[0] = s_ready[1] = 0;
-    md_snd_zram_reads = 0;
+    s_zram_reads = 0;
     s_zpoll_frames = 0;
+    s_fresh = 0;
+    s_last_zread = 0xffffffffu;
+    s_caught_line = -1;
     __sync_synchronize();
     md_snd_async = 1;
 }
@@ -167,16 +189,46 @@ static void come_home(void)
         ag_delay(1);
     }
     md_snd_async = 0;
-    md_snd_fresh = 0;
+    s_fresh = 0;
     s_zpoll_frames = 0;
     __sync_synchronize();
 }
 
-static void put(uint32_t kind, uint32_t payload)
+/* The log up to this line handed over and played: the Z80 is where the 68000
+ * is.  The rest of the line comes in the next piece. */
+static void catch_up(void)
+{
+    const int line = (scan_line < 0) ? 0 : scan_line;
+    if (line == s_caught_line) {
+        return; /* once a line */
+    }
+    s_caught_line = line;
+    if (line < (int)s_log[s_fill].lines) {
+        hand_over(line + 1, 0);
+    }
+    while (md_snd_async && (s_ready[0] || s_ready[1])) {
+        ag_delay(1);
+    }
+}
+
+void md_snd_68k_zram_read(unsigned int address)
+{
+    s_zram_reads++;
+    const int line = (scan_line < 0) ? 0 : scan_line;
+    /* a poll: the same byte again within a few lines - a driver's box looked
+     * at once a frame is not one */
+    if (s_fresh > 0 || (address == s_last_zread && line - s_last_zline < MD_POLL_LINES)) {
+        catch_up();
+    }
+    s_last_zread = address;
+    s_last_zline = line;
+}
+
+static void put_at(uint32_t kind, uint32_t payload, int at)
 {
     const int line = (scan_line < 0) ? 0 : (scan_line & 0x1ff);
     md_log_t *l = &s_log[s_fill];
-    if (l->n + 2u > MD_EV_MAX) {
+    if (l->n + 3u > MD_EV_MAX) {
         /* full: this line and the ones before it go now */
         s_split++;
         hand_over(line + 1, 0);
@@ -186,7 +238,15 @@ static void put(uint32_t kind, uint32_t payload)
         l->ev[l->n++] = (uint16_t)((EV_LINE << EV_KIND_SHIFT) | (uint32_t)line);
         l->last = (int16_t)line;
     }
+    if (at >= 0) {
+        l->ev[l->n++] = (uint16_t)((EV_LINE << EV_KIND_SHIFT) | EV_AT | (uint32_t)at);
+    }
     l->ev[l->n++] = (uint16_t)((kind << EV_KIND_SHIFT) | (payload & 0x3fffu));
+}
+
+static void put(uint32_t kind, uint32_t payload)
+{
+    put_at(kind, payload, -1);
 }
 
 void md_snd_68k_ym(unsigned int port, unsigned int value)
@@ -206,9 +266,12 @@ void md_snd_68k_psg(unsigned int value)
 
 void md_snd_68k_zctl(unsigned int address, unsigned int value)
 {
-    put(EV_ZCTL, ((address == 0x1200u) ? 0x100u : 0u) | (value ? 1u : 0u));
+    extern int m68k_cycles_master(void);
+    int at = m68k_cycles_master() - ((scan_line < 0) ? 0 : scan_line) * VDP_CYCLES_PER_LINE;
+    at = (at < 0) ? 0 : (at >= VDP_CYCLES_PER_LINE) ? VDP_CYCLES_PER_LINE - 1 : at;
+    put_at(EV_ZCTL, ((address == 0x1200u) ? 0x100u : 0u) | (value ? 1u : 0u), at);
     if (address == 0x1200u && value) {
-        md_snd_fresh = MD_FRESH_FRAMES; /* a Z80 let go from reset */
+        s_fresh = MD_FRESH_FRAMES; /* a Z80 let go from reset */
     }
 }
 
@@ -219,37 +282,19 @@ void md_snd_68k_frame_end(int lines, int visible)
     l->vis = (uint16_t)visible;
     hand_over(lines, 1);
 
-    if (md_snd_fresh > 0) {
-        md_snd_fresh--;
+    if (s_fresh > 0) {
+        s_fresh--;
     }
-    const unsigned reads = md_snd_zram_reads;
-    md_snd_zram_reads = 0;
+    s_caught_line = -1;
+    s_last_zread = 0xffffffffu; /* a poll is within a frame */
+    const unsigned reads = s_zram_reads;
+    s_zram_reads = 0;
     s_zpoll_frames = (reads >= MD_ZPOLL_READS) ? s_zpoll_frames + 1u : 0u;
     if (s_zpoll_frames >= MD_ZPOLL_FRAMES) {
         come_home();
         ag_printf("md: the game waits on the Z80 (%u reads of its RAM a frame) - "
                   "the Z80 and the sound chips back on this core\n", reads);
     }
-}
-
-/*
- * The 68000 reads the Z80's RAM soon after letting a Z80 go: the log so far
- * played - the Z80 run to the end of this line - and the rest of the frame
- * on this core (run_frame asks md_snd_async at every line).
- */
-void md_snd_68k_zram_fresh(void)
-{
-    if (!md_snd_async) {
-        md_snd_fresh = 0;
-        return;
-    }
-    const int line = (scan_line < 0) ? 0 : scan_line;
-    if (line < (int)s_log[s_fill].lines) {
-        hand_over(line + 1, 0);
-    }
-    come_home();
-    ag_printf("md: the game reads the Z80 it has just started - "
-              "the Z80 and the sound chips back on this core\n");
 }
 
 /* One event, at `clock` - the start of its line. */
@@ -284,16 +329,20 @@ static void play(const md_log_t *l)
     for (int line = l->from; line < (int)l->to && line < lines; line++) {
         const int start = line * VDP_CYCLES_PER_LINE;
         const int end = start + VDP_CYCLES_PER_LINE;
+        int at = start;
         while (i < n) {
             const uint16_t e = ev[i];
             if (((uint32_t)e >> EV_KIND_SHIFT) == EV_LINE) {
-                if ((int)(e & 0x3fffu) > line) {
+                if (e & EV_AT) {
+                    const int t = start + (int)(e & (EV_AT - 1u));
+                    at = (t > at) ? t : at; /* the time of what follows */
+                } else if ((int)(e & 0x3fffu) > line) {
                     break; /* the next run belongs to a later line */
                 }
                 i++;
                 continue;
             }
-            apply(e, start);
+            apply(e, at);
             i++;
         }
         if (s_z80_on) {

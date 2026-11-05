@@ -41,10 +41,10 @@ __license__ = "GPLv3"
 #define MD_YM_READ(t) (md_snd_async ? md_snd_68k_ym_status() : YM2612Read(t))
 #define MD_PSG_WRITE(v, t) \
   do { if (md_snd_async) md_snd_68k_psg(v); else gwenesis_SN76489_Write((v), (t)); } while (0)
-/* counted: a game that polls the Z80's RAM cannot wait for a Z80 a frame
- * behind (md_snd_async.c, md_snd_68k_frame_end) */
+/* a game waiting on the Z80 cannot wait for one a frame behind: the read
+ * catches it up first (md_snd_async.c) */
 #define MD_ZRAM_READ(a) \
-  (md_snd_zram_reads++, md_snd_fresh ? md_snd_68k_zram_fresh() : (void)0, MD_ZRAM(a))
+  (md_snd_async ? md_snd_68k_zram_read((a) & 0x1fffu) : (void)0, MD_ZRAM(a))
 #else
 #define MD_ZRAM_READ(a) MD_ZRAM(a)
 #define MD_YM_WRITE(a, v, t) YM2612Write((a), (v), (t))
