@@ -60,7 +60,14 @@ AG_DRV("SEGAPAD", "0.1", "argon");
 #define POLL_MS   8u   /* a read every 8 ms: well inside a 60 Hz frame     */
 #define REPEAT_MS 60u  /* inside the console's 150 ms                       */
 #define BUS_MS    20u  /* the longest one transfer may take                 */
-#define GONE_READS 4   /* this many empty reads in a row and the pad is gone */
+/*
+ * No good read for this long and the pad is gone, and what it held is let go.
+ * It was four reads, some 50 ms: the ESP-07 stand-in drops its answers while
+ * its page's request comes in, which is when he is pressing, and a spin dash
+ * - Down held, A pressed and pressed - let go of Down (6 Nov 2026).  A pad
+ * pulled out is let go of a quarter of a second later.
+ */
+#define GONE_MS 250u
 #define START_HOLD_MS 80u /* Start waits this long for Mode (the menu)      */
 #define SP_MENU 0x1000u   /* Start and Mode together: not a line of the pad  */
 /* A 6-button pad starts its count again after 1.5 ms with SELECT still:
@@ -109,8 +116,8 @@ static struct {
     uint16_t          six;   /* X Y Z Mode as the last 6-button read had them */
     uint32_t          blips; /* changes one read alone reported      */
     int               kind;
-    int               empty;
-    uint32_t          repeat_at;
+    uint32_t          sent_at[16]; /* when each key last went out down    */
+    uint32_t          good_at;  /* the last read that found a pad          */
     uint32_t          start_at; /* Start went down here, not yet sent; 0 none */
     int               start_out; /* Start has gone out                       */
     int               menu;      /* Start and Mode were held together        */
@@ -172,23 +179,31 @@ static void apply(uint16_t pad)
         const uint16_t b = k_keys[i].bit;
         if ((now & b) && !(was & b)) {
             send_key(k_keys[i].key, 1, 0);
+            s.sent_at[i] = ag_millis();
         } else if (!(now & b) && (was & b)) {
             send_key(k_keys[i].key, 0, 0);
         }
     }
     s.held = pad;
     s.out = now;
+}
 
+/*
+ * Each held key again, REPEAT_MS after it last went out, by its own clock and
+ * whether or not this read found anything: the console lets go of a key that
+ * has not come again for 150 ms.  The repeat was one clock for all of them,
+ * put back by every change and run only on a read two in a row agreed with -
+ * so Down, held while A was pressed again and again, went out less and less
+ * often, and while the stand-in dropped reads not at all.
+ */
+static void repeat_held(void)
+{
     const uint32_t t = ag_millis();
-    if (now != was) {
-        s.repeat_at = t + REPEAT_MS;
-    } else if (now != 0u && (int32_t)(t - s.repeat_at) >= 0) {
-        for (unsigned i = 0; i < sizeof(k_keys) / sizeof(k_keys[0]); i++) {
-            if (now & k_keys[i].bit) {
-                send_key(k_keys[i].key, 1, 1);
-            }
+    for (unsigned i = 0; i < sizeof(k_keys) / sizeof(k_keys[0]); i++) {
+        if ((s.out & k_keys[i].bit) && t - s.sent_at[i] >= REPEAT_MS) {
+            send_key(k_keys[i].key, 1, 1);
+            s.sent_at[i] = t;
         }
-        s.repeat_at = t + REPEAT_MS;
     }
 }
 
@@ -247,7 +262,7 @@ static void pad_task(void *arg)
         }
         if (kind <= 0) {
             /* Not let go on one bad read: a pad is not pulled out in 8 ms. */
-            if (++s.empty >= GONE_READS && s.kind != AG_SP_NONE) {
+            if (t0 - s.good_at >= GONE_MS && s.kind != AG_SP_NONE) {
                 apply(0);
                 ag_log(AG_LOG_WARN, "SEGAPAD", "the pad is gone (%s)",
                        kind < 0 ? "the bus does not answer"
@@ -255,7 +270,7 @@ static void pad_task(void *arg)
                 s.kind = AG_SP_NONE;
             }
         } else {
-            s.empty = 0;
+            s.good_at = t0;
             /* A 3-button pad never answers as a 6-button one, but a 6-button
              * one answers as a 3-button one whenever one step of the read
              * outlasts its 1.5 ms count.  On the CYD a step is 0.6 ms at
@@ -309,6 +324,7 @@ static void pad_task(void *arg)
             s.slow = 0;
             s.worst = 0;
         }
+        repeat_held();
         ag_delay(POLL_MS);
     }
     apply(0);
