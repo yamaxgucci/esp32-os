@@ -63,6 +63,28 @@ AG_DRV("SEGAPAD", "0.1", "argon");
 #define GONE_READS 4   /* this many empty reads in a row and the pad is gone */
 #define START_HOLD_MS 80u /* Start waits this long for Mode (the menu)      */
 #define SP_MENU 0x1000u   /* Start and Mode together: not a line of the pad  */
+/* A 6-button pad starts its count again after 1.5 ms with SELECT still:
+ * a step that takes longer spoils the read (see read_pad). */
+#define STEP_SLOW_US 1500u
+#define TALLY_MS 10000u   /* how often the journal hears the slow reads   */
+#define TALLIES  30u      /* and how many times, at most                  */
+/*
+ * Above the CYD's MD drawer (4), which never sleeps while a picture goes out,
+ * and not above 5, where the kernel's budget watches a task and holds one
+ * that overruns below applications for the rest of its window (proc/budget.c)
+ * - at 6 it did, at 21 ms of every 100.  The task is asleep or waiting on the
+ * bus nearly all the time; what it needs is to be woken the moment a transfer
+ * ends.  At 4 it waited its turn behind the drawer after each of a read's nine
+ * transfers, and a step longer than 1.5 ms loses a 6-button pad its count:
+ * steps over that in 10 s of Sonic, on reads of the ESP-07 stand-in (6 Nov
+ * 2026) - with the I/O lock held across I2C (the drawer queued behind the pad
+ * and lent it its priority) 136-236 of 470-580; with the lock let go (io.c)
+ * 273-300 of ~290, and he saw the pad press buttons by itself; at 5, 0-2 of
+ * 630.
+ */
+#ifndef PAD_PRIO
+#define PAD_PRIO 5
+#endif
 
 static const struct {
     uint16_t bit;
@@ -93,6 +115,10 @@ static struct {
     int               start_out; /* Start has gone out                       */
     int               menu;      /* Start and Mode were held together        */
     uint32_t          errs;
+    uint32_t          reads; /* since the last tally in the journal     */
+    uint32_t          slow;  /* of them, with a step over STEP_SLOW_US  */
+    uint32_t          worst; /* the longest step among them, us         */
+    uint32_t          told_at, tallies;
 } s;
 
 static void send_key(uint16_t key, int down, int repeat)
@@ -170,13 +196,24 @@ static void apply(uint16_t pad)
 static int read_pad(uint16_t *held)
 {
     uint8_t rd[AG_SEGAPAD_STEPS];
+    uint32_t worst = 0;
+    s.reads++;
     for (int i = 0; i < AG_SEGAPAD_STEPS; i++) {
-        const uint8_t out = ag_segapad_out(i);
+        const uint8_t   out = ag_segapad_out(i);
+        const ag_time_t t0 = ag_micros();
         if (ag_i2c_wrrd(s.bus, s.addr, &out, 1, &rd[i], 1, BUS_MS) != AG_OK) {
             const uint8_t idle = 0xffu;
             (void)ag_i2c_write(s.bus, s.addr, &idle, 1, BUS_MS);
             return -1;
         }
+        const uint32_t took = (uint32_t)(ag_micros() - t0);
+        worst = (took > worst) ? took : worst;
+    }
+    if (worst > STEP_SLOW_US) {
+        s.slow++;
+    }
+    if (worst > s.worst) {
+        s.worst = worst;
     }
     const uint8_t idle = ag_segapad_out(0);
     (void)ag_i2c_write(s.bus, s.addr, &idle, 1, BUS_MS);
@@ -259,6 +296,19 @@ static void pad_task(void *arg)
             }
             s.raw = held;
         }
+        if (t0 - s.told_at >= TALLY_MS && s.tallies < TALLIES) {
+            /* evidence while it runs: whether the reads keep the 6-button
+             * pad's count (the CYD's MD drawer once held them up, 6 Nov) */
+            s.tallies++;
+            ag_log(AG_LOG_INFO, "SEGAPAD", "%u reads, %u with a step over %u us, "
+                   "the longest %u us; %u bus errors so far", (unsigned)s.reads,
+                   (unsigned)s.slow, (unsigned)STEP_SLOW_US, (unsigned)s.worst,
+                   (unsigned)s.errs);
+            s.told_at = t0;
+            s.reads = 0;
+            s.slow = 0;
+            s.worst = 0;
+        }
         ag_delay(POLL_MS);
     }
     apply(0);
@@ -323,7 +373,7 @@ ag_err_t ag_driver_init(void)
     const uint8_t idle = 0xffu;
     (void)ag_i2c_write(s.bus, s.addr, &idle, 1, BUS_MS);
     ag_module_on_unload(pad_fini);
-    if (!ag_module_task(pad_task, NULL, "ag_segapad", 3072u, 4,
+    if (!ag_module_task(pad_task, NULL, "ag_segapad", 3072u, PAD_PRIO,
                         AG_THREAD_SYS_CORE)) {
         return -AG_ENOMEM;
     }

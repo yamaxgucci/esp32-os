@@ -1935,6 +1935,10 @@ static int handle_session_ev(const ag_event_t *ev)
     return 0;
 }
 
+/* `padlog`: each change of what the game holds, with the time, for a test
+ * that presses through the pad and times what reached the game */
+static int s_padlog;
+
 static void poll_pad_live(void)
 {
     ag_event_t ev;
@@ -1957,11 +1961,20 @@ static void poll_pad_live(void)
         }
         return;
     }
+    uint32_t held = 0;
     for (unsigned i = 0; i < sizeof(k_live_map) / sizeof(k_live_map[0]); i++) {
         if (ag_btnp(0, k_live_map[i].ag)) {
             gwenesis_io_pad_press_button(0, k_live_map[i].md);
+            held |= 1u << i;
         } else {
             gwenesis_io_pad_release_button(0, k_live_map[i].md);
+        }
+    }
+    if (s_padlog) {
+        static uint32_t s_was;
+        if (held != s_was) {
+            s_was = held;
+            ag_printf("md: pad %x at %u\n", (unsigned)held, (unsigned)ag_millis());
         }
     }
     /* Old 3-byte hosts only have sys.pause; btnp(START) already ORs that in. */
@@ -3213,6 +3226,10 @@ int ag_main(int argc, char **argv)
             continue;
         }
 #endif
+        if (arg_eq(argv[i], "padlog")) {
+            s_padlog = 1;
+            continue;
+        }
         if (arg_eq(argv[i], "nohelp")) {
             s_help = 0;        /* the system core draws every line alone */
             continue;
