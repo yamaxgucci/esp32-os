@@ -574,9 +574,10 @@ static void md_present_rows(const unsigned short *px, int line, int rows, int w,
 
 /*
  * The system core's half: a whole batch to the glass in one call.  A call
- * costs some 300 us here whatever it carries and a row some 30 more, so the
- * rows go in batches; and the thread is woken by the batch, not by the tick -
- * sleeping a tick let four rows out per three milliseconds.
+ * costs some 20 us on the CYD and a row 64 more, the wire's own at 80 MHz
+ * (`glassbench`, 6 Nov 2026), so the rows go in batches; and the thread is
+ * woken by the batch, not by the tick - sleeping a tick let four rows out per
+ * three milliseconds.
  */
 /* A drawn row against what the glass last got for that line. */
 MD_HOT_VDP static uint32_t md_row_hash(const unsigned short *row, int width)
@@ -1055,6 +1056,122 @@ static void md_fb_sender(void *arg)
 }
 #endif
 
+#ifdef MD_GLASSBENCH
+/*
+ * `glassbench` (built with -DMD_GLASSBENCH): what a present costs on this
+ * glass, from the drawer's own thread before its first pass - 224 rows in
+ * calls of k rows, one after the other, then with a line left out between
+ * calls (a new window each time); a call alone and the one straight after it;
+ * the bus under the driver; and calls spun S us apart.
+ *
+ * On the CYD (6 Nov 2026) a row cost 140 us where the wire takes 64, and a
+ * start of the bus now and then 7.7 ms: the pad's I2C read held the I/O lock
+ * the SPI writes take (io.c).  With it let go, 71 us a row.
+ */
+static int s_glassbench;
+static void md_glass_bench(void)
+{
+    const int w = 320, h = 224;  /* before the game has set a mode */
+    for (int r = 0; r < s_ring_n; r++) {
+        for (int x = 0; x < MD_WIDTH; x++) {
+            s_ring[r][x] = (unsigned short)(x * 33u + r * 1021u);
+        }
+    }
+    static const int ks[] = {1, 2, 3, 4, 6};
+    md_present_rows(s_ring[0], 0, 1, w, h);   /* the glass fitted and wiped first */
+    ag_delay(100);
+    for (int gap = 0; gap <= 1; gap++) {
+        for (unsigned i = 0; i < sizeof(ks) / sizeof(ks[0]); i++) {
+            const int k = ks[i] > s_ring_n ? s_ring_n : ks[i];
+            int calls = 0, rows = 0;
+            const ag_time_t t0 = ag_micros();
+            for (int line = 0; line + k <= h; line += k + gap) {
+                md_present_rows(s_ring[0], line, k, w, h);
+                calls++;
+                rows += k;
+            }
+            const uint32_t us = (uint32_t)(ag_micros() - t0);
+            ag_printf("md: glassbench %s k=%d: %d calls, %d rows, %u us, %u us a call, "
+                      "%u us a row\n", gap ? "gaps" : "run ", k, calls, rows,
+                      (unsigned)us, (unsigned)(us / (uint32_t)calls),
+                      (unsigned)(us / (uint32_t)rows));
+            ag_delay(300);  /* the console's ring drains */
+        }
+    }
+    /* a call alone (its rows still on the wire when it returns), then one
+     * straight after it, which waits for them */
+    for (unsigned i = 0; i < sizeof(ks) / sizeof(ks[0]); i++) {
+        const int k = ks[i] > s_ring_n ? s_ring_n : ks[i];
+        uint32_t lone = 0, next = 0;
+        for (int r = 0; r < 20; r++) {
+            ag_delay(2);
+            const ag_time_t t0 = ag_micros();
+            md_present_rows(s_ring[0], 10 * r, k, w, h);
+            const ag_time_t t1 = ag_micros();
+            md_present_rows(s_ring[0], 10 * r + k, k, w, h);
+            lone += (uint32_t)(t1 - t0);
+            next += (uint32_t)(ag_micros() - t1);
+        }
+        ag_printf("md: glassbench lone k=%d: %u us, the next %u us\n", k,
+                  (unsigned)(lone / 20u), (unsigned)(next / 20u));
+        ag_delay(300);
+    }
+    /* the bus alone, under the driver: n bytes started, then waited for */
+    {
+        const ag_io_api_t *io = ag_api()->io;
+        uint8_t *buf = (uint8_t *)ag_malloc_caps(5120, AG_MEM_FAST);
+        if (io != NULL && AG_HAS(io, spi_write_wait) && buf != NULL) {
+            memset(buf, 0, 5120);
+            static const uint16_t lens[] = {640, 1280, 1920, 2560, 5120};
+            for (unsigned i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+                uint32_t st = 0, wt = 0, smin = ~0u, smax = 0, wmin = ~0u, wmax = 0;
+                for (int r = 0; r < 20; r++) {
+                    const ag_time_t a = ag_micros();
+                    (void)io->spi_write_start(2, 15, buf, lens[i]);
+                    const ag_time_t b = ag_micros();
+                    (void)io->spi_write_wait(2);
+                    const uint32_t s1 = (uint32_t)(b - a), w1 = (uint32_t)(ag_micros() - b);
+                    st += s1;
+                    wt += w1;
+                    smin = s1 < smin ? s1 : smin;
+                    smax = s1 > smax ? s1 : smax;
+                    wmin = w1 < wmin ? w1 : wmin;
+                    wmax = w1 > wmax ? w1 : wmax;
+                }
+                ag_printf("md: glassbench bus %u: start %u (%u-%u), wait %u (%u-%u) us\n",
+                          (unsigned)lens[i], (unsigned)(st / 20u), (unsigned)smin,
+                          (unsigned)smax, (unsigned)(wt / 20u), (unsigned)wmin,
+                          (unsigned)wmax);
+                ag_delay(300);
+            }
+        }
+        ag_free(buf);
+    }
+    /* four rows a call, the calls S us apart, spun not slept: what the call
+     * itself costs once the wire has had time to finish */
+    static const uint16_t spaces[] = {0, 100, 200, 300, 400, 600, 900};
+    for (unsigned i = 0; i < sizeof(spaces) / sizeof(spaces[0]); i++) {
+        uint32_t in_calls = 0;
+        int line = 0;
+        const ag_time_t t0 = ag_micros();
+        for (int c = 0; c < 50; c++) {
+            const ag_time_t a = ag_micros();
+            md_present_rows(s_ring[0], line, 4, w, h);
+            const ag_time_t b = ag_micros();
+            in_calls += (uint32_t)(b - a);
+            while ((uint32_t)(ag_micros() - b) < spaces[i]) {
+            }
+            line = (line + 4 >= h) ? 0 : line + 4;
+        }
+        ag_printf("md: glassbench apart %u: %u us a call, %u us all\n",
+                  (unsigned)spaces[i], (unsigned)(in_calls / 50u),
+                  (unsigned)(ag_micros() - t0));
+        ag_delay(300);
+    }
+    memset(s_line_hash, 0xff, sizeof(s_line_hash));
+}
+#endif
+
 static void md_drawer(void)
 {
     uint32_t pass_seen = s_frames_done;   /* frames done when this pass began */
@@ -1062,6 +1179,11 @@ static void md_drawer(void)
     for (int i = 0; i < MD_RING_MAX; i++) {
         s_row_ready[i] = 0;
     }
+#ifdef MD_GLASSBENCH
+    if (s_glassbench) {
+        md_glass_bench();
+    }
+#endif
     md_open_pass();
     while (s_ring_run) {
         /* the sound side first: a frame's log played before the next row -
@@ -1241,13 +1363,23 @@ static void md_frames_start(void)
 }
 #endif
 
+/*
+ * The drawer's stack.  2.5 KB: Sonic with the sound left 2 KB of 4 never
+ * used, and an H32 line no longer takes 1152 bytes of it (gwenesis_vdp_gfx.c);
+ * at 3 KB 1044 bytes were never used (31 Oct 2026).  That left 500 while a
+ * write to the panel queued for the I/O lock behind the pad's I2C; once it no
+ * longer did (io.c, 6 Nov 2026) it went on into ESP-IDF's SPI and was
+ * interrupted there, and Ecco left 256 - so 256 more.
+ */
+#define MD_GLASS_STACK 2816
+
 static void md_ring_start(int rows)
 {
     if (s_ring_n > 0 && s_ring_sem != NULL) {
         /* the ring kept from the last game: only its thread again */
         s_ring_run = 1;
-        s_presenter = ag_thread_create(md_presenter, NULL, "mdglass", 2560, 4,
-                                       AG_THREAD_SYS_CORE);
+        s_presenter = ag_thread_create(md_presenter, NULL, "mdglass",
+                                       MD_GLASS_STACK, 4, AG_THREAD_SYS_CORE);
         if (s_presenter == NULL) {
             s_ring_run = 0;
         }
@@ -1263,11 +1395,8 @@ static void md_ring_start(int rows)
         return;
     }
     s_ring_run = 1;
-    /* 2.5 KB: Sonic with the sound left 2 KB of 4 never used, and an H32
-     * line no longer takes 1152 bytes of it (gwenesis_vdp_gfx.c); at 3 KB
-     * 1044 bytes were never used (31 Oct 2026) */
-    s_presenter = ag_thread_create(md_presenter, NULL, "mdglass", 2560, 4,
-                                   AG_THREAD_SYS_CORE);
+    s_presenter = ag_thread_create(md_presenter, NULL, "mdglass",
+                                   MD_GLASS_STACK, 4, AG_THREAD_SYS_CORE);
     if (s_presenter == NULL) {
         s_ring_run = 0;
         return;
@@ -3078,6 +3207,12 @@ int ag_main(int argc, char **argv)
             }
             continue;
         }
+#ifdef MD_GLASSBENCH
+        if (arg_eq(argv[i], "glassbench")) {
+            s_glassbench = 1;
+            continue;
+        }
+#endif
         if (arg_eq(argv[i], "nohelp")) {
             s_help = 0;        /* the system core draws every line alone */
             continue;

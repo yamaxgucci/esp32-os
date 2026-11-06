@@ -492,6 +492,21 @@ ag_err_t ag_io_i2c_up(int bus)
     return err;
 }
 
+/*
+ * The lock for bringing the bus up, not for the transfer: the port keeps a
+ * lock per I2C bus for that.  Held across the wire, one read of the CYD's
+ * Mega Drive pad - eight transfers at 50 kHz, every 8 ms - stopped every SPI
+ * write on the panel's bus behind it for up to 8 ms, and the glass got rows
+ * at 140 us each where the wire takes 64 (6 Nov 2026).
+ */
+static ag_err_t i2c_ready(int bus)
+{
+    lock();
+    const ag_err_t err = i2c_bring_up(bus);
+    unlock();
+    return err;
+}
+
 static ag_err_t io_i2c_write(int bus, uint8_t addr, const void *buf, size_t len,
                              uint32_t timeout_ms)
 {
@@ -499,13 +514,9 @@ static ag_err_t io_i2c_write(int bus, uint8_t addr, const void *buf, size_t len,
         return -AG_EINVAL;
     }
 
-    lock();
-    ag_err_t err = i2c_bring_up(bus);
-    if (err == AG_OK) {
-        err = ag_port_i2c_write(bus, addr, buf, len, timeout_ms);
-    }
-    unlock();
-    return err;
+    const ag_err_t err = i2c_ready(bus);
+    return (err != AG_OK) ? err
+                          : ag_port_i2c_write(bus, addr, buf, len, timeout_ms);
 }
 
 static ag_err_t io_i2c_read(int bus, uint8_t addr, void *buf, size_t len,
@@ -515,13 +526,9 @@ static ag_err_t io_i2c_read(int bus, uint8_t addr, void *buf, size_t len,
         return -AG_EINVAL;
     }
 
-    lock();
-    ag_err_t err = i2c_bring_up(bus);
-    if (err == AG_OK) {
-        err = ag_port_i2c_read(bus, addr, buf, len, timeout_ms);
-    }
-    unlock();
-    return err;
+    const ag_err_t err = i2c_ready(bus);
+    return (err != AG_OK) ? err
+                          : ag_port_i2c_read(bus, addr, buf, len, timeout_ms);
 }
 
 static ag_err_t io_i2c_wrrd(int bus, uint8_t addr, const void *wbuf,
@@ -532,13 +539,10 @@ static ag_err_t io_i2c_wrrd(int bus, uint8_t addr, const void *wbuf,
         return -AG_EINVAL;
     }
 
-    lock();
-    ag_err_t err = i2c_bring_up(bus);
-    if (err == AG_OK) {
-        err = ag_port_i2c_wrrd(bus, addr, wbuf, wlen, rbuf, rlen, timeout_ms);
-    }
-    unlock();
-    return err;
+    const ag_err_t err = i2c_ready(bus);
+    return (err != AG_OK) ? err
+                          : ag_port_i2c_wrrd(bus, addr, wbuf, wlen, rbuf, rlen,
+                                             timeout_ms);
 }
 
 /*
@@ -556,15 +560,10 @@ static ag_err_t io_i2c_wrrd(int bus, uint8_t addr, const void *wbuf,
  */
 static ag_err_t io_i2c_probe(int bus, uint8_t addr)
 {
-    lock();
-    ag_err_t err = i2c_bring_up(bus);
-    if (err == AG_OK) {
-        /* 10 ms: a chip that is there answers in microseconds, and this is
-         * multiplied by every address a scan asks about. */
-        err = ag_port_i2c_probe(bus, addr, 10);
-    }
-    unlock();
-    return err;
+    const ag_err_t err = i2c_ready(bus);
+    /* 10 ms: a chip that is there answers in microseconds, and this is
+     * multiplied by every address a scan asks about. */
+    return (err != AG_OK) ? err : ag_port_i2c_probe(bus, addr, 10);
 }
 
 /* ---------------------------------------------------------------------- */

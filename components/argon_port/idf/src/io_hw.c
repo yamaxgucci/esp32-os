@@ -233,6 +233,15 @@ void ag_port_gpio_reset(int pin) { (void)gpio_reset_pin((gpio_num_t)pin); }
 typedef struct {
     i2c_master_bus_handle_t bus;
     i2c_master_dev_handle_t dev;
+    /*
+     * The bus's own: the cached handle and the transfer through it.  The
+     * kernel calls in here without its I/O lock (io.c), which one I2C read
+     * used to hold for the whole of the wire - a pad read every 8 ms at
+     * 50 kHz on the CYD held the panel's SPI writes up to 8 ms at a time
+     * and halved what reached the glass (6 Nov 2026).  The codec calls in
+     * here too, with no lock of anybody's.
+     */
+    SemaphoreHandle_t       lock;
     uint32_t                khz;
     uint8_t                 dev_addr;
     bool                    up;
@@ -247,6 +256,12 @@ ag_err_t ag_port_i2c_open(int bus, int sda, int scl, uint32_t khz, bool pullups)
     }
     if (s_i2c[bus].up) {
         return AG_OK;
+    }
+    if (s_i2c[bus].lock == NULL) {
+        s_i2c[bus].lock = xSemaphoreCreateMutex();
+        if (s_i2c[bus].lock == NULL) {
+            return -AG_ENOMEM;
+        }
     }
 
     const i2c_master_bus_config_t cfg = {
@@ -286,12 +301,10 @@ ag_err_t ag_port_i2c_open(int bus, int sda, int scl, uint32_t khz, bool pullups)
  * address and this interface is per transaction, so something has to bridge the
  * two: a cache of one is enough because a driver talks to its own chip in a
  * run, and changing address costs one allocation rather than one per byte.
+ * Caller holds the bus's lock (i2c_take).
  */
 static ag_err_t i2c_device(int bus, uint8_t addr, i2c_master_dev_handle_t *out)
 {
-    if (bus < 0 || bus >= AG_PORT_I2C_BUSES || !s_i2c[bus].up) {
-        return -AG_ENODEV;
-    }
 
     if (s_i2c[bus].dev != NULL && s_i2c[bus].dev_addr == addr) {
         *out = s_i2c[bus].dev;
@@ -318,39 +331,65 @@ static ag_err_t i2c_device(int bus, uint8_t addr, i2c_master_dev_handle_t *out)
     return AG_OK;
 }
 
+/* The bus, open, and its lock taken; false if it is not open. */
+static bool i2c_take(int bus)
+{
+    if (bus < 0 || bus >= AG_PORT_I2C_BUSES || !s_i2c[bus].up) {
+        return false;
+    }
+    xSemaphoreTake(s_i2c[bus].lock, portMAX_DELAY);
+    return true;
+}
+
 ag_err_t ag_port_i2c_write(int bus, uint8_t addr, const void *buf, size_t len,
                            uint32_t timeout_ms)
 {
+    if (!i2c_take(bus)) {
+        return -AG_ENODEV;
+    }
     i2c_master_dev_handle_t dev = NULL;
-    const ag_err_t          err = i2c_device(bus, addr, &dev);
-    return (err != AG_OK)
-               ? err
-               : from_esp(i2c_master_transmit(dev, buf, len, (int)timeout_ms));
+    ag_err_t                err = i2c_device(bus, addr, &dev);
+    if (err == AG_OK) {
+        err = from_esp(i2c_master_transmit(dev, buf, len, (int)timeout_ms));
+    }
+    xSemaphoreGive(s_i2c[bus].lock);
+    return err;
 }
 
 ag_err_t ag_port_i2c_read(int bus, uint8_t addr, void *buf, size_t len,
                           uint32_t timeout_ms)
 {
+    if (!i2c_take(bus)) {
+        return -AG_ENODEV;
+    }
     i2c_master_dev_handle_t dev = NULL;
-    const ag_err_t          err = i2c_device(bus, addr, &dev);
-    return (err != AG_OK)
-               ? err
-               : from_esp(i2c_master_receive(dev, buf, len, (int)timeout_ms));
+    ag_err_t                err = i2c_device(bus, addr, &dev);
+    if (err == AG_OK) {
+        err = from_esp(i2c_master_receive(dev, buf, len, (int)timeout_ms));
+    }
+    xSemaphoreGive(s_i2c[bus].lock);
+    return err;
 }
 
 ag_err_t ag_port_i2c_wrrd(int bus, uint8_t addr, const void *wbuf, size_t wlen,
                           void *rbuf, size_t rlen, uint32_t timeout_ms)
 {
+    if (!i2c_take(bus)) {
+        return -AG_ENODEV;
+    }
     i2c_master_dev_handle_t dev = NULL;
-    const ag_err_t          err = i2c_device(bus, addr, &dev);
-    return (err != AG_OK) ? err
-                          : from_esp(i2c_master_transmit_receive(
-                                dev, wbuf, wlen, rbuf, rlen, (int)timeout_ms));
+    ag_err_t                err = i2c_device(bus, addr, &dev);
+    if (err == AG_OK) {
+        err = from_esp(i2c_master_transmit_receive(dev, wbuf, wlen, rbuf, rlen,
+                                                   (int)timeout_ms));
+    }
+    xSemaphoreGive(s_i2c[bus].lock);
+    return err;
 }
 
 ag_err_t ag_port_i2c_probe(int bus, uint8_t addr, uint32_t timeout_ms)
 {
-    if (bus < 0 || bus >= AG_PORT_I2C_BUSES || !s_i2c[bus].up) {
+    if (!i2c_take(bus)) {
         return -AG_ENODEV;
     }
 
@@ -359,6 +398,7 @@ ag_err_t ag_port_i2c_probe(int bus, uint8_t addr, uint32_t timeout_ms)
      * is silent since the bus opened (ag_port_i2c_open). */
     const esp_err_t rc = i2c_master_probe(s_i2c[bus].bus, addr,
                                           (int)timeout_ms);
+    xSemaphoreGive(s_i2c[bus].lock);
 
     if (rc == ESP_OK) {
         return AG_OK;
