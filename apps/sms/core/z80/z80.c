@@ -780,6 +780,8 @@ MD_AI uint8_t rm(uint32_t addr)
  * again changes nothing - Road Rash II's wait loop stores a 1 on every pass
  * (md_z80_spin).
  */
+void md_z80_ym_write(uint32_t address, uint8_t data, int done); /* md_z80.c */
+
 MD_HOT __attribute__((noinline)) static void md_z80_wm(uint32_t addr, uint8_t value)
 {
 	if (addr < 0x4000u)
@@ -793,6 +795,12 @@ MD_HOT __attribute__((noinline)) static void md_z80_wm(uint32_t addr, uint8_t va
 		return;
 	}
 	MD_TOUCH();
+	/* the YM (4000-5FFF): straight there, with the T-states this slice has run */
+	if (addr < 0x6000u)
+	{
+		md_z80_ym_write(addr, value, (int)(z80_requested_cycles - Z80.icount));
+		return;
+	}
 	cpu_writemem16(addr, value);
 }
 #endif
@@ -3605,6 +3613,10 @@ INLINE void take_nmi()
 /****************************************************************************
  * Processor initialization
  ****************************************************************************/
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+static void md_z80_kinds(void);
+#endif
+
 void z80_init(int32_t (*irqcallback)(int32_t))
 {
 	int32_t i, p;
@@ -3740,6 +3752,9 @@ void z80_init(int32_t (*irqcallback)(int32_t))
 	cc[Z80_TABLE_xy] = cc_xy;
 	cc[Z80_TABLE_xycb] = cc_xycb;
 	cc[Z80_TABLE_ex] = cc_ex;
+#if defined(ARGON_MD_Z80) && defined(ARGON_SMS_SMALL)
+	md_z80_kinds();
+#endif
 }
 
 /****************************************************************************
@@ -3993,6 +4008,7 @@ void md_z80_idle_advance(int n)
  */
 static uint16_t s_spin_pc;
 static uint8_t  s_spin_ok, s_spin_r;
+static uint8_t  s_spin_regs; /* s_spin_w holds the last arrival's registers */
 static uint32_t s_spin_touch;
 static int32_t  s_spin_icount;
 static uint32_t s_spin_w[8];
@@ -4040,33 +4056,46 @@ MD_HOT __attribute__((noinline)) static void md_z80_spin_body(void)
 MD_HOT __attribute__((noinline)) static void md_z80_spin(void)
 #endif
 {
-	uint32_t w[8];
-	md_spin_regs(w);
-	if (s_spin_ok && s_spin_pc == (uint16_t)PCD && s_spin_touch == md_z80_touch &&
-	    ((w[0] ^ s_spin_w[0]) | (w[1] ^ s_spin_w[1]) | (w[2] ^ s_spin_w[2]) |
-	     (w[3] ^ s_spin_w[3]) | (w[4] ^ s_spin_w[4]) | (w[5] ^ s_spin_w[5]) |
-	     (w[6] ^ s_spin_w[6]) | (w[7] ^ s_spin_w[7])) == 0u &&
-	    !Z80.nmi_pending && !(Z80.irq_state != CLEAR_LINE && Z80.iff1))
+	/*
+	 * The registers only once a pass has come back here with nothing
+	 * touched - kept then, and compared the time after: a loop that writes
+	 * every pass (a drum's, to the YM) costs two words compared, not eight
+	 * kept (~350 cycles a `jp nz` of Sonic's, 6 Nov 2026).  A wait is
+	 * counted out a pass later than it could be, to the same T-state.
+	 */
+	if (s_spin_ok && s_spin_pc == (uint16_t)PCD && s_spin_touch == md_z80_touch)
 	{
-		const int32_t pass = s_spin_icount - Z80.icount;
-		int32_t       room = Z80.icount;
-		if (s_vreads != s_spin_vreads && room > Z80.icount - s_spin_floor - 1)
-			room = Z80.icount - s_spin_floor - 1;
-		if (pass > 0 && room > pass)
+		uint32_t w[8];
+		md_spin_regs(w);
+		if (s_spin_regs &&
+		    ((w[0] ^ s_spin_w[0]) | (w[1] ^ s_spin_w[1]) | (w[2] ^ s_spin_w[2]) |
+		     (w[3] ^ s_spin_w[3]) | (w[4] ^ s_spin_w[4]) | (w[5] ^ s_spin_w[5]) |
+		     (w[6] ^ s_spin_w[6]) | (w[7] ^ s_spin_w[7])) == 0u &&
+		    !Z80.nmi_pending && !(Z80.irq_state != CLEAR_LINE && Z80.iff1))
 		{
-			const int32_t n = room / pass;
-			Z80.icount -= n * pass;
-			Z80.r = (uint8_t)(Z80.r + (uint8_t)(Z80.r - s_spin_r) * (uint32_t)n);
+			const int32_t pass = s_spin_icount - Z80.icount;
+			int32_t       room = Z80.icount;
+			if (s_vreads != s_spin_vreads && room > Z80.icount - s_spin_floor - 1)
+				room = Z80.icount - s_spin_floor - 1;
+			if (pass > 0 && room > pass)
+			{
+				const int32_t n = room / pass;
+				Z80.icount -= n * pass;
+				Z80.r = (uint8_t)(Z80.r + (uint8_t)(Z80.r - s_spin_r) * (uint32_t)n);
+			}
 		}
+		for (int k = 0; k < 8; k++)
+			s_spin_w[k] = w[k];
+		s_spin_regs = 1;
 	}
+	else
+		s_spin_regs = 0;
 	s_spin_ok = 1;
 	s_spin_pc = (uint16_t)PCD;
 	s_spin_touch = md_z80_touch;
 	s_spin_vreads = s_vreads;
 	s_spin_icount = Z80.icount;
 	s_spin_r = Z80.r;
-	for (int k = 0; k < 8; k++)
-		s_spin_w[k] = w[k];
 }
 
 /* after an instruction: a jump back by a little (or to itself) - a loop */
@@ -4105,6 +4134,29 @@ static inline __attribute__((always_inline)) int md_z80_wait_candidate(uint32_t 
 		return target <= PRVPC && PRVPC - target <= 8u;
 	}
 	return 0;
+}
+
+/*
+ * `djnz $`, the pause between two of a drum's samples: B-1 more passes at 13
+ * each, as md_z80_skip_waits counts them, from the hot part - in flash it was
+ * a call there for every sample (6 Nov 2026).
+ */
+static inline __attribute__((always_inline)) void md_z80_skip_djnz_self(void)
+{
+	if (Z80.icount <= 0)
+		return;
+	if (Z80.nmi_pending || (Z80.irq_state != CLEAR_LINE && Z80.iff1))
+		return;
+	const uint32_t b = B ? B : 256u;
+	uint32_t       n = ((uint32_t)Z80.icount - 1u) / 13u;
+	if (n > b - 1u)
+		n = b - 1u;
+	if (n == 0u)
+		return;
+	B = (uint8_t)(b - n);
+	Z80.icount -= (int32_t)(13u * n);
+	Z80.r = (uint8_t)(Z80.r + n);
+	WZ = (uint16_t)PRVPC;
 }
 
 /* noinline: one copy, not one in md_z80_fast's flattened body as well */
@@ -4213,12 +4265,47 @@ __attribute__((noinline)) static void md_z80_skip_halt(void)
  * are them: each through the core's own handler, the same flags, the cycles
  * the core's tables give (checked against cc_op/cc_xy/cc_cb).
  */
-/* the opcodes md_z80_fast takes: every one but HALT, IN, OUT and the ED and
- * FD prefixes (CB and DD for their one or two kinds) */
-static const uint32_t md_fast_ops[8] = {
-	0xffffffffu, 0xffffff7fu, 0xffffffffu, 0xffbfffffu,
-	0xffffffffu, 0xffffffffu, 0xf7f7ffffu, 0xdfffdff7u,
-};
+/*
+ * What an opcode is to md_z80_fast, one byte read for all of it: its
+ * T-states (cc_op) in the top five bits, and under them
+ *  MD_K_WAIT - may close a pass of a wait loop (md_z80_wait_candidate);
+ *  MD_K_JUMP - may go back, so may close a pass of a spin (MD_SPIN_CHECK):
+ *              nothing else can, PC only grows;
+ *  MD_K_PREFIX - CB or DD (their one or two kinds are taken).
+ * 0: not taken - DAA, HALT, IN, OUT, EX (SP),HL and the ED and FD prefixes.
+ * Asked one by one, and the T-states read out of cc[] a word at a time, all
+ * that cost a NOP some 40 of its ~190 cycles (`z80bench`, 6 Nov 2026).
+ * Filled from cc_op (md_z80_kinds), so the two cannot differ.
+ */
+#define MD_K_WAIT   1u
+#define MD_K_JUMP   2u
+#define MD_K_PREFIX 4u
+#define MD_K_CYC(k) ((k) >> 3)
+static uint8_t md_op_kind[256];
+
+static void md_z80_kinds(void)
+{
+	static const uint8_t slow[] = { 0x27, 0x76, 0xd3, 0xdb, 0xe3, 0xed, 0xfd };
+	static const uint8_t wait[] = { 0x10, 0x18, 0x3a, 0x7e, 0xc3 };
+	static const uint8_t jump[] = { 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0xc3, 0xc9, 0xcd, 0xe9 };
+	for (uint32_t op = 0; op < 256u; op++)
+	{
+		const uint32_t low = op & 7u;
+		uint32_t       k = md_cc_byte(cc_op, op) << 3;
+		/* RET cc, JP cc, CALL cc, RST */
+		if (op >= 0xc0u && (low == 0u || low == 2u || low == 4u || low == 7u))
+			k |= MD_K_JUMP;
+		md_op_kind[op] = (uint8_t)k;
+	}
+	for (unsigned i = 0; i < sizeof(wait); i++)
+		md_op_kind[wait[i]] |= MD_K_WAIT;
+	for (unsigned i = 0; i < sizeof(jump); i++)
+		md_op_kind[jump[i]] |= MD_K_JUMP;
+	for (unsigned i = 0; i < sizeof(slow); i++)
+		md_op_kind[slow[i]] = 0;
+	md_op_kind[0xcb] = MD_K_PREFIX;
+	md_op_kind[0xdd] = MD_K_PREFIX;
+}
 
 /* the eight registers of an opcode's three-bit fields; 6 is (HL) */
 static uint8_t *const md_reg8[8] = {
@@ -4243,7 +4330,8 @@ static inline __attribute__((always_inline)) uint8_t md_r8_get(uint32_t i)
 	return (i == 6u) ? rm(HL) : *md_reg8[i];
 }
 
-MD_HOT __attribute__((noinline)) static void md_r8_set(uint32_t i, uint8_t v)
+/* a register in place; (HL) through the one write there is (md_z80_wm) */
+static inline __attribute__((always_inline)) void md_r8_set(uint32_t i, uint8_t v)
 {
 	if (i == 6u)
 		wm(HL, v);
@@ -4251,7 +4339,8 @@ MD_HOT __attribute__((noinline)) static void md_r8_set(uint32_t i, uint8_t v)
 		*md_reg8[i] = v;
 }
 
-MD_HOT __attribute__((noinline)) static void md_alu(uint32_t k, uint8_t v)
+/* once in the loop: both kinds of ALU instruction come to it (`alu:`) */
+static inline __attribute__((always_inline)) void md_alu(uint32_t k, uint8_t v)
 {
 	switch (k)
 	{
@@ -4266,61 +4355,79 @@ MD_HOT __attribute__((noinline)) static void md_alu(uint32_t k, uint8_t v)
 	}
 }
 
+#ifdef MD_Z80PROF
+/* cycles in md_z80_fast by opcode (DD and CB: their kinds), `z80bench` */
+uint32_t md_zp_opcyc[256], md_zp_opn[256];
+#define MD_ZP_OP_START() uint32_t zp_c0; __asm__ volatile("rsr %0, ccount" : "=r"(zp_c0))
+#define MD_ZP_OP_END(o) do { uint32_t zp_c1; __asm__ volatile("rsr %0, ccount" : "=r"(zp_c1)); \
+	md_zp_opcyc[o] += zp_c1 - zp_c0; md_zp_opn[o]++; } while (0)
+#else
+#define MD_ZP_OP_START() ((void)0)
+#define MD_ZP_OP_END(o) ((void)0)
+#endif
 MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
 {
+	/*
+	 * Asked once, not before every instruction: nothing in a slice raises
+	 * an interrupt (the line moves between slices, md_snd_async.c), HALT
+	 * and RETI/RETN go back to the loop below, and EI returns at once - an
+	 * interrupt it lets in is taken there, one instruction later as ever.
+	 */
+	if (Z80.nmi_pending || Z80.halt || (Z80.irq_state != CLEAR_LINE && Z80.iff1))
+		return;
+	Z80.after_ei = 0;
+	Z80.after_ldair = 0;
 	while (Z80.icount > 0)
 	{
-		if (Z80.nmi_pending || Z80.halt ||
-		    (Z80.irq_state != CLEAR_LINE && Z80.iff1 && !Z80.after_ei))
-			return;
+		MD_ZP_OP_START();
 		const uint32_t pc = PCD;
 		const uint32_t op = md_z80_rd(pc);
-		if (!((md_fast_ops[op >> 5] >> (op & 31u)) & 1u))
+		const uint32_t kind = md_op_kind[op];
+		uint8_t        alu_v;
+		if (kind == 0u)
 			return;
-		if (op == 0xdd)
+		if (kind & MD_K_PREFIX)
 		{
 			const uint8_t op2 = md_z80_rd((pc + 1u) & 0xffffu);
-			if (op2 != 0x72 && op2 != 0x73)
+			if (op == 0xdd)
+			{
+				if (op2 != 0x72 && op2 != 0x73)
+					return;
+				PRVPC = pc;
+				PC += 2;
+				Z80.r += 2;
+				Z80.icount -= 19;
+				if (op2 == 0x72)
+					dd_72();
+				else
+					dd_73();
+				MD_ZP_OP_END(op);
+				continue;
+			}
+			if (op2 != 0x7f)
 				return;
-			Z80.after_ei = 0;
-			Z80.after_ldair = 0;
-			PRVPC = pc;
-			PC += 2;
-			Z80.r += 2;
-			Z80.icount -= 19;
-			if (op2 == 0x72)
-				dd_72();
-			else
-				dd_73();
-			MD_SPIN_CHECK();
-			continue;
-		}
-		if (op == 0xcb)
-		{
-			if (md_z80_rd((pc + 1u) & 0xffffu) != 0x7f)
-				return;
-			Z80.after_ei = 0;
-			Z80.after_ldair = 0;
 			PRVPC = pc;
 			PC += 2;
 			Z80.r += 2;
 			Z80.icount -= 8;
 			cb_7f();
-			MD_SPIN_CHECK();
+			MD_ZP_OP_END(op);
 			continue;
 		}
-		Z80.after_ei = 0;
-		Z80.after_ldair = 0;
 		PRVPC = pc;
 		PC++;
 		Z80.r++;
 #ifdef MD_Z80PROF
 		{ extern uint32_t md_zp_fast_n; md_zp_fast_n++; }
 #endif
-		if ((op == 0x10 || op == 0x7e || op == 0x3a || op == 0xc3 || op == 0x18) &&
-		    md_z80_wait_candidate(op))
-			md_z80_skip_waits((uint8_t)op);
-		Z80.icount -= CC_OF(Z80_TABLE_op, op);
+		if (kind & MD_K_WAIT)
+		{
+			if (op == 0x10u && md_z80_rd(PCD) == 0xfeu)
+				md_z80_skip_djnz_self();
+			else if (md_z80_wait_candidate(op))
+				md_z80_skip_waits((uint8_t)op);
+		}
+		Z80.icount -= MD_K_CYC(kind);
 		/* by the opcode's fields: its quadrant, then its low three bits */
 		switch (op >> 6)
 		{
@@ -4328,8 +4435,8 @@ MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
 			md_r8_set((op >> 3) & 7u, md_r8_get(op & 7u));
 			break;
 		case 2:
-			md_alu((op >> 3) & 7u, md_r8_get(op & 7u));
-			break;
+			alu_v = md_r8_get(op & 7u);
+			goto alu;
 		case 0:
 			switch (op & 7u)
 			{
@@ -4432,7 +4539,10 @@ MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
 				else if (op == 0xf3u)
 					op_f3();
 				else
+				{
 					op_fb();
+					return;
+				}
 				break;
 			case 4:
 				call_cond(md_cond((op >> 3) & 7u), (uint8_t)op);
@@ -4447,7 +4557,9 @@ MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
 					op_cd();
 				break;
 			case 6:
-				md_alu((op >> 3) & 7u, arg());
+				alu_v = arg();
+			alu:
+				md_alu((op >> 3) & 7u, alu_v);
 				break;
 			default:
 				rst((uint16_t)(op & 0x38u));
@@ -4455,7 +4567,9 @@ MD_HOT __attribute__((flatten)) static void md_z80_fast(void)
 			}
 			break;
 		}
-		MD_SPIN_CHECK();
+		if (kind & MD_K_JUMP)
+			MD_SPIN_CHECK();
+		MD_ZP_OP_END(op);
 	}
 }
 #endif
@@ -4482,7 +4596,7 @@ int32_t z80_execute(int32_t cycles)
 		 * straight back cost 65 cycles of every other instruction (`z80bench`) */
 		{
 			const uint32_t peek = md_z80_rd(PCD);
-			if ((md_fast_ops[peek >> 5] >> (peek & 31u)) & 1u)
+			if (md_op_kind[peek] != 0u)
 			{
 				md_z80_fast();
 				if (Z80.icount <= 0)

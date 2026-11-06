@@ -129,6 +129,33 @@ uint8_t argon_z80_read(uint16_t address)
     return 0xffu;
 }
 
+#ifdef ARGON_SMS_SMALL
+/*
+ * The YM's ports, `done` T-states into the slice: z80.c's write comes here
+ * straight, with the time it has at hand - through the pointer, this
+ * function's tests and a call back for the time, a drum's write cost the
+ * CYD's Z80 340-480 cycles against 140 for a plain instruction (6 Nov 2026).
+ */
+MD_HOT void md_z80_ym_write(uint32_t address, uint8_t data, int done)
+{
+    const int tgt = zclk + done * Z80_FREQ_DIVISOR;
+#ifdef MD_HOST_YMHASH
+    {
+        extern uint32_t md_host_ymhash;
+        md_host_ymhash = md_host_ymhash * 31u + ((address & 3u) << 8 | data) * 7u + (uint32_t)tgt;
+    }
+#endif
+#ifdef MD_Z80PROF
+    const uint32_t c0 = zp_cc();
+    YM2612Write((unsigned int)address & 3u, data, tgt);
+    md_zp_ym_cyc += zp_cc() - c0;
+    md_zp_ym_n++;
+#else
+    YM2612Write((unsigned int)address & 3u, data, tgt);
+#endif
+}
+#endif
+
 /* in the hot part: a drum is the Z80 writing the YM through here (md_z80_fast) */
 MD_HOT void argon_z80_write(uint16_t address, uint8_t data)
 {
@@ -139,6 +166,10 @@ MD_HOT void argon_z80_write(uint16_t address, uint8_t data)
         return;
     }
     if (address < 0x6000u) {
+#ifdef ARGON_SMS_SMALL
+        md_z80_ym_write(address, data, md_z80_slice_done());
+        return;
+#endif
         int tgt = md_z80_now();
 #ifdef MD_HOST_YMHASH
         {
@@ -220,6 +251,32 @@ void md_z80_prof_report(void)
         md_zp_spin_n = md_zp_spin_cyc = md_zp_exec_n = md_zp_exec_cyc = 0;
     }
     md_zp_fast_n = md_zp_slow_n = 0;
+    {
+        /* the fast loop's dearest opcodes since the last report */
+        extern uint32_t md_zp_opcyc[256], md_zp_opn[256];
+        uint32_t        all = 0;
+        for (int o = 0; o < 256; o++) {
+            all += md_zp_opcyc[o] / 64u;
+        }
+        for (int k = 0; k < 12 && all; k++) {
+            int best = -1;
+            for (int o = 0; o < 256; o++) {
+                if (md_zp_opn[o] && (best < 0 || md_zp_opcyc[o] > md_zp_opcyc[best])) {
+                    best = o;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            ag_printf("md: z80 op %02x x%u, %u cycles each, %u%%\n", (unsigned)best,
+                      (unsigned)md_zp_opn[best], (unsigned)(md_zp_opcyc[best] / md_zp_opn[best]),
+                      (unsigned)(md_zp_opcyc[best] / 64u * 100u / all));
+            md_zp_opn[best] = 0;
+        }
+        for (int o = 0; o < 256; o++) {
+            md_zp_opcyc[o] = md_zp_opn[o] = 0;
+        }
+    }
     md_zp_ym_cyc = md_zp_rom_cyc = md_zp_ym_n = md_zp_rom_n = 0;
     for (int k = 0; k < 8; k++) {
         int best = -1;
@@ -268,9 +325,36 @@ static void md_z80_bench_one(const char *where, const char *what,
         }
         const uint32_t us = (uint32_t)(ag_micros() - u0);
         const uint32_t n = md_zp_fast_n + md_zp_slow_n - n0;
+        if (quiet) {
+            /* where the quiet run's cycles went, by opcode: the ten dearest */
+            extern uint32_t md_zp_opcyc[256], md_zp_opn[256];
+            for (int k = 0; k < 10; k++) {
+                int best = -1;
+                for (int o = 0; o < 256; o++) {
+                    if (md_zp_opn[o] && (best < 0 || md_zp_opcyc[o] > md_zp_opcyc[best])) {
+                        best = o;
+                    }
+                }
+                if (best < 0) {
+                    break;
+                }
+                ag_printf("md: z80bench op %02x x%u, %u cycles each, %u%%\n", (unsigned)best,
+                          (unsigned)md_zp_opn[best],
+                          (unsigned)(md_zp_opcyc[best] / md_zp_opn[best]),
+                          (unsigned)((uint64_t)md_zp_opcyc[best] * 100u / c));
+                md_zp_opn[best] = 0;
+            }
+        }
+        {
+            extern uint32_t md_zp_opcyc[256], md_zp_opn[256];
+            for (int o = 0; o < 256; o++) {
+                md_zp_opcyc[o] = md_zp_opn[o] = 0;
+            }
+        }
         ag_printf("md: z80bench %s %s%s: %u instructions, %u cycles an instruction, "
-                  "%u MHz\n", where, what, quiet ? " (no interrupts)" : "",
-                  (unsigned)n, n ? (unsigned)(c / n) : 0u, us ? (unsigned)(c / us) : 0u);
+                  "%u MHz, %u us for the 56 ms of the Z80's\n", where, what,
+                  quiet ? " (no interrupts)" : "", (unsigned)n, n ? (unsigned)(c / n) : 0u,
+                  us ? (unsigned)(c / us) : 0u, (unsigned)(c / 240u));
     }
 }
 
@@ -283,6 +367,9 @@ static void md_z80_bench_one(const char *where, const char *what,
 void md_z80_bench(const char *where)
 {
     static uint8_t prog[80];
+    /* 0x4008xxxx-0x4009xxxx is IRAM on the ESP32, 0x400Dxxxx and up flash */
+    ag_printf("md: z80bench hot code at %p, cold at %p\n", (void *)argon_z80_write,
+              (void *)md_z80_bench);
     for (unsigned i = 0; i < 64; i++) {
         prog[i] = 0x00;
     }
@@ -312,6 +399,43 @@ void md_z80_bench(const char *where)
         0xc3, 0x00, 0x00,       /* 0014 jp 0000       */
     };
     md_z80_bench_one(where, "mix", mix, sizeof(mix));
+    /*
+     * Sonic's drum loop (its driver at $0077, 6 Nov 2026), moved to $0018:
+     * two 4-bit deltas a byte through a table, each sample written to the
+     * YM, the pause between them counted in B.  Table at $0100, the sample
+     * at $1000, the 68000's mailbox at $1FFF left 0.
+     */
+    static const uint8_t dac[] = {
+        0x31, 0x00, 0x20,       /* 0000 ld sp,2000h   */
+        0xdd, 0x21, 0x00, 0x40, /* 0003 ld ix,4000h   */
+        0x21, 0x00, 0x40,       /* 0007 ld hl,4000h   */
+        0x11, 0x2a, 0x80,       /* 000a ld de,802ah   */
+        0x0e, 0x02,             /* 000d ld c,2        */
+        0xd9,                   /* 000f exx           */
+        0x11, 0x00, 0x10,       /* 0010 ld de,1000h   */
+        0x01, 0x00, 0x04,       /* 0013 ld bc,0400h   */
+        0x26, 0x01,             /* 0016 ld h,1        */
+        0x1a, 0xe6, 0xf0, 0x0f, 0x0f, 0x0f, 0x0f, 0xc6, 0x00, 0x6f, 0x7e, /* 0018 */
+        0xd9, 0x82, 0x57, 0x75, 0xdd, 0x73, 0x00, 0xdd, 0x72, 0x01, 0x74,
+        0x41, 0x10, 0xfe, 0xd9,
+        0x1a, 0xe6, 0x0f, 0xc6, 0x00, 0x6f, 0x7e, /* 0032 */
+        0xd9, 0x82, 0x57, 0x75, 0xdd, 0x73, 0x00, 0xdd, 0x72, 0x01, 0x74,
+        0x41, 0x10, 0xfe, 0xd9,
+        0x3a, 0xff, 0x1f,       /* 0048 ld a,(1fffh)  */
+        0xcb, 0x7f,             /* 004b bit 7,a       */
+        0xc2, 0x00, 0x00,       /* 004d jp nz,0000    */
+        0x13, 0x0b, 0x79, 0xb0, /* 0050 inc de / dec bc / ld a,c / or b */
+        0xc2, 0x18, 0x00,       /* 0054 jp nz,0018    */
+        0xc3, 0x00, 0x00,       /* 0057 jp 0000       */
+    };
+    for (unsigned i = 0; i < 16; i++) {
+        MD_ZRAM(0x100u + i) = (uint8_t)(i * 17u - 120u);
+    }
+    for (unsigned i = 0; i < 0x400u; i++) {
+        MD_ZRAM(0x1000u + i) = (uint8_t)(i * 37u + (i >> 3));
+    }
+    MD_ZRAM(0x1fffu) = 0;
+    md_z80_bench_one(where, "sonic drums", dac, sizeof(dac));
 }
 
 static void zp_sample(void)

@@ -124,6 +124,11 @@ static uint64_t s_prof_vdp_us;
 static uint32_t s_frame_no;     /* frames run so far, for finding the scene */
 static uint32_t s_lines_same;   /* lines the glass already showed (md_line_end) */
 static uint32_t s_passes;       /* times the cursor went through the glass */
+static volatile uint32_t s_pass_at; /* ag_micros() at the last whole pass   */
+static uint32_t s_lent_us;      /* frame time lent to the glass (lendN)    */
+/* the window's longest pass, top to bottom, and the rows it sent and skipped */
+static uint32_t s_pass_max_us, s_pass_max_sent, s_pass_max_same;
+static uint32_t s_pass_max_snd, s_pass_max_send, s_pass_max_draw, s_pass_max_wait;
 static uint32_t s_draw_us;      /* the drawer in the VDP and the row hash      */
 static uint32_t s_gate_us;      /* the drawer waiting for the game's frames    */
 static uint32_t s_loop_us;      /* the drawer's passes, start to end           */
@@ -372,6 +377,19 @@ static void report_stats(uint32_t frames, uint64_t span_us, uint64_t work_sum,
                   (unsigned)((uint64_t)hsent * 1000000u / span_us),
                   (unsigned)((uint64_t)hwait * 1000u / span_us),
                   (unsigned)s_drawer_stack_left, (unsigned)ag_stack_left());
+        static uint32_t s_lent_seen;
+        const uint32_t lent = s_lent_us - s_lent_seen;
+        s_lent_seen += lent;
+        ag_printf("md: the game lent the glass %u ms a second; the longest "
+                  "pass %u ms, %u rows sent and %u the glass had; in it sound %u, "
+                  "send %u, draw %u, wait %u ms\n",
+                  (unsigned)((uint64_t)lent * 1000u / span_us),
+                  (unsigned)(s_pass_max_us / 1000u), (unsigned)s_pass_max_sent,
+                  (unsigned)s_pass_max_same, (unsigned)(s_pass_max_snd / 1000u),
+                  (unsigned)(s_pass_max_send / 1000u),
+                  (unsigned)(s_pass_max_draw / 1000u),
+                  (unsigned)(s_pass_max_wait / 1000u));
+        s_pass_max_us = 0;
         ag_printf("md: glass %u rows, %u.%u pictures a second, %u us a row, "
                   "the system core %u%% busy; %u.%u whole passes a second, "
                   "%u lines unchanged\n", (unsigned)rows,
@@ -643,6 +661,16 @@ static volatile int      s_pass_h;   /* the pass's lines while one is open, else
 static volatile uint8_t  s_row_ready[MD_RING_MAX];
 static volatile uint32_t s_row_hash[MD_RING_MAX];
 static int               s_help = 1; /* `nohelp`: the system core alone         */
+/*
+ * A glass that has had no whole pass for `lateN` ms (100) gets up to `lendN` us of
+ * the next frame's time from the application core: the game slows a little
+ * where the system core is full with sound, the Z80 and the wire.  Sonic's
+ * demo on the CYD (5 Nov 2026), whole passes a second in the worst 2 s and
+ * on average, and the game's fps: none 5.4/16.9/58.6; the default
+ * 9.4/17.0/57.2; lend2000 late0 10.9/18.3/52; `nosound` 12.4/21.7/58.5.
+ */
+static uint32_t          s_late_us = 100000u; /* `lateN`: N ms with no pass  */
+static uint32_t          s_lend_us = 2000u;   /* `lendN`: N us a frame, 0 none */
 #ifdef MD_PSRAM_PAGES
 /*
  * A board with PSRAM draws whole pictures (md_frames): both cores draw a
@@ -1074,6 +1102,27 @@ static void md_drawer(void)
         }
         s_pass_h = 0;             /* closed: the other core stops */
         s_passes++;
+        s_pass_at = (uint32_t)ag_micros();
+        {
+            static uint32_t s_got0, s_same0, s_snd0, s_send0, s_draw0, s_wait0;
+            const uint32_t took = s_pass_at - (uint32_t)pass_t0;
+            const uint32_t snd = md_snd_core0_us();
+            if (took > s_pass_max_us) {
+                s_pass_max_us = took;
+                s_pass_max_sent = s_ring_got - s_got0;
+                s_pass_max_same = s_lines_same - s_same0;
+                s_pass_max_snd = snd - s_snd0;
+                s_pass_max_send = s_glass_us - s_send0;
+                s_pass_max_draw = s_draw_us - s_draw0;
+                s_pass_max_wait = s_help_wait_us - s_wait0;
+            }
+            s_got0 = s_ring_got;
+            s_same0 = s_lines_same;
+            s_snd0 = snd;
+            s_send0 = s_glass_us;
+            s_draw0 = s_draw_us;
+            s_wait0 = s_help_wait_us;
+        }
         if (s_pass_raster) {
             s_pass_raster = 0;
             md_raster_done();
@@ -1664,6 +1713,16 @@ static int md_small_alloc(void)
               "%u-byte pages from %d blocks; %d rows of ring\n",
               s_run_z80_cpu ? "8 KB" : "one page (no Z80)", MD_PAGES_KB(in_iram),
               (unsigned)MD_PAGE, s_blocks, s_ring_n);
+#ifdef MD_Z80PROF
+    {
+        /* what a bigger hot part would come out of */
+        ag_meminfo_t mi;
+        ag_meminfo(&mi);
+        ag_printf("md: memory left: internal %u, arena %u of %u (largest %u)\n",
+                  (unsigned)mi.fast_free, (unsigned)mi.arena_free,
+                  (unsigned)mi.arena_total, (unsigned)mi.arena_largest);
+    }
+#endif
     __sync_synchronize();
     s_ring_go = 1;
     return 1;
@@ -3023,6 +3082,25 @@ int ag_main(int argc, char **argv)
             s_help = 0;        /* the system core draws every line alone */
             continue;
         }
+        if (arg_eq(argv[i], "nolend")) {
+            s_lend_us = 0;     /* the game's frames never wait for the glass */
+            continue;
+        }
+        if (argv[i][0] == 'l' &&
+            ((argv[i][1] == 'e' && argv[i][2] == 'n' && argv[i][3] == 'd') ||
+             (argv[i][1] == 'a' && argv[i][2] == 't' && argv[i][3] == 'e')) &&
+            argv[i][4] >= '0' && argv[i][4] <= '9') {
+            uint32_t n = 0;
+            for (const char *c = argv[i] + 4; *c >= '0' && *c <= '9'; c++) {
+                n = n * 10u + (uint32_t)(*c - '0');
+            }
+            if (argv[i][2] == 'n') {
+                s_lend_us = n;
+            } else {
+                s_late_us = n * 1000u;
+            }
+            continue;
+        }
         if (arg_eq(argv[i], "nosysdraw")) {
             s_sysdraw = 0;     /* the emulating core draws, as before */
             continue;
@@ -3258,7 +3336,7 @@ md_next_game:
 #ifdef MD_Z80PROF
     if (s_z80bench) {
         md_z80_bench("application core");
-        ag_thread_t bt = ag_thread_create(md_z80bench_sys, NULL, "z80bench", 2048, 4,
+        ag_thread_t bt = ag_thread_create(md_z80bench_sys, NULL, "z80bench", 3072, 4,
                                           AG_THREAD_SYS_CORE);
         if (bt != NULL) {
             while (!s_z80bench_done) {
@@ -3447,6 +3525,16 @@ md_next_game:
 #ifdef ARGON_MD_SMALL
             if (s_sysdraw && s_ring_n > 0 && !s_headless && s_help) {
                 md_help_draw(next_frame);
+                if (s_lend_us && (uint32_t)ag_micros() - s_pass_at > s_late_us) {
+                    const ag_time_t l0 = ag_micros();
+                    const ag_time_t from = (next_frame > l0) ? next_frame : l0;
+                    md_help_draw(from + s_lend_us);
+                    const ag_time_t l1 = ag_micros();
+                    if (l1 > from) {
+                        next_frame += l1 - from;   /* the game's time, lent */
+                        s_lent_us += (uint32_t)(l1 - from);
+                    }
+                }
             }
 #endif
             const ag_time_t later = ag_micros();

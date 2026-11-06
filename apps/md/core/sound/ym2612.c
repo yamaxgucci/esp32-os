@@ -862,7 +862,7 @@ INLINE void CSMKeyControll(FM_CH *CH)
  */
 #define YM_TIMER_CLK AUDIO_FREQ_DIVISOR
 
-INLINE void INTERNAL_TIMER_A()
+MD_HOT INLINE void INTERNAL_TIMER_A()
 {
   if (ym2612.OPN.ST.mode & 0x01)
   {
@@ -2170,7 +2170,14 @@ void ym2612_dac_settle(void)
 int md_ym_silent;
 #endif
 
-static void YM2612Update(int16_t *buffer, int length)
+/*
+ * In the hot part, with the timer it calls every sample: from flash it ran
+ * on the core that draws the picture out of flash too, and missed the cache
+ * - Sonic's sound came down from 342 to 279 ms a second of the CYD's system
+ * core, the Z80's beside it from 136 to 106, for 5 KB of VRAM's IRAM
+ * (6 Nov 2026).
+ */
+MD_HOT static void YM2612Update(int16_t *buffer, int length)
 {
 #ifdef ARGON_MD_SMALL
   if (md_ym_silent) {

@@ -66,10 +66,11 @@ extern int scan_line;
  * Events a log carries.  A frame with more - a game setting the YM's every
  * register at start - is handed over in pieces: the log so far goes to the
  * system core as the frame up to the current line, and the rest of the frame
- * continues in the other log.  Nothing is dropped; 256 is what the CYD's
- * memory holds two of.
+ * continues in the other log.  Nothing is dropped.  A piece makes the 68000
+ * wait for the system core: Sonic's demo on the CYD gave 270 pieces in 110 s
+ * at 256 and 64 at 512 (5 Nov 2026), for 1 KB more of the two logs.
  */
-#define MD_EV_MAX 256
+#define MD_EV_MAX 512
 
 /* lines the Z80 may run in one slice (play) */
 #define MD_Z80_AHEAD 8
@@ -237,7 +238,15 @@ void md_snd_68k_zctl(unsigned int address, unsigned int value)
     extern int m68k_cycles_master(void);
     int at = m68k_cycles_master() - ((scan_line < 0) ? 0 : scan_line) * VDP_CYCLES_PER_LINE;
     at = (at < 0) ? 0 : (at >= VDP_CYCLES_PER_LINE) ? VDP_CYCLES_PER_LINE - 1 : at;
-    put_at(EV_ZCTL, ((address == 0x1200u) ? 0x100u : 0u) | (value ? 1u : 0u), at);
+    /*
+     * Its time in the line only while it matters - a Z80 just let go, which
+     * the 68000 may ask within the line (catch_up): stamped always, Sonic's
+     * drums, a bus request or two a line, filled the log twice as fast and
+     * handed frames over in pieces (CYD, 5 Nov 2026).
+     */
+    const int fresh = s_fresh > 0 || (address == 0x1200u && value);
+    put_at(EV_ZCTL, ((address == 0x1200u) ? 0x100u : 0u) | (value ? 1u : 0u),
+           fresh ? at : -1);
     if (address == 0x1200u && value) {
         s_fresh = MD_FRESH_FRAMES; /* a Z80 let go from reset */
     }
