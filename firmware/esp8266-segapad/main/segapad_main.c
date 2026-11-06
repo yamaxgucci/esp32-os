@@ -36,6 +36,7 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "lwip/sockets.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "driver/soc.h"
@@ -98,6 +99,9 @@ static volatile uint32_t  s_reads, s_writes, s_lost;
  * spoils the read it was in.  s_scans counts those, s_sixes the ones that
  * also reached the 6-button step. */
 static volatile uint32_t  s_scans, s_sixes;
+/* From a request with states in it to the first whole read of the CYD after
+ * the first of them began to play, in ms: the last, the most and the sum. */
+static volatile uint32_t  s_rq_ms, s_lag_pick, s_lag, s_lag_max, s_lag_sum, s_lag_n;
 static int                s_run = -1;
 static bool               s_six_seen;
 static uint8_t            s_last_write;
@@ -370,18 +374,23 @@ static esp_err_t get_press(httpd_req_t *req)
                 }
                 p = (*end == ',') ? end + 1 : end;
             }
+            s_rq_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
         }
         s_held = m;
         s_heard_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     }
-    char out[160];
+    char out[220];
     const int n = snprintf(out, sizeof(out),
-                           "%x %u %u %u irq %u addr %u last %02x late %u scans %u six %u",
+                           "%x %u %u %u irq %u addr %u last %02x late %u scans %u six %u"
+                           " pick %u lag %u max %u sum %u n %u",
                            (unsigned)s_held, (unsigned)s_writes,
                            (unsigned)s_reads, (unsigned)s_lost,
                            (unsigned)s_irqs, (unsigned)s_addrs,
                            (unsigned)s_last_addr, (unsigned)s_late,
-                           (unsigned)s_scans, (unsigned)s_sixes);
+                           (unsigned)s_scans, (unsigned)s_sixes,
+                           (unsigned)s_lag_pick, (unsigned)s_lag,
+                           (unsigned)s_lag_max, (unsigned)s_lag_sum,
+                           (unsigned)s_lag_n);
     httpd_resp_set_type(req, "text/plain");
     return httpd_resp_send(req, out, n);
 }
@@ -465,11 +474,26 @@ static esp_err_t get_ota(httpd_req_t *req)
     return httpd_resp_send(req, msg, n);
 }
 
+/*
+ * An answer goes out as two writes, the headers and then the body, and with
+ * Nagle on the body waited for the browser to acknowledge the headers, which
+ * it puts off: the first byte came 20 ms after the request and the last 65 to
+ * 130 (6 Nov 2026) - a press, and a release, later by that much.
+ */
+static esp_err_t on_open(httpd_handle_t hd, int fd)
+{
+    (void)hd;
+    const int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    return ESP_OK;
+}
+
 static void http_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_open_sockets = 3;
     cfg.lru_purge_enable = true;
+    cfg.open_fn = on_open;
     httpd_handle_t h = NULL;
     if (httpd_start(&h, &cfg) != ESP_OK) {
         return;
@@ -520,6 +544,10 @@ static void wifi_start(void)
 #endif
     esp_wifi_set_config(ESP_IF_WIFI_AP, &ap);
     esp_wifi_start();
+    /* The radio dozes between the router's beacons by default, and a press
+     * waited for the next one: a ping took 7 to 115 ms, 47 on average, and a
+     * request of the page's about 100 (6 Nov 2026). */
+    esp_wifi_set_ps(WIFI_PS_NONE);
 #ifdef SP_SSID
     tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_STA, "segapad");
     esp_wifi_connect();
@@ -535,10 +563,18 @@ void app_main(void)
     bus_init();
     wifi_start();
     http_start();
-    uint32_t play_at = 0, scans_at = 0;
+    uint32_t play_at = 0, scans_at = 0, scans_pick = 0, rq_seen = 0;
+    bool pending = false;
     for (;;) {
         vTaskDelay(1); /* a tick, 10 ms */
         const uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (pending && s_scans != scans_pick) {
+            pending = false;
+            s_lag = now - rq_seen;
+            s_lag_max = s_lag > s_lag_max ? s_lag : s_lag_max;
+            s_lag_sum += s_lag;
+            s_lag_n++;
+        }
         if (s_held != 0u && now - s_heard_ms > HELD_MS) {
             s_held = 0;
         }
@@ -550,6 +586,12 @@ void app_main(void)
             s_play = s_states[s_st_tail % STATES];
             s_st_tail = s_st_tail + 1u;
             scans_at = s_sixes;
+            if (s_rq_ms != rq_seen) {
+                rq_seen = s_rq_ms;
+                s_lag_pick = now - rq_seen;
+                scans_pick = s_scans;
+                pending = true;
+            }
             s_playing = true;
             play_at = now;
         } else {
