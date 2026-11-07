@@ -2612,83 +2612,208 @@ static int cmd_dev(int argc, char **argv)
 #define DRV_CFG_PATH     "/sys/SYSTEM.CFG"
 /* Lowercase: LittleFS is case-sensitive; c:\drv\… resolves to /sys/drv/… */
 #define DRV_DIR_PATH     "/sys/drv"
-#define DRV_CFG_MAX      4096
 #define DRV_COPY_CHUNK   4096
+#define CFG_TMP_PATH     "/sys/SYSTEM.NEW"
+#define CFG_BAK_PATH     "/sys/SYSTEM.OLD"
 
-static int cfg_has_device_line(const char *text, const char *dos_path)
+/*
+ * Whether this line of SYSTEM.CFG is `device = <dos_path>` inside [modules],
+ * keeping track of which section the walk is in.  `cut` is a piece of a line
+ * longer than the reader's buffer: neither a header nor a device line.
+ */
+static bool cfg_is_device_line(bool *in_modules, const char *line, size_t len,
+                               bool cut, const char *dos_path)
 {
-    const char *p = text;
-    int         in_modules = 0;
+    char  buf[192];
+    char *s;
+    char *eq;
 
-    while (*p) {
-        const char *line = p;
-        const char *eol = strchr(p, '\n');
-        size_t      len = eol ? (size_t)(eol - p) : strlen(p);
-        char        buf[192];
-        char       *s;
-        char       *eq;
+    if (cut) {
+        return false;
+    }
+    if (len >= sizeof(buf)) {
+        len = sizeof(buf) - 1u;
+    }
+    memcpy(buf, line, len);
+    buf[len] = '\0';
 
-        if (len >= sizeof(buf)) {
-            len = sizeof(buf) - 1u;
+    s = buf;
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    if (*s == ';' || *s == '#' || *s == '\0') {
+        return false;
+    }
+    if (*s == '[') {
+        char *end = strchr(s, ']');
+        if (end != NULL) {
+            *end = '\0';
+            *in_modules = (ag_path_icmp(s + 1, "modules") == 0);
+        } else {
+            *in_modules = false;
         }
-        memcpy(buf, line, len);
-        buf[len] = '\0';
-        if (len > 0 && buf[len - 1u] == '\r') {
-            buf[len - 1u] = '\0';
-        }
+        return false;
+    }
+    if (!*in_modules) {
+        return false;
+    }
+    eq = strchr(s, '=');
+    if (eq == NULL) {
+        return false;
+    }
+    char *key = s;
+    /*
+     * Where the value starts, taken before anything moves.  It used to be
+     * computed as eq + 1 *after* the loop below had walked eq backwards over
+     * the spaces in front of the '=', so for the one spelling this file is
+     * actually written in - `device = path`, with spaces - it pointed at the
+     * byte that had just been set to nul.  Every value read as empty, no line
+     * ever matched, and `drv install` of a driver that was already installed
+     * added it again: SYSTEM.CFG grew a second copy of the same module and
+     * loaded it twice on every boot.
+     */
+    char *val = eq + 1;
 
-        s = buf;
-        while (*s == ' ' || *s == '\t') {
-            s++;
-        }
-        if (*s == ';' || *s == '#' || *s == '\0') {
-            /* skip */
-        } else if (*s == '[') {
-            char *end = strchr(s, ']');
-            if (end != NULL) {
-                *end = '\0';
-                in_modules = (ag_path_icmp(s + 1, "modules") == 0);
-            } else {
-                in_modules = 0;
-            }
-        } else if (in_modules) {
-            eq = strchr(s, '=');
-            if (eq != NULL) {
-                char *key = s;
-                /*
-                 * Where the value starts, taken before anything moves.  It
-                 * used to be computed as eq + 1 *after* the loop below had
-                 * walked eq backwards over the spaces in front of the '=', so
-                 * for the one spelling this file is actually written in -
-                 * `device = path`, with spaces - it pointed at the byte that
-                 * had just been set to nul.  Every value read as empty, no
-                 * line ever matched, and `drv install` of a driver that was
-                 * already installed added it again: SYSTEM.CFG grew a second
-                 * copy of the same module and loaded it twice on every boot.
-                 */
-                char *val = eq + 1;
+    *eq = '\0';
+    while (eq > key && (eq[-1] == ' ' || eq[-1] == '\t')) {
+        eq--;
+        *eq = '\0';
+    }
+    while (*val == ' ' || *val == '\t') {
+        val++;
+    }
+    return ag_path_icmp(key, "device") == 0 && ag_path_icmp(val, dos_path) == 0;
+}
 
-                *eq = '\0';
-                while (eq > key && (eq[-1] == ' ' || eq[-1] == '\t')) {
-                    eq--;
-                    *eq = '\0';
-                }
-                while (*val == ' ' || *val == '\t') {
-                    val++;
-                }
-                if (ag_path_icmp(key, "device") == 0 &&
-                    ag_path_icmp(val, dos_path) == 0) {
-                    return 1;
-                }
-            }
+/* Writes all of `n` bytes, or why not. */
+static ag_err_t cfg_write_all(ag_handle_t h, const char *text, size_t n)
+{
+    size_t off = 0;
+    while (off < n) {
+        const int32_t w = ag_vfs_write(h, text + off, n - off);
+        if (w <= 0) {
+            return (w < 0) ? (ag_err_t)w : -AG_ENOSPC;
         }
+        off += (size_t)w;
+    }
+    return AG_OK;
+}
 
-        if (eol == NULL) {
+/* One line of SYSTEM.CFG, without its newline; see cfg_each_line. */
+typedef ag_err_t (*cfg_line_fn)(void *ctx, const char *line, size_t len,
+                                bool cut, bool more);
+
+/*
+ * Every line of an open file, in order, through `fn`; carriage returns are
+ * dropped.  A line longer than the buffer goes through in pieces with `cut`
+ * set, so nothing that long is taken for a header, and `more` on every piece
+ * but its last, so a copy puts the newline back only where there was one.
+ *
+ * This is the only way this file reads SYSTEM.CFG.  `drv install` used to read
+ * the whole of it into four kilobytes, and the CYD's SYSTEM.CFG is more than
+ * that - mostly comments - so on the board where the shop puts the Sega pad's
+ * driver, the step that installs it said
+ *
+ *     SYSTEM.CFG: -28
+ *
+ * and the driver never loaded at boot.  `wifi connect` had had the same
+ * ceiling, and the same message, and had been moved to a line at a time; the
+ * driver's two functions were left reading the whole file.
+ */
+static ag_err_t cfg_each_line(ag_handle_t in, cfg_line_fn fn, void *ctx)
+{
+    char     line[256];
+    size_t   len = 0;
+    bool     cut = false;
+    ag_err_t err = AG_OK;
+
+    for (;;) {
+        char          chunk[128];
+        const int32_t n = ag_vfs_read(in, chunk, sizeof(chunk));
+        if (n < 0) {
+            return (ag_err_t)n;
+        }
+        if (n == 0) {
             break;
         }
-        p = eol + 1;
+        for (int32_t i = 0; i < n && err == AG_OK; i++) {
+            const char c = chunk[i];
+            if (c == '\r') {
+                continue; /* the file is written back with plain newlines */
+            }
+            if (c != '\n') {
+                if (len + 1u >= sizeof(line)) {
+                    err = fn(ctx, line, len, true, true);
+                    len = 0;
+                    cut = true;
+                }
+                if (err == AG_OK) {
+                    line[len++] = c;
+                }
+                continue;
+            }
+            err = fn(ctx, line, len, cut, false);
+            len = 0;
+            cut = false;
+        }
+        if (err != AG_OK) {
+            return err;
+        }
     }
-    return 0;
+    if (len > 0) { /* a last line with no newline after it */
+        err = fn(ctx, line, len, cut, false);
+    }
+    return err;
+}
+
+/* A fresh SYSTEM.NEW to write the replacement into. */
+static ag_handle_t cfg_begin(void)
+{
+    /* A leftover from a write that did not finish - this one or an older one. */
+    (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+    return ag_vfs_open(CFG_TMP_PATH, NULL,
+                       AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+}
+
+/*
+ * Closes SYSTEM.NEW and, when everything before went right (`err`), puts it in
+ * SYSTEM.CFG's place; otherwise throws it away and SYSTEM.CFG is as it was.
+ */
+static ag_err_t cfg_commit(ag_handle_t out, ag_err_t err)
+{
+    const ag_err_t cerr = ag_vfs_close(out);
+    if (err == AG_OK) {
+        err = cerr;
+    }
+    if (err != AG_OK) {
+        (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+        return err;
+    }
+
+    /*
+     * The old file becomes the backup for as long as it takes the new one to
+     * take its name, and is deleted only once that worked.  Two renames rather
+     * than an unlink and a rename, because a board that loses its file loses
+     * everything it was told - the network it joins, the drivers it loads.
+     */
+    (void)ag_vfs_unlink(CFG_BAK_PATH, NULL);
+    if (ag_vfs_rename(DRV_CFG_PATH, CFG_BAK_PATH, NULL) == AG_OK) {
+        err = ag_vfs_rename(CFG_TMP_PATH, DRV_CFG_PATH, NULL);
+        if (err == AG_OK) {
+            (void)ag_vfs_unlink(CFG_BAK_PATH, NULL);
+        } else {
+            (void)ag_vfs_rename(CFG_BAK_PATH, DRV_CFG_PATH, NULL);
+            (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+        }
+        return err;
+    }
+    /* No rename on this filesystem: replace it in place, as it used to. */
+    (void)ag_vfs_unlink(DRV_CFG_PATH, NULL);
+    err = ag_vfs_rename(CFG_TMP_PATH, DRV_CFG_PATH, NULL);
+    if (err != AG_OK) {
+        (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
+    }
+    return err;
 }
 
 /*
@@ -2773,23 +2898,6 @@ static int hex_digit(char c)
  * and `wifi connect` overflowed it - a board that restarts when a password is
  * typed.  A line at a time answers both.)
  */
-#define CFG_TMP_PATH "/sys/SYSTEM.NEW"
-#define CFG_BAK_PATH "/sys/SYSTEM.OLD"
-
-/* Writes all of `n` bytes, or why not. */
-static ag_err_t cfg_write_all(ag_handle_t h, const char *text, size_t n)
-{
-    size_t off = 0;
-    while (off < n) {
-        const int32_t w = ag_vfs_write(h, text + off, n - off);
-        if (w <= 0) {
-            return (w < 0) ? (ag_err_t)w : -AG_ENOSPC;
-        }
-        off += (size_t)w;
-    }
-    return AG_OK;
-}
-
 /* Whether this line opens any section at all. */
 static bool cfg_line_starts_section(const char *line, size_t len)
 {
@@ -2849,8 +2957,10 @@ typedef struct {
  * longer than the buffer, so it cannot be a section header - it goes through as
  * it is, in as many pieces as it takes, and nothing is dropped.
  */
-static ag_err_t cfg_rw_line(cfg_rw_t *rw, const char *line, size_t len, bool cut)
+static ag_err_t cfg_rw_line(void *ctx, const char *line, size_t len, bool cut,
+                           bool more)
 {
+    cfg_rw_t *rw = (cfg_rw_t *)ctx;
     const bool header = !cut && cfg_line_starts_section(line, len);
     if (header && cfg_line_is_section(line, len, rw->section, rw->seclen)) {
         rw->drop = true;
@@ -2871,7 +2981,7 @@ static ag_err_t cfg_rw_line(cfg_rw_t *rw, const char *line, size_t len, bool cut
         return AG_OK;
     }
     ag_err_t err = cfg_write_all(rw->out, line, len);
-    if (err == AG_OK) {
+    if (err == AG_OK && !more) {
         err = cfg_write_all(rw->out, "\n", 1);
     }
     return err;
@@ -2879,105 +2989,23 @@ static ag_err_t cfg_rw_line(cfg_rw_t *rw, const char *line, size_t len, bool cut
 
 static ag_err_t cfg_replace_section(const char *section, const char *body)
 {
-    /* A leftover from a write that did not finish - this one or an older one. */
-    (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
-
-    const ag_handle_t in = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
-    const ag_handle_t out =
-        ag_vfs_open(CFG_TMP_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
+    const ag_handle_t out = cfg_begin();
     if (out < 0) {
-        if (in >= 0) {
-            (void)ag_vfs_close(in);
-        }
         return (ag_err_t)out;
     }
-
     cfg_rw_t rw = {.out = out, .section = section, .seclen = strlen(section),
                    .body = body};
-    char     line[256];
-    size_t   len = 0;
-    bool     cut = false;
     ag_err_t err = AG_OK;
 
-    while (in >= 0) {
-        char          chunk[128];
-        const int32_t n = ag_vfs_read(in, chunk, sizeof(chunk));
-        if (n < 0) {
-            err = (ag_err_t)n;
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-        for (int32_t i = 0; i < n && err == AG_OK; i++) {
-            const char c = chunk[i];
-            if (c == '\r') {
-                continue; /* the file is written back with plain newlines */
-            }
-            if (c != '\n') {
-                if (len + 1u >= sizeof(line)) {
-                    /* Longer than a section header can be: out it goes, and
-                     * the rest of the line follows as more of the same. */
-                    err = cfg_rw_line(&rw, line, len, true);
-                    len = 0;
-                    cut = true;
-                }
-                if (err == AG_OK) {
-                    line[len++] = c;
-                }
-                continue;
-            }
-            err = cfg_rw_line(&rw, line, len, cut);
-            len = 0;
-            cut = false;
-        }
-        if (err != AG_OK) {
-            break;
-        }
-    }
-
-    if (err == AG_OK && len > 0) { /* a last line with no newline after it */
-        err = cfg_rw_line(&rw, line, len, cut);
+    const ag_handle_t in = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
+    if (in >= 0) {
+        err = cfg_each_line(in, cfg_rw_line, &rw);
+        (void)ag_vfs_close(in);
     }
     if (err == AG_OK && !rw.written) {
         err = cfg_emit_section(out, section, body); /* a section that was absent */
     }
-    if (in >= 0) {
-        (void)ag_vfs_close(in);
-    }
-    const ag_err_t cerr = ag_vfs_close(out);
-    if (err == AG_OK) {
-        err = cerr;
-    }
-    if (err != AG_OK) {
-        (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
-        return err;
-    }
-
-    /*
-     * The old file becomes the backup for as long as it takes the new one to
-     * take its name, and is deleted only once that worked.  Two renames rather
-     * than an unlink and a rename, because a board that loses its file loses
-     * everything it was told - the network it joins, the drivers it loads.
-     */
-    (void)ag_vfs_unlink(CFG_BAK_PATH, NULL);
-    if (ag_vfs_rename(DRV_CFG_PATH, CFG_BAK_PATH, NULL) == AG_OK) {
-        err = ag_vfs_rename(CFG_TMP_PATH, DRV_CFG_PATH, NULL);
-        if (err == AG_OK) {
-            (void)ag_vfs_unlink(CFG_BAK_PATH, NULL);
-        } else {
-            (void)ag_vfs_rename(CFG_BAK_PATH, DRV_CFG_PATH, NULL);
-            (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
-        }
-        return err;
-    }
-    /* No rename on this filesystem: replace it in place, as it used to. */
-    (void)ag_vfs_unlink(DRV_CFG_PATH, NULL);
-    err = ag_vfs_rename(CFG_TMP_PATH, DRV_CFG_PATH, NULL);
-    if (err != AG_OK) {
-        (void)ag_vfs_unlink(CFG_TMP_PATH, NULL);
-    }
-    return err;
+    return cfg_commit(out, err);
 }
 #endif /* ARGON_SHELL_HAS_WIFI || AG_PORT_HAS_BT || AG_PORT_HAS_USB_HID || CONFIG_ARGON_NET_SSH */
 
@@ -3044,212 +3072,94 @@ static ag_err_t cfg_ensure_bt(const char *addr, int addr_type)
 }
 #endif
 
-/*
- * The buffer comes from the heap for the reason written out above
- * cfg_replace_section: four kilobytes of stack in a task with twelve, reached
- * several frames deep, and the only sign of it is one line the chip prints.
- *
- * That fix was made in one of the three functions in this file that had the
- * same shape, and the other two were left - so `drv install` and
- * `drv uninstall` went on overflowing until an uninstall halted the board.
- * Same trap, same message, second time.
- */
-static ag_err_t cfg_ensure_device(const char *dos_path)
+/* What a pass over SYSTEM.CFG for one driver line is doing. */
+typedef struct {
+    const char *dos_path;
+    ag_handle_t out;        /* the copy being written, or -1 for a look */
+    bool        in_modules;
+    bool        found;
+} cfg_dev_t;
+
+/* Copies every line but the driver's own, and notes whether it was there. */
+static ag_err_t cfg_dev_line(void *ctx, const char *line, size_t len, bool cut,
+                             bool more)
 {
-    ag_handle_t h;
-    int32_t     n;
-    size_t      used = 0;
-    char        add[192];
-    size_t      add_len;
-
-    char *const text = (char *)ag_port_alloc(DRV_CFG_MAX,
-                                             AG_MEM_FAST | AG_MEM_BYTE);
-    if (text == NULL) {
-        return -AG_ENOMEM;
+    cfg_dev_t *d = (cfg_dev_t *)ctx;
+    if (cfg_is_device_line(&d->in_modules, line, len, cut, d->dos_path)) {
+        d->found = true;
+        return AG_OK;
     }
-
-    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
-    if (h >= 0) {
-        n = ag_vfs_read(h, text, DRV_CFG_MAX - 1u);
-        ag_vfs_close(h);
-        if (n < 0) {
-            ag_port_free(text);
-            return (ag_err_t)n;
-        }
-        used = (size_t)n;
-        text[used] = '\0';
-        if (cfg_has_device_line(text, dos_path)) {
-            ag_port_free(text);
-            return AG_OK;
-        }
-    } else if (h != -AG_ENOENT) {
-        ag_port_free(text);
-        return (ag_err_t)h;
-    } else {
-        text[0] = '\0';
-        used = 0;
+    if (d->out < 0) {
+        return AG_OK;
     }
-
-    /* Extra [modules] block is fine: ag_cfg_next walks every device=. */
-    add_len = (size_t)snprintf(add, sizeof(add), "%s[modules]\ndevice = %s\n",
-                               (used > 0 && text[used - 1u] != '\n') ? "\n" : "",
-                               dos_path);
-    if (add_len >= sizeof(add) || used + add_len + 1u > DRV_CFG_MAX) {
-        ag_port_free(text);
-        return -AG_ENOSPC;
+    ag_err_t err = cfg_write_all(d->out, line, len);
+    if (err == AG_OK && !more) {
+        err = cfg_write_all(d->out, "\n", 1);
     }
-    memcpy(text + used, add, add_len + 1u);
-    used += add_len;
-
-    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
-    if (h < 0) {
-        ag_port_free(text);
-        return (ag_err_t)h;
-    }
-    n = ag_vfs_write(h, text, used);
-    (void)ag_vfs_close(h);
-    ag_port_free(text);
-    if (n < 0) {
-        return (ag_err_t)n;
-    }
-    if ((size_t)n != used) {
-        return -AG_EIO;
-    }
-    return AG_OK;
+    return err;
 }
 
-/* Both buffers from the heap, for the reason above cfg_ensure_device: eight
- * kilobytes of stack was what halted the board on `drv uninstall`. */
-static ag_err_t cfg_remove_device(const char *dos_path)
+/* Whether SYSTEM.CFG already loads `dos_path`. */
+static ag_err_t cfg_has_device(const char *dos_path, bool *found)
 {
-    ag_handle_t h;
-    int32_t     n;
-    size_t      used;
-    size_t      out_used = 0;
-    const char *p;
-    int         in_modules = 0;
-    int         changed = 0;
-
-    char *const text = (char *)ag_port_alloc(DRV_CFG_MAX * 2u,
-                                             AG_MEM_FAST | AG_MEM_BYTE);
-    if (text == NULL) {
-        return -AG_ENOMEM;
+    cfg_dev_t         d = {.dos_path = dos_path, .out = -1};
+    const ag_handle_t in = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
+    *found = false;
+    if (in < 0) {
+        return (in == -AG_ENOENT) ? AG_OK : (ag_err_t)in;
     }
-    char *const out = text + DRV_CFG_MAX;
+    const ag_err_t err = cfg_each_line(in, cfg_dev_line, &d);
+    (void)ag_vfs_close(in);
+    *found = d.found;
+    return err;
+}
 
-    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
-    if (h < 0) {
-        ag_port_free(text);
-        return (h == -AG_ENOENT) ? AG_OK : (ag_err_t)h;
+/*
+ * SYSTEM.CFG with `dos_path`'s line taken out (`add` false) or put in once at
+ * the end (`add` true), through SYSTEM.NEW and a rename.  Nothing is written
+ * when there is nothing to change.
+ */
+static ag_err_t cfg_set_device(const char *dos_path, bool add)
+{
+    bool     found;
+    ag_err_t err = cfg_has_device(dos_path, &found);
+    if (err != AG_OK) {
+        return err;
     }
-    n = ag_vfs_read(h, text, DRV_CFG_MAX - 1u);
-    ag_vfs_close(h);
-    if (n < 0) {
-        ag_port_free(text);
-        return (ag_err_t)n;
-    }
-    used = (size_t)n;
-    text[used] = '\0';
-
-    p = text;
-    while (*p) {
-        const char *line = p;
-        const char *eol = strchr(p, '\n');
-        size_t      len = eol ? (size_t)(eol - p) : strlen(p);
-        char        buf[192];
-        char        raw[192];
-        char       *s;
-        char       *eq;
-        int         drop = 0;
-        size_t      copy_len;
-
-        if (len >= sizeof(buf)) {
-            len = sizeof(buf) - 1u;
-        }
-        memcpy(raw, line, len);
-        raw[len] = '\0';
-        memcpy(buf, raw, len + 1u);
-        if (len > 0 && buf[len - 1u] == '\r') {
-            buf[len - 1u] = '\0';
-        }
-
-        s = buf;
-        while (*s == ' ' || *s == '\t') {
-            s++;
-        }
-        if (*s == '[') {
-            char *end = strchr(s, ']');
-            if (end != NULL) {
-                *end = '\0';
-                in_modules = (ag_path_icmp(s + 1, "modules") == 0);
-            } else {
-                in_modules = 0;
-            }
-        } else if (in_modules && *s != ';' && *s != '#' && *s != '\0') {
-            eq = strchr(s, '=');
-            if (eq != NULL) {
-                char *key = s;
-                /*
-                 * Where the value starts, taken before anything moves.  It
-                 * used to be computed as eq + 1 *after* the loop below had
-                 * walked eq backwards over the spaces in front of the '=', so
-                 * for the one spelling this file is actually written in -
-                 * `device = path`, with spaces - it pointed at the byte that
-                 * had just been set to nul.  Every value read as empty, no
-                 * line ever matched, and `drv install` of a driver that was
-                 * already installed added it again: SYSTEM.CFG grew a second
-                 * copy of the same module and loaded it twice on every boot.
-                 */
-                char *val = eq + 1;
-
-                *eq = '\0';
-                while (eq > key && (eq[-1] == ' ' || eq[-1] == '\t')) {
-                    eq--;
-                    *eq = '\0';
-                }
-                while (*val == ' ' || *val == '\t') {
-                    val++;
-                }
-                if (ag_path_icmp(key, "device") == 0 &&
-                    ag_path_icmp(val, dos_path) == 0) {
-                    drop = 1;
-                    changed = 1;
-                }
-            }
-        }
-
-        copy_len = eol ? (size_t)(eol - line + 1) : strlen(line);
-        if (!drop) {
-            if (out_used + copy_len + 1u > DRV_CFG_MAX) {
-                ag_port_free(text);
-                return -AG_ENOSPC;
-            }
-            memcpy(out + out_used, line, copy_len);
-            out_used += copy_len;
-        }
-        if (eol == NULL) {
-            break;
-        }
-        p = eol + 1;
-    }
-
-    if (!changed) {
-        ag_port_free(text);
+    if (found == add) {
         return AG_OK;
     }
 
-    h = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_WRONLY | AG_O_CREATE | AG_O_TRUNC);
-    if (h < 0) {
-        ag_port_free(text);
-        return (ag_err_t)h;
+    const ag_handle_t out = cfg_begin();
+    if (out < 0) {
+        return (ag_err_t)out;
     }
-    n = ag_vfs_write(h, out, out_used);
-    (void)ag_vfs_close(h);
-    ag_port_free(text);
-    if (n < 0) {
-        return (ag_err_t)n;
+    cfg_dev_t         d = {.dos_path = dos_path, .out = out};
+    const ag_handle_t in = ag_vfs_open(DRV_CFG_PATH, NULL, AG_O_RDONLY);
+    if (in >= 0) {
+        err = cfg_each_line(in, cfg_dev_line, &d);
+        (void)ag_vfs_close(in);
     }
-    return AG_OK;
+    if (err == AG_OK && add) {
+        /* Its own [modules] block is fine: ag_cfg_next walks every device=. */
+        char      line[192];
+        const int n = snprintf(line, sizeof(line), "[modules]\ndevice = %s\n",
+                               dos_path);
+        err = (n > 0 && (size_t)n < sizeof(line))
+                  ? cfg_write_all(out, line, (size_t)n)
+                  : -AG_EINVAL;
+    }
+    return cfg_commit(out, err);
+}
+
+static ag_err_t cfg_ensure_device(const char *dos_path)
+{
+    return cfg_set_device(dos_path, true);
+}
+
+static ag_err_t cfg_remove_device(const char *dos_path)
+{
+    return cfg_set_device(dos_path, false);
 }
 
 static ag_err_t drv_copy_file(const char *src_abs, const char *dst_abs)
