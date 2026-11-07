@@ -422,8 +422,78 @@ static void test_undefined_byte_renders_as_space(void)
     ag_cp_set_active(AG_CP_437);
 }
 
+/*
+ * What went down the wire, replayed through a second screen, is the screen:
+ * cell for cell, after every flush, with long lines that wrap and scroll the
+ * screen more than once between two flushes - the shell echoing a typed
+ * command, then the command's own output.  Written when the CYD's serial
+ * console seemed to lose the wrapped half of such lines (7 Nov 2026); it did
+ * not - tools/boardtalk.py drops a line it has printed before, and the second
+ * half of the same text twice is that.  The scroll on the wire is kept honest
+ * by this all the same.
+ */
+static uint32_t g_mem3[4096];
+static uint32_t g_mem4[4096];
+
+static int replay_differs(const ag_screen_t *src, ag_screen_t *dst)
+{
+    ag_screen_write(dst, g_cap, g_cap_len);
+    int bad = 0;
+    for (uint16_t y = 0; y < src->rows; y++) {
+        for (uint16_t x = 0; x < src->cols; x++) {
+            if (ag_screen_at(src, x, y).ch != ag_screen_at(dst, x, y).ch) {
+                bad++;
+            }
+        }
+    }
+    return bad;
+}
+
+static int wrapped_lines(uint16_t rows, int rounds)
+{
+    ag_screen_t src;
+    ag_screen_t dst;
+    AG_CHECK_INT(ag_screen_init(&src, g_mem3, sizeof(g_mem3), 40, rows), AG_OK);
+    AG_CHECK_INT(ag_screen_init(&dst, g_mem4, sizeof(g_mem4), 40, rows), AG_OK);
+    ag_vtout_t out;
+    ag_vtout_init(&out);
+    ag_vtout_mark_all(&out);
+
+    static const char *long_line =
+        "Hello World 0123456789 abcdefghijklmnopqrstuvwxyz ABCXYZ -_=+[]{};:,.?/~!@";
+    int bad = 0;
+    for (int round = 0; round < rounds; round++) {
+        /* the echo of a typed command, then its output, between two flushes
+         * and in one */
+        ag_screen_puts(&src, "\n(1) A:\\>echo ");
+        ag_screen_puts(&src, long_line);
+        if (round % 2) {
+            cap_reset();
+            ag_vtout_take_dirty(&out, &src);
+            ag_vtout_flush(&out, &src, cap_sink, NULL);
+            ag_screen_clear_dirty(&src);
+            bad += replay_differs(&src, &dst);
+        }
+        ag_screen_puts(&src, "\n");
+        ag_screen_puts(&src, long_line);
+        cap_reset();
+        ag_vtout_take_dirty(&out, &src);
+        ag_vtout_flush(&out, &src, cap_sink, NULL);
+        ag_screen_clear_dirty(&src);
+        bad += replay_differs(&src, &dst);
+    }
+    return bad;
+}
+
+static void test_wrapped_lines_scroll_whole(void)
+{
+    AG_CHECK_INT(wrapped_lines(6, 6), 0);
+    AG_CHECK_INT(wrapped_lines(30, 20), 0); /* the CYD's 40x30 */
+}
+
 void run_vtout_tests(void)
 {
+    test_wrapped_lines_scroll_whole();
     test_high_bytes_go_out_as_utf8();
     test_undefined_byte_renders_as_space();
     test_first_flush_paints_everything();
