@@ -430,3 +430,17 @@ int32_t ag_port_uart_pending(int port)
     }
     return (int32_t)avail;
 }
+
+ag_err_t ag_port_uart_rx_eager(int port)
+{
+    if (!valid(port)) {
+        return -AG_EINVAL;
+    }
+    if (is_jtag(port)) {
+        return -AG_ENOTSUP;
+    }
+    /* An interrupt per byte: the FIFO-full one, which is a level, rather than
+     * the idle-line timeout that otherwise brings in the last bytes of a burst
+     * (fewer than the default threshold of 120) - see uart_console.c. */
+    return from_esp(uart_set_rx_full_threshold(port, 1));
+}

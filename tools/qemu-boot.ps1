@@ -770,6 +770,29 @@ try {
                 $hex = -join (0..($take - 1) | ForEach-Object {
                     $bytes[$at + $_].ToString('x2') })
                 Send-Line $hex
+                $lineMark = $script:sendMark
+
+                # The line's own echo before the next one - what the comment
+                # above always said and the loop did not do.  XOFF alone paces
+                # only once it arrives, and it comes back behind the guest's
+                # output: on the test PC (7 Nov 2026) the sender put all hundred
+                # lines of a 6 KB file on the wire in 0.3 s, the guest's UART
+                # ring overflowed into QEMU's receive throttling, and the same
+                # transfer cost QEMU four times the CPU - 63 s against 8 s for
+                # a run that happened to be paced.  The echo is a rendered
+                # screen, so escapes and line breaks are taken out before
+                # looking for the line's last characters; five seconds without
+                # it and the loop goes on as before rather than hang.
+                $tail = $hex.Substring([Math]::Max(0, $hex.Length - 16))
+                $echoBy = (Get-Date).AddSeconds(5)
+                while ((Get-Date) -lt $echoBy) {
+                    [void](Read-Available)
+                    $since = $text.ToString()
+                    if ($lineMark -lt $since.Length) { $since = $since.Substring($lineMark) } else { $since = '' }
+                    $since = ($since -replace "$([char]27)\[[0-9;?]*[A-Za-z]", '') -replace "[`r`n]", ''
+                    if ($since.Contains($tail)) { break }
+                    Start-Sleep -Milliseconds 2
+                }
 
                 # One line at a time, and never a second one while the guest has
                 # said stop.  That makes the transfer as fast as whatever is on

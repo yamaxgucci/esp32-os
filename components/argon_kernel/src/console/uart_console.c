@@ -58,6 +58,27 @@ ag_err_t ag_uart_console_attach(int port, int baud)
     if (err != AG_OK) {
         return err;
     }
+    /*
+     * Each byte in as it comes.  By default the UART hands bytes over 120 at
+     * a time and the last few of a burst only when the line has been idle for
+     * ten characters - and the last few are the Enter that ends a line.
+     *
+     * Espressif's QEMU loses that idle-line interrupt when the host is slow:
+     * its timer is one-shot, and if it fires while the interrupt handler is
+     * still busy with the previous block, the handler clears it without taking
+     * the new bytes.  They then sit in the FIFO until something else arrives.
+     * On the test PC once it became a VM (7 Nov 2026, 2.6x slower than the
+     * laptop) every `recv` in `argon test -Put` ended that way: 109 bytes in
+     * the FIFO (read with gdb), threshold 120, no timeout raised, `END` never
+     * seen - and the transfer looked a hundred times slower than it was.  With
+     * the FIFO-full interrupt at one byte, which QEMU computes from the FIFO's
+     * level rather than from a timer, the same transfer took 4 s.
+     *
+     * On a board this costs an interrupt per byte while bytes arrive - a few
+     * thousand a second during a paste, nothing at a prompt - and a keystroke
+     * no longer waits for the line to go quiet.
+     */
+    (void)ag_port_uart_rx_eager(port);
 
     s_ports[port].port = port;
     return ag_console_attach(&k_uart_transport, &s_ports[port]);

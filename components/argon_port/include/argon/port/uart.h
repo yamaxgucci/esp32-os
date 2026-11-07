@@ -25,6 +25,7 @@
  *   int32_t  ag_port_uart_read(int port, void *buf, size_t len,
  *                              uint32_t timeout_ms)
  *   int32_t  ag_port_uart_pending(int port)
+ *   ag_err_t ag_port_uart_rx_eager(int port)
  *
  * Contract, not advice:
  *
@@ -52,6 +53,11 @@
  * - pending() is what makes it possible to drain a port without blocking; a
  *   port that cannot tell returns -AG_ENOTSUP, and the caller then polls with a
  *   short read instead.
+ * - rx_eager() hands every byte to the receive buffer as it arrives, instead
+ *   of in blocks with an idle-line timeout for the tail.  For a port where the
+ *   last few bytes of a burst matter more than the interrupts - the console,
+ *   whose last bytes are the Enter that ends a line.  -AG_ENOTSUP where there
+ *   is no such setting.
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -82,6 +88,7 @@ int32_t  ag_port_uart_write(int port, const void *buf, size_t len);
 int32_t  ag_port_uart_read(int port, void *buf, size_t len,
                            uint32_t timeout_ms);
 int32_t  ag_port_uart_pending(int port);
+ag_err_t ag_port_uart_rx_eager(int port);
 
 /*
  * The same bytes, carried by hardware instead of by this thread.
