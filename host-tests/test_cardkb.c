@@ -20,21 +20,21 @@ void run_cardkb_tests(void)
     int mask = 7;
     AG_CHECK(ag_cardkb_judge(0, 0xA5, &mask) == AG_CARDKB_NONE && mask == -1);
     AG_CHECK(ag_cardkb_judge(0, 0xFF, &mask) == AG_CARDKB_NONE);
-    AG_CHECK(ag_cardkb_judge('a', 'a' ^ AG_CARDKB_CHECK, &mask) == AG_CARDKB_KEY &&
+    AG_CHECK(ag_cardkb_judge('a', AG_CARDKB_CHECK_OF('a', AG_CARDKB_CHECK), &mask) == AG_CARDKB_KEY &&
              mask == 0);
-    AG_CHECK(ag_cardkb_judge('a', 'a' ^ AG_CARDKB_CHECK1, &mask) == AG_CARDKB_KEY &&
+    AG_CHECK(ag_cardkb_judge('a', AG_CARDKB_CHECK_OF('a', AG_CARDKB_CHECK1), &mask) == AG_CARDKB_KEY &&
              mask == 1);
     AG_CHECK(ag_cardkb_judge('a', 0xFF, &mask) == AG_CARDKB_PLAIN && mask == -1);
-    AG_CHECK(ag_cardkb_judge('a', ('a' ^ AG_CARDKB_CHECK) ^ 0x04, &mask) ==
+    AG_CHECK(ag_cardkb_judge('a', AG_CARDKB_CHECK_OF('a', AG_CARDKB_CHECK) ^ 0x04, &mask) ==
              AG_CARDKB_GARBLED);
-    AG_CHECK(ag_cardkb_judge('a' ^ 0x01, 'a' ^ AG_CARDKB_CHECK, NULL) ==
+    AG_CHECK(ag_cardkb_judge('a' ^ 0x01, AG_CARDKB_CHECK_OF('a', AG_CARDKB_CHECK), NULL) ==
              AG_CARDKB_GARBLED);
     /* Every code under either mask is a key, under the mask it was sent with;
      * no single flipped bit of either byte makes a key of it under any mask. */
     int bad = 0;
     for (int k = 1; k < 256; k++) {
         for (int m = 0; m < 2; m++) {
-            const uint8_t chk = (uint8_t)(k ^ (m ? AG_CARDKB_CHECK1 : AG_CARDKB_CHECK));
+            const uint8_t chk = AG_CARDKB_CHECK_OF(k, m ? AG_CARDKB_CHECK1 : AG_CARDKB_CHECK);
             if (ag_cardkb_judge((uint8_t)k, chk, &mask) != AG_CARDKB_KEY || mask != m) {
                 bad++;
             }
@@ -51,6 +51,23 @@ void run_cardkb_tests(void)
         }
     }
     AG_CHECK(bad == 0);
+
+    /* The same bit spoiled in both bytes ('8' read as '<', 7 Nov 2026) is not
+     * a key either. */
+    int same = 0;
+    for (int k = 1; k < 256; k++) {
+        for (int m = 0; m < 2; m++) {
+            const uint8_t chk = AG_CARDKB_CHECK_OF(k, m ? AG_CARDKB_CHECK1 : AG_CARDKB_CHECK);
+            for (int bit = 0; bit < 8; bit++) {
+                const uint8_t key = (uint8_t)(k ^ (1 << bit));
+                if (key != 0 && ag_cardkb_judge(key, (uint8_t)(chk ^ (1 << bit)), NULL) ==
+                    AG_CARDKB_KEY) {
+                    same++;
+                }
+            }
+        }
+    }
+    AG_CHECK(same == 0);
 
     uint32_t ch = 0;
     uint16_t mods = 0;

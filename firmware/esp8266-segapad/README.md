@@ -95,8 +95,10 @@ Esc, Tab, arrows, Enter and Backspace. What is typed goes to `/k?c=HEX,...`
 as CardKB codes, up to 24 a request; the line under the field says how many
 wait and how many the board has taken.
 
-On the board: `drv load a:\cardkb.sys` (or `drv install` to keep it). The
-driver, `apps/cardkb`, works with a real CardKB as well.
+On the board nothing more is needed: `SEGAPAD.SYS` reads the keyboard beside
+the pad, after each read of the pad, and looks for it again every 2 s if the
+module answered later than the driver loaded. The same driver takes a real
+CardKB on the bus too, with or without a pad.
 
 Two things the stand-in does that a real CardKB does not, both because this bus
 is answered in software and the radio garbles a bit now and then:

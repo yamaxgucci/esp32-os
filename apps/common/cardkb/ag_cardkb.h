@@ -7,7 +7,7 @@
  *   0x08 Backspace   0x09 Tab   0x0D Enter   0x1B Esc   0x7F Delete
  *   0xB4 left        0xB5 up    0xB6 down    0xB7 right
  *
- * CARDKB.SYS reads two bytes.  A real CardKB has only the one, and the second
+ * SEGAPAD.SYS reads it beside the pad, two bytes at a time.  A real CardKB has only the one, and the second
  * comes back as the idle line, 0xFF.  The ESP-07 stand-in
  * (firmware/esp8266-segapad) sends the key's complement under AG_CARDKB_CHECK
  * as the second, and keeps the key until the board writes any byte back to say
@@ -37,6 +37,12 @@
  * either byte still matches neither. */
 #define AG_CARDKB_CHECK  0xA5u
 #define AG_CARDKB_CHECK1 0x5Au
+/* The check byte: the key turned three bits round, then the mask.  Turned, so
+ * the same bit spoiled in both bytes does not check - the stand-in once sent
+ * '8' as '<' and its check spoiled the same way, and a plain XOR took it
+ * (7 Nov 2026). */
+#define AG_CARDKB_CHECK_OF(key, mask) \
+    ((uint8_t)((((unsigned)(key) << 3) | ((unsigned)(key) >> 5)) ^ (mask)))
 
 #define AG_CARDKB_LEFT  0xB4u
 #define AG_CARDKB_UP    0xB5u

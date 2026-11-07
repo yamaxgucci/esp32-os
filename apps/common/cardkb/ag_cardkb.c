@@ -18,10 +18,10 @@ AG_CARDKB_FN int ag_cardkb_judge(uint8_t key, uint8_t check, int *mask)
     if (key == 0u) {
         return AG_CARDKB_NONE;
     }
-    if (check == (uint8_t)(key ^ AG_CARDKB_CHECK) ||
-        check == (uint8_t)(key ^ AG_CARDKB_CHECK1)) {
+    if (check == AG_CARDKB_CHECK_OF(key, AG_CARDKB_CHECK) ||
+        check == AG_CARDKB_CHECK_OF(key, AG_CARDKB_CHECK1)) {
         if (mask != NULL) {
-            *mask = (check == (uint8_t)(key ^ AG_CARDKB_CHECK)) ? 0 : 1;
+            *mask = (check == AG_CARDKB_CHECK_OF(key, AG_CARDKB_CHECK)) ? 0 : 1;
         }
         return AG_CARDKB_KEY;
     }

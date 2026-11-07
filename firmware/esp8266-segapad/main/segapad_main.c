@@ -65,7 +65,7 @@
 #define KB_ADDR  0x5F
 #define KB_CHECK 0xA5u
 #define KB_CHECK1 0x5Au  /* every other key: a key read again is not typed twice */
-#define KB_KEYS  64u
+#define KB_KEYS  128u
 #define CPU_MHZ  160u
 #define WAIT_CYC (CPU_MHZ * 2000u) /* 2 ms: a master that stopped mid-byte */
 #define HELD_MS  1000u             /* a page that went quiet lets go        */
@@ -269,8 +269,9 @@ static void IRAM_ATTR kb_transaction(bool read)
 {
     if (read) {
         const uint8_t k = kb_front();
-        const uint8_t seq[2] = {k, (uint8_t)(k ^ ((s_kb_tail & 1u) ? KB_CHECK1
-                                                                   : KB_CHECK))};
+        const uint8_t m = (s_kb_tail & 1u) ? KB_CHECK1 : KB_CHECK;
+        /* turned three bits round, then the mask: apps/common/cardkb */
+        const uint8_t seq[2] = {k, (uint8_t)((uint8_t)((k << 3) | (k >> 5)) ^ m)};
         unsigned i = 0;
         while (tx_byte(i < 2u ? seq[i] : 0xffu)) {
             i++;
@@ -459,6 +460,7 @@ static esp_err_t get_press(httpd_req_t *req)
 static esp_err_t get_keys(httpd_req_t *req)
 {
     char q[200], c[180];
+    unsigned took = 0;
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
         httpd_query_key_value(q, "c", c, sizeof(c)) == ESP_OK) {
         for (char *p = c; *p != '\0';) {
@@ -468,17 +470,21 @@ static esp_err_t get_keys(httpd_req_t *req)
                 break;
             }
             const unsigned h = s_kb_head;
-            if (v != 0u && v < 256u && h - s_kb_tail < KB_KEYS) {
+            if (v != 0u && v < 256u) {
+                if (h - s_kb_tail >= KB_KEYS) {
+                    break; /* full: the page keeps the rest and sends it again */
+                }
                 s_kb[h % KB_KEYS] = (uint8_t)v;
                 s_kb_head = h + 1u;
             }
+            took++;
             p = (*end == ',') ? end + 1 : end;
         }
     }
     char out[64];
-    const int n = snprintf(out, sizeof(out), "kb %u %u %u",
+    const int n = snprintf(out, sizeof(out), "kb %u %u %u %u",
                            (unsigned)(s_kb_head - s_kb_tail),
-                           (unsigned)s_kb_taken, (unsigned)s_kb_reads);
+                           (unsigned)s_kb_taken, (unsigned)s_kb_reads, took);
     httpd_resp_set_type(req, "text/plain");
     return httpd_resp_send(req, out, n);
 }

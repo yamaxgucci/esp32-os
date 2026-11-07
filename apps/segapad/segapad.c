@@ -1,7 +1,14 @@
 /*
- * ArgonOS - a Mega Drive pad on a PCF8574 (.SYS).
+ * ArgonOS - a Mega Drive pad on a PCF8574, and a keyboard beside it (.SYS).
  *
  *   drv load c:\segapad.sys
+ *
+ * THE KEYBOARD is on the same two wires, at 0x5F, answered as M5Stack's CardKB
+ * answers (apps/common/cardkb): the ESP-07 stand-in's page has a KEYS view for
+ * a phone's keyboard, and a real CardKB works too.  One driver for both, at
+ * his asking (7 Nov 2026): one task and one stack on a board where MD counts
+ * every kilobyte.  The keyboard is read after each read of the pad, in the
+ * quiet a 6-button pad needs between reads anyway.
  *
  * The pad is seven wires and the CYD has three free pins, so the pad goes
  * through an I2C port expander: two pins, IO21 and IO22 on the CN1 header,
@@ -53,6 +60,7 @@
 #include <argon/keys.h>
 #include <argon/libc.h>
 
+#include "ag_cardkb.h"
 #include "ag_segapad.h"
 
 AG_DRV("SEGAPAD", "0.1", "argon");
@@ -126,6 +134,17 @@ static struct {
     uint32_t          slow;  /* of them, with a step over STEP_SLOW_US  */
     uint32_t          worst; /* the longest step among them, us         */
     uint32_t          told_at, tallies;
+    /* The keyboard on the same bus (apps/common/cardkb): the ESP-07's page
+     * typed on a phone, or a real CardKB.  kb_addr 0 while none answers. */
+    uint8_t           kb_addr;
+    uint8_t           kb_want;     /* where to look for one                  */
+    uint32_t          kb_look_at;  /* when it was last looked for            */
+    uint16_t          kb_down;     /* the key that went down, not up yet      */
+    uint32_t          kb_down_at;
+    int               kb_mask;     /* the stand-in's mask on the last key    */
+    uint8_t           kb_key;
+    uint32_t          kb_keys, kb_twice, kb_garbled, kb_held_back;
+    int               kb_checked;  /* it has sent a checked key: the stand-in */
 } s;
 
 static void send_key(uint16_t key, int down, int repeat)
@@ -207,6 +226,127 @@ static void repeat_held(void)
     }
 }
 
+/* ---- the keyboard ------------------------------------------------------- */
+
+#define KB_UP_MS   30u   /* a typed key is a press, not a hold              */
+#define KB_LOOK_MS 2000u /* how often to look again for a keyboard not there */
+#define KB_READS   4     /* keys taken in one round at most                  */
+
+static bool kb_send(uint16_t key, uint32_t unicode, uint16_t mods, int down)
+{
+    ag_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = down ? AG_EV_KEY_DOWN : AG_EV_KEY_UP;
+    ev.key.keycode = key;
+    ev.key.unicode = down ? unicode : 0u;
+    ev.key.mods = mods;
+    return ag_inject_event(&ev);
+}
+
+/* The key that is down let go; false while the console has no room for it,
+ * and it is let go on a later round. */
+static bool kb_up(void)
+{
+    if (s.kb_down != 0u) {
+        if (!kb_send(s.kb_down, 0, 0, 0)) {
+            return false;
+        }
+        s.kb_down = 0;
+    }
+    return true;
+}
+
+/*
+ * The keys typed since the last round, after the pad's read and before its
+ * next: a read here is one transfer, and the 6-button pad needs its 1.5 ms of
+ * quiet between reads anyway.  A read whose two bytes disagree is left for the
+ * next round - the stand-in keeps the key until it is told it was taken - and
+ * the same key under the same mask is one taken already whose "taken" was
+ * lost, taken again and not typed twice ("WWorld", 7 Nov 2026).
+ */
+static void kb_poll(void)
+{
+    const uint32_t now = ag_millis();
+    if (s.kb_down != 0u && now - s.kb_down_at >= KB_UP_MS) {
+        (void)kb_up();
+    }
+    if (s.kb_addr == 0u) {
+        /* The stand-in boots with the board and may answer later than the
+         * driver loads: look again now and then. */
+        if (now - s.kb_look_at >= KB_LOOK_MS) {
+            s.kb_look_at = now;
+            if (ag_i2c_probe(s.bus, s.kb_want) == AG_OK) {
+                s.kb_addr = s.kb_want;
+                ag_log(AG_LOG_INFO, "SEGAPAD", "a keyboard at 0x%02x",
+                       (unsigned)s.kb_addr);
+            }
+        }
+        return;
+    }
+    for (int n = 0; n < KB_READS; n++) {
+        uint8_t rd[2] = {0, 0};
+        if (ag_i2c_read(s.bus, s.kb_addr, rd, sizeof(rd), BUS_MS) != AG_OK) {
+            return;
+        }
+        int mask = -1;
+        int said = ag_cardkb_judge(rd[0], rd[1], &mask);
+        if (said == AG_CARDKB_NONE) {
+            return;
+        }
+        /*
+         * 0xFF after the key is a real CardKB, which sends one byte - or the
+         * stand-in, which sends two, losing its second to the radio and
+         * leaving the line high.  Taken as a CardKB's, that key went in
+         * unchecked and untaken, came again, and went in twice: 627 keys for
+         * 600 sent (7 Nov 2026).  So once this keyboard has sent one checked
+         * key, it is the stand-in, and an unchecked read is a garbled one.
+         */
+        if (said == AG_CARDKB_PLAIN && s.kb_checked) {
+            said = AG_CARDKB_GARBLED;
+        }
+        if (said == AG_CARDKB_KEY) {
+            s.kb_checked = 1;
+        }
+        if (said == AG_CARDKB_GARBLED) {
+            s.kb_garbled++;
+            return;
+        }
+        const uint8_t took = 0u;
+        if (said == AG_CARDKB_KEY && mask == s.kb_mask && rd[0] == s.kb_key) {
+            /* typed already; its "taken" was lost */
+            (void)ag_i2c_write(s.bus, s.kb_addr, &took, 1, BUS_MS);
+            s.kb_twice++;
+            continue;
+        }
+        uint32_t ch = 0;
+        uint16_t mods = 0;
+        const uint16_t key = ag_cardkb_key(rd[0], &ch, &mods);
+        if (key != 0u) {
+            if (!kb_up()) { /* the one before, typed faster than KB_UP_MS */
+                s.kb_held_back++;
+                return;
+            }
+            /* The console's queue full: the key stays with the stand-in, not
+             * taken, and comes again next round - a paste is typed only as
+             * fast as the shell reads it. */
+            if (!kb_send(key, ch, mods, 1)) {
+                s.kb_held_back++;
+                return;
+            }
+            s.kb_down = key;
+            s.kb_down_at = ag_millis();
+            s.kb_keys++;
+        }
+        if (said == AG_CARDKB_KEY) {
+            (void)ag_i2c_write(s.bus, s.kb_addr, &took, 1, BUS_MS);
+            s.kb_mask = mask;
+            s.kb_key = rd[0];
+        }
+    }
+}
+
+/* ---- the pad ------------------------------------------------------------ */
+
 /* One read: eight steps, then SELECT back high.  -1 when the bus failed. */
 static int read_pad(uint16_t *held)
 {
@@ -255,6 +395,11 @@ static void pad_task(void *arg)
                    (unsigned)(t0 - last), (unsigned)s.held);
         }
         last = t0;
+        if (s.addr == 0u) { /* a keyboard and no pad on this bus */
+            kb_poll();
+            ag_delay(POLL_MS);
+            continue;
+        }
         uint16_t  held = 0;
         const int kind = read_pad(&held);
         if (kind < 0) {
@@ -325,9 +470,17 @@ static void pad_task(void *arg)
             s.worst = 0;
         }
         repeat_held();
+        kb_poll();
         ag_delay(POLL_MS);
     }
     apply(0);
+    (void)kb_up();
+    if (s.kb_keys != 0u || s.kb_garbled != 0u) {
+        ag_log(AG_LOG_INFO, "SEGAPAD", "keyboard: %u keys, %u read twice, %u "
+               "garbled reads, %u held back for the console",
+               (unsigned)s.kb_keys, (unsigned)s.kb_twice,
+               (unsigned)s.kb_garbled, (unsigned)s.kb_held_back);
+    }
 }
 
 static void pad_fini(void)
@@ -345,7 +498,11 @@ ag_err_t ag_driver_init(void)
     const ag_cfg_api_t *cfg = ag_api()->cfg;
     const int32_t bus = (cfg != NULL) ? cfg->get_int("pad.bus", 0) : 0;
     const int32_t addr = (cfg != NULL) ? cfg->get_int("pad.addr", 0) : 0;
+    const int32_t kb = (cfg != NULL) ? cfg->get_int("kbd.addr", AG_CARDKB_ADDR)
+                                     : (int32_t)AG_CARDKB_ADDR;
     memset(&s, 0, sizeof(s));
+    s.kb_mask = -1;
+    s.kb_want = (kb >= 0x08 && kb <= 0x77) ? (uint8_t)kb : (uint8_t)AG_CARDKB_ADDR;
     if (bus < 0) {
         ag_printf("SEGAPAD: pad.bus %d is not a bus\n", (int)bus);
         return -AG_ERANGE;
@@ -379,21 +536,34 @@ ag_err_t ag_driver_init(void)
                 s.addr = a;
             }
         }
-        if (s.addr == 0u) {
-            ag_printf("SEGAPAD: no PCF8574 on i2c%d at 0x20..0x27 or "
-                      "0x38..0x3f\n", s.bus);
-            return -AG_ENOENT;
-        }
+    }
+    /* The keyboard: the ESP-07 stand-in answers there beside its pad, and a
+     * real CardKB on its own. */
+    if (found(s.kb_want)) {
+        s.kb_addr = s.kb_want;
+    }
+    s.kb_look_at = ag_millis();
+    if (s.addr == 0u && s.kb_addr == 0u) {
+        ag_printf("SEGAPAD: no PCF8574 on i2c%d at 0x20..0x27 or 0x38..0x3f, "
+                  "and no keyboard at 0x%02x\n", s.bus, (unsigned)s.kb_want);
+        return -AG_ENOENT;
     }
 
     const uint8_t idle = 0xffu;
-    (void)ag_i2c_write(s.bus, s.addr, &idle, 1, BUS_MS);
+    if (s.addr != 0u) {
+        (void)ag_i2c_write(s.bus, s.addr, &idle, 1, BUS_MS);
+    }
     ag_module_on_unload(pad_fini);
     if (!ag_module_task(pad_task, NULL, "ag_segapad", 3072u, PAD_PRIO,
                         AG_THREAD_SYS_CORE)) {
         return -AG_ENOMEM;
     }
-    ag_printf("SEGAPAD: PCF8574 on i2c%d at 0x%02x, read every %u ms\n",
-              s.bus, (unsigned)s.addr, (unsigned)POLL_MS);
+    if (s.addr != 0u) {
+        ag_printf("SEGAPAD: PCF8574 on i2c%d at 0x%02x, read every %u ms\n",
+                  s.bus, (unsigned)s.addr, (unsigned)POLL_MS);
+    }
+    ag_printf("SEGAPAD: keyboard %s 0x%02x\n",
+              s.kb_addr != 0u ? "at" : "not there yet, looking at",
+              (unsigned)s.kb_want);
     return AG_OK;
 }

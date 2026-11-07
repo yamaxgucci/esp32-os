@@ -785,6 +785,18 @@ bool ag_console_inject_event(const ag_event_t *ev)
     if (ev->type == AG_EV_NONE) {
         return false;
     }
+    /*
+     * False when there is no room, rather than an event dropped inside
+     * publish() with true said all the same.  A driver with a queue of its own
+     * keeps the event and offers it again: keys pasted on the phone into the
+     * pad stand-in's keyboard came down faster than the shell ran the lines
+     * they made, and the start of every line after the first was gone (CYD,
+     * 7 Nov 2026).  Two slots, so a press is never let in without room for
+     * its release.
+     */
+    if (ag_port_queue_space(s_events) < 2u) {
+        return false;
+    }
     publish(ev);
     return true;
 }

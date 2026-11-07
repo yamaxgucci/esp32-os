@@ -88,8 +88,10 @@ static const char k_page[] =
 "function kput(c){kq.push(c);ksend()}"
 "function ksend(){if(kbusy)return;var e=kq.splice(0,24);kbusy=1;"
 "fetch('/k'+(e.length?'?c='+e.map(hx).join(','):'')).then(function(r){return r.text()}).then(function(t){"
-"var p=t.split(' ');kst.textContent='waiting '+p[1]+', the board took '+p[2]}).catch(function(){"
-"kq=e.concat(kq);kst.textContent='no answer'}).then(function(){kbusy=0;if(kq.length)ksend()})}"
+"var p=t.split(' '),n=+p[4];if(n<e.length)kq=e.slice(n).concat(kq);"
+"kst.textContent='waiting '+(+p[1]+kq.length)+', the board took '+p[2]}).catch(function(){"
+"kq=e.concat(kq);kst.textContent='no answer'}).then(function(){kbusy=0;"
+"if(kq.length)setTimeout(ksend,kq.length>24?100:0)})}"
 "setInterval(function(){if(kbOn)ksend()},700);"
 "</script></body></html>";
 
