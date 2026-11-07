@@ -29,6 +29,7 @@ void run_licence_tests(void);
 void run_codepage_tests(void);
 void run_hidrep_tests(void);
 void run_segapad_tests(void);
+void run_cardkb_tests(void);
 void run_mdpad_tests(void);
 void run_reslist_tests(void);
 void run_arena_tests(void);
@@ -104,6 +105,7 @@ int main(void)
     run_espldr_tests();
     run_stm32ldr_tests();
     run_segapad_tests();
+    run_cardkb_tests();
     run_mdpad_tests();
 
     printf("%d checks, %d failures\n", ag_test_checks, ag_test_failures);

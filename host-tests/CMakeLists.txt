@@ -195,6 +195,8 @@ add_executable(argon_tests
     "${ARGON_ROOT}/apps/common/stm32/ag_stm32ldr.c"
     test_segapad.c
     "${ARGON_ROOT}/apps/common/segapad/ag_segapad.c"
+    test_cardkb.c
+    "${ARGON_ROOT}/apps/common/cardkb/ag_cardkb.c"
     # MD's pad port: the file itself, #included (its save state is stubbed)
     test_mdpad.c
     ${ARGON_CRYPTO_SRCS}

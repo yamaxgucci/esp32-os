@@ -382,6 +382,12 @@
       "include": ["apps/common/segapad"],
       "src": ["apps/segapad/segapad.c", "apps/common/segapad/ag_segapad.c"]
     },
+    {
+      "out": "CARDKB.SYS", "group": "board",
+      "_note": "A keyboard on I2C that answers like M5Stack's CardKB at 0x5F: a real CardKB, or the ESP-07 Sega pad stand-in with a keyboard typed on a phone. Reads it every 10 ms on the system core and gives keys with their characters (US layout, Enter, Backspace, Tab, Esc, Delete, arrows). A key is taken only when its check byte agrees, and the stand-in keeps it until the board writes back. [kbd] bus/addr in SYSTEM.CFG. Logic in apps/common/cardkb.",
+      "include": ["apps/common/cardkb"],
+      "src": ["apps/cardkb/cardkb.c", "apps/common/cardkb/ag_cardkb.c"]
+    },
 
     {
       "out": "AGVM.AXE", "group": "core",

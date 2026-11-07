@@ -86,6 +86,32 @@ to the second slot and `esp_ota_end` refused it (0x1503,
 ESP_ERR_OTA_VALIDATE_FAILED: the entry point was outside the slot). On
 5 November it went 0 to 1, 1 to 0 and 0 to 1 again.
 
+## A keyboard on the same two wires
+
+The module answers a second address, 0x5F, as M5Stack's CardKB does: a read is
+the key at the head of a queue. The page's **KEYS** button (top right) swaps
+the pad for a text field, which brings up the phone's keyboard, and a row of
+Esc, Tab, arrows, Enter and Backspace. What is typed goes to `/k?c=HEX,...`
+as CardKB codes, up to 24 a request; the line under the field says how many
+wait and how many the board has taken.
+
+On the board: `drv load a:\cardkb.sys` (or `drv install` to keep it). The
+driver, `apps/cardkb`, works with a real CardKB as well.
+
+Two things the stand-in does that a real CardKB does not, both because this bus
+is answered in software and the radio garbles a bit now and then:
+
+- A read is two bytes, the key and a check byte - the key under 0xA5 or 0x5A,
+  the mask changing with every key. A read whose bytes disagree is read again.
+- The key stays at the head until the board writes any byte back. A board that
+  read a key and whose "taken" was lost reads it again under the same mask, and
+  does not type it twice. Measured on the CYD (7 Nov 2026): a 67-character line
+  typed three times, all 201 keys arrived, one of them read twice and dropped
+  as such; before the mask changed per key, the same test typed "WWorld".
+
+Only Latin letters, digits and ASCII punctuation reach the board (US layout);
+the page says so when something else is typed.
+
 ## The page and the module talk in states
 
 `/p?m=HEX&e=HEX,...`: `m` is what is held now, `e` every state the buttons went

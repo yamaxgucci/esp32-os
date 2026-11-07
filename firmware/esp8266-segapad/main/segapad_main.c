@@ -57,6 +57,15 @@
 #define SCL_BIT (1u << SCL_PIN)
 
 #define PCF_ADDR 0x20
+/* A keyboard typed on the phone, answered as M5Stack's CardKB answers at 0x5F
+ * (apps/common/cardkb): a read is the key at the head of the queue and its
+ * check byte, and the key stays there until the board writes any byte to say
+ * it has it - this bus is answered in software, and a garbled read must be
+ * asked again, not lost. */
+#define KB_ADDR  0x5F
+#define KB_CHECK 0xA5u
+#define KB_CHECK1 0x5Au  /* every other key: a key read again is not typed twice */
+#define KB_KEYS  64u
 #define CPU_MHZ  160u
 #define WAIT_CYC (CPU_MHZ * 2000u) /* 2 ms: a master that stopped mid-byte */
 #define HELD_MS  1000u             /* a page that went quiet lets go        */
@@ -109,6 +118,11 @@ static uint8_t            s_last_write;
  * (and the last one), and STARTs that came too late to follow. */
 static volatile uint32_t  s_irqs, s_addrs, s_late;
 static volatile uint8_t   s_last_addr;
+/* The keys the page sent, oldest first: httpd adds at the head, the bus takes
+ * from the tail when the board says it has the key there. */
+static uint8_t            s_kb[KB_KEYS];
+static volatile unsigned  s_kb_head, s_kb_tail;
+static volatile uint32_t  s_kb_reads, s_kb_taken;
 
 static inline uint32_t lines(void)
 {
@@ -245,6 +259,42 @@ static uint8_t IRAM_ATTR port_read(void)
     return (uint8_t)(ag_segapad_model_read(&s_pad) & (s_latch | 0x3fu));
 }
 
+static inline uint8_t IRAM_ATTR kb_front(void)
+{
+    return (s_kb_tail != s_kb_head) ? s_kb[s_kb_tail % KB_KEYS] : 0u;
+}
+
+/* The keyboard's half of a transaction, after its address was acknowledged. */
+static void IRAM_ATTR kb_transaction(bool read)
+{
+    if (read) {
+        const uint8_t k = kb_front();
+        const uint8_t seq[2] = {k, (uint8_t)(k ^ ((s_kb_tail & 1u) ? KB_CHECK1
+                                                                   : KB_CHECK))};
+        unsigned i = 0;
+        while (tx_byte(i < 2u ? seq[i] : 0xffu)) {
+            i++;
+        }
+        s_kb_reads++;
+        return;
+    }
+    bool taken = false;
+    for (;;) {
+        const int d = rx_byte();
+        if (d < 0) {
+            return;
+        }
+        if (!taken && s_kb_tail != s_kb_head) {
+            s_kb_tail = s_kb_tail + 1u;
+            s_kb_taken++;
+        }
+        taken = true;
+        if (!ack()) {
+            return;
+        }
+    }
+}
+
 static void IRAM_ATTR transaction(void)
 {
     for (;;) {
@@ -260,6 +310,12 @@ static void IRAM_ATTR transaction(void)
         }
         s_addrs++;
         s_last_addr = (uint8_t)a;
+        if ((a >> 1) == KB_ADDR) {
+            if (ack()) {
+                kb_transaction((a & 1) != 0);
+            }
+            return;
+        }
         if ((a >> 1) != PCF_ADDR) {
             return; /* not ours: let the next START find us */
         }
@@ -396,6 +452,38 @@ static esp_err_t get_press(httpd_req_t *req)
 }
 
 /*
+ * /k?c=HEX,HEX...: keys typed on the page, CardKB codes, queued for the board
+ * in order.  The answer says how many are waiting and how many the board has
+ * taken, so the page can show that the keys arrive.
+ */
+static esp_err_t get_keys(httpd_req_t *req)
+{
+    char q[200], c[180];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "c", c, sizeof(c)) == ESP_OK) {
+        for (char *p = c; *p != '\0';) {
+            char *end = p;
+            const unsigned long v = strtoul(p, &end, 16);
+            if (end == p) {
+                break;
+            }
+            const unsigned h = s_kb_head;
+            if (v != 0u && v < 256u && h - s_kb_tail < KB_KEYS) {
+                s_kb[h % KB_KEYS] = (uint8_t)v;
+                s_kb_head = h + 1u;
+            }
+            p = (*end == ',') ? end + 1 : end;
+        }
+    }
+    char out[64];
+    const int n = snprintf(out, sizeof(out), "kb %u %u %u",
+                           (unsigned)(s_kb_head - s_kb_tail),
+                           (unsigned)s_kb_taken, (unsigned)s_kb_reads);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, out, n);
+}
+
+/*
  * POST /ota with the application image as the body: written to the other
  * slot, made the one to boot, and the module restarts into it.  A module in
  * the CYD's CN1 has no GPIO0 within reach, so this is how it is updated.
@@ -500,10 +588,12 @@ static void http_start(void)
     }
     static const httpd_uri_t page = {"/", HTTP_GET, get_page, NULL};
     static const httpd_uri_t press = {"/p", HTTP_GET, get_press, NULL};
+    static const httpd_uri_t keys = {"/k", HTTP_GET, get_keys, NULL};
     static const httpd_uri_t ota = {"/ota", HTTP_POST, post_ota, NULL};
     static const httpd_uri_t slot = {"/ota", HTTP_GET, get_ota, NULL};
     httpd_register_uri_handler(h, &page);
     httpd_register_uri_handler(h, &press);
+    httpd_register_uri_handler(h, &keys);
     httpd_register_uri_handler(h, &ota);
     httpd_register_uri_handler(h, &slot);
 }
