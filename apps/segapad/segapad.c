@@ -40,10 +40,12 @@
  * the phone's pad does the same, and MD already tells a repeat from a press.
  *
  * WHEN.  A task of its own on the system core reads the pad POLL_MS apart.
- * One read is eight write-and-read pairs on the bus, about 4 ms at 100 kHz;
- * the 6-button pad forgets its count after 1.5 ms of quiet, which the gap
- * between reads is far longer than.  100 kHz because that is the PCF8574's
- * speed - [i2c0] khz in BOARD.CFG.
+ * One read is six steps under repeated STARTs (read_pad_steps), about 1.4 ms
+ * at 400 kHz; the 6-button pad forgets its count after a quiet - 1.5 ms by
+ * Sega's book, ~400 us on the one on the CYD at 3.3 V - which the gap
+ * between reads is far longer than and a step must not be.  400 kHz is past
+ * the PCF8574's datasheet and what that pad needs ([i2c0] khz in the CYD's
+ * BOARD.CFG).
  *
  * A pad pulled out, or a bus that stops answering, lets every key go at once,
  * so nothing stays held on a pad that is not there; the journal says when it
@@ -133,6 +135,9 @@ static struct {
     uint32_t          reads; /* since the last tally in the journal     */
     uint32_t          slow;  /* of them, with a step over STEP_SLOW_US  */
     uint32_t          worst; /* the longest step among them, us         */
+    uint32_t          no6;   /* of them, a 6-button pad answering as a 3 */
+    int               no_steps; /* the kernel has no i2c_steps: a transfer a step */
+    uint32_t          retried;  /* reads asked again for the 6-button step */
     uint32_t          told_at, tallies;
     /* The keyboard on the same bus (apps/common/cardkb): the ESP-07's page
      * typed on a phone, or a real CardKB.  kb_addr 0 while none answers. */
@@ -347,12 +352,70 @@ static void kb_poll(void)
 
 /* ---- the pad ------------------------------------------------------------ */
 
+/*
+ * One read as six steps under repeated STARTs (ag_i2c_steps, ABI 0.78): two
+ * transactions on the ESP32 where eight transfers were, with the bus's own
+ * pace between the edges instead of the program's.  The pad on the CYD (a
+ * 6-button one at 3.3 V) forgets its count after ~400 us without an edge:
+ * measured 9 Nov 2026 with a pause before step 5, kept at +50 us and lost at
+ * +100 on 330 us steps.  A transfer each, at 400 kHz, kept it at rest, and
+ * lost it in 4-12% of the reads while The Lost Vikings ran - and in a third
+ * while MD also printed its stats.  Steps 2 and 4 are only edges (the decode
+ * reads 0 1 3 5 6 7), so each goes out as a second byte of the step after
+ * it; the PCF8574 sets its port at each byte's ACK.
+ *
+ * 1 when it read, 0 when the kernel has no i2c_steps (before 0.78), -1 when
+ * the bus failed.
+ */
+static int read_pad_steps(uint8_t rd[AG_SEGAPAD_STEPS])
+{
+    static const uint8_t hi = 0xffu;
+    static const uint8_t lo = (uint8_t)(0xffu & ~AG_SEGAPAD_SELECT);
+    static const uint8_t hilo[2] = {0xffu, (uint8_t)(0xffu & ~AG_SEGAPAD_SELECT)};
+    const ag_i2c_step_t steps[] = {
+        {.wbuf = &hi, .rbuf = &rd[0], .wlen = 1, .rlen = 1},
+        {.wbuf = &lo, .rbuf = &rd[1], .wlen = 1, .rlen = 1},
+        {.wbuf = hilo, .rbuf = &rd[3], .wlen = 2, .rlen = 1},
+        {.wbuf = hilo, .rbuf = &rd[5], .wlen = 2, .rlen = 1},
+        {.wbuf = &hi, .rbuf = &rd[6], .wlen = 1, .rlen = 1},
+        {.wbuf = &lo, .rbuf = &rd[7], .wlen = 1, .rlen = 1},
+    };
+    const ag_err_t err = ag_i2c_steps(s.bus, s.addr, steps,
+                                      sizeof(steps) / sizeof(steps[0]), BUS_MS);
+    if (err == -AG_ENOSYS) {
+        return 0;
+    }
+    if (err != AG_OK) {
+        return -1;
+    }
+    rd[2] = rd[0];
+    rd[4] = rd[0];
+    return 1;
+}
+
 /* One read: eight steps, then SELECT back high.  -1 when the bus failed. */
 static int read_pad(uint16_t *held)
 {
     uint8_t rd[AG_SEGAPAD_STEPS];
     uint32_t worst = 0;
     s.reads++;
+    if (!s.no_steps) {
+        const ag_time_t t0 = ag_micros();
+        const int r = read_pad_steps(rd);
+        if (r != 0) {
+            const uint8_t idle = ag_segapad_out(0);
+            (void)ag_i2c_write(s.bus, s.addr, &idle, 1, BUS_MS);
+            if (r < 0) {
+                return -1;
+            }
+            worst = (uint32_t)(ag_micros() - t0);
+            if (worst > s.worst) {
+                s.worst = worst;
+            }
+            return ag_segapad_decode(rd, held);
+        }
+        s.no_steps = 1;
+    }
     for (int i = 0; i < AG_SEGAPAD_STEPS; i++) {
         const uint8_t   out = ag_segapad_out(i);
         const ag_time_t t0 = ag_micros();
@@ -401,7 +464,17 @@ static void pad_task(void *arg)
             continue;
         }
         uint16_t  held = 0;
-        const int kind = read_pad(&held);
+        int       kind = read_pad(&held);
+        if (kind == AG_SP_3BTN && s.kind == AG_SP_6BTN) {
+            /* The count ran out somewhere in the read: once more, after the
+             * quiet that starts a new one - two transactions on the ESP32
+             * leave one gap a busy core can stretch past ~400 us, 1-2% of
+             * reads while MD ran (9 Nov 2026), and X Y Z Mode would wait for
+             * the next read. */
+            s.retried++;
+            ag_delay(2);
+            kind = read_pad(&held);
+        }
         if (kind < 0) {
             s.errs++;
         }
@@ -438,6 +511,7 @@ static void pad_task(void *arg)
                 s.six = (uint16_t)(held & six);
             } else if (s.kind == AG_SP_6BTN) {
                 held = (uint16_t)((held & ~six) | s.six);
+                s.no6++;
             }
             /* A change counts when two reads in a row agree on it, 12 ms
              * apart - a frame, about, which is how often a Mega Drive game
@@ -461,13 +535,16 @@ static void pad_task(void *arg)
              * pad's count (the CYD's MD drawer once held them up, 6 Nov) */
             s.tallies++;
             ag_log(AG_LOG_INFO, "SEGAPAD", "%u reads, %u with a step over %u us, "
-                   "the longest %u us; %u bus errors so far", (unsigned)s.reads,
+                   "the longest %u us, %u asked again and %u without the "
+                   "6-button step; %u bus errors so far", (unsigned)s.reads,
                    (unsigned)s.slow, (unsigned)STEP_SLOW_US, (unsigned)s.worst,
-                   (unsigned)s.errs);
+                   (unsigned)s.retried, (unsigned)s.no6, (unsigned)s.errs);
             s.told_at = t0;
             s.reads = 0;
             s.slow = 0;
             s.worst = 0;
+            s.no6 = 0;
+            s.retried = 0;
         }
         repeat_held();
         kb_poll();
