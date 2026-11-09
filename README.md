@@ -89,7 +89,7 @@ on its own task and core with almost all of the RAM.
 
 | | |
 |---|---|
-| Mega Drive / Genesis emulator | [docs/user/08-mega-drive.md](docs/user/08-mega-drive.md) |
+| Mega Drive / Genesis emulator: from the shop to a build from source | [docs/mega-drive.md](docs/mega-drive.md) |
 | Master System emulator | [apps/sms](apps/sms/README.md) |
 | Game Boy emulator | `apps/gb` |
 | Fallout 1 and 2 (the engine is built from upstream plus our patches, not shipped) | [apps/fallout](apps/fallout/README.md) |
