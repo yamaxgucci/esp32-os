@@ -74,6 +74,20 @@ extern "C" {
  * The stack is clamped to 2..64 KB and comes out of internal SRAM for as long as
  * the process lives; the arena comes from extended memory.
  */
+/*
+ * The oldest ABI minor the image runs on, which is what its header says and
+ * what the loader checks it against (a kernel refuses a newer minor).  The
+ * tables only ever grow at the end, so an image that calls nothing past an
+ * older minor - or asks AG_HAS first, as every wrapper here does for its own
+ * addition - may say so, and older firmware loads it.  Define it before this
+ * header is included:
+ *
+ *     #define AG_APP_ABI_MINOR 77u   // MD: nothing past fs->media
+ */
+#ifndef AG_APP_ABI_MINOR
+#define AG_APP_ABI_MINOR AG_ABI_MINOR
+#endif
+
 #define AG_APP_SIZED(app_name, app_version, app_author, app_flags,           \
                      app_stack, app_heap)                                    \
     AG_LINKAGE const ag_api_t *g_ag_api = NULL;                              \
@@ -81,7 +95,7 @@ extern "C" {
     const ag_app_header_t __ag_app_header = {                                \
         .magic = AG_AXE_MAGIC,                                               \
         .abi_major = AG_ABI_MAJOR,                                           \
-        .abi_minor = AG_ABI_MINOR,                                           \
+        .abi_minor = AG_APP_ABI_MINOR,                                       \
         .flags = (app_flags),                                                \
         .stack_size = (app_stack),                                           \
         .heap_size = (app_heap),                                             \

@@ -58,6 +58,9 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
+/* ag_i2c_steps (0.78) is asked for and falls back without it: firmware
+ * from before it loads this driver and reads the pad a transfer a step. */
+#define AG_APP_ABI_MINOR 77u
 #include <argon/argon.h>
 #include <argon/keys.h>
 #include <argon/libc.h>

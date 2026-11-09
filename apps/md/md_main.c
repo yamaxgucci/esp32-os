@@ -12,6 +12,9 @@
  *
  * Copyright (c) 2026 ArgonOS contributors.  SPDX-License-Identifier: Apache-2.0
  */
+/* Nothing past fs->media (0.77): the shop's MD runs on the firmware boards
+ * already have. */
+#define AG_APP_ABI_MINOR 77u
 #include <argon/argon.h>
 #include <argon/keys.h>
 
