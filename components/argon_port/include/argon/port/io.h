@@ -255,6 +255,9 @@ ag_err_t ag_port_i2c_read(int bus, uint8_t addr, void *buf, size_t len,
 ag_err_t ag_port_i2c_wrrd(int bus, uint8_t addr, const void *wbuf, size_t wlen,
                           void *rbuf, size_t rlen, uint32_t timeout_ms);
 ag_err_t ag_port_i2c_probe(int bus, uint8_t addr, uint32_t timeout_ms);
+/* Steps checked by the caller (io.c): wlen <= AG_I2C_STEP_WMAX, not both 0. */
+ag_err_t ag_port_i2c_steps(int bus, uint8_t addr, const ag_i2c_step_t *steps,
+                           size_t n, uint32_t timeout_ms);
 
 ag_err_t ag_port_spi_open(int bus, int sck, int mosi, int miso, uint32_t khz);
 ag_err_t ag_port_spi_set_khz(int bus, int cs, uint32_t khz);

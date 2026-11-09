@@ -537,6 +537,18 @@ static inline ag_err_t ag_i2c_wrrd(int bus, uint8_t addr, const void *wbuf,
                                   timeout_ms);
 }
 
+/* Writes and reads back to back under repeated STARTs (see i2c_steps in
+ * abi.h); -AG_ENOSYS before 0.78. */
+static inline ag_err_t ag_i2c_steps(int bus, uint8_t addr,
+                                    const ag_i2c_step_t *steps, size_t n,
+                                    uint32_t timeout_ms)
+{
+    if (!AG_HAS(g_ag_api->io, i2c_steps)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->io->i2c_steps(bus, addr, steps, n, timeout_ms);
+}
+
 /* cs < 0 leaves the chip select to the caller.  At most 1024 bytes at a time. */
 static inline ag_err_t ag_spi_xfer(int bus, int cs, const void *tx, void *rx,
                                    size_t len)

@@ -533,9 +533,15 @@ extern "C" {
  * 0.77 fs->media (3 Nov 2026): an application lets the card go and mounts it
  *      again - the Mega Drive picks a game from the card and then needs the
  *      card's memory for the machine.  APPENDED past unmap.
+ *
+ * 0.78 io->i2c_steps (9 Nov 2026): writes and reads to one chip back to back
+ *      under repeated STARTs, as many in one transaction as the controller
+ *      holds - a 6-button pad behind a PCF8574 forgets its count in ~400 us
+ *      and eight transfers had a program's gap between each.  APPENDED past
+ *      spi_write_wait.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 77u
+#define AG_ABI_MINOR 78u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -2295,6 +2301,20 @@ typedef struct {
     uint8_t  rsv[3];
 } ag_spilink_block_t;
 
+/*
+ * One step of ag_io_api_t.i2c_steps: wlen bytes written to the chip, then
+ * rlen read back into rbuf.  Either length may be 0; wlen at most
+ * AG_I2C_STEP_WMAX.
+ */
+#define AG_I2C_STEP_WMAX 15u
+typedef struct {
+    const uint8_t *wbuf;
+    uint8_t       *rbuf;
+    uint8_t        wlen;
+    uint8_t        rlen;
+    uint8_t        rsv[2];
+} ag_i2c_step_t;
+
 typedef struct ag_io_api {
     uint32_t size;
 
@@ -2535,6 +2555,21 @@ typedef struct ag_io_api {
      */
     ag_err_t (*spi_write_start)(int bus, int cs, const void *tx, size_t len);
     ag_err_t (*spi_write_wait)(int bus);
+
+    /*
+     * ABI 0.78: n steps to one chip, each written and read under a repeated
+     * START right after the one before - as many in one transaction as the
+     * controller's command list holds (three of one byte out and one in on
+     * the ESP32, one on the S3), and the bus held between transactions.  For
+     * a chip whose state runs out between transfers: a 6-button Mega Drive
+     * pad behind a PCF8574 counts SELECT's edges and forgets the count after
+     * ~400 us without one (the CYD's, at 3.3 V), and a transfer each with the
+     * program's own time between them lost it in a third of the reads while
+     * a game drew.  A step's write lands at its last byte's ACK, so several
+     * bytes in one step are several edges ~22 us apart at 400 kHz.
+     */
+    ag_err_t (*i2c_steps)(int bus, uint8_t addr, const ag_i2c_step_t *steps,
+                          size_t n, uint32_t timeout_ms);
 } ag_io_api_t;
 
 /* ------------------------------------------------------------------------ */

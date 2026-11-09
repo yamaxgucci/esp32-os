@@ -498,9 +498,19 @@ ag_err_t ag_io_i2c_up(int bus)
  * Mega Drive pad - eight transfers at 50 kHz, every 8 ms - stopped every SPI
  * write on the panel's bus behind it for up to 8 ms, and the glass got rows
  * at 140 us each where the wire takes 64 (6 Nov 2026).
+ *
+ * And not even that once the bus is up - `up` is set once and never cleared.
+ * The panel's SPI writes hold the lock for a row or a band at a time, and a
+ * read of a 6-button pad is eight transfers each of which waited its turn
+ * behind them: the pad forgets its count after ~400 us without SELECT moving
+ * (the one on the CYD, at 3.3 V), and a third of its reads lost it while MD
+ * drew (9 Nov 2026).
  */
 static ag_err_t i2c_ready(int bus)
 {
+    if (bus >= 0 && bus < AG_I2C_BUSES && s_i2c[bus].up) {
+        return AG_OK;
+    }
     lock();
     const ag_err_t err = i2c_bring_up(bus);
     unlock();
@@ -543,6 +553,27 @@ static ag_err_t io_i2c_wrrd(int bus, uint8_t addr, const void *wbuf,
     return (err != AG_OK) ? err
                           : ag_port_i2c_wrrd(bus, addr, wbuf, wlen, rbuf, rlen,
                                              timeout_ms);
+}
+
+/* Steps back to back under repeated STARTs (ABI 0.78, abi.h). */
+static ag_err_t io_i2c_steps(int bus, uint8_t addr, const ag_i2c_step_t *steps,
+                             size_t n, uint32_t timeout_ms)
+{
+    if (steps == NULL || n == 0) {
+        return -AG_EINVAL;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (steps[i].wlen > AG_I2C_STEP_WMAX ||
+            (steps[i].wlen != 0 && steps[i].wbuf == NULL) ||
+            (steps[i].rlen != 0 && steps[i].rbuf == NULL) ||
+            (steps[i].wlen == 0 && steps[i].rlen == 0)) {
+            return -AG_EINVAL;
+        }
+    }
+
+    const ag_err_t err = i2c_ready(bus);
+    return (err != AG_OK) ? err
+                          : ag_port_i2c_steps(bus, addr, steps, n, timeout_ms);
 }
 
 /*
@@ -1650,6 +1681,7 @@ const ag_io_api_t ag_io_api_table = {
     .uart_link_recv2 = ag_uartlink_recv2,
     .spi_write_start = io_spi_write_start,
     .spi_write_wait = io_spi_write_wait,
+    .i2c_steps = io_i2c_steps,
 };
 
 ag_err_t ag_io_init(void)

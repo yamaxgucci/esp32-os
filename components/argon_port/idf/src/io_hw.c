@@ -16,6 +16,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h" /* xTaskGetTickCount: the deadline a reap works to */
 #include "driver/i2c_master.h"
+#include "soc/soc_caps.h" /* SOC_I2C_CMD_REG_NUM: steps in one transaction */
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "driver/spi_slave.h"
@@ -382,6 +383,73 @@ ag_err_t ag_port_i2c_wrrd(int bus, uint8_t addr, const void *wbuf, size_t wlen,
     if (err == AG_OK) {
         err = from_esp(i2c_master_transmit_receive(dev, wbuf, wlen, rbuf, rlen,
                                                    (int)timeout_ms));
+    }
+    xSemaphoreGive(s_i2c[bus].lock);
+    return err;
+}
+
+/*
+ * Steps back to back (ABI 0.78): START and the step's bytes, a repeated START
+ * and the step's bytes in, then the next step - as many in one transaction as
+ * the controller's command list holds, and the bus's lock held from the first
+ * transaction to the last so nothing else comes between them.  The driver
+ * puts the device's address in after each START itself (a write's into the
+ * same command, a read's as a command of its own), so the list is counted in
+ * the controller's commands, not in operations: SOC_I2C_CMD_REG_NUM of them,
+ * a STOP included - three steps of a byte out and a byte in on the ESP32.
+ */
+ag_err_t ag_port_i2c_steps(int bus, uint8_t addr, const ag_i2c_step_t *steps,
+                           size_t n, uint32_t timeout_ms)
+{
+    if (!i2c_take(bus)) {
+        return -AG_ENODEV;
+    }
+    i2c_master_dev_handle_t dev = NULL;
+    ag_err_t                err = i2c_device(bus, addr, &dev);
+
+    i2c_operation_job_t ops[SOC_I2C_CMD_REG_NUM];
+    size_t i = 0;
+    while (err == AG_OK && i < n) {
+        size_t k = 0;    /* operations in this transaction */
+        size_t cmds = 1; /* the controller's commands: the STOP */
+        while (i < n) {
+            const ag_i2c_step_t *st = &steps[i];
+            const size_t need = (st->wlen ? 2u : 0u) +
+                                (st->rlen ? (st->rlen > 1 ? 4u : 3u) : 0u);
+            if (cmds + need > SOC_I2C_CMD_REG_NUM) {
+                break;
+            }
+            cmds += need;
+            if (st->wlen) {
+                ops[k++] = (i2c_operation_job_t){.command = I2C_MASTER_CMD_START};
+                ops[k++] = (i2c_operation_job_t){
+                    .command = I2C_MASTER_CMD_WRITE,
+                    .write = {.ack_check = true, .data = (uint8_t *)st->wbuf,
+                              .total_bytes = st->wlen}};
+            }
+            if (st->rlen) {
+                ops[k++] = (i2c_operation_job_t){.command = I2C_MASTER_CMD_START};
+                if (st->rlen > 1) {
+                    ops[k++] = (i2c_operation_job_t){
+                        .command = I2C_MASTER_CMD_READ,
+                        .read = {.ack_value = I2C_ACK_VAL, .data = st->rbuf,
+                                 .total_bytes = st->rlen - 1u}};
+                }
+                ops[k++] = (i2c_operation_job_t){
+                    .command = I2C_MASTER_CMD_READ,
+                    .read = {.ack_value = I2C_NACK_VAL,
+                             .data = st->rbuf + st->rlen - 1u,
+                             .total_bytes = 1}};
+            }
+            i++;
+        }
+        if (k == 0) {
+            err = -AG_EINVAL; /* one step too big for the command list */
+            break;
+        }
+        ops[k++] = (i2c_operation_job_t){.command = I2C_MASTER_CMD_STOP};
+        err = from_esp(i2c_master_execute_defined_operations(dev, ops, k,
+                                                             (int)timeout_ms));
     }
     xSemaphoreGive(s_i2c[bus].lock);
     return err;
