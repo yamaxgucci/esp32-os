@@ -126,6 +126,17 @@ Pick a game with the arrows and press Enter. Controls are in
 
 ## 3. Games: which files and where
 
+In short, which file starts from where:
+
+| File | From the game list (`run a:\apps\md.axe`) | From the command line (`run a:\apps\md.axe a:\game`) |
+|---|---|---|
+| `.BIN`, `.MD`, `.GEN` | yes: the first time, MD makes a `.SWP` beside it | **no**: MD takes the file as it is and the game will not run |
+| `.SWP` | yes | yes |
+| `.SMD` | no: first `python tools\mdrom.py game.smd` | no: the same |
+| `.ZIP` | no: unzip it | no |
+
+In more detail:
+
 - **Format:** a cartridge image `.BIN`, `.MD` or `.GEN`, **unzipped**. MD
   does not open ZIP files. It does not open `.SMD` files either (the Super
   Magic Drive copier format, with a header and interleaved blocks), and ROM
@@ -198,11 +209,36 @@ stays held only through auto-repeat. For playing you need a pad.
 
 ### 5.1. A real Sega pad on a PCF8574
 
+> Everything step by step - parts, soldering, setup, checking and
+> troubleshooting - is on a page of its own: [sega-pad.md](sega-pad.md).
+> A summary follows.
+
 A Mega Drive pad connects to the board through a PCF8574 I/O expander on the
 I2C bus. The `SEGAPAD.SYS` driver finds the expander by itself at 0x20–0x27
 (0x38–0x3F for a PCF8574A) and tells a 3-button pad from a 6-button one.
 
-| PCF8574 | Pad connector (DB9) | Signal |
+**What you need:** a PCF8574 module (tested: a red one with three DIP
+address switches) and a **male DB9** connector, like the console's, for the
+pad's plug. A ready module beats a bare chip: its bus pull-ups and capacitor
+are already on it.
+
+**Module to the CYD**, header CN1 (GND, IO22, IO21 and 3.3 V in a row). Use
+the header on the input side, the one with INT; the other identical header
+is for chaining modules.
+
+| Module | CYD CN1 |
+|---|---|
+| VCC | 3.3 V |
+| GND | GND |
+| SDA | IO21 |
+| SCL | IO22 |
+| INT | not connected |
+
+**Module to the DB9.** The pin numbers are moulded next to the solder cups.
+Looking at the pins from the front, wide side up, the top row is 1…5 from
+left to right and the bottom row 6…9; from the solder side it is mirrored.
+
+| Module | DB9 | Signal |
 |---|---|---|
 | P0 | 1 | up |
 | P1 | 2 | down |
@@ -211,20 +247,47 @@ I2C bus. The `SEGAPAD.SYS` driver finds the expander by itself at 0x20–0x27
 | P4 | 6 | A / B |
 | P5 | 9 | Start / C |
 | P6 | 7 | SELECT |
-| — | 5 | 3.3 V |
-| — | 8 | ground |
+| P7 | — | not connected |
+| VCC | 5 | pad power |
+| GND | 8 | ground |
 
-On the CYD the expander plugs into the **CN1** header, which has GND,
-IO22 (SCL), IO21 (SDA) and 3.3 V in a row. The board pack already sets up
-that bus (`[i2c0]`, 100 kHz). On another board, add it to `C:\SYSTEM.CFG`:
+- **3.3 V only, not 5 V**: the pad's outputs go straight into the expander,
+  and through the bus to the ESP32's pins.
+- **The DIP switches** can be anywhere: the driver tries every address.
+- **A bare chip** (DIP-16) instead of a module: VDD is pin 16, VSS 8, SDA 15,
+  SCL 14, A0–A2 (1–3) to ground, P0–P3 are pins 4–7, P4–P7 9–12. Add
+  4.7–10 kΩ pull-ups from SDA and SCL to 3.3 V and 100 nF between pins 16
+  and 8.
+
+**Bus speed: 400 kHz.** A 6-button pad counts SELECT's edges and starts
+again when SELECT stays still for too long. Sega's figure is ~1.5 ms at 5 V,
+but the pad tested here, at 3.3 V, started again after ~400 µs. At 100 kHz
+one step of a read takes about that long, and the pad answered as a
+3-button one: X, Y, Z and Mode did nothing. At 400 kHz the PCF8574 works
+without errors (2000 reads of 2000), although its datasheet says 100 kHz.
+The CYD board pack now sets 400. On a board flashed earlier, add this to the
+end of `C:\SYSTEM.CFG` (the last value wins):
+
+```
+[i2c0]
+khz = 400
+```
+
+On another board, describe the whole bus:
 
 ```
 [i2c0]
 sda = 21
 scl = 22
-khz = 100
+khz = 400
 pullups = true
 ```
+
+From ABI 0.78 the driver reads the pad in two transactions instead of
+eight, with no gap of the program's between the steps; while a game runs no
+read loses the 6-button step. On older firmware the driver reads the old
+way: there about 5–10% of reads during a game lose X, Y, Z and Mode, and the
+driver takes them from the read before.
 
 Load the driver **before starting MD**, with one of two commands:
 

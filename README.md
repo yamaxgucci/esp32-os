@@ -90,6 +90,7 @@ on its own task and core with almost all of the RAM.
 | | |
 |---|---|
 | Mega Drive / Genesis emulator: from the shop to a build from source | [docs/mega-drive.md](docs/mega-drive.md) |
+| A real Sega pad (3 or 6 buttons) through a PCF8574 | [docs/sega-pad.md](docs/sega-pad.md) |
 | Master System emulator | [apps/sms](apps/sms/README.md) |
 | Game Boy emulator | `apps/gb` |
 | Fallout 1 and 2 (the engine is built from upstream plus our patches, not shipped) | [apps/fallout](apps/fallout/README.md) |

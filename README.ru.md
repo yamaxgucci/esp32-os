@@ -85,6 +85,7 @@ POSIX: тонкое ядро, таблица системных вызовов �
 | | |
 |---|---|
 | Эмулятор Mega Drive / Genesis: от магазина до сборки из исходников | [docs/mega-drive.ru.md](docs/mega-drive.ru.md) |
+| Настоящий джойстик Sega (3 или 6 кнопок) через PCF8574 | [docs/sega-pad.ru.md](docs/sega-pad.ru.md) |
 | Эмулятор Master System | [apps/sms](apps/sms/README.md) |
 | Эмулятор Game Boy | `apps/gb` |
 | Fallout 1 и 2 (движок собирается из оригинала с нашими патчами, в репозитории его нет) | [apps/fallout](apps/fallout/README.md) |
