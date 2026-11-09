@@ -9,6 +9,9 @@ and the emulator from source. A separate section explains how to fit in the
 memory of a board without PSRAM. Memory is what most often stops a game from
 starting.
 
+> **Playing with a Sega pad** (3- or 6-button): how to connect it and what
+> to solder is on a page of its own, [sega-pad.md](sega-pad.md).
+
 The emulator is called **MD** (`MD.AXE`). It lists the games on the card,
 pauses a game with save and load state, plays sound and understands 3- and
 6-button pads. The core is gwenesis with Musashi (68000). How it works inside
@@ -18,7 +21,8 @@ is in [apps/md/README.md](../apps/md/README.md).
 - [2. The easy way: the shop](#2-the-easy-way-the-shop)
 - [3. Games: which files and where](#3-games-which-files-and-where)
 - [4. Running and controls](#4-running-and-controls)
-- [5. A pad](#5-a-pad)
+- [5. A pad](#5-a-pad) - soldering and setup in detail:
+  [sega-pad.md](sega-pad.md)
 - [6. Memory: making the game start](#6-memory-making-the-game-start)
 - [7. Building from source](#7-building-from-source)
 - [8. When something is wrong](#8-when-something-is-wrong)
@@ -47,7 +51,8 @@ for it. Only these two have been tested.
 - a computer with Chrome or Edge: the shop page flashes the board over Web
   Serial, which Firefox does not have;
 - cartridge images that you own ([section 3](#3-games-which-files-and-where));
-- optionally, a Sega pad and a PCF8574 expander ([section 5](#5-a-pad)).
+- optionally, a Sega pad, a PCF8574 module and a male DB9 connector
+  ([section 5](#5-a-pad); soldering step by step in [sega-pad.md](sega-pad.md)).
 
 ## 2. The easy way: the shop
 
@@ -524,7 +529,7 @@ the size with `dir`.
 | An old game reacts oddly to the buttons | Try the `pad3` option, a 3-button pad |
 | No card after leaving MD (`file not found`) | Type `mount a:`. If the card does not mount, type `eject`, then `mount a:` |
 | The CYD's card stopped answering altogether | Unplug the board for a few seconds. RST is sometimes not enough |
-| The pad is silent | When it loads, the driver prints `SEGAPAD: PCF8574 on i2c0 at 0x20` or says why it found no expander. `drv` shows whether the driver is loaded, `log` shows the journal. Check `[i2c0]` in `C:\SYSTEM.CFG` and the wires |
+| The pad is silent | When it loads, the driver prints `SEGAPAD: PCF8574 on i2c0 at 0x20` or says why it found no expander. `drv` shows whether the driver is loaded, `log` shows the journal. Check `[i2c0]` in `C:\SYSTEM.CFG` and the wires. All about the pad: [sega-pad.md](sega-pad.md#8-when-it-does-not-work) |
 | The board will not flash | A power-only cable, the wrong COM port, or it needs the boot loader: hold BOOT while plugging it in |
 
 ## 9. Options
