@@ -1939,6 +1939,14 @@ static int handle_session_ev(const ag_event_t *ev)
  * that presses through the pad and times what reached the game */
 static int s_padlog;
 
+/*
+ * The buttons held when the pause menu closed, kept from the game until they
+ * are let go: RESUME is picked with Start, and Sonic 2, seeing Start still
+ * down for 134 ms after it, paused itself - he saw the game freeze after
+ * RESUME (9 Nov 2026).  ~0 until poll_pad_live has the buttons to take.
+ */
+static uint32_t s_pad_swallow;
+
 static void poll_pad_live(void)
 {
     ag_event_t ev;
@@ -1964,8 +1972,17 @@ static void poll_pad_live(void)
     uint32_t held = 0;
     for (unsigned i = 0; i < sizeof(k_live_map) / sizeof(k_live_map[0]); i++) {
         if (ag_btnp(0, k_live_map[i].ag)) {
-            gwenesis_io_pad_press_button(0, k_live_map[i].md);
             held |= 1u << i;
+        }
+    }
+    if (s_pad_swallow == ~0u) {
+        s_pad_swallow = held;
+    }
+    s_pad_swallow &= held;     /* a button let go is the game's again */
+    held &= ~s_pad_swallow;
+    for (unsigned i = 0; i < sizeof(k_live_map) / sizeof(k_live_map[0]); i++) {
+        if (held & (1u << i)) {
+            gwenesis_io_pad_press_button(0, k_live_map[i].md);
         } else {
             gwenesis_io_pad_release_button(0, k_live_map[i].md);
         }
@@ -2570,6 +2587,7 @@ static void md_pause_menu(void)
     }
     /* the game's own rows over the box */
     memset(s_line_hash, 0xff, sizeof(s_line_hash));
+    s_pad_swallow = ~0u; /* what picked RESUME is not the game's press */
     ag_printf("md: resumed\n");
 }
 
