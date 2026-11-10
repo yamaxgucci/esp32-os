@@ -3309,6 +3309,11 @@ int ag_main(int argc, char **argv)
             stats = 1;
         } else if (arg_eq(argv[i], "sndhere")) {
             s_snd_here = 1; /* the CYD: Z80 and chips on this core, as before */
+#ifdef MD_Z80PROF
+        } else if (arg_eq(argv[i], "ymplain")) {
+            extern int md_ym_plain; /* ym2612.c: no update left short, to compare */
+            md_ym_plain = 1;
+#endif
         } else if (arg_eq(argv[i], "hifi")) {
             md_sound_set_hifi(1); /* the CYD: the chips at the whole rate */
         } else if (arg_eq(argv[i], "noz80")) {

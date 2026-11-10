@@ -31,6 +31,7 @@ void md_ym_frame_begin(int lines_per_frame)
     }
 #ifdef ARGON_MD_SMALL
     ym2612_dac_settle(); /* the frame's clock starts again */
+    ym2612_status_forget();
 #endif
     ym2612_index = 0;
     ym2612_clock = 0;

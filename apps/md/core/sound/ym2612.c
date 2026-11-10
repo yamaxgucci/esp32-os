@@ -1566,10 +1566,14 @@ INLINE signed int op_calc1(UINT32 phase, unsigned int env, unsigned int pm)
   return ym_tl(p);
 }
 
-INLINE void chan_calc(FM_CH *CH, int num)
+/* `quiet`: a bit a channel, from CH on - one that sounds nothing for the
+ * whole update and is passed over (ym_quiet_channels) */
+INLINE void chan_calc(FM_CH *CH, int num, unsigned int quiet)
 {
   do
   {
+   if (!(quiet & 1u))
+   {
     UINT32 AM = ym2612.OPN.LFO_AM >> CH->ams;
     unsigned int eg_out = volume_calc(&CH->SLOT[SLOT1]);
 
@@ -1637,6 +1641,8 @@ INLINE void chan_calc(FM_CH *CH, int num)
       CH->SLOT[SLOT3].phase += CH->SLOT[SLOT3].Incr;
       CH->SLOT[SLOT4].phase += CH->SLOT[SLOT4].Incr;
     }
+   }
+    quiet >>= 1;
 
     /* next channel */
     CH++;
@@ -2043,10 +2049,38 @@ static void init_tables(void)
 
 }
 
+#ifdef ARGON_MD_SMALL
+/*
+ * The system clock before which the status cannot change (ym2612_status_until),
+ * kept from one read to the next; YM_UNTIL_NONE: to be worked out again.
+ *
+ * A read of the status caught the chip up to its time first - and a driver
+ * that waits on a timer reads it every pass: Ranger X's ~50 thousand times a
+ * second, ~58 ms of the CYD's system core, each running the chip for a
+ * sample or none (10 Nov 2026).  Before the next overflow the status is what
+ * it was, so such a read leaves the chip where it is; the samples are made
+ * in the line's batch.  Kept across the chip running on: the time of the
+ * next overflow does not move as it runs (a sample takes its divisor off the
+ * counter and adds it to the clock).  Forgotten on anything that does move
+ * it: a write to the chip, a new divisor, a new frame's clock, a reset.
+ */
+#define YM_UNTIL_NONE ((int)0x80000000)
+static int s_status_until = YM_UNTIL_NONE;
+
+void ym2612_status_forget(void)
+{
+  s_status_until = YM_UNTIL_NONE;
+}
+#define YM_STATUS_FORGET() (s_status_until = YM_UNTIL_NONE)
+#else
+#define YM_STATUS_FORGET() ((void)0)
+#endif
+
 /* initialize ym2612 emulator */
 void YM2612Init(void) {
   static unsigned init_table_done = 0;
 
+  YM_STATUS_FORGET();
   memset(&ym2612, 0, sizeof(YM2612));
   if (init_table_done == 0) {
     init_tables();
@@ -2061,6 +2095,7 @@ void YM2612ResetChip(void)
 
   int i;
 
+  YM_STATUS_FORGET();
   ym2612.OPN.eg_timer     = 0;
   ym2612.OPN.eg_cnt       = 0;
 
@@ -2169,6 +2204,12 @@ void ym2612_dac_settle(void)
  */
 int md_ym_silent;
 #endif
+#ifdef MD_Z80PROF
+/* -DMD_Z80PROF: the updates' cycles, their number and samples (md_z80.c
+ * prints them), and `ymplain` - every operator every sample, to compare */
+int      md_ym_plain;
+uint32_t md_zp_ymu_cyc, md_zp_ymu_n, md_zp_ymu_s;
+#endif
 
 /*
  * In the hot part, with the timer it calls every sample: from flash it ran
@@ -2225,6 +2266,48 @@ MD_HOT static void YM2612Update(int16_t *buffer, int length)
   refresh_fc_eg_chan(&ym2612.CH[4]);
   refresh_fc_eg_chan(&ym2612.CH[5]);
 
+  /*
+   * What an update can leave out, the same for all its samples - nothing in
+   * it writes a register (a write catches the chip up first, ym2612_run):
+   *
+   *  - the SSG-EG pass over all 24 operators, a sample, when none of them
+   *    has SSG-EG on.  Sonic 1 and 2, Ranger X, Gunstar Heroes, Thunder
+   *    Force IV: none, ever (host harness, 10 Nov 2026).
+   *  - a channel whose four operators are off and below hearing, with
+   *    nothing left in its feedback and its delayed sample: it adds 0 to
+   *    every sample, and only its phases move - by their steps, all at once
+   *    at the end.  27-86% of the channels' samples in those games.  Not
+   *    with the LFO moving its phases, and not channel 3 under CSM, which a
+   *    timer A overflow keys on in the middle of an update.
+   */
+  unsigned int ssg = 0, quiet = 0;
+  for (int c = 0; c < 6; c++)
+  {
+    FM_CH *C = &ym2612.CH[c];
+    unsigned int q = !C->pms && !C->op1_out[0] && !C->op1_out[1] && !C->mem_value &&
+                     !(c == 2 && (ym2612.OPN.ST.mode & 0xC0) == 0x80);
+    for (int k = 0; k < 4; k++)
+    {
+      ssg |= C->SLOT[k].ssg;
+      if (C->SLOT[k].state != EG_OFF || C->SLOT[k].vol_out < ENV_QUIET)
+        q = 0;
+    }
+    quiet |= q << c;
+  }
+  ssg &= 0x08;
+#ifdef MD_Z80PROF
+  {
+    extern int md_ym_plain; /* `ymplain`: every operator, every sample, as before */
+    if (md_ym_plain)
+    {
+      ssg = 0x08;
+      quiet = 0;
+    }
+  }
+#endif
+  if (ym2612.dacen)
+    quiet &= 0x1fu; /* channel 6 is the DAC: not computed at all */
+
   /* buffering */
   for(i=0; i < length ; i++)
   {
@@ -2237,19 +2320,20 @@ MD_HOT static void YM2612Update(int16_t *buffer, int length)
     out_fm[5] = 0;
 
     /* update SSG-EG output */
-    update_ssg_eg_channels(&ym2612.CH[0]);
+    if (ssg)
+      update_ssg_eg_channels(&ym2612.CH[0]);
 
     /* calculate FM */
     YM_DAC_DUE(i)
     if (!ym2612.dacen)
     {
-      chan_calc(&ym2612.CH[0],6);
+      chan_calc(&ym2612.CH[0],6,quiet);
     }
     else
     {
       /* DAC Mode */
       out_fm[5] = ym2612.dacout;
-      chan_calc(&ym2612.CH[0],5);
+      chan_calc(&ym2612.CH[0],5,quiet);
     }
 
     /* advance LFO */
@@ -2335,6 +2419,17 @@ MD_HOT static void YM2612Update(int16_t *buffer, int length)
     }
   }
 
+  /* the quiet channels' phases, all the update's steps at once */
+  for (int c = 0; quiet; c++, quiet >>= 1)
+  {
+    if (quiet & 1u)
+    {
+      FM_CH *C = &ym2612.CH[c];
+      for (int k = 0; k < 4; k++)
+        C->SLOT[k].phase += (UINT32)C->SLOT[k].Incr * (UINT32)length;
+    }
+  }
+
   /* timer B control */
   INTERNAL_TIMER_B(length);
 }
@@ -2352,13 +2447,24 @@ void ym2612_run( int target) {
    * line's samples rather than a frame's */
   if (ym2612_index - ym2612_base > GWENESIS_YM2612_BUF_LEN) {
     ym2612_index = ym2612_base + GWENESIS_YM2612_BUF_LEN;
+    YM_STATUS_FORGET(); /* the clock goes on past samples not made */
   }
 #endif
   if (ym2612_index > ym2612_prev_index) {
 #ifdef ARGON_MD_SMALL
     s_upd_at = ym2612_prev_index;
 #endif
-#if ARGON_TARGET
+#if ARGON_TARGET && defined(MD_Z80PROF)
+    {
+      uint32_t c0, c1;
+      __asm__ volatile("rsr %0, ccount" : "=r"(c0));
+      YM2612Update(gwenesis_ym2612_buffer + (ym2612_prev_index - ym2612_base), ym2612_index-ym2612_prev_index);
+      __asm__ volatile("rsr %0, ccount" : "=r"(c1));
+      md_zp_ymu_cyc += c1 - c0;
+      md_zp_ymu_n++;
+      md_zp_ymu_s += (uint32_t)(ym2612_index - ym2612_prev_index);
+    }
+#elif ARGON_TARGET
     YM2612Update(gwenesis_ym2612_buffer + (ym2612_prev_index - ym2612_base), ym2612_index-ym2612_prev_index);
 #else
     YM2612Update(gwenesis_ym2612_buffer + ym2612_prev_index, ym2612_index-ym2612_prev_index);
@@ -2419,6 +2525,7 @@ void YM2612Write(unsigned int a, unsigned int v,  int target)
   //Sync
   if (GWENESIS_AUDIO_ACCURATE == 1)
     ym2612_run(target);
+  YM_STATUS_FORGET();
 
   switch( a )
   {
@@ -2462,11 +2569,22 @@ void YM2612Write(unsigned int a, unsigned int v,  int target)
   }
 }
 
+#ifdef ARGON_MD_SMALL
+static int ym_status_until_now(void);
+#endif
+
 unsigned int YM2612Read(int target)
 {
+#ifdef ARGON_MD_SMALL
+  if (target < s_status_until)
+    return ym2612.OPN.ST.status & 0xff;
+#endif
   // //Sync
   if (GWENESIS_AUDIO_ACCURATE == 1)
     ym2612_run(target);
+#ifdef ARGON_MD_SMALL
+  s_status_until = ym_status_until_now();
+#endif
   ym_log(__FUNCTION__, "%02x",ym2612.OPN.ST.status & 0xff);
   return ym2612.OPN.ST.status & 0xff;
 }
@@ -2480,6 +2598,15 @@ unsigned int YM2612Read(int target)
  */
 int ym2612_status_until(void)
 {
+#ifdef ARGON_MD_SMALL
+  if (s_status_until == YM_UNTIL_NONE)
+    s_status_until = ym_status_until_now();
+  return s_status_until;
+}
+
+static int ym_status_until_now(void)
+{
+#endif
   const int d = (int)ym2612.divisor;
   int k = 0x7fffffff;
   if ((ym2612.OPN.ST.mode & 0x05) == 0x05 && !(ym2612.OPN.ST.status & 0x01)) {
@@ -2528,6 +2655,7 @@ void YM2612SetSampleDivisor(int div)
   if (div > 0) {
     ym2612.divisor = div;
   }
+  YM_STATUS_FORGET();
 }
 #endif
 
@@ -2539,6 +2667,7 @@ void YM2612SaveRegs(uint8_t *regs)
 void YM2612LoadRegs(uint8_t *regs)
 {
   int i;
+  YM_STATUS_FORGET();
   for (i=0;i<sizeof(OPNREGS);++i)
   {
     if (i <= 0x30)
@@ -2656,6 +2785,7 @@ size_t md_ym_state_size(void)
 void md_ym_state_io(void (*io)(void *p, size_t n), int load)
 {
   uint8 dt[6][4];
+  YM_STATUS_FORGET();
   if (!load) {
     for (int c = 0; c < 6; c++) {
       for (int k = 0; k < 4; k++) {

@@ -25,6 +25,8 @@
 extern int ym2612_base;
 #ifdef ARGON_MD_SMALL
 void ym2612_dac_settle(void);
+/* the status's next change to be worked out again (a new frame's clock) */
+void ym2612_status_forget(void);
 #endif
 void YM2612SetSampleDivisor(int div);
 #endif

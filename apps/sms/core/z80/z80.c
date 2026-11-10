@@ -166,6 +166,10 @@ Z80_Regs Z80;
  */
 uint32_t md_z80_touch;
 #define MD_TOUCH() (md_z80_touch++)
+/* What reaches it from outside, between slices (md_z80_spin carries a wait
+ * from one slice to the next only with neither changed): */
+uint32_t          md_z80_ext;   /* on the Z80's side (md_z80.c, md_snd_async.c) */
+volatile uint32_t md_z80_ext68; /* the 68000's writes to its RAM - its own core */
 #else
 #define MD_TOUCH() ((void)0)
 #endif
@@ -3763,7 +3767,10 @@ void z80_init(int32_t (*irqcallback)(int32_t))
 void z80_reset()
 {
 	leave_halt();
-	
+#ifdef ARGON_MD_Z80
+	md_z80_ext++;
+#endif
+
 	PC = 0x0000;
 	Z80.i = 0;
 	Z80.r = 0;
@@ -3986,6 +3993,7 @@ void md_z80_idle_advance(int n)
 	Z80.r = (uint8_t)(Z80.r + (uint32_t)(Z80.halt ? 1u : s_idle_r) * (uint32_t)n);
 	if (!Z80.halt && n > 0)
 		WZ = s_idle_lo;
+	md_z80_ext++;
 }
 
 /*
@@ -4016,6 +4024,24 @@ static uint32_t s_spin_w[8];
  * timer's next overflow (md_z80.c): passes counted out end before it. */
 static uint32_t s_vreads, s_spin_vreads;
 static int32_t  s_spin_floor; /* the icount at which the last one may change */
+
+/*
+ * From one slice to the next.  Started afresh each slice, the rule spent two
+ * passes of every wait finding it again - the slices are a few lines each, a
+ * thousand a second: Ranger X's driver, a wait of fourteen instructions read
+ * round its timer, ran 6x Sonic 2's instructions (host harness, 10 Nov 2026).
+ * Between two slices only the outside reaches the Z80, and everything that
+ * does - the 68000's writes to its RAM and its chips, the bus, a reset, the
+ * interrupt line, a slice counted out - is counted here: nothing counted, and
+ * the wait goes on where it was, its times moved to the new slice's.
+ */
+static uint8_t   s_spin_carry; /* a slice has ended and nothing came since */
+static uint32_t   s_end_ext, s_beg_ext68;
+static int32_t    s_end_icount;
+/* where passes were last counted out: arriving there, the registers are kept
+ * at once - the pass after the timer's handler is the wait again, and is not
+ * spent finding it (a write every pass, a drum's, never gets here) */
+static uint32_t   s_spin_hot = 0xffffffffu;
 
 void md_z80_spin_until(int tstates)
 {
@@ -4082,10 +4108,16 @@ MD_HOT __attribute__((noinline)) static void md_z80_spin(void)
 				const int32_t n = room / pass;
 				Z80.icount -= n * pass;
 				Z80.r = (uint8_t)(Z80.r + (uint8_t)(Z80.r - s_spin_r) * (uint32_t)n);
+				s_spin_hot = PCD;
 			}
 		}
 		for (int k = 0; k < 8; k++)
 			s_spin_w[k] = w[k];
+		s_spin_regs = 1;
+	}
+	else if (PCD == s_spin_hot)
+	{
+		md_spin_regs(s_spin_w);
 		s_spin_regs = 1;
 	}
 	else
@@ -4587,7 +4619,21 @@ int32_t z80_execute(int32_t cycles)
 	z80_requested_cycles = Z80.icount;
 	z80_exec = 1;
 #ifdef ARGON_MD_Z80
-	s_spin_ok = 0;
+	/*
+	 * The last arrival's T-states in this slice's count: the previous one
+	 * ended at s_end_icount (0 or past it), this one starts at `cycles`.  The
+	 * YM's floor is in the chip's time, which went on to this slice's start
+	 * (md_z80.c's zclk), less a fraction of a T-state: one more for that.
+	 */
+	if (s_spin_ok && s_spin_carry && md_z80_ext == s_end_ext && md_z80_ext68 == s_beg_ext68)
+	{
+		s_spin_icount += cycles - s_end_icount;
+		s_spin_floor += cycles + 1;
+	}
+	else
+		s_spin_ok = 0;
+	s_spin_carry = 0;
+	s_beg_ext68 = md_z80_ext68;
 #endif
 	do
 	{
@@ -4646,6 +4692,11 @@ int32_t z80_execute(int32_t cycles)
 
 	z80_exec = 0;
 	z80_cycle_count += (cycles - Z80.icount);
+#ifdef ARGON_MD_Z80
+	s_spin_carry = 1;
+	s_end_icount = Z80.icount;
+	s_end_ext = md_z80_ext;
+#endif
 #ifdef MD_Z80PROF
 	{
 		extern uint32_t md_zp_exec_cyc, md_zp_exec_n;

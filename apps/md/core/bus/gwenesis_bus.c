@@ -36,8 +36,13 @@ __license__ = "GPLv3"
 /* The CYD: with the sound side on the other core, the 68000's writes to the
  * chips are logged for it (md_snd_async.c). */
 #include "md_snd_async.h"
+/* what the 68000 does to the Z80's world: a wait of the Z80's is not carried
+ * from one slice to the next over it (z80.c, md_z80_ext) */
+extern uint32_t          md_z80_ext;
+extern volatile uint32_t md_z80_ext68;
+#define MD_Z80_EXT68() (md_z80_ext68++)
 #define MD_YM_WRITE(a, v, t) \
-  do { if (md_snd_async) md_snd_68k_ym((a), (v)); else YM2612Write((a), (v), (t)); } while (0)
+  do { if (md_snd_async) md_snd_68k_ym((a), (v)); else { md_z80_ext++; YM2612Write((a), (v), (t)); } } while (0)
 #define MD_YM_READ(t) (md_snd_async ? md_snd_68k_ym_status() : YM2612Read(t))
 #define MD_PSG_WRITE(v, t) \
   do { if (md_snd_async) md_snd_68k_psg(v); else gwenesis_SN76489_Write((v), (t)); } while (0)
@@ -48,6 +53,7 @@ __license__ = "GPLv3"
   (md_snd_async ? md_snd_68k_zram_read() : (void)0, MD_ZRAM(a))
 #else
 #define MD_ZRAM_READ(a) MD_ZRAM(a)
+#define MD_Z80_EXT68() ((void)0)
 #define MD_YM_WRITE(a, v, t) YM2612Write((a), (v), (t))
 #define MD_YM_READ(t) YM2612Read(t)
 #define MD_PSG_WRITE(v, t) gwenesis_SN76489_Write((v), (t))
@@ -592,6 +598,7 @@ MD_HOT static inline void gwenesis_bus_write_memory_8(unsigned int address,
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
     MD_ZRAM(address) = value;
+    MD_Z80_EXT68();
     return;
 
   case Z80_YM2612_ADDR:
@@ -644,6 +651,7 @@ MD_HOT static inline void gwenesis_bus_write_memory_16(unsigned int address,
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
     MD_ZRAM(address) = value >> 8;
+    MD_Z80_EXT68();
     return;
 
   case IO_CTRL:

@@ -271,6 +271,8 @@ static void apply(uint16_t e, int clock)
     const uint32_t kind = (uint32_t)e >> EV_KIND_SHIFT;
     const uint32_t p = (uint32_t)e & 0x3fffu;
     if (kind == EV_YM) {
+        extern uint32_t md_z80_ext; /* z80.c: its timers, as a Z80 wait sees them */
+        md_z80_ext++;
         YM2612Write((p >> 8) & 3u, p & 0xffu, clock);
     } else if (kind == EV_PSG) {
         gwenesis_SN76489_Write((int)(p & 0xffu), clock);

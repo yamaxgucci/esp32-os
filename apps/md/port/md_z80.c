@@ -74,6 +74,7 @@ static inline uint32_t zp_cc(void)
     return c;
 }
 uint32_t md_zp_ym_cyc, md_zp_rom_cyc, md_zp_ym_n, md_zp_rom_n;
+uint32_t md_zp_ymr_cyc, md_zp_ymr_n; /* reads of the YM's status: it runs the chip to now */
 uint32_t md_zp_fast_n, md_zp_slow_n; /* instructions, by which loop ran them */
 uint32_t md_zp_exec_cyc, md_zp_exec_n; /* cycles inside the interpreter, slices */
 #endif
@@ -107,7 +108,14 @@ uint8_t argon_z80_read(uint16_t address)
     }
     if (address < 0x6000u) {
         int tgt = md_z80_now();
+#ifdef MD_Z80PROF
+        const uint32_t r0 = zp_cc();
         const uint8_t v = (uint8_t)YM2612Read(tgt);
+        md_zp_ymr_cyc += zp_cc() - r0;
+        md_zp_ymr_n++;
+#else
+        const uint8_t v = (uint8_t)YM2612Read(tgt);
+#endif
 #ifdef ARGON_SMS_SMALL
         /* its status is time's: the same until a timer's next overflow */
         const int until = ym2612_status_until();
@@ -238,9 +246,20 @@ static uint16_t s_zp_pc[24];
 static uint32_t s_zp_n[24];
 void md_z80_prof_report(void)
 {
-    ag_printf("md: z80 ym writes %u (%u us), rom reads %u (%u us)\n",
+    ag_printf("md: z80 ym writes %u (%u us), status reads %u (%u us), "
+              "rom reads %u (%u us)\n",
               (unsigned)md_zp_ym_n, (unsigned)(md_zp_ym_cyc / 240u),
+              (unsigned)md_zp_ymr_n, (unsigned)(md_zp_ymr_cyc / 240u),
               (unsigned)md_zp_rom_n, (unsigned)(md_zp_rom_cyc / 240u));
+    md_zp_ymr_cyc = md_zp_ymr_n = 0;
+    {
+        extern uint32_t md_zp_ymu_cyc, md_zp_ymu_n, md_zp_ymu_s; /* ym2612.c */
+        ag_printf("md: ym updates %u, %u samples, %u us (%u cycles a sample)\n",
+                  (unsigned)md_zp_ymu_n, (unsigned)md_zp_ymu_s,
+                  (unsigned)(md_zp_ymu_cyc / 240u),
+                  (unsigned)(md_zp_ymu_s ? md_zp_ymu_cyc / md_zp_ymu_s : 0u));
+        md_zp_ymu_cyc = md_zp_ymu_n = md_zp_ymu_s = 0;
+    }
     ag_printf("md: z80 instructions %u from the hot part, %u from flash\n",
               (unsigned)md_zp_fast_n, (unsigned)md_zp_slow_n);
     {
@@ -463,9 +482,20 @@ int  md_z80_idle_pass(void);    /* z80.c */
 void md_z80_idle_advance(int n);
 #endif
 
+extern uint32_t          md_z80_ext;   /* z80.c: what reached the Z80 from outside */
+extern volatile uint32_t md_z80_ext68;
+
+/* where the last slice the Z80 ran ended: a slice that starts anywhere else
+ * (a frame's end moves zclk back, a held bus lets it run on alone) does not
+ * go on with the last one's wait (z80.c, md_z80_ext) */
+static int s_zclk_end = -1;
+
 void z80_run(int target)
 {
     int rem = 0;
+    if (zclk != s_zclk_end) {
+        md_z80_ext++;
+    }
 #ifdef MD_Z80PROF
     zp_sample();
 #endif
@@ -496,6 +526,9 @@ void z80_run(int target)
             if (rem < 0) {
                 rem = 0;
             }
+            zclk = target - rem * Z80_FREQ_DIVISOR;
+            s_zclk_end = zclk;
+            return;
         }
     }
     zclk = target - rem * Z80_FREQ_DIVISOR;
@@ -519,6 +552,7 @@ static int s_reset68 = 1;
 
 void md_z80_ctl_apply(unsigned int address, unsigned int value)
 {
+    md_z80_ext++;
     if (address == 0x1100u) {
         s_bus_ack = value ? 1 : 0;
     } else if (address == 0x1200u) {
@@ -544,6 +578,7 @@ void z80_write_ctrl(unsigned int address, unsigned int value)
         return;
     }
     z80_sync();
+    md_z80_ext++;
     if (address == 0x1100u) {
         s_bus_ack = value ? 1 : 0;
     } else if (address == 0x1200u) {
@@ -581,6 +616,7 @@ void z80_irq_line(unsigned int value)
     if (!s_reset_once) {
         return;
     }
+    md_z80_ext++;
     z80_set_irq_line(0, value ? ASSERT_LINE : CLEAR_LINE);
 }
 
@@ -588,6 +624,7 @@ void z80_write_memory_8(unsigned int address, unsigned int value)
 {
     if (s_zram != 0) {
         MD_ZRAM(address) = (unsigned char)value;
+        md_z80_ext68++;
     }
 }
 

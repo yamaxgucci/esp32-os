@@ -23,7 +23,8 @@ is in [apps/md/README.md](../apps/md/README.md).
 - [4. Running and controls](#4-running-and-controls)
 - [5. A pad](#5-a-pad) - soldering and setup in detail:
   [sega-pad.md](sega-pad.md)
-- [6. Memory: making the game start](#6-memory-making-the-game-start)
+- [6. Memory: making the game start](#6-memory-making-the-game-start),
+  and [what else is limited on the CYD](#the-cyd-what-else-is-limited)
 - [7. Building from source](#7-building-from-source)
 - [8. When something is wrong](#8-when-something-is-wrong)
 - [9. Options](#9-options)
@@ -384,12 +385,65 @@ md: 68000 RAM 64 KB, Z80 RAM 8 KB, VRAM 64 KB (31 KB in IRAM) - 512-byte pages f
 If it prints `md: short of memory` instead, there was not enough. Look for the
 cause in the table above.
 
-Two more limits on the CYD:
+### The CYD: what else is limited
 
-- Save states go to `C:\`, and there is not much room on `C:` (512 KB). The
-  save file is opened when the game starts: in the middle of a game the CYD
-  does not have even 512 contiguous bytes for the file system's buffer.
-- Games of at most ~1 MB ([section 3](#3-games-which-files-and-where)).
+Memory is not the only thing a board without PSRAM is short of. Here is what
+else to know in advance.
+
+**Games of at most ~1 MB.** MD reads the game straight out of flash. It copies
+it into the program partition (1.5 MB), which already holds the cold part of
+MD itself (~420 KB). Cartridges of 2-4 MB do not fit there; they only run on
+the S3-CAM.
+
+| Fit (1 MB or less) | Do not fit |
+|---|---|
+| Sonic the Hedgehog, Sonic 2, Sonic Spinball, Gunstar Heroes, Thunder Force IV, Road Rash II, Ranger X, The Lost Vikings | Streets of Rage 2, Comix Zone (2 MB), Sonic 3 (2 MB), Mortal Kombat 3 Ultimate (4 MB) |
+
+The `.SWP` file tells the size: 1,048,576 bytes or less will run.
+
+**Sound takes time from the screen.** The ESP32 has two cores. One is taken
+whole by the 68000 and the video chip. The other, the system core, does three
+jobs: it runs the Z80 with the game's sound driver, computes the sound chips
+and draws part of the screen's rows. The game itself still runs at its own
+speed, 55-60 frames a second. But the heavier the sound driver, the fewer
+times a second the screen is updated:
+
+| Game | Sound driver | Screen updates a second |
+|---|---|---|
+| Sonic 2 | light: the Z80 waits nearly all the time | 45-55 |
+| Ranger X | heavy: the Z80 keeps polling the sound chip's timer and plays the drums through the DAC itself, ~5 thousand samples a second | ~20, movement visibly jerky |
+
+Heavy drivers are found in games with sampled drums and speech.
+
+**Sound at 11 kHz.** The sound chips are computed at 11,025 Hz, and 22,050 Hz
+goes out. The high end is duller for it. The `hifi` option computes the chips
+at the full 22,050 Hz, but that costs twice as much and takes even more time
+from the screen.
+
+**Nothing runs beside the game.** Once a game is running only a couple of
+kilobytes are free, so:
+
+- the file manager unloads itself before the game starts and comes back when
+  MD exits (on boards with PSRAM it stays in memory);
+- Wi-Fi has to be off while you play, and firmware with Wi-Fi does not fit
+  together with a pad ([step 2.4](#24-cyd-only-free-the-memory));
+- a phone cannot be the pad. Use a PCF8574 or an ESP-07
+  ([section 5](#5-a-pad)).
+
+**The card is off while a game runs.** The card takes ~44 KB, so MD
+disconnects it before the game starts. Two things follow:
+
+- save states go to `C:\`, and there is not much room on `C:` (512 KB);
+- the save file is opened when the game starts: in the middle of a game the
+  CYD does not have even 512 contiguous bytes for the file system's buffer.
+
+The card comes back when LOAD GAME is chosen in the pause menu or MD exits.
+If it is not there after you exit, `mount a:` helps
+([section 8](#8-when-something-is-wrong)).
+
+**Installing is by cable only, and slow.** On firmware without radio MD
+installs over the cable in about 7 minutes; games go onto the card with a
+card reader.
 
 ### The S3-CAM: plenty of room
 
@@ -546,6 +600,7 @@ Options go after the game's name, separated by spaces, for example
 | `pad3` | a 3-button pad instead of a 6-button one, for old games it confuses |
 | `fps30` | draws every second frame; all 60 are emulated |
 | `sndhere` | the Z80 and sound on the same core as the game: slower, but the Z80 keeps pace with the game |
+| `hifi` | the sound chips at 22,050 Hz instead of 11,025: cleaner sound, but the CYD's screen is updated less often |
 | `nosound` | no sound |
 
 The full list is in [apps/md/README.md](../apps/md/README.md#run).
