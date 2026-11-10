@@ -2696,9 +2696,10 @@ static void pk_parent(char *dir)
 /*
  * Entry `want` of the window (folders first, then cartridges, as the folder
  * lists them - nothing is held, so nothing is sorted), or the count with
- * want < 0.  Index 0 is "..".
+ * want < 0.  Index 0 is "..".  Read from the folder itself: two passes over
+ * it for each entry asked for.
  */
-static int pk_entry(int want, char *name, bool *dir)
+static int pk_entry_read(int want, char *name, bool *dir)
 {
     int n = 0;
     if (s_pk_dir[0] == '\0') {
@@ -2750,6 +2751,132 @@ static int pk_entry(int want, char *name, bool *dir)
         (void)ag_closedir(h);
     }
     return n;
+}
+
+/*
+ * The folder's entries, read once while the window is open.
+ *
+ * Read for each line, the window read the folder 18 times to move down a
+ * line past the page - nine lines, two passes each - and the card's root,
+ * ~80 files, took some 4 s a line on the CYD (10 Nov 2026).  So the names go
+ * into a block taken while the window is up and given back when it closes
+ * (the game needs the memory), each as its flag and its name; a folder that
+ * does not fit is read as before.
+ */
+#define PK_POOL  4096
+#define PK_MAX   256
+
+static char     *s_pk_pool;            /* "D" or "F", then the name, then 0 */
+static uint16_t *s_pk_at;              /* where entry i starts in the pool */
+static int       s_pk_n = -1;          /* entries held; -1: none, -2: s_pk_for does not fit */
+static char      s_pk_for[PK_PATH];    /* the folder they are of */
+
+static void pk_forget(void)
+{
+    if (s_pk_pool != NULL) {
+        ag_free(s_pk_pool);
+        s_pk_pool = NULL;
+    }
+    s_pk_at = NULL;
+    s_pk_n = -1;
+}
+
+/* the folder's entries into the pool, in pk_entry_read's order; false if
+ * they do not fit (or there is no memory for them) */
+static bool pk_hold(void)
+{
+    if (s_pk_pool == NULL) {
+        s_pk_pool = (char *)ag_malloc(PK_POOL + PK_MAX * sizeof(uint16_t));
+        if (s_pk_pool == NULL) {
+            return false;
+        }
+        s_pk_at = (uint16_t *)(void *)(s_pk_pool + PK_POOL);
+    }
+    s_pk_n = -2;               /* until it is all in */
+    (void)snprintf(s_pk_for, sizeof(s_pk_for), "%s", s_pk_dir);
+    int    n = 0;
+    size_t used = 0;
+    const int total = pk_entry_read(-1, NULL, NULL);
+    if (total > PK_MAX) {
+        return false;
+    }
+    bool fits = true;
+    /* the drives, or ".." and the folder's two passes, as pk_entry_read */
+    for (int want = 0; want < total && fits; want++) {
+        char name[PK_NAME];
+        bool dir = false;
+        if (s_pk_dir[0] == '\0' || want == 0) {
+            if (pk_entry_read(want, name, &dir) != want) {
+                fits = false;
+                break;
+            }
+        } else {
+            break;             /* the folder: in one walk, below */
+        }
+        const size_t len = strlen(name) + 2u;
+        if (used + len > PK_POOL) {
+            fits = false;
+            break;
+        }
+        s_pk_at[n++] = (uint16_t)used;
+        s_pk_pool[used] = dir ? 'D' : 'F';
+        memcpy(s_pk_pool + used + 1, name, len - 1u);
+        used += len;
+    }
+    if (fits && s_pk_dir[0] != '\0') {
+        for (int pass = 0; pass < 2 && fits; pass++) {
+            const ag_handle_t h = ag_opendir(s_pk_dir);
+            if (h < 0) {
+                break;
+            }
+            ag_dirent_t e;
+            while (ag_readdir(h, &e) == AG_OK) {
+                const bool d = (e.st.attr & AG_A_DIR) != 0;
+                if (e.name[0] == '.' || (pass == 0) != d || (!d && !pk_rom(e.name)) ||
+                    strcmp(e.name, "System Volume Information") == 0) {
+                    continue;
+                }
+                size_t len = 0;
+                while (len < PK_NAME - 1u && e.name[len] != '\0') {
+                    len++;     /* as much of the name as pk_entry_read gives */
+                }
+                len += 2u;
+                if (n >= PK_MAX || used + len > PK_POOL) {
+                    fits = false;
+                    break;
+                }
+                s_pk_at[n++] = (uint16_t)used;
+                s_pk_pool[used] = d ? 'D' : 'F';
+                memcpy(s_pk_pool + used + 1, e.name, len - 2u);
+                s_pk_pool[used + len - 1u] = '\0';
+                used += len;
+            }
+            (void)ag_closedir(h);
+        }
+    }
+    if (!fits) {
+        return false;
+    }
+    s_pk_n = n;
+    return true;
+}
+
+/* pk_entry_read's answer, from the pool when the folder is held there */
+static int pk_entry(int want, char *name, bool *dir)
+{
+    if (s_pk_n == -1 || strcmp(s_pk_for, s_pk_dir) != 0) {
+        (void)pk_hold();
+    }
+    if (s_pk_n < 0) {
+        return pk_entry_read(want, name, dir);
+    }
+    if (want < 0 || want >= s_pk_n) {
+        return s_pk_n;
+    }
+    const char *p = s_pk_pool + s_pk_at[want];
+    *dir = (p[0] == 'D');
+    (void)snprintf(name, PK_NAME, "%s", p + 1);
+    return want;
 }
 
 /*
@@ -2965,8 +3092,19 @@ static void pk_fill(int top, int count, int sel)
     s_win.sel = sel - top;
 }
 
-/* The window: 1 with a cartridge in s_pk_rom, 0 back to the main screen. */
+static int md_pick_open(void);
+
+/* The window: 1 with a cartridge in s_pk_rom, 0 back to the main screen.
+ * The folder is read afresh each time it opens, and let go when it closes. */
 static int md_pick(void)
+{
+    pk_forget();
+    const int r = md_pick_open();
+    pk_forget();
+    return r;
+}
+
+static int md_pick_open(void)
 {
     if (ui_row() == NULL) {
         return 0;
@@ -3061,6 +3199,7 @@ static int md_pick(void)
             win_paint_foot();
             if (pk_raw(name)) {
                 if (!pk_ready(rom, s_pk_rom, sizeof(s_pk_rom))) {
+                    s_pk_n = -1;           /* a .SWP may have come and gone */
                     s_win.foot = "NOT A CARTRIDGE, OR CARD FULL";
                     continue;
                 }
