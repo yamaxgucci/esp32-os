@@ -515,13 +515,31 @@ void ag_console_write(const char *buf, size_t len)
     ag_console_unlock();
 }
 
+/*
+ * A journal line's copy on the console, which waits for the console at most
+ * AG_CON_LOG_WAIT_MS and is dropped after that - the journal has the line
+ * already, written first.  It waited for ever, and the console's own task
+ * holds the console's lock while it paints a row, and a panel's row goes out
+ * on a bus under the I/O lock: anything that logged while holding the I/O lock
+ * (io.c bringing a bus up, "i2c0 up on ...") waited for the painter, which
+ * waited for it.  The CYD hung at boot that way, at SEGAPAD's load, now and
+ * then - whenever the painter was mid-row at that moment (9 Nov 2026).
+ */
+#define AG_CON_LOG_WAIT_MS 100u
+static uint32_t s_log_dropped;
+
 void ag_console_write_log(const char *buf, size_t len)
 {
     if (!s_ready || buf == NULL || len == 0) {
         return;
     }
 
-    ag_console_lock();
+    if (s_lock != NULL &&
+        !ag_port_mutex_take_recursive(s_lock,
+                                      ag_port_ms_to_ticks(AG_CON_LOG_WAIT_MS))) {
+        s_log_dropped++;
+        return;
+    }
     ag_con_sink_fn sink = NULL;
     void          *sink_ctx = NULL;
     if (sink_for_this_write(&sink, &sink_ctx)) {
