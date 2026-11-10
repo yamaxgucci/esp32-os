@@ -22,11 +22,31 @@
 /* Only the plain text application build declares an image header; the built-in
  * lives in the kernel image, and GFXFM supplies its own header. */
 #if !defined(AG_BUILTIN) && !defined(FM_GFX_BUILD)
-AG_APP("FM", "1.0", "argon", 0);
+/* 16 KB of arena named, not left to the default: a board without PSRAM gives
+ * an image that names none no arena at all (proc.c heap_create), and on the
+ * CYD the panels found nothing to come out of - "not enough memory for the
+ * panels" (10 Nov 2026).  128 entries a panel fit. */
+AG_APP_SIZED("FM", "1.0", "argon", 0, 0, 16 * 1024);
 #endif
 
 fm_panel_t g_panel[2];
 int        g_active;
+
+/*
+ * /pad: driven by a game pad (SEGAPAD.SYS), whose Start and Mode together are
+ * Esc - so Esc does not close the panels here, F10 does.  He asked for it: a
+ * menu chord pressed a beat early must not drop a person to the prompt.
+ */
+static bool s_pad;
+/*
+ * A program run from here on a board without PSRAM runs after this process,
+ * not under it (ag_then, ABI 0.79), and this comes back afterwards with the
+ * same panels: its 44 KB on the CYD were the Mega Drive's video memory
+ * ("VRAM 44/64 KB", 10 Nov 2026).  s_self is how to start this again.
+ */
+static bool s_leave_to_run;
+static bool s_left;            /* set: the loop ends, the program is next */
+static char s_self[AG_PATH_MAX];
 
 /* ---------------------------------------------------------------------- */
 /* Drawing                                                               */
@@ -174,6 +194,73 @@ static bool parent_of(const char *path, char *out, size_t len)
 
 fm_panel_t *fm_active(void) { return &g_panel[g_active]; }
 fm_panel_t *fm_other(void) { return &g_panel[g_active ^ 1]; }
+
+/* A path as a word of a command line: quoted when it has a space in it. */
+static void cmd_word(char *line, size_t cap, const char *word)
+{
+    bool quote = false;
+    for (const char *c = word; *c != '\0'; c++) {
+        quote = quote || *c == ' ';
+    }
+    ag_strlcat(line, " ", cap);
+    if (quote) {
+        ag_strlcat(line, "\"", cap);
+    }
+    ag_strlcat(line, word, cap);
+    if (quote) {
+        ag_strlcat(line, "\"", cap);
+    }
+}
+
+/*
+ * Run `path` after this process instead of under it, and this again after
+ * that, with the panels as they are.  False when it cannot be done that way
+ * (a board with PSRAM, a kernel before 0.79, a line too long), and the caller
+ * runs it under itself as before.
+ */
+bool fm_run_after(const char *path)
+{
+    if (!s_leave_to_run || s_self[0] == '\0') {
+        return false;
+    }
+    char run[AG_THEN_LINE] = "run";
+    cmd_word(run, sizeof(run), path);
+
+    char back[AG_THEN_LINE] = "run";
+    char dos[AG_PATH_MAX];
+    cmd_word(back, sizeof(back), s_self);
+    if (s_pad) {
+        ag_strlcat(back, " /pad", sizeof(back));
+    }
+    char num[12];
+    ag_strlcat(back, " /back:", sizeof(back));
+    ag_strlcat(back, ag_utoa((uint64_t)g_active, num, sizeof(num), 0, false),
+               sizeof(back));
+    for (int i = 0; i < 2; i++) {
+        ag_strlcat(back, ",", sizeof(back));
+        ag_strlcat(back, ag_utoa((uint64_t)(uint32_t)g_panel[i].cursor, num,
+                                 sizeof(num), 0, false),
+                   sizeof(back));
+    }
+    for (int i = 0; i < 2; i++) {
+        fm_dos_path(g_panel[i].path, dos, sizeof(dos));
+        cmd_word(back, sizeof(back), dos);
+    }
+    /* ag_strlcat stops at the end: a line that filled its buffer is cut */
+    if (ag_strlcat(run, "", sizeof(run)) + 1u >= sizeof(run) ||
+        ag_strlcat(back, "", sizeof(back)) + 1u >= sizeof(back)) {
+        return false;
+    }
+    if (ag_then(run) != AG_OK) {
+        return false;
+    }
+    if (ag_then(back) != AG_OK) {
+        /* MD then, and no way back here: the prompt, which beats nothing */
+        ag_log(AG_LOG_WARN, "fm", "no room to come back after %s", path);
+    }
+    s_left = true;
+    return true;
+}
 
 fm_entry_t *fm_current(void)
 {
@@ -873,10 +960,64 @@ int FM_ENTRY(int argc, char **argv)
         ag_strlcpy(start, "/", sizeof(start));
     }
 
-    const char *left = (argc > 1) ? argv[1] : start;
-    const char *right = (argc > 2) ? argv[2] : start;
+    /*
+     * Switches before the panels: /pad (see s_pad), and /back:A,C0,C1 - the
+     * active panel and both cursors, which is how this comes back where it
+     * was after a program it ran after itself (fm_run_after).
+     */
+    s_pad = false;
+    s_left = false;
+    int back[3] = {-1, -1, -1};
+    int first = 1;
+    while (first < argc) {
+        const char *sw = argv[first];
+        if (ag_stricmp(sw, "/pad") == 0) {
+            s_pad = true;
+        } else if (sw[0] == '/' && (sw[1] == 'b' || sw[1] == 'B') &&
+                   sw[2] != '\0' && sw[3] != '\0' && sw[4] != '\0' &&
+                   sw[5] == ':') {
+            int k = 0, v = -1;
+            for (const char *c = sw; *c != '\0' && k < 3; c++) {
+                if (*c >= '0' && *c <= '9') {
+                    v = (v < 0 ? 0 : v * 10) + (*c - '0');
+                } else if (v >= 0) {
+                    back[k++] = v;
+                    v = -1;
+                }
+            }
+            if (v >= 0 && k < 3) {
+                back[k] = v;
+            }
+        } else {
+            break; /* a path that starts with '/' */
+        }
+        first++;
+    }
+    s_self[0] = '\0';
+    if (argc > 0 && argv[0] != NULL) {
+        ag_strlcpy(s_self, argv[0], sizeof(s_self));
+    }
+    {
+        ag_sysinfo_t si;
+        ag_sysinfo_get(&si);
+        s_leave_to_run = ag_strcmp(si.profile, "full") != 0;
+    }
+#ifdef AG_BUILTIN
+    s_leave_to_run = false; /* part of the kernel: nothing of it to give back */
+#endif
+
+    const char *left = (argc > first) ? argv[first] : start;
+    const char *right = (argc > first + 1) ? argv[first + 1] : start;
 
     ag_err_t err = fm_read_panel(&g_panel[0], left);
+    if (err != AG_OK && left != start) {
+        /* A:\APPS before anything is installed there, or no card at all:
+         * where this was started instead - a board that boots into this has
+         * nothing else to show (AUTOEXEC.BAT of the shop's CYD) */
+        ag_log(AG_LOG_WARN, "fm", "%s: %s, opening %s", left,
+               ag_strerror(err), start);
+        err = fm_read_panel(&g_panel[0], start);
+    }
     if (err != AG_OK) {
         ag_printf("%s: %s\n", left, ag_strerror(err));
         return 1;
@@ -886,8 +1027,17 @@ int FM_ENTRY(int argc, char **argv)
         /* One good panel is enough to start with. */
         (void)fm_read_panel(&g_panel[1], g_panel[0].path);
     }
+    for (int i = 0; i < 2; i++) {
+        if (back[i + 1] >= 0 && back[i + 1] < g_panel[i].count) {
+            g_panel[i].cursor = back[i + 1];
+            scroll_into_view(&g_panel[i]);
+        }
+    }
+    if (back[0] == 1) {
+        g_active = 1;
+    }
     /* The panel that is not active must not leave the cwd where it looked last. */
-    (void)ag_chdir(g_panel[0].path);
+    (void)ag_chdir(fm_active()->path);
 
     const char *exit_why = NULL;
 
@@ -984,6 +1134,33 @@ int FM_ENTRY(int argc, char **argv)
         const bool     alt = (ev.key.mods & AG_MOD_ALT) != 0;
         bool           moved_only = false;
 
+        /*
+         * A key held is sent again and again, marked as a repeat - by a
+         * keyboard after its delay, and by SEGAPAD.SYS every 60 ms from the
+         * first, because the console forgets a key it has not heard of for
+         * 150 ms.  Only moving repeats, and only as a keyboard does it: from
+         * 350 ms after the press, one in every 80 ms.  Enter repeated was the
+         * program run twice; a cursor that moved every 60 ms could not be
+         * stopped on the line wanted with a pad.
+         */
+        {
+            static uint16_t s_key;
+            static uint32_t s_down_ms, s_step_ms;
+            const uint32_t  now = ag_millis();
+            if (!ev.key.repeat) {
+                s_key = key;
+                s_down_ms = s_step_ms = now;
+            } else {
+                const bool moves = key == AG_KEY_UP || key == AG_KEY_DOWN ||
+                                   key == AG_KEY_PAGEUP || key == AG_KEY_PAGEDOWN;
+                if (!moves || key != s_key || now - s_down_ms < 350u ||
+                    now - s_step_ms < 80u) {
+                    continue;
+                }
+                s_step_ms = now;
+            }
+        }
+
         if (alt && key == AG_KEY_F1) {
             choose_drive(0);
             fm_draw_all();
@@ -1030,14 +1207,23 @@ int FM_ENTRY(int argc, char **argv)
         case AG_KEY_F6:  fm_move(); break;
         case AG_KEY_F7:  fm_mkdir(); break;
         case AG_KEY_F8:  fm_delete(); break;
-        case AG_KEY_F10:
         case AG_KEY_ESC:
+            if (s_pad) {
+                break; /* the pad's menu chord: F10 closes, see s_pad */
+            }
+            /* fall through */
+        case AG_KEY_F10:
             exit_why = (key == AG_KEY_ESC) ? "ESC" : "F10";
             running = false;
             break;
 
         default:
             break;
+        }
+
+        if (s_left) {
+            exit_why = "a program runs after this";
+            running = false;
         }
 
         if (running && ag_focused()) {

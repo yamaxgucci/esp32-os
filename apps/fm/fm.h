@@ -157,5 +157,8 @@ void fm_mkdir(void);  /* F7 */
 void fm_delete(void); /* F8 */
 void fm_help(void);   /* F1 */
 void fm_run(const fm_entry_t *entry);
+/* Runs `dos_path` after this process and this again after it, if the board
+ * wants that (no PSRAM, ABI 0.79); false and nothing done otherwise. */
+bool fm_run_after(const char *dos_path);
 
 #endif /* ARGON_FM_H */

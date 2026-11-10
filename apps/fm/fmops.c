@@ -846,6 +846,15 @@ void fm_run(const fm_entry_t *entry)
     char path[AG_PATH_MAX];
     fm_join(fm_active()->path, entry->name, path, sizeof(path));
 
+    /* On a board without PSRAM: after this process, not under it. */
+    {
+        char dos[AG_PATH_MAX];
+        fm_dos_path(path, dos, sizeof(dos));
+        if (fm_run_after(dos)) {
+            return;
+        }
+    }
+
     /*
      * Hand the display back for the duration: whatever the child prints, it
      * prints over an ordinary console, and it has every right to.
