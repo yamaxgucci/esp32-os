@@ -2379,12 +2379,17 @@ static void menu_draw(int sel, const char *note)
     }
 }
 
-/* The buttons the front end answers, as a mask of what is held. */
+/*
+ * The buttons the front end answers, as a mask of what is held.  C is MENU's
+ * back, beside Esc: a pad has no Esc but Start and Mode together, which a
+ * 3-button pad cannot press, and he could not leave the game window or MD
+ * itself with the pad in his hands (10 Nov 2026).  A and Start pick.
+ */
 #define MB_UP   0x01u
 #define MB_DOWN 0x02u
-#define MB_PICK (0x04u | 0x08u | 0x10u)
+#define MB_PICK (0x04u | 0x10u)
 #define MB_BACK 0x20u
-#define MB_MENU 0x40u
+#define MB_MENU (0x40u | 0x08u)
 
 static unsigned menu_buttons(void)
 {
@@ -2410,11 +2415,11 @@ static unsigned ui_key(uint16_t k)
         return MB_DOWN;
     case AG_KEY_ENTER:
     case AG_KEY_Z:
-    case AG_KEY_C:
         return MB_PICK;
     case AG_KEY_X:
     case AG_KEY_BACKSPACE:
         return MB_BACK;
+    case AG_KEY_C:
     case AG_KEY_ESC:
         return MB_MENU;
     default:
@@ -2973,7 +2978,7 @@ static int md_pick(void)
             (void)snprintf(s_pk_dir, sizeof(s_pk_dir), "A:\\");
         }
     }
-    static const char k_hint[] = "A:OPEN  B:UP  MENU:BACK";
+    static const char k_hint[] = "A:OPEN  B:UP  C:BACK";
     int sel = 0, top = 0, count = 0, shown_sel = -1, shown_top = -1;
     bool fresh = true;
     unsigned held = menu_buttons();
@@ -3098,7 +3103,7 @@ static void md_settings(void)
     s_win.dir[0] = 0;
     s_win.n = 1;
     s_win.sel = -1;
-    s_win.foot = "B OR MENU: BACK";
+    s_win.foot = "B OR C: BACK";
     win_paint();
     unsigned held = menu_buttons();
     uint32_t since = ag_millis();

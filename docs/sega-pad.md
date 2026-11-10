@@ -229,6 +229,7 @@ The driver turns the pad's buttons into keys:
 |---|---|
 | d-pad | arrows |
 | A B C | Z X C |
+| B, C (also) | Backspace, Tab, once a press |
 | Start | Enter |
 | X Y Z | A S D |
 | Mode | M |
@@ -239,6 +240,16 @@ The driver turns the pad's buttons into keys:
   Mode, so there the menu opens with a touch on the screen.
 - Start goes out 80 ms late: the driver waits to see whether Mode comes with
   it. A short press of Start still gets through.
+
+**In MD's windows** (the main screen, the game list, the pause menu): A or
+Start picks, B goes up a folder, **C goes back**. To leave MD: pause menu →
+EXIT → C on the main screen.
+
+**In the file manager** (FM with `/pad`; the shop's CYD firmware without the
+radio opens it at power-on): up/down choose, Start opens or runs, B goes up a
+folder, C switches panels. Esc (Start+Mode) does not close FM. On a board
+without PSRAM FM leaves memory while a program runs and comes back to the same
+place when it ends.
 
 ## 8. When it does not work
 

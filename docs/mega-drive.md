@@ -189,12 +189,15 @@ run a:\apps\md.axe                   the window with the games on the card
 run a:\apps\md.axe a:\sonic.swp      straight into a game, a .SWP only
 ```
 
-In the game list: arrows choose, A, C or Start opens, B goes up a folder, Esc
-leaves.
+In MD's windows (the main screen, the game list, the pause menu): arrows
+choose, A or Start opens, B goes up a folder, **C or Esc goes back**.
 
 **The pause menu** opens with Esc on a keyboard, Start+Mode on a 6-button pad,
 or a touch on the screen (the CYD's screen is a touch screen). It has RESUME,
 SAVE STATE, LOAD STATE, LOAD GAME (another game) and EXIT.
+
+**Leaving MD:** pause menu → EXIT → C (or Esc) on the main screen. If MD was
+started from the file manager, the file manager opens again afterwards.
 
 | Key | Mega Drive button |
 |---|---|
