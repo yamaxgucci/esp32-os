@@ -22,6 +22,8 @@
  *   d-pad  arrows       A  Z       B  X       C  C       Start  Enter
  *   X  A                Y  S       Z  D       Mode  M
  *   Start and Mode together  Esc (MD's pause menu), and neither of them
+ *   B and C also Backspace and Tab, once a press (the file manager's
+ *   folder-up and other panel; no game reads them)
  *
  * X, Y, Z and Mode are the keys the input layer's own pad table gives them
  * (components/argon_kernel/src/dev/input.c), so a program that reads buttons
@@ -81,6 +83,7 @@ AG_DRV("SEGAPAD", "0.1", "argon");
  * pulled out is let go of a quarter of a second later.
  */
 #define GONE_MS 250u
+#define PAD_LOOK_MS 1000u /* no expander: look for one again this often     */
 #define START_HOLD_MS 80u /* Start waits this long for Mode (the menu)      */
 #define SP_MENU 0x1000u   /* Start and Mode together: not a line of the pad  */
 /* A 6-button pad starts its count again after 1.5 ms with SELECT still:
@@ -106,17 +109,25 @@ AG_DRV("SEGAPAD", "0.1", "argon");
 #define PAD_PRIO 5
 #endif
 
+/*
+ * once: sent at the press and not again while held.  B and C also give
+ * Backspace and Tab, the file manager's folder-up and other-panel (FM.AXE
+ * with /pad, which a board without a keyboard boots into): a game reads
+ * neither, and a key repeated there would climb a folder every 60 ms.
+ */
 static const struct {
     uint16_t bit;
     uint16_t key;
+    uint8_t  once;
 } k_keys[] = {
-    {AG_SP_UP, AG_KEY_UP},       {AG_SP_DOWN, AG_KEY_DOWN},
-    {AG_SP_LEFT, AG_KEY_LEFT},   {AG_SP_RIGHT, AG_KEY_RIGHT},
-    {AG_SP_A, AG_KEY_Z},         {AG_SP_B, AG_KEY_X},
-    {AG_SP_C, AG_KEY_C},         {AG_SP_START, AG_KEY_ENTER},
-    {AG_SP_X, AG_KEY_A},         {AG_SP_Y, AG_KEY_S},
-    {AG_SP_Z, AG_KEY_D},         {AG_SP_MODE, AG_KEY_M},
-    {SP_MENU, AG_KEY_ESC},
+    {AG_SP_UP, AG_KEY_UP, 0},       {AG_SP_DOWN, AG_KEY_DOWN, 0},
+    {AG_SP_LEFT, AG_KEY_LEFT, 0},   {AG_SP_RIGHT, AG_KEY_RIGHT, 0},
+    {AG_SP_A, AG_KEY_Z, 0},         {AG_SP_B, AG_KEY_X, 0},
+    {AG_SP_C, AG_KEY_C, 0},         {AG_SP_START, AG_KEY_ENTER, 0},
+    {AG_SP_X, AG_KEY_A, 0},         {AG_SP_Y, AG_KEY_S, 0},
+    {AG_SP_Z, AG_KEY_D, 0},         {AG_SP_MODE, AG_KEY_M, 0},
+    {SP_MENU, AG_KEY_ESC, 0},
+    {AG_SP_B, AG_KEY_BACKSPACE, 1}, {AG_SP_C, AG_KEY_TAB, 1},
 };
 
 static struct {
@@ -140,6 +151,7 @@ static struct {
     uint32_t          worst; /* the longest step among them, us         */
     uint32_t          no6;   /* of them, a 6-button pad answering as a 3 */
     int               no_steps; /* the kernel has no i2c_steps: a transfer a step */
+    uint32_t          pad_look_at; /* when the expander was last looked for */
     uint32_t          retried;  /* reads asked again for the 6-button step */
     uint32_t          told_at, tallies;
     /* The keyboard on the same bus (apps/common/cardkb): the ESP-07's page
@@ -227,7 +239,8 @@ static void repeat_held(void)
 {
     const uint32_t t = ag_millis();
     for (unsigned i = 0; i < sizeof(k_keys) / sizeof(k_keys[0]); i++) {
-        if ((s.out & k_keys[i].bit) && t - s.sent_at[i] >= REPEAT_MS) {
+        if ((s.out & k_keys[i].bit) && !k_keys[i].once &&
+            t - s.sent_at[i] >= REPEAT_MS) {
             send_key(k_keys[i].key, 1, 1);
             s.sent_at[i] = t;
         }
@@ -446,6 +459,8 @@ static const char *kind_name(int k)
     return k == AG_SP_6BTN ? "a 6-button pad" : "a 3-button pad";
 }
 
+static uint8_t pad_look(void);
+
 static void pad_task(void *arg)
 {
     (void)arg;
@@ -461,7 +476,17 @@ static void pad_task(void *arg)
                    (unsigned)(t0 - last), (unsigned)s.held);
         }
         last = t0;
-        if (s.addr == 0u) { /* a keyboard and no pad on this bus */
+        if (s.addr == 0u) { /* no pad (yet): a keyboard, perhaps */
+            if (t0 - s.pad_look_at >= PAD_LOOK_MS) {
+                s.pad_look_at = t0;
+                s.addr = pad_look();
+                if (s.addr != 0u) {
+                    const uint8_t idle = 0xffu;
+                    (void)ag_i2c_write(s.bus, s.addr, &idle, 1, BUS_MS);
+                    ag_log(AG_LOG_INFO, "SEGAPAD", "PCF8574 at 0x%02x",
+                           (unsigned)s.addr);
+                }
+            }
             kb_poll();
             ag_delay(POLL_MS);
             continue;
@@ -573,6 +598,17 @@ static int found(uint8_t a)
     return ag_i2c_probe(s.bus, a) == AG_OK;
 }
 
+/* The expander, at 0x20..0x27 (PCF8574) or 0x38..0x3f (PCF8574A); 0 if none */
+static uint8_t pad_look(void)
+{
+    for (uint8_t a = 0x20; a <= 0x3f; a++) {
+        if ((a <= 0x27 || a >= 0x38) && found(a)) {
+            return a;
+        }
+    }
+    return 0;
+}
+
 ag_err_t ag_driver_init(void)
 {
     const ag_cfg_api_t *cfg = ag_api()->cfg;
@@ -611,10 +647,15 @@ ag_err_t ag_driver_init(void)
                       s.bus, s.bus);
             return e;
         }
-        for (uint8_t a = 0x20; a <= 0x3f && s.addr == 0u; a++) {
-            if ((a <= 0x27 || a >= 0x38) && found(a)) {
-                s.addr = a;
+        /* A few times: from cold, a board's own 3.3 V brings the expander
+         * up with it, and on the CYD it had not answered yet when this
+         * loaded (10 Nov 2026) - the driver failed and the pad was dead
+         * until the next reset. */
+        for (int tries = 0; tries < 6 && s.addr == 0u; tries++) {
+            if (tries > 0) {
+                ag_delay(50);
             }
+            s.addr = pad_look();
         }
     }
     /* The keyboard: the ESP-07 stand-in answers there beside its pad, and a
@@ -624,9 +665,11 @@ ag_err_t ag_driver_init(void)
     }
     s.kb_look_at = ag_millis();
     if (s.addr == 0u && s.kb_addr == 0u) {
-        ag_printf("SEGAPAD: no PCF8574 on i2c%d at 0x20..0x27 or 0x38..0x3f, "
-                  "and no keyboard at 0x%02x\n", s.bus, (unsigned)s.kb_want);
-        return -AG_ENOENT;
+        /* Loaded all the same, and looked for again every PAD_LOOK_MS: a pad
+         * plugged in later is a pad, and so is one that was slow to wake. */
+        ag_printf("SEGAPAD: no PCF8574 on i2c%d at 0x20..0x27 or 0x38..0x3f "
+                  "yet, and no keyboard at 0x%02x; looking\n", s.bus,
+                  (unsigned)s.kb_want);
     }
 
     const uint8_t idle = 0xffu;
