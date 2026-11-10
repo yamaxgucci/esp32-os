@@ -596,6 +596,15 @@ static inline int32_t ag_exec(const char *path, int argc, const char **argv)
 {
     return g_ag_api->proc->exec(path, argc, argv);
 }
+/* A command line for this slot to run after this process ends (see then in
+ * abi.h); -AG_ENOSYS before 0.79. */
+static inline ag_err_t ag_then(const char *cmdline)
+{
+    if (!AG_HAS(g_ag_api->proc, then)) {
+        return -AG_ENOSYS;
+    }
+    return g_ag_api->proc->then(cmdline);
+}
 static inline ag_pid_t ag_spawn(const char *path, int argc, const char **argv,
                                 uint32_t flags)
 {

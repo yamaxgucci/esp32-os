@@ -184,6 +184,82 @@ int ag_session_slot_of(ag_pid_t pid)
     return -1;
 }
 
+/*
+ * proc->then (ABI 0.79): command lines a slot's prompt runs once the process
+ * that left them has ended.  Each is allocated while it waits and freed when
+ * taken, so a board that never uses them pays nothing, and one that does pays
+ * a line's bytes - the CYD has a couple of kilobytes to spare while the Mega
+ * Drive runs, and the file manager's line to start itself again waits there
+ * all that time.
+ */
+typedef struct {
+    int8_t   slot;
+    ag_pid_t owner; /* who left it: run only once that one is all gone */
+    char    *line;
+} then_t;
+static then_t s_then[AG_THEN_MAX];
+
+ag_err_t ag_session_then(ag_pid_t pid, const char *cmdline)
+{
+    if (cmdline == NULL || cmdline[0] == '\0') {
+        return -AG_EINVAL;
+    }
+    const size_t len = strlen(cmdline);
+    if (len >= AG_THEN_LINE) {
+        return -AG_ERANGE;
+    }
+    const int slot = ag_session_slot_of(pid);
+    if (slot < 0 || !is_user_slot(slot)) {
+        return -AG_ENOENT;
+    }
+    for (unsigned i = 0; i < AG_THEN_MAX; i++) {
+        if (s_then[i].line == NULL) {
+            char *copy = (char *)ag_port_alloc(len + 1u, AG_MEM_BYTE);
+            if (copy == NULL) {
+                return -AG_ENOMEM;
+            }
+            memcpy(copy, cmdline, len + 1u);
+            s_then[i].slot = (int8_t)slot;
+            s_then[i].owner = pid;
+            s_then[i].line = copy;
+            ag_log(AG_LOG_INFO, "session", "slot %d then: %s",
+                   ag_session_display_number(slot), copy);
+            return AG_OK;
+        }
+    }
+    return -AG_ENOSPC;
+}
+
+bool ag_session_take_then(int slot, char *out, size_t cap)
+{
+    for (unsigned i = 0; i < AG_THEN_MAX; i++) {
+        if (s_then[i].line != NULL && s_then[i].slot == slot) {
+            /*
+             * The slot is given back before the process's memory is (reap in
+             * proc.c: unbind, then the image and the arena), and what runs
+             * next is here because it needs that memory - so it waits for the
+             * process to be gone altogether, a few milliseconds.
+             */
+            ag_proc_state_t st;
+            for (int w = 0; w < 150 && s_then[i].owner != AG_PID_KERNEL &&
+                            ag_proc_state_of(s_then[i].owner, &st) == AG_OK;
+                 w++) {
+                ag_port_task_delay(ag_port_ms_to_ticks(20));
+            }
+            snprintf(out, cap, "%s", s_then[i].line);
+            ag_port_free(s_then[i].line);
+            s_then[i].line = NULL;
+            /* the rest keep their order: the next one waits behind it */
+            for (unsigned j = i; j + 1u < AG_THEN_MAX; j++) {
+                s_then[j] = s_then[j + 1u];
+            }
+            s_then[AG_THEN_MAX - 1u].line = NULL;
+            return true;
+        }
+    }
+    return false;
+}
+
 const char *ag_session_cwd(int slot)
 {
     if (slot == AG_SESSION_SYSTEM) {

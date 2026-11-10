@@ -1439,6 +1439,12 @@ static const ag_power_api_t k_power = {
     .declare = api_power_declare,
 };
 
+/* proc->then (ABI 0.79): a line for the caller's slot to run after it ends. */
+static ag_err_t api_then(const char *cmdline)
+{
+    return ag_session_then(ag_proc_self(), cmdline);
+}
+
 static const ag_proc_api_t k_proc = {
     .size = sizeof(ag_proc_api_t),
     .exec = api_exec,
@@ -1456,6 +1462,7 @@ static const ag_proc_api_t k_proc = {
     .migrate_wanted = ag_migrate_wanted,
     .migrate_save = ag_migrate_save,
     .migrate_restore = ag_migrate_restore,
+    .then = api_then,
 };
 
 /* ---------------------------------------------------------------------- */

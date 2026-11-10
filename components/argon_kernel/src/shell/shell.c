@@ -7249,6 +7249,27 @@ static void prompt_loop(void)
         sync_cwd_from_session();
         ag_shell_clear_interrupted();
 
+        /*
+         * What a program left for this slot to run after it (proc->then,
+         * ABI 0.79): the file manager on a board without PSRAM leaves "run
+         * MD" and itself, and goes - its 44 KB were the Mega Drive's video
+         * memory.  Run as if typed, one at a time, each when the one before
+         * has given the slot back.
+         */
+        {
+            const int slot = (sh()->slot == AG_SESSION_FOLLOW)
+                                 ? ag_session_focused()
+                                 : sh()->slot;
+            char then[AG_THEN_LINE];
+            if (ag_session_take_then(slot, then, sizeof(then))) {
+                s_last_status = ag_shell_execute(then);
+                ag_log(AG_LOG_INFO, "shell", "slot %d ran '%s' (then) -> %d",
+                       ag_session_display_number(slot), then,
+                       (int)s_last_status);
+                continue;
+            }
+        }
+
         ag_lineedit_reset(&s_line);
         show_prompt();
         redraw_line(&s_line, &s_prompt_pos);

@@ -539,9 +539,13 @@ extern "C" {
  *      holds - a 6-button pad behind a PCF8574 forgets its count in ~400 us
  *      and eight transfers had a program's gap between each.  APPENDED past
  *      spi_write_wait.
+ *
+ * 0.79 proc->then (10 Nov 2026): a command line the caller's slot runs after
+ *      the caller has ended - so a launcher need not stay in memory under
+ *      what it launched.  APPENDED past migrate_restore.
  */
 #define AG_ABI_MAJOR 0u
-#define AG_ABI_MINOR 78u
+#define AG_ABI_MINOR 79u
 
 /* ------------------------------------------------------------------------ */
 /* Basic types                                                              */
@@ -2852,7 +2856,21 @@ typedef struct ag_proc_api {
      * program, and worth failing loudly rather than truncating.
      */
     int32_t (*migrate_restore)(void *out, uint32_t cap);
+
+    /*
+     * ABI 0.79: a command line for this process's slot to run once it has
+     * ended, as if typed at the slot's prompt - "run c:\md.axe", then the
+     * caller itself again.  Up to AG_THEN_MAX of them wait, in order, each at
+     * most AG_THEN_LINE bytes; -AG_ENOSPC past that, -AG_ENOENT for a process
+     * that has no slot.  For a program that starts another and need not be in
+     * memory while it runs: the file manager on a board without PSRAM, whose
+     * 44 KB left the Mega Drive short of its video memory.
+     */
+    ag_err_t (*then)(const char *cmdline);
 } ag_proc_api_t;
+
+#define AG_THEN_MAX  2u
+#define AG_THEN_LINE 192u
 
 /* The most that travels with a migrating program.  See migrate_save. */
 #define AG_MIGRATE_MAX 1024u

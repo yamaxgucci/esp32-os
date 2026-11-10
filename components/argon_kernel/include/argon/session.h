@@ -97,6 +97,14 @@ int  ag_session_slot_of(ag_pid_t pid);
 const char *ag_session_cwd(int slot);
 ag_err_t    ag_session_set_cwd(int slot, const char *absolute_path);
 
+/*
+ * proc->then (ABI 0.79): a command line pid's slot runs after pid has ended.
+ * take() hands the oldest one waiting for `slot` to that slot's prompt and
+ * forgets it; false when there is none.
+ */
+ag_err_t ag_session_then(ag_pid_t pid, const char *cmdline);
+bool     ag_session_take_then(int slot, char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif
